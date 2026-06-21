@@ -1,0 +1,474 @@
+"""
+Density Engine — Bookmap-style heatmap renderer.
+Maintains SEPARATE bid/ask density accumulators per price level.
+Percentile-based adaptive normalization makes accumulation zones GLOW.
+Pure NumPy, no Qt imports.
+"""
+
+from collections import deque
+from typing import Optional
+
+import numpy as np
+
+from ..core import BBO, BookLevel
+from .color_system import ColorSystem
+from .normalizer import AdaptiveNormalizer
+
+
+class DensityEngine:
+    """
+    Incremental heatmap renderer with per-side density tracking.
+
+    Parameters
+    ----------
+    max_levels : int, default 50
+        Maximum number of levels to track.
+    history_width : int, default 600
+        Width of the rolling buffer in columns.
+    decay : float, default 0.92
+        Multiplicative decay factor per tick (0.5–0.99).
+    config : EngineConfig, optional
+        Alternative config object; overrides other kwargs when provided.
+
+    Key design:
+    - SEPARATE _bid_density[price] and _ask_density[price] accumulators
+    - Each decays independently: density *= decay, then += new_size
+    - Fixed-reference normalization per side (default bid ref=8000, ask ref=8000)
+    - Linear ratio for wide color spread
+    - Buffer scrolls left, rightmost column is CLEARED before drawing new data
+    """
+
+    def __init__(self, max_levels=50, history_width=600, decay=0.92,
+                 config: Optional["EngineConfig"] = None):
+        from .config import EngineConfig
+        if config is not None:
+            self.config = config
+        else:
+            self.config = EngineConfig(
+                max_levels=max_levels,
+                history_width=history_width,
+                decay=decay,
+                bid_ref=3000.0,
+                ask_ref=3000.0
+            )
+
+
+        self._bid_density: dict[float, float] = {}   # price → accumulated bid density
+        self._ask_density: dict[float, float] = {}   # price → accumulated ask density
+        self._bbo: Optional[BBO] = None
+        self._levels: list[BookLevel] = []
+
+        self._price_history: deque[float] = deque(maxlen=self.history_width)
+        self._bbo_history: deque[tuple[float, float]] = deque(maxlen=self.history_width)
+
+        # Exposed price→row mapping
+        self.selected_prices: list[float] = []
+        self.spacing: int = 1
+        self.pad_top: int = 0
+
+        # Linear scale variables
+        self.tick_size: float = 0.05
+        self.center_price_ticks: Optional[int] = None
+        self._center_price_ticks_float: Optional[float] = None
+        self._in_recenter_drift: bool = False
+
+        # Buffer — starts 1×1, filled with background color
+        self._buffer = np.zeros((1, 1, 4), dtype=np.uint8)
+        self._buffer[:] = ColorSystem.BG_COLOR
+        self._needs_rebuild = True
+
+        # Pre-allocated arrays to avoid GC overhead during heavy tick bursts
+        self._arr = np.zeros(1, dtype=np.float64)
+        self._normalized = np.zeros(1, dtype=np.float64)
+
+        # Adaptive normalizers
+        self._bid_normalizer = AdaptiveNormalizer(fixed_ref=self.config.bid_ref)
+        self._ask_normalizer = AdaptiveNormalizer(fixed_ref=self.config.ask_ref)
+        self._norm = self._bid_normalizer
+
+    def push_snapshot(self, levels: list[BookLevel], bbo: BBO, auto_follow: bool = True):
+        """Process one tick."""
+        self._levels = levels
+        self._bbo = bbo
+
+        # 0. Detect tick size from snapshot levels (keep running minimum to avoid vertical scaling jumps)
+        prices = sorted([lv.price for lv in levels])
+        if len(prices) >= 2:
+            diffs = np.diff(prices)
+            valid_diffs = diffs[diffs > 0.000001]
+            if len(valid_diffs) > 0:
+                obs_min = float(np.min(valid_diffs))
+                if not hasattr(self, '_tick_size_detected') or not self._tick_size_detected:
+                    self.tick_size = obs_min
+                    self._tick_size_detected = True
+                else:
+                    self.tick_size = min(self.tick_size, obs_min)
+
+        # 1. Decay existing densities (separate bid/ask) using fast dictionary comprehension
+        decay = self.decay
+        self._bid_density = {p: v * decay for p, v in self._bid_density.items() if v * decay >= 0.005}
+        self._ask_density = {p: v * decay for p, v in self._ask_density.items() if v * decay >= 0.005}
+
+        # 2. Add new sizes to SEPARATE density accumulators
+        for lv in levels:
+            if lv.bid_size > 0:
+                self._bid_density[lv.price] = (
+                    self._bid_density.get(lv.price, 0.0) + lv.bid_size
+                )
+            if lv.ask_size > 0:
+                self._ask_density[lv.price] = (
+                    self._ask_density.get(lv.price, 0.0) + lv.ask_size
+                )
+
+        # 3. Track mid price and BBO history
+        bid = bbo.bid if bbo else 0.0
+        ask = bbo.ask if bbo else 0.0
+        self._bbo_history.append((bid, ask))
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+        self._price_history.append(mid)
+
+        # 4. Scroll buffer left + clear rightmost + draw new column
+        vr, hw = self._buffer.shape[0], self._buffer.shape[1]
+        if vr > 1 and hw > 1:
+            if mid > 0:
+                mid_ticks_float = mid / self.tick_size
+                if self.center_price_ticks is None:
+                    self.center_price_ticks = int(round(mid_ticks_float))
+                    self._center_price_ticks_float = float(self.center_price_ticks)
+                    self._in_recenter_drift = False
+
+                # Centering calculation
+                new_center_ticks = self.center_price_ticks
+
+                if auto_follow:
+                    if self.centering_mode == "immediate":
+                        new_center_ticks = int(round(mid_ticks_float))
+                        self._center_price_ticks_float = float(new_center_ticks)
+                    elif self.centering_mode == "deadband":
+                        deadband = max(1, int(self.centering_deadband_pct * vr))
+                        current_mid_ticks_int = int(round(mid_ticks_float))
+                        delta_ticks = current_mid_ticks_int - self.center_price_ticks
+                        if abs(delta_ticks) > deadband:
+                            new_center_ticks = current_mid_ticks_int
+                            self._center_price_ticks_float = float(new_center_ticks)
+                    elif self.centering_mode == "ema":
+                        self._center_price_ticks_float = (
+                            (1.0 - self.centering_ema_alpha) * self._center_price_ticks_float +
+                            self.centering_ema_alpha * mid_ticks_float
+                        )
+                        new_center_ticks = int(round(self._center_price_ticks_float))
+                    elif self.centering_mode == "smooth_deadband":
+                        deadband = max(1, int(self.centering_deadband_pct * vr))
+                        current_mid_ticks_int = int(round(mid_ticks_float))
+                        delta_ticks = current_mid_ticks_int - self.center_price_ticks
+                        if abs(delta_ticks) > deadband or self._in_recenter_drift:
+                            self._in_recenter_drift = True
+                            self._center_price_ticks_float = (
+                                (1.0 - self.centering_ema_alpha) * self._center_price_ticks_float +
+                                self.centering_ema_alpha * mid_ticks_float
+                            )
+                            new_center_ticks = int(round(self._center_price_ticks_float))
+                            if abs(self._center_price_ticks_float - mid_ticks_float) < 1.0:
+                                self._in_recenter_drift = False
+                        else:
+                            self._center_price_ticks_float = float(self.center_price_ticks)
+
+                delta_ticks = new_center_ticks - self.center_price_ticks
+                if delta_ticks != 0:
+                    self._buffer = np.roll(self._buffer, delta_ticks, axis=0)
+                    if delta_ticks > 0:
+                        self._buffer[:delta_ticks, :, :] = ColorSystem.BG_COLOR
+                    else:
+                        self._buffer[delta_ticks:, :, :] = ColorSystem.BG_COLOR
+                    self.center_price_ticks = new_center_ticks
+
+            # Shift buffer left
+            self._buffer[:, :-1, :] = self._buffer[:, 1:, :]
+            # CRITICAL: clear rightmost column to BG_COLOR
+            self._buffer[:, -1, :] = ColorSystem.BG_COLOR
+            self._draw_column(vr, hw)
+
+    def _draw_column(self, vis_rows, hm_width):
+        """Draw rightmost column using linear price tick scale."""
+        if not self._levels or self.center_price_ticks is None:
+            return
+
+        self.selected_prices = sorted([lv.price for lv in self._levels])
+        self.spacing = 1
+        self.pad_top = 0
+
+        col = hm_width - 1
+        
+        if self._arr.shape[0] != vis_rows:
+            self._arr = np.zeros(vis_rows, dtype=np.float64)
+            self._normalized = np.zeros(vis_rows, dtype=np.float64)
+            self._bid_arr = np.zeros(vis_rows, dtype=np.float64)
+            self._ask_arr = np.zeros(vis_rows, dtype=np.float64)
+            self._is_bid = np.zeros(vis_rows, dtype=bool)
+            self._active_bids = np.zeros(vis_rows, dtype=bool)
+            self._active_asks = np.zeros(vis_rows, dtype=bool)
+            self._norm_bids = np.zeros(vis_rows, dtype=np.float64)
+            self._norm_asks = np.zeros(vis_rows, dtype=np.float64)
+        elif not hasattr(self, '_active_bids') or self._active_bids.shape[0] != vis_rows:
+            self._bid_arr = np.zeros(vis_rows, dtype=np.float64)
+            self._ask_arr = np.zeros(vis_rows, dtype=np.float64)
+            self._is_bid = np.zeros(vis_rows, dtype=bool)
+            self._active_bids = np.zeros(vis_rows, dtype=bool)
+            self._active_asks = np.zeros(vis_rows, dtype=bool)
+            self._norm_bids = np.zeros(vis_rows, dtype=np.float64)
+            self._norm_asks = np.zeros(vis_rows, dtype=np.float64)
+            
+        bid_arr = self._bid_arr
+        ask_arr = self._ask_arr
+        bid_arr.fill(0.0)
+        ask_arr.fill(0.0)
+
+        # Vectorized mapping of prices to row indices
+        if self._bid_density:
+            bid_prices = np.fromiter(self._bid_density.keys(), dtype=np.float64)
+            bid_values = np.fromiter(self._bid_density.values(), dtype=np.float64)
+            bid_rows = (vis_rows // 2) - np.round(bid_prices / self.tick_size).astype(np.int32) + self.center_price_ticks
+            mask = (bid_rows >= 0) & (bid_rows < vis_rows)
+            np.maximum.at(bid_arr, bid_rows[mask], bid_values[mask])
+
+        if self._ask_density:
+            ask_prices = np.fromiter(self._ask_density.keys(), dtype=np.float64)
+            ask_values = np.fromiter(self._ask_density.values(), dtype=np.float64)
+            ask_rows = (vis_rows // 2) - np.round(ask_prices / self.tick_size).astype(np.int32) + self.center_price_ticks
+            mask = (ask_rows >= 0) & (ask_rows < vis_rows)
+            np.maximum.at(ask_arr, ask_rows[mask], ask_values[mask])
+
+        # Apply vertical smoothing if enabled
+        if self.vertical_smoothing > 0.01:
+            bid_arr = self._smooth_column(bid_arr, self.vertical_smoothing)
+            ask_arr = self._smooth_column(ask_arr, self.vertical_smoothing)
+
+        # Calculate active_bids and active_asks
+        active_bids = self._active_bids
+        np.greater(bid_arr, 0.01, out=active_bids)
+        
+        active_asks = self._active_asks
+        np.greater(ask_arr, 0.01, out=active_asks)
+
+        # Update normalizer references from config dynamically
+        self._bid_norm.global_ref = self.config.bid_ref
+        self._ask_norm.global_ref = self.config.ask_ref
+
+        # Update adaptive normalizers
+        if np.any(active_bids):
+            self._bid_norm.update(bid_arr[active_bids])
+            
+        if np.any(active_asks):
+            self._ask_norm.update(ask_arr[active_asks])
+
+        # Normalize separately
+        norm_bids = self._norm_bids
+        norm_bids.fill(0.0)
+        if np.any(active_bids):
+            norm_bids[active_bids] = self._bid_norm.normalize(bid_arr[active_bids])
+            
+        norm_asks = self._norm_asks
+        norm_asks.fill(0.0)
+        if np.any(active_asks):
+            norm_asks[active_asks] = self._ask_norm.normalize(ask_arr[active_asks])
+
+        # Combine for active indices check using max selection logic
+        normalized = self._normalized
+        np.maximum(norm_bids, norm_asks, out=normalized)
+        active_indices = normalized > 0.0005
+        
+        is_bid = self._is_bid
+        is_bid.fill(False)
+        mid_price = (self._bbo.bid + self._bbo.ask) / 2.0 if self._bbo else 0.0
+        if mid_price > 0:
+            p_ticks = self.center_price_ticks + (vis_rows // 2 - np.arange(vis_rows, dtype=np.int32))
+            prices = p_ticks * self.tick_size
+            np.less_equal(prices, mid_price, out=is_bid)
+        else:
+            np.greater(bid_arr, ask_arr, out=is_bid)
+        
+        if np.any(active_indices):
+            idx = np.clip((normalized[active_indices] * 255).astype(np.int32), 0, 255)
+            self._buffer[active_indices, col, :] = ColorSystem.HEATMAP_LUT[idx]
+
+        # Draw current BBO tick directly into the buffer column (no-copy scroll history lines!)
+        if self._bbo:
+            bid_ticks = round(self._bbo.bid / self.tick_size)
+            bid_row = (vis_rows // 2) - (bid_ticks - self.center_price_ticks)
+            if 0 <= bid_row < vis_rows:
+                self._buffer[bid_row, col, :] = [100, 255, 120, 180]
+                
+            ask_ticks = round(self._bbo.ask / self.tick_size)
+            ask_row = (vis_rows // 2) - (ask_ticks - self.center_price_ticks)
+            if 0 <= ask_row < vis_rows:
+                self._buffer[ask_row, col, :] = [255, 100, 90, 180]
+
+    def resize(self, vis_rows, hm_width, old_center_ticks: Optional[int] = None):
+        if vis_rows < 1:
+            vis_rows = 1
+        if hm_width < 1:
+            hm_width = 1
+        ch, cw = self._buffer.shape[0], self._buffer.shape[1]
+        if ch == vis_rows and cw == hm_width:
+            return
+        new_buf = np.zeros((vis_rows, hm_width, 4), dtype=np.uint8)
+        new_buf[:] = ColorSystem.BG_COLOR
+        copy_w = min(cw, hm_width)
+        if copy_w > 0 and ch > 0:
+            if self.center_price_ticks is not None:
+                ref_old = old_center_ticks if old_center_ticks is not None else self.center_price_ticks
+                shift = (vis_rows // 2) - (ch // 2) + (self.center_price_ticks - ref_old)
+                dst_y_start = max(0, shift)
+                dst_y_end = min(vis_rows, ch + shift)
+                src_y_start = max(0, -shift)
+                src_y_end = min(ch, vis_rows - shift)
+                if dst_y_end > dst_y_start and src_y_end > src_y_start:
+                    new_buf[dst_y_start:dst_y_end, -copy_w:] = self._buffer[src_y_start:src_y_end, -copy_w:]
+            else:
+                copy_h = min(ch, vis_rows)
+                new_buf[:copy_h, -copy_w:] = self._buffer[:copy_h, -copy_w:]
+        self._buffer = new_buf
+        self._needs_rebuild = True
+        
+        # Resize recycled arrays
+        self._arr = np.zeros(vis_rows, dtype=np.float64)
+        self._normalized = np.zeros(vis_rows, dtype=np.float64)
+
+    def get_buffer(self) -> np.ndarray:
+        return self._buffer
+
+    @property
+    def _bid_norm(self) -> AdaptiveNormalizer:
+        self._bid_normalizer.global_ref = self.config.bid_ref
+        return self._bid_normalizer
+
+    @property
+    def _ask_norm(self) -> AdaptiveNormalizer:
+        self._ask_normalizer.global_ref = self.config.ask_ref
+        return self._ask_normalizer
+
+    @property
+    def decay(self) -> float:
+        return self.config.decay
+
+    @decay.setter
+    def decay(self, value: float) -> None:
+        self.config.decay = max(0.5, min(0.99, value))
+
+    @property
+    def history_width(self) -> int:
+        return self.config.history_width
+
+    @history_width.setter
+    def history_width(self, value: int) -> None:
+        self.config.history_width = value
+        # Update deque maxlens if changed
+        if hasattr(self, '_price_history') and self._price_history.maxlen != value:
+            self._price_history = deque(self._price_history, maxlen=value)
+        if hasattr(self, '_bbo_history') and self._bbo_history.maxlen != value:
+            self._bbo_history = deque(self._bbo_history, maxlen=value)
+
+    @property
+    def _depth_levels(self) -> int:
+        return self.config.depth_levels
+
+    @_depth_levels.setter
+    def _depth_levels(self, value: int) -> None:
+        self.config.depth_levels = value
+
+    @property
+    def _density_threshold(self) -> float:
+        return self.config.density_threshold
+
+    @_density_threshold.setter
+    def _density_threshold(self, value: float) -> None:
+        self.config.density_threshold = value
+
+    @property
+    def _spacing_min(self) -> int:
+        return self.config.spacing_min
+
+    @_spacing_min.setter
+    def _spacing_min(self, value: int) -> None:
+        self.config.spacing_min = value
+
+    @property
+    def vertical_smoothing(self) -> float:
+        return getattr(self.config, 'vertical_smoothing', 1.0)
+
+    @vertical_smoothing.setter
+    def vertical_smoothing(self, value: float) -> None:
+        if hasattr(self.config, 'vertical_smoothing'):
+            self.config.vertical_smoothing = value
+
+    @property
+    def centering_mode(self) -> str:
+        return getattr(self.config, 'centering_mode', 'ema')
+
+    @centering_mode.setter
+    def centering_mode(self, value: str) -> None:
+        if hasattr(self.config, 'centering_mode'):
+            self.config.centering_mode = value
+
+    @property
+    def centering_ema_alpha(self) -> float:
+        return getattr(self.config, 'centering_ema_alpha', 0.05)
+
+    @centering_ema_alpha.setter
+    def centering_ema_alpha(self, value: float) -> None:
+        if hasattr(self.config, 'centering_ema_alpha'):
+            self.config.centering_ema_alpha = value
+
+    @property
+    def centering_deadband_pct(self) -> float:
+        return getattr(self.config, 'centering_deadband_pct', 0.35)
+
+    @centering_deadband_pct.setter
+    def centering_deadband_pct(self, value: float) -> None:
+        if hasattr(self.config, 'centering_deadband_pct'):
+            self.config.centering_deadband_pct = value
+
+    def get_price_history(self) -> list:
+        return list(self._price_history)
+
+    def get_bbo_history(self) -> list[tuple[float, float]]:
+        return list(self._bbo_history)
+
+    def set_decay(self, d):
+        self.decay = max(0.5, min(0.99, d))
+
+    def set_vertical_smoothing(self, val: float):
+        self.vertical_smoothing = max(0.0, min(5.0, val))
+
+    def _smooth_column(self, arr: np.ndarray, sigma: float) -> np.ndarray:
+        """Apply vertical 1D Gaussian smoothing to a column array using NumPy."""
+        if sigma <= 0.01:
+            return arr
+            
+        # Cache kernel
+        if not hasattr(self, '_cached_sigma') or self._cached_sigma != sigma:
+            import math
+            self._cached_sigma = sigma
+            radius = int(math.ceil(3 * sigma))
+            self._cached_radius = radius
+            x = np.arange(-radius, radius + 1)
+            kernel = np.exp(-0.5 * (x / sigma) ** 2)
+            kernel /= np.sum(kernel)
+            self._cached_kernel = kernel
+        else:
+            kernel = self._cached_kernel
+            radius = self._cached_radius
+
+        vis_rows = arr.shape[0]
+        pad_size = vis_rows + 2 * radius
+        
+        # Reuse padded array
+        if not hasattr(self, '_padded_arr') or self._padded_arr.shape[0] != pad_size:
+            self._padded_arr = np.zeros(pad_size, dtype=np.float64)
+            
+        padded = self._padded_arr
+        padded[radius : radius + vis_rows] = arr
+        padded[0 : radius] = arr[0]
+        padded[radius + vis_rows : ] = arr[-1]
+        
+        return np.convolve(padded, kernel, mode='valid')

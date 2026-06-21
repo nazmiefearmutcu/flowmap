@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+flowmap.egg-info/
+build/
+dist/
+.DS_Store
+
+# Temporary visual renders & benchmarks
+heatmap_final.png
+flowmap_final*.png
+flowmap_live.png
+flowmap_headless_render.png
+heatmap_test.png
+benchmark_report.json
