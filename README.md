@@ -2,97 +2,41 @@
 
 **Open-source Bookmap-style order flow visualization platform.**
 
-FlowMap brings institutional-grade order book heatmap visualization to everyone. Built with Python and PyQt6, it renders real-time liquidity heatmaps, trade execution bubbles, DOM depth, and volume analytics — inspired by [Bookmap](https://bookmap.com/).
+FlowMap brings institutional-grade order book heatmap visualization to your desktop. Built with Python, PyQt6, and vectorized NumPy array projections, it renders real-time liquidity heatmaps, trade execution bubbles, DOM depth, and volume analytics — inspired by [Bookmap Classic](https://bookmap.com/).
 
-![FlowMap Screenshot](https://img.shields.io/badge/status-alpha-orange)
+---
+
+## 🏷️ Tags & Badges
+
+![Status](https://img.shields.io/badge/status-active--development-emerald)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![PyQt6](https://img.shields.io/badge/PyQt-6-green)
+![PyQt6](https://img.shields.io/badge/PyQt-6-darkblue)
+![Engine](https://img.shields.io/badge/engine-NumPy%20Vectorized-orange)
+![Replay](https://img.shields.io/badge/replay-Crypcodile%20DuckDB-purple)
 
 ---
 
 ## ✨ Features
 
-### 🔥 Real-Time Order Book Heatmap
-- Bid/ask depth visualized as colored rows (green = bids, red = asks)
-- Multiple color schemes: **Bookmap**, **Mono**
-- Gamma correction for better depth perception
-- Configurable row height and zoom
+### 🔥 Real-Time Bookmap Classic Heatmap
+- **Unified Color Scale**: Transitions smoothly based on volume density (transparent $\rightarrow$ white $\rightarrow$ orange/red) on both bid and ask sides.
+- **Flicker-Free Stratigraphy**: Iterates the union of all active price levels in memory, allowing historical lines to smoothly decay and fade out rather than instantly vanish.
+- **Zero Vertical Jitter**: Uses a running minimum of observed tick intervals to freeze the vertical price tick scale.
 
-### 🫧 Trade Execution Bubbles
-- Every trade plotted at its exact price level
-- Bubble size scales with trade quantity
-- Color-coded by aggressor side (green = buy, red = sell)
-- Flash effect on new trades
+### 🫧 Trade Execution Bubbles & Overlays
+- **Interactive Trade Circles**: Every trade is plotted at its exact price row, with size scaling by volume and color mapped to aggressor side (green = buy, red = sell).
+- **Volume Profile Overlay**: Matches the exact float-based boundaries of heatmap rows to prevent vertical layout drift.
+- **VWAP & CVD (Market Pulse)**: Continuous float-based sub-pixel line rendering for technical analysis.
+- **High-Readability BBO Current Price Tags**: Snapped bid/ask tags highlighted inside dark, side-colored rounded capsules.
 
-### 📊 Market Analytics
-- **VWAP** — Volume-weighted average price overlay
-- **Volume Profile** — Horizontal histogram with POC
-- **CVD** — Cumulative Volume Delta
-- **BBO** — Best bid/offer markers
-- **DOM Ladder** — Depth of market display
-- **Imbalance & Absorption** — Order book pressure analysis
-- **Liquidity Wall Detection** — Algorithmic iceberg/spoof detection
+### 🗄️ Crypcodile Replay Data Integration
+- **DuckDB Querying**: Connects locally to parquet-structured Crypcodile historical data folders (e.g., `exchange=binance-spot`, `channel=book_delta`).
+- **Asynchronous QThread Playback**: Pushes records to the UI loop via a thread-safe update queue.
 
-### 🎮 Interactive Controls
-- Mouse-wheel zoom and scroll
-- Keyboard shortcuts (F=follow, Space=auto-follow, +/-=zoom)
-- Auto-follow mode keeps BBO centered
-- Simulation speed control (1× to 20×)
-- One-click presets (Scalper, Swing, HFT, Clean)
-
-### 🖥️ Platform
-- **Desktop app** — Python/PyQt6 (cross-platform: Windows, macOS, Linux)
-- **Demo mode** — Built-in market simulator with realistic data
-- **Live mode** — WebSocket connection to crypto exchanges via CCXT
-- **Replay mode** — Record and replay market sessions
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Python 3.10+
-- pip or uv
-
-### Installation
-
-```bash
-# Clone the repo
-git clone https://github.com/yourusername/flowmap.git
-cd flowmap
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run
-python run_flowmap.py
-```
-
-### Or install as a package
-
-```bash
-pip install -e .
-flowmap
-```
-
----
-
-## ⌨️ Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `F` | Center view on best bid/offer |
-| `Space` | Toggle auto-follow mode |
-| `+` / `=` | Zoom in (increase row height) |
-| `-` | Zoom out (decrease row height) |
-| `R` | Reset scroll position |
-| `Ctrl+R` | Start/stop simulation |
-| `Ctrl+Q` | Quit application |
+### 🖥️ Platform & Rendering
+- **GPU Acceleration**: Supports both CPU (`QWidget`) and GPU (`QOpenGLWidget`) backends.
+- **Performance Optimized**: Vectorized price projections (`np.fromiter` and `np.maximum.at`) and pre-allocated/cached `QPen`/`QBrush` styling objects allow uncapped rendering speeds of **135+ FPS** at 1080p.
 
 ---
 
@@ -106,60 +50,79 @@ flowmap/
 │   │   └── order_book.py  # L2 limit order book
 │   ├── data/           # Data sources
 │   │   ├── simulator.py   # Synthetic market data
+│   │   ├── crypcodile_replay.py # Historical DuckDB/Parquet player
 │   │   └── crypto.py      # Live crypto feeds (CCXT)
 │   ├── ui/             # PyQt6 GUI
-│   │   ├── heatmap/       # Heatmap render engine
-│   │   ├── dom/           # DOM ladder
+│   │   ├── bubbles.py     # Trade circles canvas
+│   │   ├── price_chart.py # Sits above heatmap, sharing time axis
+│   │   ├── pulse.py       # Cumulative Volume Delta (CVD)
 │   │   ├── overlays/      # VWAP, CVD, Volume Profile
+│   │   ├── dom/           # DOM ladder
+│   │   ├── theme.py       # Styling and CSS
 │   │   └── main_window.py # App orchestration
-│   ├── indicators/     # Technical indicators
-│   ├── plugins/        # Plugin/addon API
-│   ├── trading/        # Broker integration
+│   ├── engine/         # Quant/Visual computation
+│   │   ├── density_engine.py  # Vectorized row projections
+│   │   └── color_system.py    # Look-up tables (LUTs)
 │   └── main.py         # Entry point
-├── tests/
-├── requirements.txt
-└── README.md
 ```
+
+---
+
+## 🚀 Quick Start
+
+### 📦 Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/nazmiefearmutcu/flowmap.git
+   cd flowmap
+   ```
+
+2. **Create a virtual environment & install dependencies:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+### 🎮 Running the Platform
+
+To launch the dashboard:
+```bash
+python run_flowmap.py
+```
+
+- **Data Source Selection**: Choose **Simulator** or **Crypcodile Replay** from the toolbar source dropdown.
+- **Controls**: Press **Start** to run. Use `+`/`-` or mouse scroll with `Ctrl` held down to adjust vertical line zoom. Use `Space` to toggle auto-follow BBO centering.
 
 ---
 
 ## 🛣️ Roadmap
 
-### Phase 1 — Core Engine ✅ (Current)
-- [x] Order book data structures
-- [x] Market data simulator
-- [x] Heatmap render engine
-- [x] Basic UI with controls
+### Phase 1 — Core Engine & UI ✅
+- [x] Vectorized order book density engine
+- [x] Zero-flicker double-buffered layout scaling
+- [x] Bookmap Classic colormap implementation
+- [x] Interactive mouse zooming, scrolling, and dragging
 
-### Phase 2 — Indicators & Overlays
-- [ ] VWAP overlay
-- [ ] Volume Profile (POC)
-- [ ] CVD chart
-- [ ] DOM ladder widget
-- [ ] Time & Sales tape
+### Phase 2 — Indicators & Overlays ✅
+- [x] VWAP overlays and snap price lines
+- [x] Volume Profile (perfectly aligned POC)
+- [x] CVD (Market Pulse) with Color Vision Deficiency (CVD) support
+- [x] DOM Ladder panel
 
-### Phase 3 — Live Data
-- [ ] Crypto exchange WebSocket (CCXT)
-- [ ] Record & replay
-- [ ] Multi-symbol support
+### Phase 3 — Live & Replay Feeds ✅
+- [x] Crypcodile Replay parquet DuckDB connector
+- [x] CCXT Live exchanges WebSocket provider
+- [x] Record & Replay session manager
 
-### Phase 4 — Advanced
-- [ ] Plugin API (like Bookmap's Python API)
-- [ ] Order book imbalance detection
-- [ ] Liquidity wall detection
-- [ ] Footprint charts
-- [ ] Multi-book (consolidated order books)
+### Phase 4 — Algorithmic Detection 🔨
+- [ ] Liquidity Wall & Iceberg order detection
+- [ ] Order book order-flow imbalance indicators
+- [ ] Footprint chart widgets
 
 ---
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-- [Bookmap](https://bookmap.com/) — The inspiration and gold standard for order flow visualization
-- [OrderFlowMap](https://github.com/Azhagesan-dev/OrderFlowMap) — Excellent single-file browser-based Bookmap-style visualizer
-- [OpenAlgo](https://github.com/marketcalls/openalgo) — WebSocket market data server
+Distributed under the MIT License. See `LICENSE` for more information.
