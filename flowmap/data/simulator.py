@@ -41,7 +41,7 @@ class MarketSimulator(DataProvider):
         tick_size: float = 0.05,
         min_size: float = 30.0,
         max_size: float = 2000.0,
-        depth_levels: int = 15,
+        depth_levels: int = 100,
         spread_bps: float = 0.5,
         volatility: float = 0.02,
         volume_per_tick: float = 0.25,
@@ -97,9 +97,9 @@ class MarketSimulator(DataProvider):
         # Bookmap-style: large walls at key levels creating horizontal bands
         # MORE zones (10-15), LONGER life (300-800 ticks), LARGER sizes (up to 12x max_size)
         # Clustered: 2-3 groups of zones at nearby prices for hotspot effect
-        zone_count = random.randint(3, 5)
+        zone_count = random.randint(10, 15)
         self._zones: list[dict] = []
-        num_clusters = random.randint(1, 2)
+        num_clusters = random.randint(2, 3)
         cluster_centers = []
         for _ in range(num_clusters):
             side_offset = random.randint(-15, 15)
@@ -186,14 +186,14 @@ class MarketSimulator(DataProvider):
         return size
 
     def _generate_bids(self) -> list[tuple[float, float]]:
-        """Generate realistic bid levels with exponential size decay from BBO."""
+        """Generate realistic bid levels with continuous 1-tick spacing."""
         bids = []
-        price = self.current_price - self.tick_size * random.uniform(1, 3)
+        price = self.current_price - self.tick_size * random.uniform(1, 2)
         price = round(price / self.tick_size) * self.tick_size
 
-        # ── Random level gaps: each tick, 2-4 levels forced to zero on this side ──
-        gap_count = random.randint(2, 4)
-        gap_levels = set(random.sample(range(1, self.depth_levels), gap_count))
+        # Random level gaps: occasional empty levels
+        gap_count = random.randint(3, 6)
+        gap_levels = set(random.sample(range(2, self.depth_levels), gap_count)) if self.depth_levels > 10 else set()
 
         for level in range(self.depth_levels):
             distance = self.current_price - price
@@ -207,49 +207,81 @@ class MarketSimulator(DataProvider):
 
             # ── Static zone contribution (persistent liquidity walls) ──
             for zone in self._zones:
-                if zone['life'] > 0 and abs(price - zone['price']) < self.tick_size * 1.5:
+                if zone['life'] > 0 and abs(price - zone['price']) < self.tick_size * 0.1:
                     size += zone['size']
-                    zone['life'] -= 1
-                    zone['size'] *= 0.985  # faster decay → less persistent bands
+                    # Only decay the wall size when the price is close (being traded/filled)
+                    if abs(self.current_price - zone['price']) < self.tick_size * 1.5:
+                        zone['life'] -= 1
+                        zone['size'] *= 0.98  # shrink size as it gets traded
 
             # Burst multiplier (dramatic but brief)
             size *= self._burst_multiplier
 
             # Jitter
-            size *= random.uniform(0.7, 1.3)
+            size *= random.uniform(0.85, 1.15)
 
             # BBO boost: ensure top-of-book levels are always visible
             if level == 0:
-                size = max(size, 500.0)
+                size = max(size, 800.0)
             elif level == 1:
-                size = max(size, 100.0)
+                size = max(size, 300.0)
 
-            # Random level gaps: force selected levels to zero for natural Bookmap look
+            # Random level gaps: force selected levels to zero for natural look
             if level in gap_levels:
                 size = 0.0
 
-            # Cap total order size to prevent density explosion
-            size = min(size, 2000.0)
+            # Cap total order size at 5000 to allow prominent liquidity walls
+            size = min(size, 5000.0)
 
             if size > 0:
                 bids.append((max(0.01, price), max(self.min_size, size)))
 
-            # Wider spacing at deeper levels (creates V-shape from BBO)
-            spacing = self.tick_size * random.uniform(1.0, 2.5 + level * 0.1)
-            price -= spacing
+            # Continuous 1-tick spacing
+            price -= self.tick_size
             price = round(price / self.tick_size) * self.tick_size
+
+        # Collect any extra prices for active bids (zones, icebergs, accumulations) that were not covered
+        extra_prices = set()
+        for zone in self._zones:
+            if zone['life'] > 0 and zone['price'] < self.current_price:
+                extra_prices.add(round(zone['price'] / self.tick_size) * self.tick_size)
+        for iceberg in self._iceberg_orders:
+            if iceberg['remaining'] > 0 and iceberg['side'] == 'bid' and iceberg['price'] < self.current_price:
+                extra_prices.add(round(iceberg['price'] / self.tick_size) * self.tick_size)
+        for (acc_price, acc_side) in self._accumulated_orders:
+            if acc_side == 'bid' and acc_price < self.current_price:
+                extra_prices.add(round(acc_price / self.tick_size) * self.tick_size)
+
+        existing_prices = {b[0] for b in bids}
+        for ep in sorted(extra_prices, reverse=True):
+            if ep not in existing_prices:
+                distance = self.current_price - ep
+                size = self._size_at_distance(distance)
+                size = self._apply_accumulation(ep, 'bid', size)
+                size = self._apply_iceberg(ep, 'bid', size)
+                for zone in self._zones:
+                    if zone['life'] > 0 and abs(ep - zone['price']) < self.tick_size * 0.1:
+                        size += zone['size']
+                        if abs(self.current_price - zone['price']) < self.tick_size * 1.5:
+                            zone['life'] -= 1
+                            zone['size'] *= 0.98
+                size *= self._burst_multiplier
+                size *= random.uniform(0.85, 1.15)
+                size = min(size, 5000.0)
+                if size > 0:
+                    bids.append((ep, max(self.min_size, size)))
 
         return bids
 
     def _generate_asks(self) -> list[tuple[float, float]]:
-        """Generate realistic ask levels with exponential size decay from BBO."""
+        """Generate realistic ask levels with continuous 1-tick spacing."""
         asks = []
-        price = self.current_price + self.tick_size * random.uniform(1, 3)
+        price = self.current_price + self.tick_size * random.uniform(1, 2)
         price = round(price / self.tick_size) * self.tick_size
 
-        # ── Random level gaps: each tick, 2-4 levels forced to zero on this side ──
-        gap_count = random.randint(2, 4)
-        gap_levels = set(random.sample(range(1, self.depth_levels), gap_count))
+        # Random level gaps: occasional empty levels
+        gap_count = random.randint(3, 6)
+        gap_levels = set(random.sample(range(2, self.depth_levels), gap_count)) if self.depth_levels > 10 else set()
 
         for level in range(self.depth_levels):
             distance = price - self.current_price
@@ -263,36 +295,69 @@ class MarketSimulator(DataProvider):
 
             # ── Static zone contribution (persistent liquidity walls) ──
             for zone in self._zones:
-                if zone['life'] > 0 and abs(price - zone['price']) < self.tick_size * 1.5:
+                if zone['life'] > 0 and abs(price - zone['price']) < self.tick_size * 0.1:
                     size += zone['size']
-                    zone['life'] -= 1
-                    zone['size'] *= 0.985  # faster decay → less persistent bands
+                    # Only decay the wall size when the price is close (being traded/filled)
+                    if abs(self.current_price - zone['price']) < self.tick_size * 1.5:
+                        zone['life'] -= 1
+                        zone['size'] *= 0.98  # shrink size as it gets traded
 
-            # Burst multiplier
+            # Burst multiplier (dramatic but brief)
             size *= self._burst_multiplier
 
             # Jitter
-            size *= random.uniform(0.7, 1.3)
+            size *= random.uniform(0.85, 1.15)
 
             # BBO boost: ensure top-of-book levels are always visible
             if level == 0:
-                size = max(size, 500.0)
+                size = max(size, 800.0)
             elif level == 1:
-                size = max(size, 100.0)
+                size = max(size, 300.0)
 
-            # Random level gaps: force selected levels to zero for natural Bookmap look
+            # Random level gaps: force selected levels to zero for natural look
             if level in gap_levels:
                 size = 0.0
 
-            # Cap total order size to prevent density explosion
-            size = min(size, 2000.0)
+            # Cap total order size at 5000 to allow prominent liquidity walls
+            size = min(size, 5000.0)
 
             if size > 0:
                 asks.append((price, max(self.min_size, size)))
 
-            spacing = self.tick_size * random.uniform(1.0, 2.5 + level * 0.1)
-            price += spacing
+            # Continuous 1-tick spacing
+            price += self.tick_size
             price = round(price / self.tick_size) * self.tick_size
+
+        # Collect any extra prices for active asks (zones, icebergs, accumulations) that were not covered
+        extra_prices = set()
+        for zone in self._zones:
+            if zone['life'] > 0 and zone['price'] > self.current_price:
+                extra_prices.add(round(zone['price'] / self.tick_size) * self.tick_size)
+        for iceberg in self._iceberg_orders:
+            if iceberg['remaining'] > 0 and iceberg['side'] == 'ask' and iceberg['price'] > self.current_price:
+                extra_prices.add(round(iceberg['price'] / self.tick_size) * self.tick_size)
+        for (acc_price, acc_side) in self._accumulated_orders:
+            if acc_side == 'ask' and acc_price > self.current_price:
+                extra_prices.add(round(acc_price / self.tick_size) * self.tick_size)
+
+        existing_prices = {a[0] for a in asks}
+        for ep in sorted(extra_prices):
+            if ep not in existing_prices:
+                distance = ep - self.current_price
+                size = self._size_at_distance(distance)
+                size = self._apply_accumulation(ep, 'ask', size)
+                size = self._apply_iceberg(ep, 'ask', size)
+                for zone in self._zones:
+                    if zone['life'] > 0 and abs(ep - zone['price']) < self.tick_size * 0.1:
+                        size += zone['size']
+                        if abs(self.current_price - zone['price']) < self.tick_size * 1.5:
+                            zone['life'] -= 1
+                            zone['size'] *= 0.98
+                size *= self._burst_multiplier
+                size *= random.uniform(0.85, 1.15)
+                size = min(size, 5000.0)
+                if size > 0:
+                    asks.append((ep, max(self.min_size, size)))
 
         return asks
 

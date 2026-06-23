@@ -8,10 +8,10 @@ import os
 class AppConfig:
     """Master configuration for the entire FlowMap application."""
     # Engine
-    max_levels: int = 50
+    max_levels: int = 100
     history_width: int = 600
     decay: float = 0.92
-    depth_levels: int = 15
+    depth_levels: int = 100
     bid_ref: float = 5000.0
     ask_ref: float = 5000.0
     vertical_smoothing: float = 1.0

@@ -83,7 +83,7 @@ def analyze_buffer(buf: np.ndarray, mid_price: float, levels: list) -> dict:
         'red_pct':   pct(bot_r, bot_nb),
         'green_pct': pct(bot_g, bot_nb),
         'non_bg_pct': pct(bot_nb, bot_t),
-        'is_bid_zone': bot_r > 0 and bot_nb > 20,
+        'is_bid_zone': bot_g > 0 and bot_nb > 20,
     }
 
     # ── Unique colors ──
@@ -353,7 +353,7 @@ def main():
     ))
     checks.append((
         "PASS" if buf_r['bot_zone']['is_bid_zone'] else "WARN",
-        "Bottom rows = BID zone (contains high-density red/orange walls)"
+        "Bottom rows = BID zone (contains high-density green walls)"
     ))
     checks.append((
         "PASS" if buf_r['unique_colors_ok'] else "FAIL",
@@ -389,8 +389,8 @@ def main():
             f"Dark background > 20%  ({png['pct_dark']}%)"
         ))
         checks.append((
-            "PASS" if png['pct_green'] < 1.0 else "WARN",
-            f"Green pixels < 1.0% (expected low under unified colormap)  ({png['pct_green']}%)"
+            "PASS" if png['pct_green'] > 0.5 else "WARN",
+            f"Green pixels > 0.5%  ({png['pct_green']}%)"
         ))
         checks.append((
             "PASS" if png['pct_red'] > 0.5 else "WARN",

@@ -10,12 +10,14 @@ from .crypto import CryptoProvider
 from .manager import DataManager
 from .simulator import MarketSimulator
 
-# Optional: CrypcodileReplay provider
+# Optional: CrypcodileReplay & CrypcodileLive providers
 try:
     from .crypcodile_replay import CrypcodileReplayProvider
+    from .crypcodile_live import CrypcodileLiveProvider
     HAS_CRYPCODILE = True
 except ImportError:
     CrypcodileReplayProvider = None
+    CrypcodileLiveProvider = None
     HAS_CRYPCODILE = False
 
 __all__ = [
@@ -24,6 +26,7 @@ __all__ = [
     "DataManager",
     "MarketSimulator",
     "CrypcodileReplayProvider",
+    "CrypcodileLiveProvider",
     "HAS_CRYPCODILE",
     "EXCHANGE_CONFIG",
     "ExchangeCfg",

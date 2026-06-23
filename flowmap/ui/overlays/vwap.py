@@ -87,32 +87,36 @@ class VWAPOverlay(QWidget):
     # ── Painting ───────────────────────────────────────────────
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        if self._current_vwap is None or not self._visible_levels:
+        if self._current_vwap is None:
             return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         w, h = self.width(), self.height()
-        left = self.price_column_width
-        heatmap_width = w - left
+        left = 0
+        heatmap_width = w - self.price_column_width
 
-        # Find Y pixel of the price level closest to VWAP
+        # Position using HeatmapWidget's unified price-to-screen mapping
         vwap_y: Optional[int] = None
-        for i, level in enumerate(self._visible_levels):
-            if abs(level.price - self._current_vwap) < 0.001:
-                vwap_y = i * self.row_height + self.row_height // 2
-                break
-
-        # If no exact match, interpolate
-        if vwap_y is None and len(self._visible_levels) >= 2:
-            first = self._visible_levels[0].price
-            last = self._visible_levels[-1].price
-            if last > first and first <= self._current_vwap <= last:
-                # Linear interpolation
-                price_range = last - first
-                rel = (self._current_vwap - first) / price_range
-                vwap_y = int(rel * (len(self._visible_levels) - 1) * self.row_height + self.row_height // 2)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_price_to_screen_y'):
+            vwap_y = int(parent._price_to_screen_y(self._current_vwap, h))
+        else:
+            # Fallback to the old logic if parent method is not accessible
+            if self._visible_levels:
+                for i, level in enumerate(self._visible_levels):
+                    if abs(level.price - self._current_vwap) < 0.001:
+                        vwap_y = i * self.row_height + self.row_height // 2
+                        break
+                if vwap_y is None and len(self._visible_levels) >= 2:
+                    first = self._visible_levels[0].price
+                    last = self._visible_levels[-1].price
+                    p_min, p_max = min(first, last), max(first, last)
+                    if p_max > p_min and p_min <= self._current_vwap <= p_max:
+                        price_range = p_max - p_min
+                        rel = (first - self._current_vwap) / price_range
+                        vwap_y = int(rel * (len(self._visible_levels) - 1) * self.row_height + self.row_height // 2)
 
         if vwap_y is not None and 0 <= vwap_y < h:
             # ── Dashed line ──
@@ -129,13 +133,26 @@ class VWAPOverlay(QWidget):
             label_w = fm.horizontalAdvance(label_text) + 10
             label_h = fm.height() + 4
 
-            # Label background
+            # Label background - solid dark color to block out the heatmap and line behind the text
+            badge_bg = QColor(18, 18, 22, 240)
             painter.fillRect(
                 left + heatmap_width - label_w - 4,
                 vwap_y - label_h // 2,
                 label_w,
                 label_h,
-                self.label_bg,
+                badge_bg,
+            )
+
+            # Draw a gold border around the label badge to make it look premium
+            border_pen = QPen(self.line_color, 1)
+            painter.setPen(border_pen)
+            painter.drawRoundedRect(
+                left + heatmap_width - label_w - 4,
+                vwap_y - label_h // 2,
+                label_w,
+                label_h,
+                3.0,
+                3.0,
             )
 
             # Label text

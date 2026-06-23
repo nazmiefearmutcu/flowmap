@@ -14,7 +14,7 @@ except ImportError:
     
     if os.path.exists(venv_python) and sys.executable != venv_python:
         # Re-execute the script using the virtual environment's python interpreter
-        os.execv(venv_python, [venv_python] + sys.argv)
+        os.execv(venv_python, [venv_python, "-u"] + sys.argv)
     else:
         print("Error: Required dependencies (PyQt6/numpy) are missing, and no local .venv was found.")
         sys.exit(1)

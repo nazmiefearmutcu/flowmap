@@ -19,7 +19,8 @@ class EngineConfig:
     bid_ref: float = 20000.0
     ask_ref: float = 20000.0
     vertical_smoothing: float = 1.0
-    centering_mode: str = "ema"
+    centering_mode: str = "smooth_deadband"
     centering_ema_alpha: float = 0.05
     centering_deadband_pct: float = 0.35
+    ticks_per_row: int = 1
 

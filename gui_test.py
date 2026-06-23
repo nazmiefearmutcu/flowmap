@@ -15,24 +15,27 @@ app.processEvents()
 
 # Auto-start simulation after 500ms
 def start_sim():
-    window._source.toggle_simulation()
-    print("Simulation started")
+    if not window._source.running:
+        window._source.toggle_simulation()
+        print("Simulation started")
+    else:
+        print("Simulation already running")
     
     # Wait 20 seconds for data buildup, then capture
     def capture():
         print("Capturing screenshot...")
         pixmap = window.grab()
-        pixmap.save("/tmp/flowmap_gui_auto.png")
-        print("Saved: /tmp/flowmap_gui_auto.png")
+        pixmap.save("/Users/nazmi/flowmap/flowmap_gui_auto.png")
+        print("Saved: /Users/nazmi/flowmap/flowmap_gui_auto.png")
         
         # Also capture just the heatmap widget
         hm_pixmap = window.heatmap.grab()
-        hm_pixmap.save("/tmp/flowmap_heatmap_widget.png")
+        hm_pixmap.save("/Users/nazmi/flowmap/flowmap_heatmap_widget.png")
         print(f"Heatmap widget: {hm_pixmap.width()}x{hm_pixmap.height()}")
         
         # Analyze
         from PyQt6.QtGui import QImage
-        img = QImage("/tmp/flowmap_gui_auto.png")
+        img = QImage("/Users/nazmi/flowmap/flowmap_gui_auto.png")
         w, h = img.width(), img.height()
         ptr = img.bits()
         ptr.setsize(w*h*4)
@@ -86,7 +89,7 @@ def start_sim():
         
         app.quit()
     
-    QTimer.singleShot(20000, capture)
+    QTimer.singleShot(5000, capture)
 
 QTimer.singleShot(500, start_sim)
 app.exec()

@@ -55,7 +55,8 @@ class VolumeProfileOverlay(QWidget):
         self._va_throttle_sec: float = 0.1
 
         # ── Appearance ──
-        self.bg_color = QColor(18, 18, 22)
+        from ..theme import Colors
+        self.bg_color = Colors.BG_PANEL
         self.grid_color = QColor(35, 35, 45)
         self.text_color = QColor(180, 180, 190)
         self.poc_color = QColor(0, 200, 255)        # Bright cyan
@@ -85,17 +86,40 @@ class VolumeProfileOverlay(QWidget):
 
     def add_trade(self, price: float, size: float) -> None:
         """Record trade volume at a given price level."""
-        old_vol = self._volumes.get(price, 0.0)
+        price_key = round(price, 6)
+        old_vol = self._volumes.get(price_key, 0.0)
         new_vol = old_vol + size
-        self._volumes[price] = new_vol
+        self._volumes[price_key] = new_vol
         self._total_volume += size
         
         # Incrementally update max volume and POC (O(1) updates)
         if new_vol > self._poc_volume:
             self._poc_volume = new_vol
-            self._poc_price = price
+            self._poc_price = price_key
         if new_vol > self._max_volume:
             self._max_volume = new_vol
+
+        self._va_stale = True
+        self.update()
+
+    def add_trades(self, trades: list[Trade]) -> None:
+        """Record a batch of trade volumes at given price levels."""
+        if not trades:
+            return
+        for trade in trades:
+            price, size = trade.price, trade.size
+            price_key = round(price, 6)
+            old_vol = self._volumes.get(price_key, 0.0)
+            new_vol = old_vol + size
+            self._volumes[price_key] = new_vol
+            self._total_volume += size
+            
+            # Incrementally update max volume and POC
+            if new_vol > self._poc_volume:
+                self._poc_volume = new_vol
+                self._poc_price = price_key
+            if new_vol > self._max_volume:
+                self._max_volume = new_vol
 
         self._va_stale = True
         self.update()
@@ -229,7 +253,8 @@ class VolumeProfileOverlay(QWidget):
             if y_start > h:
                 break
 
-            vol = self._volumes.get(price, 0.0)
+            price_key = round(price, 6)
+            vol = self._volumes.get(price_key, 0.0)
             if vol <= 0:
                 continue
 
@@ -244,13 +269,13 @@ class VolumeProfileOverlay(QWidget):
             in_va = (
                 self._va_low is not None
                 and self._va_high is not None
-                and self._va_low <= price <= self._va_high
+                and self._va_low <= price_key <= self._va_high
             )
 
             # Is this the POC?
             is_poc = (
                 self._poc_price is not None
-                and abs(price - self._poc_price) < 0.001
+                and abs(price_key - self._poc_price) < 0.001
             )
 
             # Bar X position (right-aligned)

@@ -347,9 +347,9 @@ class DomLadder(QWidget):
 
         # ── Vertical dividers between sections ──
         painter.setPen(QPen(self.GRID_COLOR, 1))
-        # Thin lines at the boundaries of the fixed columns
-        for col_idx in (0, 2, 4):  # after bid_qty, after price, after ask_qty
-            x = cols[col_idx].right()
+        # Thin lines at the boundaries of all columns
+        for col_idx in (0, 1, 2, 3, 4):
+            x = cols[col_idx].x() + cols[col_idx].width()
             painter.drawLine(x, 0, x, h)
 
         painter.end()

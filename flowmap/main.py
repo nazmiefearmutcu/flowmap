@@ -10,6 +10,7 @@ from .ui.main_window import MainWindow
 def main():
     """Launch the FlowMap application."""
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("FlowMap")
     app.setOrganizationName("FlowMap")
 

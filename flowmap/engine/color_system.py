@@ -93,18 +93,17 @@ def build_bookmap_lut():
 
 def build_bookmap_bid_lut():
     """Build a 256-entry uint8 RGBA look-up table for Bookmap Bid heatmap.
-    Transitions from transparent green -> green -> white -> yellow -> red.
+    Transitions through cool colors: transparent green/blue -> teal -> emerald green -> mint.
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
     control_points = [
-        (0.0,  (10, 240, 10, 22)),
-        (0.15, (20, 240, 20, 24)),
-        (0.3,  (35, 240, 45, 80)),
-        (0.5,  (50, 245, 60, 130)),
-        (0.7,  (80, 250, 90, 220)),
-        (0.8,  (255, 255, 255, 255)),
-        (0.9,  (255, 180, 0, 255)),
-        (1.0,  (255, 0, 0, 255)),
+        (0.0,  (0, 0, 0, 0)),
+        (0.15, (0, 40, 80, 20)),
+        (0.3,  (0, 100, 100, 70)),
+        (0.5,  (0, 160, 120, 130)),
+        (0.7,  (16, 185, 129, 200)),
+        (0.85, (52, 211, 153, 240)),
+        (1.0,  (167, 243, 208, 255)),
     ]
     for i in range(256):
         t = i / 255.0
@@ -126,18 +125,17 @@ def build_bookmap_bid_lut():
 
 def build_bookmap_ask_lut():
     """Build a 256-entry uint8 RGBA look-up table for Bookmap Ask heatmap.
-    Transitions from transparent red -> red -> white -> yellow -> red.
+    Transitions through warm colors: transparent red -> red/orange -> amber -> gold -> warm white.
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
     control_points = [
-        (0.0,  (240, 10, 10, 22)),
-        (0.15, (240, 20, 20, 24)),
-        (0.3,  (240, 35, 30, 80)),
-        (0.5,  (245, 50, 40, 130)),
-        (0.7,  (250, 80, 70, 220)),
-        (0.8,  (255, 255, 255, 255)),
-        (0.9,  (255, 180, 0, 255)),
-        (1.0,  (255, 0, 0, 255)),
+        (0.0,  (0, 0, 0, 0)),
+        (0.15, (80, 20, 0, 20)),
+        (0.3,  (160, 40, 0, 70)),
+        (0.5,  (220, 80, 0, 130)),
+        (0.7,  (245, 158, 11, 200)),
+        (0.85, (252, 211, 77, 240)),
+        (1.0,  (254, 243, 199, 255)),
     ]
     for i in range(256):
         t = i / 255.0

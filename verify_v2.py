@@ -63,7 +63,7 @@ def test_density_engine():
         engine.push_snapshot(levels, bbo)
 
     buf = engine.get_buffer()
-    assert buf.shape == (200, 200, 4), f"Bad buffer: {buf.shape}"
+    assert buf.shape == (1000, 200, 4), f"Bad buffer: {buf.shape}"
 
     # Check non-background pixels
     non_bg = np.sum(np.any(buf[:, :, :3] != ColorSystem.BG_COLOR[:3], axis=2))
@@ -86,7 +86,7 @@ def test_density_engine():
 
     print(f"  Top red-dominant: {top_red}, Bot green-dominant: {bot_green}")
 
-    assert coverage > 1.0, f"Coverage too low: {coverage:.1f}%"
+    assert coverage > 0.2, f"Coverage too low: {coverage:.1f}%"
     assert unique > 10, f"Too few unique colors: {unique}"
     print("✓ Density engine buffer tests PASSED")
 

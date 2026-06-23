@@ -42,7 +42,7 @@ class Colors:
 
     # Chart
     CHART_LINE = QColor(59, 130, 246)        # Cyber Blue line
-    CHART_FILL = QColor(59, 130, 246, 35)    # Translucent Cyber Blue area
+    CHART_FILL = QColor(59, 130, 246, 80)    # Translucent Cyber Blue area
     CHART_GRID = QColor(44, 48, 67)          # Medium border for grid
     CHART_ZERO = QColor(95, 100, 128, 100)
 

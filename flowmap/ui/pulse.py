@@ -16,12 +16,16 @@ import math
 import time
 from collections import deque
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, QPointF, QTimer
+if TYPE_CHECKING:
+    from .heatmap_widget import HeatmapWidget
+
+import itertools
+from PyQt6.QtCore import Qt, QPointF, QTimer, QRectF
 from PyQt6.QtGui import (
     QPainter, QColor, QBrush, QPen, QFont, QFontMetrics,
-    QPaintEvent, QAction,
+    QPaintEvent, QAction, QPolygonF,
 )
 from PyQt6.QtWidgets import QWidget, QSizePolicy, QMenu
 
@@ -86,8 +90,9 @@ class MarketPulse(QWidget):
     SWEEP_BUY_COLOR = QColor(60, 255, 120, 200)
     SWEEP_SELL_COLOR = QColor(255, 70, 70, 200)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, heatmap: Optional[HeatmapWidget] = None) -> None:
         super().__init__(parent)
+        self._heatmap = heatmap
         self.setMinimumHeight(100)
         self.setMaximumHeight(180)
         self.setSizePolicy(
@@ -130,6 +135,11 @@ class MarketPulse(QWidget):
         self._throttle_timer.setInterval(33)  # ~30fps
         self._throttle_timer.timeout.connect(self._on_throttle_tick)
         self._throttle_timer.start()
+
+    def set_heatmap(self, heatmap: HeatmapWidget) -> None:
+        self._heatmap = heatmap
+        self._dirty = True
+        self.update()
 
     def set_color_vision_mode(self, mode: ColorVisionMode) -> None:
         """Change the Color Vision Deficiency rendering mode."""
@@ -216,6 +226,22 @@ class MarketPulse(QWidget):
         self._recent_trades.append((price, size, side, now_ts))
         self._check_sweep(now_ts)
 
+        self._dirty = True
+
+    def add_trades(self, trades: list[Trade]) -> None:
+        """Record multiple trades: update CVD and check for sweeps in batch."""
+        if not trades:
+            return
+        now_ts = time.time()
+        for trade in trades:
+            price, size, side = trade.price, trade.size, trade.side
+            delta = size if side == Side.BUY else -size
+            self._current_cvd += delta
+            self._cvd_values.append(self._current_cvd)
+            self._timestamps.append(now_ts)
+            self._recent_trades.append((price, size, side, now_ts))
+
+        self._check_sweep(now_ts)
         self._dirty = True
 
     def reset(self) -> None:
@@ -316,13 +342,11 @@ class MarketPulse(QWidget):
 
         w, h = self.width(), self.height()
 
-        # Background
-        painter.fillRect(0, 0, w, h, self.BG_COLOR)
-
-        # Compute plot area
+        # Compute plot area - aligned horizontally with Heatmap
         ml, mr, mt, mb = self._margin_left, self._margin_right, self._margin_top, self._margin_bottom
-        plot_left = ml
-        plot_right = w - mr
+        plot_left = 0
+        price_axis_w = self._heatmap.price_axis_w if self._heatmap is not None else 62
+        plot_right = w - price_axis_w
         plot_top = mt
         plot_bottom = h - mb
         plot_w = plot_right - plot_left
@@ -332,17 +356,38 @@ class MarketPulse(QWidget):
             painter.end()
             return
 
+        # Background (draw BG_CHART for plot area, and BG_DEEP for axis area)
+        painter.fillRect(0, 0, plot_right, h, Colors.BG_CHART)
+        painter.fillRect(plot_right, 0, w - plot_right, h, Colors.BG_DEEP)
+
+        # Plot boundary border
+        painter.setPen(QPen(Colors.BORDER_CHART, 1))
+        painter.drawRect(0, 0, plot_right - 1, h - 1)
+
         # ── Left axis label ──
         painter.setFont(Fonts.sans(9))
         painter.setPen(self.TEXT_COLOR)
-        painter.drawText(4, plot_top + 12, "CVD")
+        painter.drawText(8, plot_top + 12, "CVD")
 
         # ── Resolve Colors for CVD Mode ──
         line_pos, line_neg, fill_pos, fill_neg, sweep_buy, sweep_sell = self._get_colors()
 
-        # ── Draw the chart ──
-        n = len(self._cvd_values)
-        if n < 2:
+        # ── Get CVD history and engine buffer width ──
+        if self._heatmap is not None:
+            engine = self._heatmap._engine
+            buf = engine.get_buffer()
+            bw = buf.shape[1]
+            history_len = len(engine._cvd_history)
+            slice_start = max(0, history_len - bw)
+            cvd_values = list(itertools.islice(engine._cvd_history, slice_start, history_len))
+            timestamps = list(itertools.islice(engine._timestamp_history, slice_start, history_len))
+        else:
+            cvd_values = list(self._cvd_values)
+            timestamps = list(self._timestamps)
+            bw = len(cvd_values)
+
+        n = len(cvd_values)
+        if n < 2 or bw <= 0:
             painter.drawText(
                 plot_left, plot_top, plot_w, plot_h,
                 Qt.AlignmentFlag.AlignCenter,
@@ -351,9 +396,22 @@ class MarketPulse(QWidget):
             painter.end()
             return
 
-        # Y range
-        min_val = min(self._cvd_values)
-        max_val = max(self._cvd_values)
+        # Downsample to screen resolution to prevent heavy CPU load on high tick rates/history widths
+        step = 1
+        if n > plot_w and plot_w > 0:
+            step = max(1, n // plot_w)
+            cvd_drawn = cvd_values[::step]
+            # Ensure the last element is always included to make the live line look responsive
+            if (n - 1) % step != 0:
+                cvd_drawn.append(cvd_values[-1])
+        else:
+            cvd_drawn = cvd_values
+
+        n_drawn = len(cvd_drawn)
+
+        # Y range (compute based on the visible/drawn slice to stay tight and correct)
+        min_val = min(cvd_drawn)
+        max_val = max(cvd_drawn)
         val_range = max_val - min_val
         if val_range < 0.01:
             val_range = 1.0
@@ -367,13 +425,29 @@ class MarketPulse(QWidget):
         max_val += pad
         val_range = max_val - min_val
 
-        def y_of(value: float) -> float:
-            return plot_top + plot_h * (1.0 - (value - min_val) / val_range)
+        # Precompute scales and offsets for inline drawing to avoid function call overhead
+        y_scale = plot_h / val_range
+        x_scale = plot_w / bw
 
-        def x_of(idx: int) -> float:
-            if n <= 1:
-                return plot_left
-            return plot_left + (idx / (n - 1)) * plot_w
+        from PyQt6.QtCore import QPointF
+        if self._heatmap is not None:
+            col_offset = bw - n
+            q_points = [
+                QPointF(
+                    (col_offset + (j * step if j < n_drawn - 1 else n - 1)) * x_scale,
+                    plot_top + plot_h - (val - min_val) * y_scale
+                )
+                for j, val in enumerate(cvd_drawn)
+            ]
+        else:
+            x_scale_fallback = plot_w / (n - 1) if n > 1 else 1.0
+            q_points = [
+                QPointF(
+                    plot_left + (j * step if j < n_drawn - 1 else n - 1) * x_scale_fallback,
+                    plot_top + plot_h - (val - min_val) * y_scale
+                )
+                for j, val in enumerate(cvd_drawn)
+            ]
 
         # ── Grid ──
         painter.setPen(QPen(self.GRID_COLOR, 1))
@@ -382,148 +456,103 @@ class MarketPulse(QWidget):
             painter.drawLine(QPointF(plot_left, gy), QPointF(plot_right, gy))
 
         # ── Zero line ──
-        zero_y = y_of(0.0)
-        if plot_top <= zero_y <= plot_bottom:
+        zero_y_plot = plot_top + plot_h - (0.0 - min_val) * y_scale
+        if plot_top <= zero_y_plot <= plot_bottom:
             painter.setPen(QPen(self.ZERO_LINE_COLOR, 1, Qt.PenStyle.DashLine))
-            painter.drawLine(QPointF(plot_left, zero_y), QPointF(plot_right, zero_y))
+            painter.drawLine(QPointF(plot_left, zero_y_plot), QPointF(plot_right, zero_y_plot))
 
-        # ── Build point list ──
-        points: list[tuple[float, float]] = []
-        for i in range(n):
-            points.append((x_of(i), y_of(self._cvd_values[i])))
+        # ── Draw filled area and lines using fast clipping instead of slow element-by-element Python loops ──
+        if len(q_points) >= 2:
+            # Create a closed polygon at the zero line
+            polygon_points = [QPointF(q_points[0].x(), zero_y_plot)] + q_points + [QPointF(q_points[-1].x(), zero_y_plot)]
+            poly = QPolygonF(polygon_points)
+            line_poly = QPolygonF(q_points)
 
-        # ── Filled area (split at zero, grouped into contiguous segments to avoid crossover issues) ──
-        zero_y_plot = y_of(0.0)
-        current_segment: list[tuple[float, float]] = []
-        current_is_positive: Optional[bool] = None
-
-        segments_above: list[list[tuple[float, float]]] = []
-        segments_below: list[list[tuple[float, float]]] = []
-
-        for i in range(n - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            v1 = self._cvd_values[i]
-            v2 = self._cvd_values[i + 1]
-
-            if v1 >= 0 and v2 >= 0:
-                if current_is_positive is False:
-                    if current_segment:
-                        segments_below.append(current_segment)
-                    current_segment = []
-                current_is_positive = True
-                if not current_segment:
-                    current_segment.append((x1, y1))
-                current_segment.append((x2, y2))
-            elif v1 <= 0 and v2 <= 0:
-                if current_is_positive is True:
-                    if current_segment:
-                        segments_above.append(current_segment)
-                    current_segment = []
-                current_is_positive = False
-                if not current_segment:
-                    current_segment.append((x1, y1))
-                current_segment.append((x2, y2))
-            else:
-                # Crosses zero
-                t = (0.0 - v1) / (v2 - v1) if v2 != v1 else 0.5
-                ix = x1 + t * (x2 - x1)
-                iy = y1 + t * (y2 - y1)
-
-                if v1 >= 0:
-                    # Positive to negative
-                    if current_is_positive is True or current_is_positive is None:
-                        if not current_segment:
-                            current_segment.append((x1, y1))
-                        current_segment.append((ix, iy))
-                        segments_above.append(current_segment)
-                    current_segment = [(ix, iy), (x2, y2)]
-                    current_is_positive = False
-                else:
-                    # Negative to positive
-                    if current_is_positive is False or current_is_positive is None:
-                        if not current_segment:
-                            current_segment.append((x1, y1))
-                        current_segment.append((ix, iy))
-                        segments_below.append(current_segment)
-                    current_segment = [(ix, iy), (x2, y2)]
-                    current_is_positive = True
-
-        # Flush the last segment
-        if current_segment:
-            if current_is_positive:
-                segments_above.append(current_segment)
-            else:
-                segments_below.append(current_segment)
-
-        # Draw filled polygons
-        def draw_fill(pts: list[tuple[float, float]], color: QColor, base_y: float) -> None:
-            if len(pts) < 2:
-                return
-            path_pts = list(pts)
-            path_pts.append((path_pts[-1][0], base_y))
-            path_pts.append((path_pts[0][0], base_y))
-            qpoints = [QPointF(p[0], p[1]) for p in path_pts]
-            painter.setBrush(QBrush(color))
+            # 1. Positive area (above zero line, y < zero_y_plot)
+            painter.save()
+            rect_top = QRectF(plot_left, plot_top, plot_w, max(0.0, zero_y_plot - plot_top))
+            painter.setClipRect(rect_top)
+            # Fill
+            painter.setBrush(QBrush(fill_pos))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawPolygon(*qpoints)
+            painter.drawPolygon(poly)
+            # Line
+            painter.setPen(QPen(line_pos, 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(line_poly)
+            painter.restore()
 
-        for seg in segments_above:
-            draw_fill(seg, fill_pos, zero_y_plot)
-        for seg in segments_below:
-            draw_fill(seg, fill_neg, zero_y_plot)
+            # 2. Negative area (below zero line, y > zero_y_plot)
+            painter.save()
+            rect_bottom = QRectF(plot_left, zero_y_plot, plot_w, max(0.0, plot_bottom - zero_y_plot))
+            painter.setClipRect(rect_bottom)
+            # Fill
+            painter.setBrush(QBrush(fill_neg))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(poly)
+            # Line
+            painter.setPen(QPen(line_neg, 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(line_poly)
+            painter.restore()
 
-        # ── Line ──
-        for i in range(n - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            cvd_j = self._cvd_values[i + 1]
-            seg_color = line_pos if cvd_j >= 0 else line_neg
-            painter.setPen(QPen(seg_color, 1.5))
-            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        # ── Latest CVD badge (in the axis column: w - 60 to w - 2) ──
+        latest = cvd_values[-1]
+        latest_y = plot_top + plot_h - (latest - min_val) * y_scale
 
-        # ── Sweep markers with historical alignment and pulse oscillations ──
+        # ── Sweep markers with fast bisect search and pulse oscillations ──
+        import bisect
         now_ts = time.time()
         for sweep in self._sweeps:
             age = now_ts - sweep.timestamp
             if age > 3.0:
                 continue
 
-            # Find closest historical index in self._timestamps to match exact timeline position
+            # Bisect search (O(log N)) to find closest timeline column
+            idx = bisect.bisect_left(timestamps, sweep.timestamp)
             best_idx = -1
             min_diff = float('inf')
-            for i, ts in enumerate(self._timestamps):
-                diff = abs(ts - sweep.timestamp)
-                if diff < min_diff:
-                    min_diff = diff
-                    best_idx = i
+            for check_idx in (idx - 1, idx, idx + 1):
+                if 0 <= check_idx < len(timestamps):
+                    diff = abs(timestamps[check_idx] - sweep.timestamp)
+                    if diff < min_diff:
+                        min_diff = diff
+                        best_idx = check_idx
 
-            if best_idx != -1 and min_diff < 1.0:  # must match within 1 second of data
-                sx = x_of(best_idx)
-                sy = y_of(self._cvd_values[best_idx])
+            if best_idx != -1 and min_diff < 1.5:  # must match within 1.5 seconds of data
+                drawn_idx = min(len(q_points) - 1, best_idx // step)
+                sx = q_points[drawn_idx].x()
+                sy = q_points[drawn_idx].y()
             else:
-                # If too old or not found, fall back to sliding near the right edge
-                sx = plot_right - 12
-                sy = y_of(self._current_cvd)
+                # If too old or not found, only show near the right edge if we are in live mode (not scrolled)
+                is_live = True
+                if self._heatmap is not None:
+                    is_live = self._heatmap.auto_follow and (self._heatmap._scroll_offset == 0)
+
+                if is_live and age < 1.5: # only show extremely recent sweeps near right edge
+                    sx = plot_right - 12
+                    sy = latest_y
+                else:
+                    continue
 
             if plot_top <= sy <= plot_bottom and plot_left <= sx <= plot_right:
                 # Fade alpha smoothly over the 3 seconds life
                 alpha = max(0, int(200 * (1.0 - age / 3.0)))
-                
+
                 # Resolve sweep color based on side
                 c_base = sweep_buy if sweep.side == Side.BUY else sweep_sell
                 c = QColor(c_base)
                 c.setAlpha(alpha)
-                
+
                 # Base radius from sweep size
                 r_base = 4.0 + sweep.total_size * 0.2
                 r_base = max(3.0, min(8.0, r_base))
-                
+
                 # 1. Pulsating center core (using a fast sine wave over time)
                 t_pulse = time.time() * 12.0  # speed of core pulse
                 r_pulse = r_base + math.sin(t_pulse) * 1.5
                 r_pulse = max(2.0, r_pulse)
-                
+
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QBrush(c))
                 painter.drawEllipse(QPointF(sx, sy), r_pulse, r_pulse)
@@ -538,29 +567,38 @@ class MarketPulse(QWidget):
                         ripple_alpha = int(140 * (1.0 - progress))
                         ripple_color = QColor(c_base)
                         ripple_color.setAlpha(ripple_alpha)
-                        
+
                         painter.setBrush(Qt.BrushStyle.NoBrush)
                         painter.setPen(QPen(ripple_color, 1.0 + (1.0 - progress) * 1.5))
                         painter.drawEllipse(QPointF(sx, sy), ripple_r, ripple_r)
 
-        # ── Latest CVD label (right side) ──
-        latest = self._cvd_values[-1]
-        latest_y = y_of(latest)
-        label_color = line_pos if latest >= 0 else line_neg
-
-        painter.setFont(Fonts.mono(10, bold=True))
-        painter.setPen(label_color)
+        painter.setFont(Fonts.mono(8, bold=True))
+        fm = QFontMetrics(painter.font())
         sign = '+' if latest >= 0 else ''
         label_text = f"{sign}{latest:,.0f}"
-        fm = QFontMetrics(painter.font())
-        label_w = fm.horizontalAdvance(label_text)
-        label_x = plot_right - label_w - 6
-        label_y = max(plot_top + fm.ascent() + 2, min(plot_bottom, int(latest_y)))
-        painter.drawText(int(label_x), int(label_y), label_text)
+        tw = fm.horizontalAdvance(label_text)
+
+        badge_w = 58
+        badge_h = fm.height() + 4
+        badge_x = w - 60
+        badge_y = latest_y - badge_h / 2
+        badge_y = max(2.0, min(h - badge_h - 2, badge_y))
+
+        # Badge color (green if positive, red if negative)
+        badge_color = line_pos if latest >= 0 else line_neg
+        painter.setBrush(QBrush(badge_color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(QRectF(badge_x, badge_y, badge_w, badge_h), 3, 3)
+
+        # Text inside badge (black)
+        painter.setPen(QColor("#000000"))
+        tx = badge_x + (badge_w - tw) / 2
+        ty = badge_y + fm.ascent() + 2
+        painter.drawText(int(tx), int(ty), label_text)
 
         # ── Bottom axis ──
         painter.setFont(Fonts.sans(8))
         painter.setPen(self.AXIS_COLOR)
-        painter.drawText(int(plot_left), h - 2, "Time →")
+        painter.drawText(int(plot_left) + 8, h - 2, "Time →")
 
         painter.end()

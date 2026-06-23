@@ -79,6 +79,7 @@ class OrderBook:
         self._recalc_bbo()
         self._last_update_time = snap.timestamp
         self.last_receive_timestamp = getattr(snap, 'receive_timestamp', 0.0)
+        self._prune_book()
 
     def apply_update(self, update: Level2Update) -> None:
         """Apply an incremental L2 update."""
@@ -98,23 +99,7 @@ class OrderBook:
         self._last_update_time = update.timestamp
         self.last_receive_timestamp = getattr(update, 'receive_timestamp', 0.0)
 
-        # Prune bids/asks if they grow too large to prevent memory growth and state drift
-        max_keep = self.depth * 5
-        if len(self._bids) > max_keep:
-            # self._bids is sorted ascending, so the largest keys (best bids) are at the end.
-            # We want to remove the smallest keys at the beginning.
-            num_to_remove = len(self._bids) - max_keep
-            keys_to_remove = list(self._bids.keys()[:num_to_remove])
-            for k in keys_to_remove:
-                self._bids.pop(k, None)
-
-        if len(self._asks) > max_keep:
-            # self._asks is sorted ascending, so the smallest keys (best asks) are at the start.
-            # We want to remove the largest keys at the end.
-            num_to_remove = len(self._asks) - max_keep
-            keys_to_remove = list(self._asks.keys()[-num_to_remove:])
-            for k in keys_to_remove:
-                self._asks.pop(k, None)
+        self._prune_book()
 
         if self.on_update:
             self.on_update(update)
@@ -140,26 +125,46 @@ class OrderBook:
         self._last_update_time = updates[-1].timestamp
         self.last_receive_timestamp = getattr(updates[-1], 'receive_timestamp', 0.0)
 
-        # Prune once at the end
-        max_keep = self.depth * 5
-        if len(self._bids) > max_keep:
-            num_to_remove = len(self._bids) - max_keep
-            keys_to_remove = list(self._bids.keys()[:num_to_remove])
-            for k in keys_to_remove:
-                self._bids.pop(k, None)
-
-        if len(self._asks) > max_keep:
-            num_to_remove = len(self._asks) - max_keep
-            keys_to_remove = list(self._asks.keys()[-num_to_remove:])
-            for k in keys_to_remove:
-                self._asks.pop(k, None)
+        self._prune_book()
 
         if self.on_update:
             for update in updates:
                 self.on_update(update)
 
+    def apply_bbo(self, bbo: BBO) -> None:
+        """Apply a direct BBO update."""
+        if bbo.bid > 0:
+            self._best_bid = bbo.bid
+            self._best_bid_size = bbo.bid_size
+            self._bids[bbo.bid] = bbo.bid_size
+            self._max_bid_size = max(self._max_bid_size, bbo.bid_size)
+            
+            # Prune bids higher than the new best bid
+            stale_bids = [p for p in self._bids.keys() if p > bbo.bid]
+            for p in stale_bids:
+                self._bids.pop(p, None)
+
+        if bbo.ask > 0:
+            self._best_ask = bbo.ask
+            self._best_ask_size = bbo.ask_size
+            self._asks[bbo.ask] = bbo.ask_size
+            self._max_ask_size = max(self._max_ask_size, bbo.ask_size)
+            
+            # Prune asks lower than the new best ask
+            stale_asks = [p for p in self._asks.keys() if p < bbo.ask]
+            for p in stale_asks:
+                self._asks.pop(p, None)
+
+        self._last_update_time = bbo.timestamp
+        self.last_receive_timestamp = getattr(bbo, 'receive_timestamp', 0.0)
+
+        self._prune_book()
+
+        if self.on_bbo:
+            self.on_bbo(bbo)
+
     def record_trade(self, trade: Trade) -> None:
-        """Record a trade at a price level."""
+        """Record a trade at a price level and absorb matching resting orders."""
         price = trade.price
         self._trade_volume[price] = self._trade_volume.get(price, 0.0) + trade.size
         self._trade_count[price] = self._trade_count.get(price, 0) + 1
@@ -170,13 +175,92 @@ class OrderBook:
 
         if trade.side == Side.BUY:
             self.total_buy_volume += trade.size
+            # Buy trades execute against asks (sellers) - deduct from resting asks
+            target_price = None
+            if price in self._asks:
+                target_price = price
+            else:
+                for k in self._asks.keys():
+                    if abs(k - price) < 0.00005:
+                        target_price = k
+                        break
+            if target_price is not None:
+                self._asks[target_price] = max(0.0, self._asks[target_price] - trade.size)
+                if self._asks[target_price] <= 0.000001:
+                    self._asks.pop(target_price)
         else:
             self.total_sell_volume += trade.size
+            # Sell trades execute against bids (buyers) - deduct from resting bids
+            target_price = None
+            if price in self._bids:
+                target_price = price
+            else:
+                for k in self._bids.keys():
+                    if abs(k - price) < 0.00005:
+                        target_price = k
+                        break
+            if target_price is not None:
+                self._bids[target_price] = max(0.0, self._bids[target_price] - trade.size)
+                if self._bids[target_price] <= 0.000001:
+                    self._bids.pop(target_price)
 
+        self._recalc_bbo()
         self.last_receive_timestamp = getattr(trade, 'receive_timestamp', 0.0)
 
         if self.on_trade:
             self.on_trade(trade)
+
+    def record_trades(self, trades: list[Trade]) -> None:
+        """Record a batch of trades and recalculate BBO once at the end."""
+        if not trades:
+            return
+
+        for trade in trades:
+            price = trade.price
+            self._trade_volume[price] = self._trade_volume.get(price, 0.0) + trade.size
+            self._trade_count[price] = self._trade_count.get(price, 0) + 1
+            self._last_trade_side[price] = trade.side
+
+            self.total_volume += trade.size
+            self.trade_count += 1
+
+            if trade.side == Side.BUY:
+                self.total_buy_volume += trade.size
+                # Buy trades execute against asks (sellers) - deduct from resting asks
+                target_price = None
+                if price in self._asks:
+                    target_price = price
+                else:
+                    for k in self._asks.keys():
+                        if abs(k - price) < 0.00005:
+                            target_price = k
+                            break
+                if target_price is not None:
+                    self._asks[target_price] = max(0.0, self._asks[target_price] - trade.size)
+                    if self._asks[target_price] <= 0.000001:
+                        self._asks.pop(target_price)
+            else:
+                self.total_sell_volume += trade.size
+                # Sell trades execute against bids (buyers) - deduct from resting bids
+                target_price = None
+                if price in self._bids:
+                    target_price = price
+                else:
+                    for k in self._bids.keys():
+                        if abs(k - price) < 0.00005:
+                            target_price = k
+                            break
+                if target_price is not None:
+                    self._bids[target_price] = max(0.0, self._bids[target_price] - trade.size)
+                    if self._bids[target_price] <= 0.000001:
+                        self._bids.pop(target_price)
+
+        self._recalc_bbo()
+        self.last_receive_timestamp = getattr(trades[-1], 'receive_timestamp', 0.0)
+
+        if self.on_trade:
+            for trade in trades:
+                self.on_trade(trade)
 
     # ── Query ──────────────────────────────────────────────────
 
@@ -185,14 +269,18 @@ class OrderBook:
         Get all price levels with aggregated data for the heatmap renderer.
         Returns levels centered around the best bid/ask.
         """
-        d = depth or self.depth
         all_prices: set[float] = set()
 
-        # Take top N bids (highest prices) and top N asks (lowest prices)
-        bid_prices = list(reversed(list(self._bids.keys())[-d:]))
-        ask_prices = list(self._asks.keys()[:d])
-        all_prices.update(bid_prices)
-        all_prices.update(ask_prices)
+        if depth is not None:
+            # Take top N bids (highest prices) and top N asks (lowest prices)
+            bid_prices = list(reversed(list(self._bids.keys())[-depth:]))
+            ask_prices = list(self._asks.keys()[:depth])
+            all_prices.update(bid_prices)
+            all_prices.update(ask_prices)
+        else:
+            # Return all stored levels (which are already pruned to ±15%)
+            all_prices.update(self._bids.keys())
+            all_prices.update(self._asks.keys())
 
         if not all_prices:
             return []
@@ -343,6 +431,34 @@ class OrderBook:
         self.total_buy_volume = 0.0
         self.total_sell_volume = 0.0
         self.trade_count = 0
+
+    def _prune_book(self) -> None:
+        """Prune bids/asks to prevent memory growth while keeping levels within ±15% of BBO mid price."""
+        mid = (self._best_bid + self._best_ask) / 2.0 if (self._best_bid > 0 and self._best_ask > 0) else None
+        if mid is not None:
+            min_keep_price = mid * 0.85
+            max_keep_price = mid * 1.15
+            
+            # Remove bids below min_keep_price
+            while self._bids and self._bids.keys()[0] < min_keep_price:
+                self._bids.popitem(0)
+                
+            # Remove asks above max_keep_price
+            while self._asks and self._asks.keys()[-1] > max_keep_price:
+                self._asks.popitem(-1)
+        else:
+            # Fallback to count-based pruning
+            max_keep = self.depth * 5
+            if len(self._bids) > max_keep:
+                num_to_remove = len(self._bids) - max_keep
+                keys_to_remove = list(self._bids.keys()[:num_to_remove])
+                for k in keys_to_remove:
+                    self._bids.pop(k, None)
+            if len(self._asks) > max_keep:
+                num_to_remove = len(self._asks) - max_keep
+                keys_to_remove = list(self._asks.keys()[-num_to_remove:])
+                for k in keys_to_remove:
+                    self._asks.pop(k, None)
 
     def __repr__(self) -> str:
         return (f"OrderBook({self.symbol}, bids={len(self._bids)}, "

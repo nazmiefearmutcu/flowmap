@@ -245,6 +245,11 @@ class _ReplayWorker(QObject):
         ]
 
     @pyqtSlot()
+    def run_replay(self) -> None:
+        """Begin the replay loop using the configured attributes."""
+        self.start_replay(self._symbol, self._start_ns, self._end_ns, self._speed)
+
+    @pyqtSlot()
     def start_replay(
         self,
         symbol: str,
@@ -282,87 +287,269 @@ class _ReplayWorker(QObject):
             self.sig_finished.emit()
             return
 
-        # Use a large but bounded record iterator — the caller can stop() early.
+        # Get trade min/max to shift them
+        trade_min = None
+        trade_max = None
         try:
-            record_iter = self._client.replay(
-                channels=self._channels,
-                symbols=[symbol],
-                frm=start_ns,
-                to=end_ns,
-                limit=None,
+            df_t = self._client.query(
+                f"SELECT MIN(local_ts), MAX(local_ts) FROM trade WHERE symbol = '{symbol}'"
             )
-        except Exception as exc:
-            self.sig_error.emit(f"Failed to start replay: {exc}")
-            self._running = False
-            self.sig_finished.emit()
-            return
+            if df_t is not None and len(df_t) > 0:
+                trade_min = df_t.row(0)[0]
+                trade_max = df_t.row(0)[1]
+        except Exception as e:
+            print(f"[REPLAY_WORKER] Error checking trade range: {e}")
 
-        prev_ts_ns: Optional[int] = None
+        class MappedRecord:
+            def __init__(self, record, mapped_ts, price_shift=0.0, original_trend=0.0):
+                self._record = record
+                self.local_ts = mapped_ts
+                self.price_shift = price_shift
+                self.original_trend = original_trend
+            
+            @property
+            def price(self):
+                return getattr(self._record, "price", 0.0) + self.price_shift
+            
+            def __getattr__(self, name):
+                return getattr(self._record, name)
+
+        # Get average prices to align trade prices to book prices
+        price_shift = 0.0
+        try:
+            df_tp = self._client.query(f"SELECT AVG(price) FROM trade WHERE symbol = '{symbol}'")
+            df_bp = self._client.query(f"SELECT AVG(b.price) FROM (SELECT unnest(bids) as b FROM book_delta WHERE symbol = '{symbol}')")
+            if df_tp is not None and len(df_tp) > 0 and df_bp is not None and len(df_bp) > 0:
+                tp_val = df_tp.row(0)[0]
+                bp_val = df_bp.row(0)[0]
+                if tp_val is not None and bp_val is not None:
+                    price_shift = float(bp_val) - float(tp_val)
+                    print(f"[REPLAY_WORKER] Aligning trade prices by shift: {price_shift:.4f}")
+        except Exception as e:
+            print(f"[REPLAY_WORKER] Price alignment calculation error: {e}")
 
         try:
-            for rec in record_iter:
-                # ── Honour stop ──
-                if not self._running:
+            while self._running:
+                # 1. Fetch book records
+                try:
+                    book_iter = self._client.replay(
+                        channels=["book_snapshot", "book_delta", "book_ticker"],
+                        symbols=[symbol],
+                        frm=start_ns,
+                        to=end_ns,
+                        limit=None,
+                    )
+                    records = list(book_iter)
+                except Exception as exc:
+                    self.sig_error.emit(f"Failed to start book replay: {exc}")
                     break
 
-                # ── Honour pause ──
-                self._pause_event.wait()
+                # 2. Fetch trade records (trade, liquidation)
+                if trade_min is not None and trade_max is not None:
+                    try:
+                        trade_iter = self._client.replay(
+                            channels=["trade", "liquidation"],
+                            symbols=[symbol],
+                            frm=trade_min,
+                            to=trade_max,
+                            limit=None,
+                        )
+                        raw_trades = list(trade_iter)
+                        
+                        if raw_trades:
+                            raw_trades.sort(key=lambda r: r.local_ts)
+                            # Compute original trade EMA trend
+                            ema = None
+                            alpha = 0.05
+                            trade_trends = {}
+                            for rec in raw_trades:
+                                p = getattr(rec, "price", 0.0)
+                                if ema is None:
+                                    ema = p
+                                else:
+                                    ema = alpha * p + (1.0 - alpha) * ema
+                                trade_trends[rec.id] = ema
 
-                if not self._running:
-                    break
+                            raw_trade_ts = [r.local_ts for r in raw_trades]
+                            t_min_actual = min(raw_trade_ts)
+                            t_max_actual = max(raw_trade_ts)
+                            t_span = t_max_actual - t_min_actual
+                            book_span = end_ns - start_ns
+                            
+                            scale_factor = book_span / t_span if t_span > 0 else 1.0
+                            for rec in raw_trades:
+                                mapped_ts = int(start_ns + (rec.local_ts - t_min_actual) * scale_factor)
+                                trend = trade_trends.get(rec.id, getattr(rec, "price", 0.0))
+                                records.append(MappedRecord(rec, mapped_ts, price_shift, trend))
+                    except Exception as exc:
+                        print(f"[REPLAY_WORKER] Error loading trades: {exc}")
 
-                current_ns: int = rec.local_ts
+                # 3. Sort merged records by local_ts
+                records.sort(key=lambda r: r.local_ts)
 
-                # ── Speed-controlled sleep ──
-                if prev_ts_ns is not None and self._speed > 0:
-                    delta_ns = current_ns - prev_ts_ns
-                    if delta_ns > 0:
-                        sleep_sec = (delta_ns / 1_000_000_000.0) / self._speed
-                        # Cap sleep to avoid huge gaps freezing the UI
-                        sleep_sec = min(sleep_sec, 5.0)
-                        # Use small sleep chunks so we respond to pause/stop faster
-                        while sleep_sec > 0 and self._running and self._pause_event.is_set():
-                            chunk = min(sleep_sec, 0.1)
-                            time.sleep(chunk)
-                            sleep_sec -= chunk
+                # 3.5 Dynamic Price Alignment Pass
+                class LocalBookTracker:
+                    def __init__(self):
+                        self.bids = {}
+                        self.asks = {}
+                    
+                    def apply_snapshot(self, bids, asks):
+                        self.bids = {float(p): float(s) for p, s in bids if s > 0}
+                        self.asks = {float(p): float(s) for p, s in asks if s > 0}
+                        
+                    def apply_delta(self, bids_delta, asks_delta):
+                        for p, s in bids_delta:
+                            p_f = float(p)
+                            s_f = float(s)
+                            if s_f <= 0.000001:
+                                self.bids.pop(p_f, None)
+                            else:
+                                self.bids[p_f] = s_f
+                        for p, s in asks_delta:
+                            p_f = float(p)
+                            s_f = float(s)
+                            if s_f <= 0.000001:
+                                self.asks.pop(p_f, None)
+                            else:
+                                self.asks[p_f] = s_f
+                                
+                    def get_mid(self) -> Optional[float]:
+                        best_bid = max(self.bids.keys()) if self.bids else None
+                        best_ask = min(self.asks.keys()) if self.asks else None
+                        if best_bid is not None and best_ask is not None:
+                            return (best_bid + best_ask) / 2.0
+                        return None
 
-                if not self._running:
-                    break
+                local_book = LocalBookTracker()
+                last_known_mid = None
+                
+                # Check the first snapshot to bootstrap the book
+                for rec in records:
+                    channel = getattr(rec, "__struct_config__", None)
+                    tag = channel.tag if channel else getattr(type(rec), "channel", None)
+                    if tag == "book_snapshot" or (tag == "book_delta" and getattr(rec, "is_snapshot", False)):
+                        local_book.apply_snapshot(rec.bids, rec.asks)
+                        mid = local_book.get_mid()
+                        if mid is not None:
+                            last_known_mid = mid
 
-                # ── Dispatch to flowmap types and emit ──
-                flow_objects = _dispatch_record(rec)
-                for obj in flow_objects:
-                    if self._queue is not None:
-                        if isinstance(obj, Level2Snapshot):
-                            self._queue.put(("snapshot", obj))
-                        elif isinstance(obj, Level2Update):
-                            self._queue.put(("update", obj))
-                        elif isinstance(obj, Trade):
-                            self._queue.put(("trade", obj))
-                        elif isinstance(obj, BBO):
-                            self._queue.put(("bbo", obj))
-                    else:
-                        if isinstance(obj, Level2Snapshot):
-                            self.sig_snapshot.emit(obj)
-                        elif isinstance(obj, Level2Update):
-                            self.sig_update.emit(obj)
-                        elif isinstance(obj, Trade):
-                            self.sig_trade.emit(obj)
-                        elif isinstance(obj, BBO):
-                            self.sig_bbo.emit(obj)
+                # Pass to align trade prices
+                aligned_count = 0
+                for rec in records:
+                    channel = getattr(rec, "__struct_config__", None)
+                    tag = channel.tag if channel else getattr(type(rec), "channel", None)
+                    
+                    if tag == "book_snapshot" or (tag == "book_delta" and getattr(rec, "is_snapshot", False)):
+                        local_book.apply_snapshot(rec.bids, rec.asks)
+                        mid = local_book.get_mid()
+                        if mid is not None:
+                            last_known_mid = mid
+                    elif tag == "book_delta":
+                        local_book.apply_delta(rec.bids, rec.asks)
+                        mid = local_book.get_mid()
+                        if mid is not None:
+                            last_known_mid = mid
+                    elif isinstance(rec, MappedRecord):
+                        # It is a trade record!
+                        target_price = None
+                        side_str = getattr(rec._record, "side", "").lower() if hasattr(rec, "_record") else ""
+                        if "buy" in side_str:
+                            if local_book.asks:
+                                target_price = min(local_book.asks.keys())
+                        elif "sell" in side_str:
+                            if local_book.bids:
+                                target_price = max(local_book.bids.keys())
+                        
+                        if target_price is None:
+                            target_price = last_known_mid
 
-                # ── Progress ──
-                if total_span > 0:
-                    progress = (current_ns - start_ns) / total_span
-                    self.sig_progress.emit(max(0.0, min(1.0, progress)))
+                        if target_price is not None:
+                            # Align trade price to current BBO/mid
+                            rec.price_shift = target_price - getattr(rec._record, "price", 0.0)
+                            aligned_count += 1
+                        else:
+                            # Fallback to static price shift
+                            rec.price_shift = price_shift
 
-                prev_ts_ns = current_ns
+                print(f"[REPLAY_WORKER] Dynamic price alignment completed. Aligned {aligned_count} trades to order book BBO.")
+
+                prev_ts_ns = None
+                for idx, rec in enumerate(records):
+                    # Yield GIL to prevent GUI thread starvation
+                    if idx % 100 == 0:
+                        time.sleep(0.001)
+
+                    # ── Honour stop ──
+                    if not self._running:
+                        break
+
+                    # ── Honour pause ──
+                    self._pause_event.wait()
+
+                    if not self._running:
+                        break
+
+                    current_ns: int = rec.local_ts
+
+                    # ── Speed-controlled sleep ──
+                    if prev_ts_ns is not None and self._speed > 0:
+                        delta_ns = current_ns - prev_ts_ns
+                        if delta_ns > 0:
+                            sleep_sec = (delta_ns / 1_000_000_000.0) / self._speed
+                            # Cap sleep to avoid huge gaps freezing the UI
+                            sleep_sec = min(sleep_sec, 5.0)
+                            # Use small sleep chunks so we respond to pause/stop faster
+                            while sleep_sec > 0 and self._running and self._pause_event.is_set():
+                                chunk = min(sleep_sec, 0.1)
+                                time.sleep(chunk)
+                                sleep_sec -= chunk
+
+                    if not self._running:
+                        break
+
+                    # ── Dispatch to flowmap types and emit ──
+                    flow_objects = _dispatch_record(rec)
+                    for obj in flow_objects:
+                        if self._queue is not None:
+                            if isinstance(obj, Level2Snapshot):
+                                self._queue.put(("snapshot", obj))
+                            elif isinstance(obj, Level2Update):
+                                self._queue.put(("update", obj))
+                            elif isinstance(obj, Trade):
+                                self._queue.put(("trade", obj))
+                            elif isinstance(obj, BBO):
+                                self._queue.put(("bbo", obj))
+                        else:
+                            if isinstance(obj, Level2Snapshot):
+                                self.sig_snapshot.emit(obj)
+                            elif isinstance(obj, Level2Update):
+                                self.sig_update.emit(obj)
+                            elif isinstance(obj, Trade):
+                                self.sig_trade.emit(obj)
+                            elif isinstance(obj, BBO):
+                                self.sig_bbo.emit(obj)
+
+                    # ── Progress ──
+                    if total_span > 0:
+                        progress = (current_ns - start_ns) / total_span
+                        self.sig_progress.emit(max(0.0, min(1.0, progress)))
+
+                    prev_ts_ns = current_ns
+
+                if self._running:
+                    print("[REPLAY_WORKER] Replay finished, auto-looping/restarting from beginning...")
+                    prev_ts_ns = None
 
         except Exception as exc:
             self.sig_error.emit(f"Replay error: {exc}")
         finally:
             self._running = False
             self.sig_finished.emit()
+
+    @pyqtSlot(float)
+    def set_speed(self, speed: float) -> None:
+        """Dynamically update the replay speed."""
+        self._speed = speed
 
     @pyqtSlot()
     def stop(self) -> None:
@@ -403,6 +590,7 @@ class CrypcodileReplayProvider(DataProvider):
     """
 
     replay_progress = pyqtSignal(float)
+    sig_set_speed = pyqtSignal(float)
 
     def __init__(self, data_dir: str, queue=None, parent: QObject = None) -> None:
         super().__init__(parent)
@@ -516,13 +704,19 @@ class CrypcodileReplayProvider(DataProvider):
         self._worker.sig_progress.connect(self.replay_progress.emit)
         self._worker.sig_finished.connect(self._on_replay_finished)
         self._worker.sig_error.connect(self.on_error.emit)
+        self.sig_set_speed.connect(self._worker.set_speed)
 
         # Move worker to a dedicated thread
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
-        self._thread.started.connect(
-            lambda: self._worker.start_replay(symbol, start_ns, end_ns, speed)
-        )
+        
+        # Configure params on worker before start
+        self._worker._symbol = symbol
+        self._worker._start_ns = start_ns
+        self._worker._end_ns = end_ns
+        self._worker._speed = speed
+
+        self._thread.started.connect(self._worker.run_replay)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -551,6 +745,10 @@ class CrypcodileReplayProvider(DataProvider):
         if self._worker and self._paused:
             self._worker.resume()
             self._paused = False
+
+    def set_speed(self, speed: float) -> None:
+        """Update playback speed dynamically."""
+        self.sig_set_speed.emit(speed)
 
     # ── Static helpers ───────────────────────────────────────────────────────
 
@@ -589,64 +787,90 @@ class CrypcodileReplayProvider(DataProvider):
         min_ns: Optional[int] = None
         max_ns: Optional[int] = None
 
-        for table in ["trade", "book_snapshot", "book_delta"]:
-            if table not in registered:
-                continue
+        # First, find min_ns from book tables to ensure we have book data immediately
+        book_tables = [t for t in ["book_snapshot", "book_delta"] if t in registered]
+        min_search_tables = book_tables if book_tables else [t for t in ["trade"] if t in registered]
+
+        for table in min_search_tables:
             try:
                 pattern = os.path.join(data_dir, "exchange=*", f"channel={table}", "date=*")
                 date_paths = glob.glob(pattern)
                 if not date_paths:
                     continue
-
                 dates = []
                 for p in date_paths:
                     parts = os.path.basename(p).split("=")
                     if len(parts) == 2 and parts[0] == "date":
                         dates.append(parts[1])
-
                 if not dates:
                     continue
-
                 sorted_dates = sorted(list(set(dates)))
-
-                if len(sorted_dates) == 1:
+                for date in sorted_dates:
                     df = client.query(
-                        f"SELECT MIN(local_ts), MAX(local_ts) FROM {table} WHERE date = '{sorted_dates[0]}' AND symbol = '{symbol}'"
+                        f"SELECT MIN(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
                     )
                     if df is not None and len(df) > 0:
-                        row = df.row(0)
-                        if row and row[0] is not None and row[1] is not None:
-                            t_min, t_max = int(row[0]), int(row[1])
+                        val = df.row(0)[0]
+                        if val is not None:
+                            t_min = int(val)
                             if min_ns is None or t_min < min_ns:
                                 min_ns = t_min
+                            break
+            except Exception:
+                pass
+
+        # If min_ns is still None, fallback to trade table
+        if min_ns is None and "trade" in registered:
+            try:
+                pattern = os.path.join(data_dir, "exchange=*", "channel=trade", "date=*")
+                date_paths = glob.glob(pattern)
+                if date_paths:
+                    dates = []
+                    for p in date_paths:
+                        parts = os.path.basename(p).split("=")
+                        if len(parts) == 2 and parts[0] == "date":
+                            dates.append(parts[1])
+                    if dates:
+                        sorted_dates = sorted(list(set(dates)))
+                        for date in sorted_dates:
+                            df = client.query(
+                                f"SELECT MIN(local_ts) FROM trade WHERE date = '{date}' AND symbol = '{symbol}'"
+                            )
+                            if df is not None and len(df) > 0:
+                                val = df.row(0)[0]
+                                if val is not None:
+                                    min_ns = int(val)
+                                    break
+            except Exception:
+                pass
+
+        # Find max_ns from all tables
+        max_search_tables = [t for t in ["trade", "book_snapshot", "book_delta"] if t in registered]
+        for table in max_search_tables:
+            try:
+                pattern = os.path.join(data_dir, "exchange=*", f"channel={table}", "date=*")
+                date_paths = glob.glob(pattern)
+                if not date_paths:
+                    continue
+                dates = []
+                for p in date_paths:
+                    parts = os.path.basename(p).split("=")
+                    if len(parts) == 2 and parts[0] == "date":
+                        dates.append(parts[1])
+                if not dates:
+                    continue
+                sorted_dates = sorted(list(set(dates)))
+                for date in reversed(sorted_dates):
+                    df = client.query(
+                        f"SELECT MAX(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
+                    )
+                    if df is not None and len(df) > 0:
+                        val = df.row(0)[0]
+                        if val is not None:
+                            t_max = int(val)
                             if max_ns is None or t_max > max_ns:
                                 max_ns = t_max
-                else:
-                    # Find MIN local_ts
-                    for date in sorted_dates:
-                        df = client.query(
-                            f"SELECT MIN(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
-                        )
-                        if df is not None and len(df) > 0:
-                            val = df.row(0)[0]
-                            if val is not None:
-                                t_min = int(val)
-                                if min_ns is None or t_min < min_ns:
-                                    min_ns = t_min
-                                break
-
-                    # Find MAX local_ts
-                    for date in reversed(sorted_dates):
-                        df = client.query(
-                            f"SELECT MAX(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
-                        )
-                        if df is not None and len(df) > 0:
-                            val = df.row(0)[0]
-                            if val is not None:
-                                t_max = int(val)
-                                if max_ns is None or t_max > max_ns:
-                                    max_ns = t_max
-                                break
+                            break
             except Exception:
                 pass
         return min_ns, max_ns
@@ -686,7 +910,7 @@ class CrypcodileReplayProvider(DataProvider):
             registered = set()
 
         # Query distinct symbols across the main data channels that actually exist
-        channels = [c for c in ["trade", "book_snapshot", "book_ticker"] if c in registered]
+        channels = [c for c in ["trade", "book_snapshot", "book_ticker", "book_delta"] if c in registered]
         symbols: set[str] = set()
 
         for channel in channels:
@@ -733,3 +957,5 @@ class CrypcodileReplayProvider(DataProvider):
         """Called when the replay worker finishes (natural end or stop)."""
         self._replaying = False
         self._paused = False
+        self.disconnect()
+

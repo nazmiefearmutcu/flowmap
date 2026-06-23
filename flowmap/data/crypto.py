@@ -505,6 +505,17 @@ class CryptoProvider(DataProvider):
             ob = self._rest_exchange.fetch_order_book(symbol, self._depth)
             rec_time = time.time()
             snap = _snapshot_from_ccxt(ob, self._depth, rec_time)
+            bbo = _bbo_from_ccxt(ob, symbol, rec_time)
+
+            # Trades (REST fallback)
+            trades = []
+            rec_time_trades = rec_time
+            try:
+                trades = self._rest_exchange.fetch_trades(symbol, limit=20)
+                rec_time_trades = time.time()
+            except Exception:
+                pass
+
             if self._queue is not None:
                 self._queue.put(("snapshot", snap))
                 self._queue.put(("bbo", bbo))
