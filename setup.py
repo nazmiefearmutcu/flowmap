@@ -7,11 +7,11 @@ from setuptools import setup, find_packages
 setup(
     name="flowmap",
     version="0.1.0",
-    description="Open-source Bookmap-style order flow visualization platform",
+    description="Open-source real-time order flow and market depth visualization platform",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     keywords=[
-        "order-flow", "bookmap", "trading-visualization", "market-depth",
+        "order-flow", "trading-visualization", "market-depth",
         "pyqt6", "numpy", "order-book", "liquidity-heatmap", "crypcodile"
     ],
     author="FlowMap Contributors",

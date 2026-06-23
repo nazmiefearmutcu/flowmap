@@ -1,8 +1,8 @@
 # FlowMap 📊
 
-**Open-source Bookmap-style order flow visualization platform.**
+**Open-source real-time order flow and market depth visualization platform.**
 
-FlowMap brings institutional-grade order book heatmap visualization to your desktop. Built with Python, PyQt6, and vectorized NumPy array projections, it renders real-time liquidity heatmaps, trade execution bubbles, DOM depth, and volume analytics — inspired by [Bookmap Classic](https://bookmap.com/).
+FlowMap brings institutional-grade order book heatmap visualization to your desktop. Built with Python, PyQt6, and vectorized NumPy array projections, it renders real-time liquidity heatmaps, trade execution bubbles, DOM depth, and volume analytics.
 
 ---
 
@@ -19,7 +19,7 @@ FlowMap brings institutional-grade order book heatmap visualization to your desk
 
 ## ✨ Features
 
-### 🔥 Real-Time Bookmap Classic Heatmap
+### 🔥 Real-Time Liquidity Stratigraphy Heatmap
 - **Unified Color Scale**: Transitions smoothly based on volume density (transparent $\rightarrow$ white $\rightarrow$ orange/red) on both bid and ask sides.
 - **Flicker-Free Stratigraphy**: Iterates the union of all active price levels in memory, allowing historical lines to smoothly decay and fade out rather than instantly vanish.
 - **Zero Vertical Jitter**: Uses a running minimum of observed tick intervals to freeze the vertical price tick scale.
@@ -104,7 +104,7 @@ python run_flowmap.py
 ### Phase 1 — Core Engine & UI ✅
 - [x] Vectorized order book density engine
 - [x] Zero-flicker double-buffered layout scaling
-- [x] Bookmap Classic colormap implementation
+- [x] Professional bi-color density colormap implementation
 - [x] Interactive mouse zooming, scrolling, and dragging
 
 ### Phase 2 — Indicators & Overlays ✅
