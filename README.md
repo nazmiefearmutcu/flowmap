@@ -30,9 +30,10 @@ FlowMap brings institutional-grade order book heatmap visualization to your desk
 - **VWAP & CVD (Market Pulse)**: Continuous float-based sub-pixel line rendering for technical analysis.
 - **High-Readability BBO Current Price Tags**: Snapped bid/ask tags highlighted inside dark, side-colored rounded capsules.
 
-### 🗄️ Crypcodile Replay Data Integration
-- **DuckDB Querying**: Connects locally to parquet-structured Crypcodile historical data folders (e.g., `exchange=binance-spot`, `channel=book_delta`).
-- **Asynchronous QThread Playback**: Pushes records to the UI loop via a thread-safe update queue.
+### 🗄️ Crypcodile Live & Replay Feed Integration
+- **DuckDB Querying (Replay)**: Connects locally to parquet-structured Crypcodile historical data folders (e.g., `exchange=binance-spot`, `channel=book_delta`).
+- **Real-Time WebSocket Feed (Live)**: Connects to live data pipelines for instant order flow charting on live tickers.
+- **Zero-Lag Queue Optimization**: Direct queue processing of BBO (Best Bid & Offer) quotes, trade executions, and L2 snapshots/updates to update the heatmap on every packet.
 
 ### 🖥️ Platform & Rendering
 - **GPU Acceleration**: Supports both CPU (`QWidget`) and GPU (`QOpenGLWidget`) backends.
@@ -51,6 +52,7 @@ flowmap/
 │   ├── data/           # Data sources
 │   │   ├── simulator.py   # Synthetic market data
 │   │   ├── crypcodile_replay.py # Historical DuckDB/Parquet player
+│   │   ├── crypcodile_live.py   # Real-time WebSocket feed provider
 │   │   └── crypto.py      # Live crypto feeds (CCXT)
 │   ├── ui/             # PyQt6 GUI
 │   │   ├── bubbles.py     # Trade circles canvas
