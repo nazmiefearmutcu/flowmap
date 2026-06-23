@@ -26,7 +26,6 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPaintEvent
 
 from flowmap.ui.heatmap_widget import HeatmapWidget
-from flowmap.ui.price_chart import PriceChart
 from flowmap.ui.main_window import MainWindow
 from flowmap.core.order_book import OrderBook
 from flowmap.data.simulator import MarketSimulator
@@ -82,7 +81,6 @@ class MonitoredMainWindow(MainWindow):
     def __init__(self):
         super().__init__()
         self.heatmap_paint_times = []
-        self.chart_paint_times = []
         
         # Override heatmap's paintEvent
         old_hm_paint = self.heatmap.paintEvent
@@ -92,15 +90,6 @@ class MonitoredMainWindow(MainWindow):
             t1 = time.perf_counter()
             self.heatmap_paint_times.append(t1 - t0)
         self.heatmap.paintEvent = hm_paint
-        
-        # Override price_chart's paintEvent
-        old_chart_paint = self.price_chart.paintEvent
-        def chart_paint(event):
-            t0 = time.perf_counter()
-            old_chart_paint(event)
-            t1 = time.perf_counter()
-            self.chart_paint_times.append(t1 - t0)
-        self.price_chart.paintEvent = chart_paint
 
 # =========================================================================
 # Data Feed Helpers
@@ -115,10 +104,7 @@ def push_data_to_window(window: MainWindow, levels, snapshot, bbo, trades):
     for trade in trades:
         window.heatmap.add_trade(trade.price, trade.size, trade.side, is_liquidation=trade.is_liquidation)
         
-    # Push to price_chart
-    if bbo is not None and bbo.bid > 0 and bbo.ask > 0:
-        mid = (bbo.bid + bbo.ask) / 2.0
-        window.price_chart.push_price(mid)
+    pass
 
 def push_data_to_widget(widget: HeatmapWidget, levels, snapshot, bbo, trades):
     """Push levels, BBO, and trades directly to HeatmapWidget."""
@@ -142,7 +128,6 @@ def run_uncapped_benchmark(app, target, test_snapshots, duration=3.0):
     # Reset monitored paint times
     if isinstance(target, MainWindow):
         target.heatmap_paint_times.clear()
-        target.chart_paint_times.clear()
     else:
         target.paint_times.clear()
         
@@ -191,7 +176,6 @@ def run_capped_benchmark(app, target, test_snapshots, duration=3.0, target_fps=6
     # Reset monitored paint times
     if isinstance(target, MainWindow):
         target.heatmap_paint_times.clear()
-        target.chart_paint_times.clear()
     else:
         target.paint_times.clear()
         
@@ -371,13 +355,9 @@ def main():
         
         # Extract paint stats (skip first 20 frames for JIT/warmup)
         hm_paint_ms = np.array(window.heatmap_paint_times[20:]) * 1000.0 if len(window.heatmap_paint_times) > 20 else np.array(window.heatmap_paint_times) * 1000.0
-        chart_paint_ms = np.array(window.chart_paint_times[20:]) * 1000.0 if len(window.chart_paint_times) > 20 else np.array(window.chart_paint_times) * 1000.0
         
         avg_hm = np.mean(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
         max_hm = np.max(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
-        
-        avg_chart = np.mean(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
-        max_chart = np.max(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
         
         results.append({
             "resolution": f"{width}x{height}",
@@ -388,17 +368,6 @@ def main():
             "avg_paint": avg_hm,
             "max_paint": max_hm,
             "std_paint": np.std(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
-        })
-        
-        results.append({
-            "resolution": f"{width}x{height}",
-            "target": "MainWindow (PriceChart)",
-            "mode": "Uncapped",
-            "fps": res_uncapped_win["fps"],
-            "avg_cpu": res_uncapped_win["avg_cpu"],
-            "avg_paint": avg_chart,
-            "max_paint": max_chart,
-            "std_paint": np.std(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
         })
         
         # Run window capped at 60 FPS
@@ -406,13 +375,9 @@ def main():
         res_capped_win = run_capped_benchmark(app, window, test_snapshots, duration=3.0, target_fps=60)
         
         hm_paint_ms = np.array(window.heatmap_paint_times[20:]) * 1000.0 if len(window.heatmap_paint_times) > 20 else np.array(window.heatmap_paint_times) * 1000.0
-        chart_paint_ms = np.array(window.chart_paint_times[20:]) * 1000.0 if len(window.chart_paint_times) > 20 else np.array(window.chart_paint_times) * 1000.0
         
         avg_hm = np.mean(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
         max_hm = np.max(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
-        
-        avg_chart = np.mean(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
-        max_chart = np.max(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
         
         results.append({
             "resolution": f"{width}x{height}",
@@ -423,17 +388,6 @@ def main():
             "avg_paint": avg_hm,
             "max_paint": max_hm,
             "std_paint": np.std(hm_paint_ms) if len(hm_paint_ms) > 0 else 0.0
-        })
-        
-        results.append({
-            "resolution": f"{width}x{height}",
-            "target": "MainWindow (PriceChart)",
-            "mode": "Capped (60 FPS)",
-            "fps": res_capped_win["fps"],
-            "avg_cpu": res_capped_win["avg_cpu"],
-            "avg_paint": avg_chart,
-            "max_paint": max_chart,
-            "std_paint": np.std(chart_paint_ms) if len(chart_paint_ms) > 0 else 0.0
         })
         
         window.close()
@@ -472,7 +426,7 @@ def main():
     artifact_dir = os.environ.get("GEMINI_ARTIFACT_DIR")
     if not artifact_dir:
         # Fallback to local brain directory
-        artifact_dir = "/Users/nazmi/.gemini/antigravity-cli/brain/26063ac9-4060-4915-8e5d-01dcd19c1e60"
+        artifact_dir = "/Users/nazmi/.gemini/antigravity-cli/brain/856e1eac-1929-4976-9d73-840a512778ca"
         
     md_report_path = os.path.join(artifact_dir, "benchmark_results.md")
     

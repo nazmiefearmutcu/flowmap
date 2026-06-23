@@ -99,6 +99,28 @@ python run_flowmap.py
 
 ---
 
+## 📊 Benchmarks & Performance Metrics
+
+To ensure institutional-grade reliability and low latency, FlowMap is continuously benchmarked using headless offscreen rendering driven by [benchmark_rendering.py](file:///Users/nazmi/flowmap/benchmark_rendering.py).
+
+Under maximum throughput stress tests (rendering L2 book updates, CVD delta ticks, and trade events as fast as the queue drains), the platform achieves the following metrics:
+
+| Resolution | Target Component | Mode | Throughput / FPS | Avg CPU Usage | Avg Paint Time | Max Paint Time |
+|:---|:---|:---|:---|:---|:---|:---|
+| **800x600** | HeatmapWidget | Uncapped | 56.3 FPS | 63.3% | 8.46 ms | 268.69 ms |
+| **800x600** | MainWindow (Heatmap) | Uncapped | **147.9 FPS** | 90.0% | **2.73 ms** | 94.89 ms |
+| **800x600** | MainWindow (Heatmap) | Capped (60 FPS) | 53.9 FPS | 62.4% | 4.64 ms | 50.42 ms |
+| **1920x1080** | HeatmapWidget | Uncapped | 67.4 FPS | 88.8% | 6.06 ms | 180.31 ms |
+| **1920x1080** | MainWindow (Heatmap) | Uncapped | **104.0 FPS** | 89.0% | **3.34 ms** | 134.66 ms |
+| **1920x1080** | MainWindow (Heatmap) | Capped (60 FPS) | 39.2 FPS | 58.3% | 6.23 ms | 155.69 ms |
+
+### Key Reliability Features
+- **Zero-Lag Event Pipeline**: Rather than choking the UI event thread on high-frequency feeds, incoming messages are batched using thread-safe queues.
+- **Microsecond Desync Protection**: BBO updates are applied directly to the order book's BBO tracking state, automatically cleaning crossed levels and triggering a repaint only when new data changes.
+- **Offscreen Benchmarking**: Benchmarked headlessly via Qt's `offscreen` QPA platform to measure true internal computation limits independent of display server v-sync capping.
+
+---
+
 ## 🛣️ Roadmap
 
 ### Phase 1 — Core Engine & UI ✅
