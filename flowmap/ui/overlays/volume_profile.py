@@ -1,195 +1,194 @@
 """
 Volume Profile Panel — horizontal histogram to the right of the heatmap.
 
-Shows trade volume distribution across price levels as horizontal
-bars extending left from the right edge.  Highlights:
-- Point of Control (POC): the highest-volume level
-- Value Area: the narrowest price range containing ~70% of total volume
+Displays depth and volume profile columns side by side:
+- COB (Current Order Book): resting limit order depth (bids in green, asks in red)
+- CVP (Chart Range Volume Profile): traded volume within the visible chart range
+- SVP (Session Range Volume Profile): accumulated traded volume since start of session
 """
 from __future__ import annotations
-import math
 from typing import Optional
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPaintEvent, QLinearGradient
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPaintEvent
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 
 
 class VolumeProfileOverlay(QWidget):
     """
-    Volume Profile histogram panel.
+    Volume Profile overlay panel displaying COB, CVP, and SVP.
 
-    Designed to sit to the right of the heatmap.  Horizontal bars
-    extending left from the right edge, with POC highlighted.
-
-    Methods
-    -------
-    add_trade(price, size) : record volume at a price level
-    set_levels(levels) : sync with heatmap price levels for row positions
-    reset() : clear all data
+    Designed to sit to the right of the heatmap. Refreshes dynamically
+    with grid alignment to the visible heatmap rows.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, heatmap=None):
         super().__init__(parent)
-        self.setMinimumWidth(100)
+        self._heatmap = heatmap
+        self._order_book = None
+        
+        self.setMinimumWidth(220)
         self.setSizePolicy(
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
 
-        # ── Data ──
-        # price → cumulative volume
-        self._volumes: dict[float, float] = {}
-        self._levels: list = []  # BookLevel list (for row positioning)
-        self._total_volume: float = 0.0
+        # ── Toggle states for the columns ──
+        self.show_cob: bool = True
+        self.show_cvp: bool = True
+        self.show_svp: bool = True
 
-        # Computed on each paint (or incrementally)
-        self._max_volume: float = 0.0
-        self._poc_price: Optional[float] = None
-        self._poc_volume: float = 0.0
-        self._va_high: Optional[float] = None
-        self._va_low: Optional[float] = None
+        # ── SVP Data (Session Volume Profile) ──
+        self._svp_volumes: dict[float, float] = {}
+        self._svp_total_volume: float = 0.0
+        self._svp_max_volume: float = 0.0
+        self._svp_poc_price: Optional[float] = None
+        self._svp_poc_volume: float = 0.0
+        self._svp_va_low: Optional[float] = None
+        self._svp_va_high: Optional[float] = None
+        self._svp_va_stale: bool = True
 
-        self._va_stale: bool = True
-        self._last_va_compute_time: float = 0.0
-        self._va_throttle_sec: float = 0.1
+        # ── CVP Data (Chart Volume Profile) ──
+        self._cvp_volumes: dict[float, float] = {}
+        self._cvp_total_volume: float = 0.0
+        self._cvp_max_volume: float = 0.0
+        self._cvp_poc_price: Optional[float] = None
+        self._cvp_poc_volume: float = 0.0
+        self._cvp_va_low: Optional[float] = None
+        self._cvp_va_high: Optional[float] = None
+
+        self._levels: list = []  # BookLevel list (synced from heatmap)
+        self.row_height: int = 20
 
         # ── Appearance ──
         from ..theme import Colors
         self.bg_color = Colors.BG_PANEL
-        self.grid_color = QColor(35, 35, 45)
-        self.text_color = QColor(180, 180, 190)
-        self.poc_color = QColor(0, 200, 255)        # Bright cyan
-        self.poc_label_color = QColor(0, 200, 255)
-        self.va_color = QColor(30, 80, 140, 80)     # Dark blue shade
-        self.bar_gradient_top = QColor(20, 60, 120)  # Dark blue
-        self.bar_gradient_bot = QColor(0, 180, 220)  # Bright cyan
-
-        # Row sync from heatmap
-        self.row_height: int = 20
-        self.bar_max_width: int = 80
-
-        # Label area
-        self._label_width: int = 36  # Space on the right for POC/VAL labels
-
-        # Pre-generate color tables for performance (indexed by intensity 0-255)
-        self._va_colors = [
-            QColor(int(30 + i * 50 / 255), int(80 + i * 100 / 255), int(140 + i * 100 / 255), 200)
+        self.grid_color = QColor(31, 34, 47)
+        self.text_color = Colors.TEXT_SECONDARY
+        
+        # Color mapping tables for Value Area intensity (0-255)
+        self._svp_va_colors = [
+            QColor(int(94 + i * 20 / 255), int(114 + i * 40 / 255), int(228 + i * 20 / 255), 200)
             for i in range(256)
         ]
-        self._reg_colors = [
-            QColor(int(20 + i * 30 / 255), int(60 + i * 120 / 255), int(120 + i * 100 / 255), 180)
+        self._svp_reg_colors = [
+            QColor(int(51 + i * 20 / 255), int(65 + i * 20 / 255), int(85 + i * 20 / 255), 150)
+            for i in range(256)
+        ]
+        self._cvp_va_colors = [
+            QColor(int(59 + i * 40 / 255), int(130 + i * 40 / 255), int(246 + i * 9 / 255), 200)
+            for i in range(256)
+        ]
+        self._cvp_reg_colors = [
+            QColor(int(99 + i * 20 / 255), int(102 + i * 20 / 255), int(241 + i * 14 / 255), 150)
             for i in range(256)
         ]
 
     # ── Public API ─────────────────────────────────────────────
 
-    def add_trade(self, price: float, size: float) -> None:
-        """Record trade volume at a given price level."""
-        price_key = round(price, 6)
-        old_vol = self._volumes.get(price_key, 0.0)
-        new_vol = old_vol + size
-        self._volumes[price_key] = new_vol
-        self._total_volume += size
-        
-        # Incrementally update max volume and POC (O(1) updates)
-        if new_vol > self._poc_volume:
-            self._poc_volume = new_vol
-            self._poc_price = price_key
-        if new_vol > self._max_volume:
-            self._max_volume = new_vol
+    def set_order_book(self, order_book) -> None:
+        """Link the data source order book directly for COB queries."""
+        self._order_book = order_book
 
-        self._va_stale = True
+    def add_trade(self, price: float, size: float) -> None:
+        """Record trade volume at a given price level for SVP."""
+        price_key = round(price, 6)
+        old_vol = self._svp_volumes.get(price_key, 0.0)
+        new_vol = old_vol + size
+        self._svp_volumes[price_key] = new_vol
+        self._svp_total_volume += size
+        
+        # Incrementally update max volume and POC
+        if new_vol > self._svp_poc_volume:
+            self._svp_poc_volume = new_vol
+            self._svp_poc_price = price_key
+        if new_vol > self._svp_max_volume:
+            self._svp_max_volume = new_vol
+
+        self._svp_va_stale = True
         self.update()
 
-    def add_trades(self, trades: list[Trade]) -> None:
-        """Record a batch of trade volumes at given price levels."""
+    def add_trades(self, trades: list) -> None:
+        """Record a batch of trade volumes at given price levels for SVP."""
         if not trades:
             return
         for trade in trades:
             price, size = trade.price, trade.size
             price_key = round(price, 6)
-            old_vol = self._volumes.get(price_key, 0.0)
+            old_vol = self._svp_volumes.get(price_key, 0.0)
             new_vol = old_vol + size
-            self._volumes[price_key] = new_vol
-            self._total_volume += size
+            self._svp_volumes[price_key] = new_vol
+            self._svp_total_volume += size
             
             # Incrementally update max volume and POC
-            if new_vol > self._poc_volume:
-                self._poc_volume = new_vol
-                self._poc_price = price_key
-            if new_vol > self._max_volume:
-                self._max_volume = new_vol
+            if new_vol > self._svp_poc_volume:
+                self._svp_poc_volume = new_vol
+                self._svp_poc_price = price_key
+            if new_vol > self._svp_max_volume:
+                self._svp_max_volume = new_vol
 
-        self._va_stale = True
+        self._svp_va_stale = True
         self.update()
 
     def set_levels(self, levels: list) -> None:
-        """
-        Sync with the heatmap's visible price levels.
-        This determines which rows are drawn and their order.
-        """
+        """Sync with the heatmap's visible price levels to match rows."""
         self._levels = levels
-        # Vis range shifts do not affect historical POC or Value Area,
-        # so we do NOT call _invalidate() here to avoid unnecessary computations.
         self.update()
 
     def set_row_height(self, h: int) -> None:
-        """Set row height for matching heatmap layout."""
+        """Set row height matching the heatmap layout."""
         if self.row_height != h:
             self.row_height = h
             self.update()
 
     def reset(self) -> None:
-        """Clear all volume profile data."""
-        self._volumes.clear()
+        """Clear all COB, CVP, and SVP data."""
+        self._svp_volumes.clear()
+        self._svp_total_volume = 0.0
+        self._svp_max_volume = 0.0
+        self._svp_poc_price = None
+        self._svp_poc_volume = 0.0
+        self._svp_va_low = None
+        self._svp_va_high = None
+        self._svp_va_stale = True
+
+        self._cvp_volumes.clear()
+        self._cvp_total_volume = 0.0
+        self._cvp_max_volume = 0.0
+        self._cvp_poc_price = None
+        self._cvp_poc_volume = 0.0
+        self._cvp_va_low = None
+        self._cvp_va_high = None
+
         self._levels.clear()
-        self._total_volume = 0.0
-        self._max_volume = 0.0
-        self._poc_price = None
-        self._poc_volume = 0.0
-        self._va_high = None
-        self._va_low = None
-        self._va_stale = True
         self.update()
 
-    # ── Internal ───────────────────────────────────────────────
+    # ── Calculations ───────────────────────────────────────────
 
-    def _invalidate(self) -> None:
-        """Mark computed values as stale."""
-        self._va_stale = True
-
-    def _compute(self) -> None:
-        """Compute POC and Value Area from current volume data."""
-        if not self._volumes or self._total_volume <= 0:
+    def _compute_svp_va(self) -> None:
+        """Compute POC and Value Area for Session Volume Profile."""
+        if not self._svp_volumes or self._svp_total_volume <= 0:
             return
 
         # Ensure POC is computed (fallback)
-        if self._poc_price is None or self._poc_price not in self._volumes:
-            self._poc_price = max(self._volumes, key=self._volumes.get)
-            self._poc_volume = self._volumes[self._poc_price]
-            self._max_volume = max(self._max_volume, self._poc_volume)
+        if self._svp_poc_price is None or self._svp_poc_price not in self._svp_volumes:
+            self._svp_poc_price = max(self._svp_volumes, key=self._svp_volumes.get)
+            self._svp_poc_volume = self._svp_volumes[self._svp_poc_price]
+            self._svp_max_volume = max(self._svp_max_volume, self._svp_poc_volume)
 
-        if not self._va_stale:
+        if not self._svp_va_stale:
             return
 
-        import time
-        now = time.time()
-        if now - self._last_va_compute_time < self._va_throttle_sec and self._va_low is not None:
-            return
+        self._svp_va_stale = False
 
-        self._last_va_compute_time = now
-        self._va_stale = False
-
-        # Compute Value Area (narrowest range containing ~70% of volume)
-        # Sort levels by volume descending and accumulate until 70%
+        # Value Area (narrowest range containing 70% of total volume)
         sorted_levels = sorted(
-            self._volumes.items(),
+            self._svp_volumes.items(),
             key=lambda x: x[1],
             reverse=True,
         )
 
-        target_vol = self._total_volume * 0.70
+        target_vol = self._svp_total_volume * 0.70
         accumulated = 0.0
         va_levels: list[float] = []
 
@@ -200,8 +199,60 @@ class VolumeProfileOverlay(QWidget):
             va_levels.append(price)
 
         if va_levels:
-            self._va_low = min(va_levels)
-            self._va_high = max(va_levels)
+            self._svp_va_low = min(va_levels)
+            self._svp_va_high = max(va_levels)
+
+    def _compute_cvp(self) -> None:
+        """Dynamically compute CVP (Chart Volume Profile) from visible trades."""
+        self._cvp_volumes.clear()
+        self._cvp_total_volume = 0.0
+        self._cvp_max_volume = 0.0
+        self._cvp_poc_price = None
+        self._cvp_poc_volume = 0.0
+        self._cvp_va_low = None
+        self._cvp_va_high = None
+
+        if not self._heatmap:
+            return
+
+        # Fetch on-screen visible trades from the heatmap cache
+        visible_trades = self._heatmap.get_visible_trades()
+        for t in visible_trades:
+            # Format: (price, size, side, ts, tick_index)
+            if len(t) >= 4:
+                price, size = t[0], t[1]
+                price_key = round(price, 6)
+                self._cvp_volumes[price_key] = self._cvp_volumes.get(price_key, 0.0) + size
+                self._cvp_total_volume += size
+
+        if not self._cvp_volumes or self._cvp_total_volume <= 0:
+            return
+
+        # Compute POC for CVP
+        self._cvp_poc_price = max(self._cvp_volumes, key=self._cvp_volumes.get)
+        self._cvp_poc_volume = self._cvp_volumes[self._cvp_poc_price]
+        self._cvp_max_volume = self._cvp_poc_volume
+
+        # Compute Value Area for CVP
+        sorted_levels = sorted(
+            self._cvp_volumes.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        target_vol = self._cvp_total_volume * 0.70
+        accumulated = 0.0
+        va_levels: list[float] = []
+
+        for price, vol in sorted_levels:
+            if accumulated >= target_vol:
+                break
+            accumulated += vol
+            va_levels.append(price)
+
+        if va_levels:
+            self._cvp_va_low = min(va_levels)
+            self._cvp_va_high = max(va_levels)
 
     # ── Painting ───────────────────────────────────────────────
 
@@ -211,39 +262,69 @@ class VolumeProfileOverlay(QWidget):
 
         w, h = self.width(), self.height()
 
-        # Background
+        # Fill background
         painter.fillRect(0, 0, w, h, self.bg_color)
 
-        if not self._levels or not self._volumes:
+        # Determine which columns to render
+        active_cols = []
+        if self.show_cob:
+            active_cols.append("COB")
+        if self.show_cvp:
+            active_cols.append("CVP")
+        if self.show_svp:
+            active_cols.append("SVP")
+
+        num_cols = len(active_cols)
+        if num_cols == 0 or not self._levels:
             painter.setPen(self.text_color)
             painter.setFont(QFont('Helvetica Neue', 9))
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
-                "No data",
+                "No active profiles" if num_cols == 0 else "No data",
             )
             painter.end()
             return
 
-        # Compute POC and VA if stale
-        self._compute()
+        # Compute profile metrics
+        if self.show_svp:
+            self._compute_svp_va()
+        if self.show_cvp:
+            self._compute_cvp()
 
-        # If still no volume data after computing, bail
-        if self._total_volume <= 0:
-            painter.end()
-            return
+        # Build current order book map for COB column
+        cob_bids = {}
+        cob_asks = {}
+        levels_source = []
+        if self._heatmap and hasattr(self._heatmap, '_levels') and self._heatmap._levels:
+            levels_source = self._heatmap._levels
+        elif self._order_book:
+            levels_source = self._order_book.get_levels()
 
-        bar_area_right = w
-        bar_area_left = 4
-        bar_width = bar_area_right - bar_area_left
-        if bar_width <= 0:
-            painter.end()
-            return
+        for lv in levels_source:
+            price_key = round(lv.price, 6)
+            if lv.bid_size > 0:
+                cob_bids[price_key] = lv.bid_size
+            if lv.ask_size > 0:
+                cob_asks[price_key] = lv.ask_size
 
-        # Normalize max volume for bar scaling
-        max_v = max(self._max_volume, 1.0)
+        # Grid geometry parameters
+        margin = 4
+        spacing = 8
+        net_w = w - 2 * margin - (num_cols - 1) * spacing
+        col_w = max(10, net_w // num_cols)
 
-        # Draw bars for each visible price level using nearest-neighbor row boundaries
+        # Normalization constants
+        max_cob = 0.0
+        for level in self._levels:
+            price_key = round(level.price, 6)
+            max_cob = max(max_cob, cob_bids.get(price_key, 0.0), cob_asks.get(price_key, 0.0))
+        max_cob = max(max_cob, 1.0)
+
+        max_cvp = max(self._cvp_max_volume, 1.0)
+        max_svp = max(self._svp_max_volume, 1.0)
+
+        # Draw the price rows
         bh = len(self._levels)
         for i, level in enumerate(self._levels):
             price = level.price
@@ -254,78 +335,157 @@ class VolumeProfileOverlay(QWidget):
                 break
 
             price_key = round(price, 6)
-            vol = self._volumes.get(price_key, 0.0)
-            if vol <= 0:
-                continue
-
-            # Bar width proportional to volume
-            bar_len = int((vol / max_v) * bar_width)
-            bar_len = min(bar_len, bar_width)
-
-            if bar_len <= 0:
-                continue
-
-            # Determine if this level is in the value area
-            in_va = (
-                self._va_low is not None
-                and self._va_high is not None
-                and self._va_low <= price_key <= self._va_high
-            )
-
-            # Is this the POC?
-            is_poc = (
-                self._poc_price is not None
-                and abs(price_key - self._poc_price) < 0.001
-            )
-
-            # Bar X position (right-aligned)
-            bar_x = bar_area_right - bar_len
-
-            # Keep a 1-pixel gap if height allows, otherwise draw at full row height
             draw_height = max(1, y_height - 1) if y_height > 1 else y_height
 
-            # ── Bar fill ──
-            if is_poc:
-                # POC: bright cyan
-                painter.fillRect(
-                    bar_x, y_start, bar_len, draw_height,
-                    self.poc_color,
-                )
-            else:
-                intensity = vol / max_v
-                idx = int(intensity * 255)
-                idx = max(0, min(255, idx))
-                if in_va:
-                    # Value Area: slightly different shade (blue tint)
-                    painter.fillRect(
-                        bar_x, y_start, bar_len, draw_height,
-                        self._va_colors[idx],
-                    )
+            for idx, col_name in enumerate(active_cols):
+                x_col_start = margin + idx * (col_w + spacing)
+
+                if col_name == "COB":
+                    bid_sz = cob_bids.get(price_key, 0.0)
+                    ask_sz = cob_asks.get(price_key, 0.0)
+                    if bid_sz > 0:
+                        bar_len = int((bid_sz / max_cob) * col_w)
+                        bar_len = max(1, min(bar_len, col_w))
+                        # Green bid bar
+                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, QColor(16, 185, 129, 180))
+                    elif ask_sz > 0:
+                        bar_len = int((ask_sz / max_cob) * col_w)
+                        bar_len = max(1, min(bar_len, col_w))
+                        # Red ask bar
+                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, QColor(239, 68, 68, 180))
+
+                elif col_name == "CVP":
+                    vol = self._cvp_volumes.get(price_key, 0.0)
+                    if vol > 0:
+                        bar_len = int((vol / max_cvp) * col_w)
+                        bar_len = max(1, min(bar_len, col_w))
+
+                        in_va = (
+                            self._cvp_va_low is not None
+                            and self._cvp_va_high is not None
+                            and self._cvp_va_low <= price_key <= self._cvp_va_high
+                        )
+                        is_poc = (
+                            self._cvp_poc_price is not None
+                            and abs(price_key - self._cvp_poc_price) < 0.000001
+                        )
+
+                        if is_poc:
+                            # CVP POC: Bright amber yellow
+                            color = QColor(245, 158, 11)
+                        elif in_va:
+                            # Value Area: Deep blue intensity
+                            intensity = vol / max_cvp
+                            c_idx = max(0, min(255, int(intensity * 255)))
+                            color = self._cvp_va_colors[c_idx]
+                        else:
+                            # Regular: Indigo intensity
+                            intensity = vol / max_cvp
+                            c_idx = max(0, min(255, int(intensity * 255)))
+                            color = self._cvp_reg_colors[c_idx]
+
+                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, color)
+
+                        # Draw subtle horizontal line for CVP POC
+                        if is_poc:
+                            painter.setPen(QPen(QColor(245, 158, 11), 1, Qt.PenStyle.SolidLine))
+                            painter.drawLine(x_col_start, y_start + draw_height // 2, x_col_start + col_w, y_start + draw_height // 2)
+                            painter.setPen(Qt.PenStyle.NoPen)
+
+                elif col_name == "SVP":
+                    vol = self._svp_volumes.get(price_key, 0.0)
+                    if vol > 0:
+                        bar_len = int((vol / max_svp) * col_w)
+                        bar_len = max(1, min(bar_len, col_w))
+
+                        in_va = (
+                            self._svp_va_low is not None
+                            and self._svp_va_high is not None
+                            and self._svp_va_low <= price_key <= self._svp_va_high
+                        )
+                        is_poc = (
+                            self._svp_poc_price is not None
+                            and abs(price_key - self._svp_poc_price) < 0.000001
+                        )
+
+                        if is_poc:
+                            # SVP POC: Bright Cyan
+                            color = QColor(0, 200, 255)
+                        elif in_va:
+                            # Value area: Royal purple intensity
+                            intensity = vol / max_svp
+                            c_idx = max(0, min(255, int(intensity * 255)))
+                            color = self._svp_va_colors[c_idx]
+                        else:
+                            # Regular: Slate intensity
+                            intensity = vol / max_svp
+                            c_idx = max(0, min(255, int(intensity * 255)))
+                            color = self._svp_reg_colors[c_idx]
+
+                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, color)
+
+                        # Draw subtle horizontal line for SVP POC
+                        if is_poc:
+                            painter.setPen(QPen(QColor(0, 200, 255), 1, Qt.PenStyle.SolidLine))
+                            painter.drawLine(x_col_start, y_start + draw_height // 2, x_col_start + col_w, y_start + draw_height // 2)
+                            painter.setPen(Qt.PenStyle.NoPen)
+
+        # ── Draw HUD Column Headers ──
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        
+        # Header banner (semi-transparent slate)
+        painter.fillRect(0, 0, w, 20, QColor(10, 11, 16, 230))
+        painter.setPen(QPen(QColor(31, 34, 47), 1, Qt.PenStyle.SolidLine))
+        painter.drawLine(0, 20, w, 20)
+
+        header_font = QFont('Inter', 8, QFont.Weight.Bold)
+        painter.setFont(header_font)
+
+        for idx, col_name in enumerate(active_cols):
+            x_col_start = margin + idx * (col_w + spacing)
+
+            # Draw vertical column separator line
+            if idx < num_cols - 1:
+                x_sep = x_col_start + col_w + spacing // 2
+                painter.setPen(QPen(QColor(31, 34, 47), 1, Qt.PenStyle.SolidLine))
+                painter.drawLine(x_sep, 0, x_sep, h)
+
+            # Draw Column Label
+            painter.setPen(QColor(226, 228, 233))
+            fm = painter.fontMetrics()
+            label_w = fm.horizontalAdvance(col_name)
+            tx = x_col_start + (col_w - label_w) // 2
+            painter.drawText(tx, 13, col_name)
+
+        # ── Draw HUD Footers ──
+        painter.fillRect(0, h - 16, w, 16, QColor(10, 11, 16, 230))
+        painter.setPen(QPen(QColor(31, 34, 47), 1, Qt.PenStyle.SolidLine))
+        painter.drawLine(0, h - 16, w, h - 16)
+
+        footer_font = QFont('Helvetica Neue', 7, QFont.Weight.Bold)
+        painter.setFont(footer_font)
+
+        for idx, col_name in enumerate(active_cols):
+            x_col_start = margin + idx * (col_w + spacing)
+
+            painter.setPen(self.text_color)
+            txt = ""
+            if col_name == "COB":
+                txt = "BOOK"
+            elif col_name == "CVP":
+                if self._cvp_total_volume >= 1000.0:
+                    txt = f"{self._cvp_total_volume/1000.0:.1f}k"
                 else:
-                    # Regular bar: gradient from dark blue to cyan based on volume
-                    painter.fillRect(
-                        bar_x, y_start, bar_len, draw_height,
-                        self._reg_colors[idx],
-                    )
+                    txt = f"{self._cvp_total_volume:.0f}"
+            elif col_name == "SVP":
+                if self._svp_total_volume >= 1000.0:
+                    txt = f"{self._svp_total_volume/1000.0:.1f}k"
+                else:
+                    txt = f"{self._svp_total_volume:.0f}"
 
-            # ── POC label ──
-            if is_poc:
-                font = QFont('Menlo', 8, QFont.Weight.Bold)
-                painter.setFont(font)
-                painter.setPen(self.poc_label_color)
-                label = "POC"
-                fm = painter.fontMetrics()
-                label_w = fm.horizontalAdvance(label)
-                painter.drawText(
-                    bar_area_right - label_w - 4,
-                    y_start + y_height - 4,
-                    label,
-                )
-
-        # ── Bottom info line ──
-        painter.setFont(QFont('Helvetica Neue', 8))
-        painter.setPen(self.text_color)
-        info = f"Vol: {self._total_volume:.1f}"
-        painter.drawText(4, h - 4, info)
+            fm = painter.fontMetrics()
+            label_w = fm.horizontalAdvance(txt)
+            tx = x_col_start + (col_w - label_w) // 2
+            painter.drawText(tx, h - 5, txt)
 
         painter.end()

@@ -91,7 +91,8 @@ class MainWindow(QMainWindow):
 
         # Volume Profile Overlay in Row 0, Column 1
         from .overlays.volume_profile import VolumeProfileOverlay
-        self.volume_profile = VolumeProfileOverlay()
+        self.volume_profile = VolumeProfileOverlay(heatmap=self.heatmap)
+        self.volume_profile.set_order_book(self._order_book)
         left_layout.addWidget(self.volume_profile, 0, 1)
 
         # Market Pulse (CVD) in Row 1, Column 0
@@ -107,7 +108,7 @@ class MainWindow(QMainWindow):
 
         # Set column stretch factors for perfect visual grid alignment
         left_layout.setColumnStretch(0, 8)
-        left_layout.setColumnStretch(1, 1)
+        left_layout.setColumnStretch(1, 2)
         left_layout.setRowStretch(0, 5)
         left_layout.setRowStretch(1, 1)
 
@@ -256,6 +257,22 @@ class MainWindow(QMainWindow):
         self.show_vp_cb.setChecked(True)
         self.show_vp_cb.stateChanged.connect(self._on_show_vp_toggled)
         visuals_layout.addWidget(self.show_vp_cb)
+
+        # Sub-checkboxes for specific profiles
+        self.show_cob_cb = QCheckBox("  Show COB (Book Depth)")
+        self.show_cob_cb.setChecked(True)
+        self.show_cob_cb.stateChanged.connect(self._on_show_cob_toggled)
+        visuals_layout.addWidget(self.show_cob_cb)
+
+        self.show_cvp_cb = QCheckBox("  Show CVP (Chart Vol)")
+        self.show_cvp_cb.setChecked(True)
+        self.show_cvp_cb.stateChanged.connect(self._on_show_cvp_toggled)
+        visuals_layout.addWidget(self.show_cvp_cb)
+
+        self.show_svp_cb = QCheckBox("  Show SVP (Session Vol)")
+        self.show_svp_cb.setChecked(True)
+        self.show_svp_cb.stateChanged.connect(self._on_show_svp_toggled)
+        visuals_layout.addWidget(self.show_svp_cb)
 
         visuals_layout.addStretch()
         self.sidebar_tabs.addTab(visuals_tab, "VISUALS")
@@ -465,8 +482,28 @@ class MainWindow(QMainWindow):
         self.heatmap.update()
 
     def _on_show_vp_toggled(self, state: int) -> None:
+        is_visible = (state == 2 or state == True)
         if hasattr(self, 'volume_profile') and self.volume_profile is not None:
-            self.volume_profile.setVisible(state == 2 or state == True)
+            self.volume_profile.setVisible(is_visible)
+        if hasattr(self, 'show_cob_cb'):
+            self.show_cob_cb.setEnabled(is_visible)
+            self.show_cvp_cb.setEnabled(is_visible)
+            self.show_svp_cb.setEnabled(is_visible)
+
+    def _on_show_cob_toggled(self, state: int) -> None:
+        if hasattr(self, 'volume_profile') and self.volume_profile is not None:
+            self.volume_profile.show_cob = (state == 2 or state == True)
+            self.volume_profile.update()
+
+    def _on_show_cvp_toggled(self, state: int) -> None:
+        if hasattr(self, 'volume_profile') and self.volume_profile is not None:
+            self.volume_profile.show_cvp = (state == 2 or state == True)
+            self.volume_profile.update()
+
+    def _on_show_svp_toggled(self, state: int) -> None:
+        if hasattr(self, 'volume_profile') and self.volume_profile is not None:
+            self.volume_profile.show_svp = (state == 2 or state == True)
+            self.volume_profile.update()
 
     def _on_decay_changed(self, val: int) -> None:
         decay = val / 100.0
@@ -615,6 +652,9 @@ class MainWindow(QMainWindow):
 
         cvd = self._order_book.get_volume_delta()
         self.heatmap.push_snapshot(levels, bbo, self._order_book.last_receive_timestamp, cvd=cvd)
+
+        if hasattr(self, 'volume_profile') and self.volume_profile is not None:
+            self.volume_profile.update()
 
         if hasattr(self, '_dom_ladder') and self._dom_ladder is not None:
             self._dom_ladder.set_levels(levels)

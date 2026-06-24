@@ -100,6 +100,7 @@ class HeatmapWidget(BaseHeatmapWidget):
         self.column_width: float = 1.0
         self.COLUMN_WIDTH_LEVELS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
         self.price_axis_w: int = 62
+        self.right_margin_w: int = 60
         self._scroll_offset: int = 0
         self._drag_start_scroll_offset: int = 0
         self.auto_follow: bool = True
@@ -313,6 +314,31 @@ class HeatmapWidget(BaseHeatmapWidget):
             for r in range(vis_rows)
         ]
 
+    def get_visible_trades(self) -> list:
+        """Get the list of trades currently visible on the heatmap timeframe."""
+        if not self._trades:
+            return []
+        
+        # We need the horizontal dimension in columns (bw)
+        buf = self._engine.get_buffer()
+        if buf is None:
+            return []
+        bw = buf.shape[1]
+        if bw <= 0:
+            return []
+            
+        visible_end_frame = self._frame_count - self._scroll_offset
+        start_tick = visible_end_frame - bw + 1
+        end_tick = visible_end_frame
+        
+        import bisect
+        trades_list = list(self._trades)
+        
+        # Binary search for trades within the visible tick range
+        start_idx = bisect.bisect_left(trades_list, start_tick, key=lambda t: t[4] if len(t) == 5 else t[3])
+        end_idx = bisect.bisect_right(trades_list, end_tick, key=lambda t: t[4] if len(t) == 5 else t[3])
+        return trades_list[start_idx:end_idx]
+
     # ── Public API ────────────────────────────────────────────────
 
     def push_snapshot(self, levels: list[BookLevel], bbo: Optional[BBO], receive_timestamp: float = 0.0, cvd: float = 0.0) -> None:
@@ -355,7 +381,8 @@ class HeatmapWidget(BaseHeatmapWidget):
 
         vr = max(1, self.height() // self.row_height)
         hm_w = max(1, self.width() - self.price_axis_w)
-        target_bw = max(1, int(hm_w / self.column_width))
+        timeline_w = max(1, hm_w - self.right_margin_w)
+        target_bw = max(1, int(timeline_w / self.column_width))
 
         # Resize/Rebuild engine if needed
         if vr != self._last_vis_rows or target_bw != self._last_hm_w:
@@ -546,7 +573,8 @@ class HeatmapWidget(BaseHeatmapWidget):
         """Fully rebuild/re-render the entire heatmap buffer from history."""
         vr = max(1, self.height() // self.row_height)
         hm_w = max(1, self.width() - self.price_axis_w)
-        target_bw = max(1, int(hm_w / self.column_width))
+        timeline_w = max(1, hm_w - self.right_margin_w)
+        target_bw = max(1, int(timeline_w / self.column_width))
         
         # 1. Clear engine buffer and state
         if hasattr(self._engine, '_bid_density') and self._engine._bid_density:
@@ -825,7 +853,8 @@ class HeatmapWidget(BaseHeatmapWidget):
     def scroll_time(self, delta_cols: int) -> None:
         """Scroll timeframe horizontally by delta_cols."""
         hm_w = max(1, self.width() - self.price_axis_w)
-        target_bw = max(1, int(hm_w / self.column_width))
+        timeline_w = max(1, hm_w - self.right_margin_w)
+        target_bw = max(1, int(timeline_w / self.column_width))
         max_scroll = max(0, len(self._history) - target_bw)
         new_scroll = max(0, min(max_scroll, self._scroll_offset + delta_cols))
         
@@ -980,6 +1009,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                 if bh > 0 and bw > 0:
                     hm_left = 0
                     hm_w = cache_w - self.price_axis_w
+                    timeline_w = max(1, hm_w - self.right_margin_w)
 
                     if self.show_heatmap:
                         qimg = QImage(
@@ -997,40 +1027,44 @@ class HeatmapWidget(BaseHeatmapWidget):
                         vis_rows = max(1, cache_h // self.row_height)
                         start_row = bh // 2 - vis_rows // 2
                         cache_painter.drawImage(
-                            QRect(hm_left, 0, hm_w, cache_h),
+                            QRect(hm_left, 0, timeline_w, cache_h),
                             qimg,
                             QRect(0, start_row, bw, vis_rows)
                         )
 
                     # Draw BBO history lines
-                    self._draw_bbo_history_lines(cache_painter, cache_w, cache_h, hm_w)
+                    self._draw_bbo_history_lines(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw trades
                     if self.show_trades:
-                        self._draw_trades(cache_painter, cache_w, cache_h, hm_w)
+                        self._draw_trades(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw liquidations
-                    self._draw_liquidations(cache_painter, cache_w, cache_h, hm_w)
+                    self._draw_liquidations(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw large lot tracker lines (LLT)
-                    self._draw_llt_lines(cache_painter, cache_w, cache_h, hm_w)
+                    self._draw_llt_lines(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw stops execution badges
-                    self._draw_stops(cache_painter, cache_w, cache_h, hm_w)
+                    self._draw_stops(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw icebergs badges
-                    self._draw_icebergs(cache_painter, cache_w, cache_h, hm_w)
+                    self._draw_icebergs(cache_painter, cache_w, cache_h, timeline_w)
 
                     # Draw volume bubbles (after heatmap, before axis)
                     if self.show_trades and self._levels:
                         cache_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                         price_to_y = lambda price: self._price_to_screen_y(price, cache_h)
                         visible_end_frame = self._frame_count - self._scroll_offset
-                        self._bubbles.draw(cache_painter, cache_w, cache_h, hm_w, price_to_y, visible_end_frame, bw, self.row_height, self._engine.ticks_per_row)
+                        self._bubbles.draw(cache_painter, cache_w, cache_h, timeline_w, price_to_y, visible_end_frame, bw, self.row_height, self._engine.ticks_per_row)
                         cache_painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
                     # Draw pulse overlay boxes (top left)
                     self._draw_pulse_boxes(cache_painter, cache_w, cache_h)
+
+                    # Draw vertical timeline boundary separator line
+                    cache_painter.setPen(QPen(Colors.BORDER_SUBTLE, 1.0, Qt.PenStyle.SolidLine))
+                    cache_painter.drawLine(QPointF(timeline_w, 0), QPointF(timeline_w, cache_h))
 
                     # Draw price axis
                     self._draw_price_axis(cache_painter, cache_w, cache_h)
@@ -1117,7 +1151,8 @@ class HeatmapWidget(BaseHeatmapWidget):
             p.save()
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             hm_w = ww - self.price_axis_w
-            btn_rect = QRectF(hm_w - 110, wh - 45, 100, 30)
+            timeline_w = max(1, hm_w - self.right_margin_w)
+            btn_rect = QRectF(timeline_w - 110, wh - 45, 100, 30)
             
             # Check hover
             is_hovered = btn_rect.contains(QPointF(self._mx, self._my))
@@ -1839,7 +1874,8 @@ class HeatmapWidget(BaseHeatmapWidget):
                     dx_cols = int(round(dx / self.column_width))
                     target_scroll = self._drag_start_scroll_offset + dx_cols
                     hm_w = max(1, self.width() - self.price_axis_w)
-                    target_bw = max(1, int(hm_w / self.column_width))
+                    timeline_w = max(1, hm_w - self.right_margin_w)
+                    target_bw = max(1, int(timeline_w / self.column_width))
                     max_scroll = max(0, len(self._history) - target_bw)
                     new_scroll = max(0, min(max_scroll, target_scroll))
                     
@@ -1882,7 +1918,8 @@ class HeatmapWidget(BaseHeatmapWidget):
             # Check if clicked "Go Live" button
             if not self.auto_follow:
                 hm_w = self.width() - self.price_axis_w
-                btn_rect = QRectF(hm_w - 110, self.height() - 45, 100, 30)
+                timeline_w = max(1, hm_w - self.right_margin_w)
+                btn_rect = QRectF(timeline_w - 110, self.height() - 45, 100, 30)
                 if btn_rect.contains(e.position()):
                     self.auto_follow = True
                     self._scroll_offset = 0
@@ -2019,14 +2056,15 @@ class HeatmapWidget(BaseHeatmapWidget):
             return
 
         hm_w = max(1, self.width() - self.price_axis_w)
-        dist_px = hm_w - mx
+        timeline_w = max(1, hm_w - self.right_margin_w)
+        dist_px = timeline_w - mx
         
         delta_offset = (dist_px / old_w) - (dist_px / closest_w)
         new_scroll = self._scroll_offset + delta_offset
         
         self.column_width = closest_w
         
-        target_bw = max(1, int(hm_w / self.column_width))
+        target_bw = max(1, int(timeline_w / self.column_width))
         max_scroll = max(0, len(self._history) - target_bw)
         self._scroll_offset = max(0, min(max_scroll, int(round(new_scroll))))
         
@@ -2126,7 +2164,8 @@ class HeatmapWidget(BaseHeatmapWidget):
             self._vwap_overlay.setGeometry(self.rect())
         vr = max(1, self.height() // self.row_height)
         hm_w = max(1, self.width() - self.price_axis_w)
-        target_bw = max(1, int(hm_w / self.column_width))
+        timeline_w = max(1, hm_w - self.right_margin_w)
+        target_bw = max(1, int(timeline_w / self.column_width))
         if vr != self._last_vis_rows or target_bw != self._last_hm_w:
             self._engine.resize(vr, target_bw)
             self._last_vis_rows = vr
