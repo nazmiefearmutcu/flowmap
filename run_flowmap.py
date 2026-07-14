@@ -19,6 +19,11 @@ except ImportError:
         print("Error: Required dependencies (PyQt6/numpy) are missing, and no local .venv was found.")
         sys.exit(1)
 
+# Fix empty/broken system CA store before any network I/O (live Binance WS).
+from flowmap.ssl_bootstrap import bootstrap_ssl
+
+bootstrap_ssl()
+
 from flowmap.main import main
 
 if __name__ == "__main__":

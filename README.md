@@ -95,7 +95,12 @@ python run_flowmap.py
 ```
 
 - **Data Source Selection**: Choose **Simulator** or **Crypcodile Replay** from the toolbar source dropdown.
-- **Controls**: Press **Start** to run. Use `+`/`-` or mouse scroll with `Ctrl` held down to adjust vertical line zoom. Use `Space` to toggle auto-follow BBO centering.
+- **Controls**:
+  - **Start / Stop**: toolbar **Start** button or **Space**
+  - **Auto-follow BBO**: **F** (toggle)
+  - **Zoom**: mouse **wheel** (time zoom on chart; price zoom on price axis) or `+`/`-`
+  - **Pan / scroll**: **Ctrl + wheel** (time pan on chart; price scroll on price axis); arrow keys also pan time
+  - **Reset view**: **R**
 
 ---
 

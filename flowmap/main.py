@@ -3,6 +3,11 @@ FlowMap — Open-source Bookmap-style order flow visualization.
 """
 
 import sys
+
+from .ssl_bootstrap import bootstrap_ssl
+
+bootstrap_ssl()
+
 from PyQt6.QtWidgets import QApplication
 from .ui.main_window import MainWindow
 

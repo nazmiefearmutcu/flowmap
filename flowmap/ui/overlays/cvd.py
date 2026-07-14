@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPaintEvent
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 
-from ...core import Side
+from ...core import Side, is_buy_side
 
 
 class CVDOverlay(QWidget):
@@ -77,7 +77,7 @@ class CVDOverlay(QWidget):
         side : Side — BUY adds volume, SELL subtracts volume
         """
         import time
-        delta = size if side == Side.BUY else -size
+        delta = size if is_buy_side(side) else -size
         self._current_cvd += delta
         self._cvd_values.append(self._current_cvd)
         self._timestamps.append(time.time())

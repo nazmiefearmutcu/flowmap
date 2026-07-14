@@ -22,7 +22,23 @@ from .base import DataProvider
 # Helpers – convert CCXT data to FlowMap core types
 # ---------------------------------------------------------------------------
 
-_SIDE_MAP = {"buy": Side.BUY, "sell": Side.SELL}
+_SIDE_MAP = {"buy": Side.BUY, "sell": Side.SELL, "bid": Side.BID, "ask": Side.ASK}
+
+
+def _side_from_ccxt(raw) -> Side:
+    """Map CCXT trade/liq side string to Side. Unknown/empty → UNKNOWN (FIND-NUM-05)."""
+    if raw is None:
+        return Side.UNKNOWN
+    if isinstance(raw, str):
+        key = raw.lower().strip()
+        if not key:
+            return Side.UNKNOWN
+        return _SIDE_MAP.get(key, Side.UNKNOWN)
+    val = getattr(raw, "value", raw)
+    if isinstance(val, str):
+        key = val.lower().strip()
+        return _SIDE_MAP.get(key, Side.UNKNOWN) if key else Side.UNKNOWN
+    return Side.UNKNOWN
 
 
 def _ccxt_ts(ccxt_item: dict) -> float:
@@ -79,7 +95,8 @@ def _trades_from_ccxt(raw_trades: list[dict], symbol: str, receive_timestamp: fl
     """Convert a list of CCXT trade dicts to FlowMap Trade objects."""
     out: list[Trade] = []
     for t in raw_trades:
-        side = _SIDE_MAP.get(t.get("side", "buy"), Side.BUY)
+        # Missing/garbage side → UNKNOWN (not silent BUY bias)
+        side = _side_from_ccxt(t.get("side"))
         out.append(Trade(
             timestamp=_ccxt_ts(t),
             symbol=str(t.get("symbol", symbol)),
@@ -144,6 +161,11 @@ class _WsWorker(QObject):
         self._trade_buffer: list[Trade] = []
         self._orderbook_buffer: Optional[dict] = None
         self._ticker_buffer: Optional[dict] = None
+        # Nonces: ccxt mutates dicts in-place; identity checks cannot detect updates.
+        self._orderbook_nonce: int = 0
+        self._ticker_nonce: int = 0
+        self._last_ob_nonce: int = -1
+        self._last_ticker_nonce: int = -1
 
     # ── Public API (called via signal/slot from the owning thread) ──
 
@@ -222,8 +244,13 @@ class _WsWorker(QObject):
                         self.sig_trade.emit(trades_to_emit)
 
                 # 2. Conflate orderbook and its derived BBO
+                # CCXT often mutates one dict in-place; identity (`is not`) never
+                # changes after the first assignment → book would stall forever.
+                # Use a nonce bumped by the watch loop instead.
                 ob = self._orderbook_buffer
-                if ob is not None and ob is not last_ob:
+                ob_nonce = getattr(self, "_orderbook_nonce", 0)
+                last_ob_nonce = getattr(self, "_last_ob_nonce", -1)
+                if ob is not None and ob_nonce != last_ob_nonce:
                     snap = _snapshot_from_ccxt(ob, self._depth)
                     bbo = _bbo_from_ccxt(ob, ob.get("symbol", ""))
                     if self._queue is not None:
@@ -232,17 +259,21 @@ class _WsWorker(QObject):
                     else:
                         self.sig_snapshot.emit(snap)
                         self.sig_bbo.emit(bbo)
+                    self._last_ob_nonce = ob_nonce
                     last_ob = ob
 
                 # 3. Conflate ticker BBO
                 ticker = self._ticker_buffer
-                if ticker is not None and ticker is not last_ticker:
+                ticker_nonce = getattr(self, "_ticker_nonce", 0)
+                last_ticker_nonce = getattr(self, "_last_ticker_nonce", -1)
+                if ticker is not None and ticker_nonce != last_ticker_nonce:
                     bbo = _bbo_from_ticker(ticker, ticker.get("symbol", ""))
                     if bbo is not None:
                         if self._queue is not None:
                             self._queue.put(("bbo", bbo))
                         else:
                             self.sig_bbo.emit(bbo)
+                    self._last_ticker_nonce = ticker_nonce
                     last_ticker = ticker
 
             except asyncio.CancelledError:
@@ -257,7 +288,7 @@ class _WsWorker(QObject):
             try:
                 raw = await self._exchange.watch_liquidations(symbol)
                 for liq in raw:
-                    side = _SIDE_MAP.get(liq.get("side", "buy"), Side.BUY)
+                    side = _side_from_ccxt(liq.get("side"))
                     trade = Trade(
                         timestamp=_ccxt_ts(liq),
                         symbol=str(liq.get("symbol", symbol)),
@@ -278,6 +309,7 @@ class _WsWorker(QObject):
             try:
                 ob = await self._exchange.watch_order_book(symbol)
                 self._orderbook_buffer = ob
+                self._orderbook_nonce += 1
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -300,6 +332,7 @@ class _WsWorker(QObject):
             try:
                 ticker = await self._exchange.watch_ticker(symbol)
                 self._ticker_buffer = ticker
+                self._ticker_nonce += 1
             except asyncio.CancelledError:
                 break
             except Exception as exc:

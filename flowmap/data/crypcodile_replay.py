@@ -16,14 +16,69 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import threading
 import time
-from typing import Optional
+from typing import Iterable, Optional
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 
 from ..core import Level2Snapshot, Level2Update, Trade, BBO, Side
 from .base import DataProvider
+
+# Hard cap for materializing crypcodile replay iterators into RAM (FIND-P239-03).
+# Override with env FLOWMAP_REPLAY_MAX_RECORDS; set to 0 for unlimited.
+_DEFAULT_REPLAY_MAX_RECORDS = 2_000_000
+
+
+def _replay_max_records() -> Optional[int]:
+    """Resolve materialize cap from ``FLOWMAP_REPLAY_MAX_RECORDS``.
+
+    * Unset / empty → default ``2_000_000``.
+    * ``0`` (or negative) → unlimited (``None``).
+    * Positive int → that hard cap.
+    """
+    raw = os.environ.get("FLOWMAP_REPLAY_MAX_RECORDS")
+    if raw is None or str(raw).strip() == "":
+        return _DEFAULT_REPLAY_MAX_RECORDS
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        return _DEFAULT_REPLAY_MAX_RECORDS
+    if n <= 0:
+        return None  # unlimited
+    return n
+
+
+def _consume_iter_capped(
+    iterable: Iterable,
+    max_records: Optional[int] = None,
+) -> tuple[list, bool]:
+    """Materialize *iterable* into a list, stopping at *max_records*.
+
+    Parameters
+    ----------
+    iterable:
+        Source records (e.g. crypcodile ``client.replay()`` iterator).
+    max_records:
+        Hard cap. ``None`` or ``<= 0`` means unlimited (full ``list(iterable)``).
+
+    Returns
+    -------
+    (items, truncated)
+        *items* is the materialized list. *truncated* is True only when the
+        cap stopped consumption while more items remained.
+    """
+    if max_records is None or max_records <= 0:
+        return list(iterable), False
+
+    out: list = []
+    for i, item in enumerate(iterable):
+        if i >= max_records:
+            return out, True
+        out.append(item)
+    return out, False
+
 
 # ── Optional crypcodile imports ──────────────────────────────────────────────
 
@@ -74,13 +129,21 @@ def _ns_to_seconds(ns: int) -> float:
 
 
 def _get_flowmap_side(cryp_side) -> Side:
-    """Safely map a crypcodile side (enum or string) to flowmap Side enum."""
+    """Map crypcodile side (enum or string) to flowmap Side.
+
+    Empty/None/unknown → Side.UNKNOWN so CVD does not bias buy or sell
+    (FIND-NUM-05 / FIND-P203-03). Known strings: buy/sell/bid/ask.
+    """
     if cryp_side is None:
-        return Side.BUY
+        return Side.UNKNOWN
     val = getattr(cryp_side, "value", cryp_side)
     if isinstance(val, str):
-        val = val.lower()
-    return _SIDE_MAP.get(val, Side.BUY)
+        val = val.lower().strip()
+        if not val:
+            return Side.UNKNOWN
+    elif val is None:
+        return Side.UNKNOWN
+    return _SIDE_MAP.get(val, Side.UNKNOWN)
 
 
 def _cryp_trade_to_flowmap(rec: _CrypTrade) -> Trade:
@@ -210,6 +273,18 @@ def _dispatch_record(rec: Record):
 
 # ── Replay worker (runs in a background QThread) ─────────────────────────────
 
+
+def _sql_str(value: str) -> str:
+    """Quote a SQL string literal; reject embedded quotes/semicolons (FIND-P241)."""
+    if value is None:
+        raise ValueError("SQL string is None")
+    s = str(value)
+    if any(c in s for c in (";", "--", "/*", "*/", "\x00")):
+        raise ValueError(f"Unsafe SQL identifier/literal: {s!r}")
+    # Escape single quotes for SQL
+    return "'" + s.replace("'", "''") + "'"
+
+
 class _ReplayWorker(QObject):
     """Runs the blocking CrypcodileClient.replay() iterator in a dedicated thread.
 
@@ -257,11 +332,18 @@ class _ReplayWorker(QObject):
         end_ns: int,
         speed: float = 1.0,
     ) -> None:
-        """Begin the replay loop (called from owning thread via signal/slot)."""
+        """Begin the replay loop (called from owning thread via signal/slot).
+
+        FIND-ERR-01: every early-exit path must clear ``_running`` and emit
+        ``sig_finished`` so the provider can reset ``_replaying`` and the UI
+        can start again without a stuck worker.
+        """
         if not _CRYPCODILE_AVAILABLE:
             self.sig_error.emit(
                 f"Crypcodile is not installed: {_CRYPCODILE_IMPORT_ERROR}"
             )
+            self._running = False
+            self.sig_finished.emit()
             return
 
         self._symbol = symbol
@@ -276,6 +358,8 @@ class _ReplayWorker(QObject):
             self._client = CrypcodileClient(data_dir=self._data_dir)
         except Exception as exc:
             self.sig_error.emit(f"Failed to open CrypcodileClient: {exc}")
+            self._running = False
+            self.sig_finished.emit()
             return
 
         total_span = end_ns - start_ns
@@ -292,7 +376,7 @@ class _ReplayWorker(QObject):
         trade_max = None
         try:
             df_t = self._client.query(
-                f"SELECT MIN(local_ts), MAX(local_ts) FROM trade WHERE symbol = '{symbol}'"
+                "SELECT MIN(local_ts), MAX(local_ts) FROM trade WHERE symbol = " + _sql_str(symbol)
             )
             if df_t is not None and len(df_t) > 0:
                 trade_min = df_t.row(0)[0]
@@ -317,8 +401,14 @@ class _ReplayWorker(QObject):
         # Get average prices to align trade prices to book prices
         price_shift = 0.0
         try:
-            df_tp = self._client.query(f"SELECT AVG(price) FROM trade WHERE symbol = '{symbol}'")
-            df_bp = self._client.query(f"SELECT AVG(b.price) FROM (SELECT unnest(bids) as b FROM book_delta WHERE symbol = '{symbol}')")
+            df_tp = self._client.query(
+                "SELECT AVG(price) FROM trade WHERE symbol = " + _sql_str(symbol)
+            )
+            df_bp = self._client.query(
+                "SELECT AVG(b.price) FROM (SELECT unnest(bids) as b FROM book_delta WHERE symbol = "
+                + _sql_str(symbol)
+                + ")"
+            )
             if df_tp is not None and len(df_tp) > 0 and df_bp is not None and len(df_bp) > 0:
                 tp_val = df_tp.row(0)[0]
                 bp_val = df_bp.row(0)[0]
@@ -329,8 +419,9 @@ class _ReplayWorker(QObject):
             print(f"[REPLAY_WORKER] Price alignment calculation error: {e}")
 
         try:
+            max_records = _replay_max_records()
             while self._running:
-                # 1. Fetch book records
+                # 1. Fetch book records (capped materialize — FIND-P239-03)
                 try:
                     book_iter = self._client.replay(
                         channels=["book_snapshot", "book_delta", "book_ticker"],
@@ -339,7 +430,13 @@ class _ReplayWorker(QObject):
                         to=end_ns,
                         limit=None,
                     )
-                    records = list(book_iter)
+                    records, book_truncated = _consume_iter_capped(
+                        book_iter, max_records
+                    )
+                    if book_truncated:
+                        msg = f"Replay truncated at {max_records} records"
+                        print(f"[REPLAY_WORKER] {msg} (book)")
+                        self.sig_error.emit(msg)
                 except Exception as exc:
                     self.sig_error.emit(f"Failed to start book replay: {exc}")
                     break
@@ -354,7 +451,13 @@ class _ReplayWorker(QObject):
                             to=trade_max,
                             limit=None,
                         )
-                        raw_trades = list(trade_iter)
+                        raw_trades, trade_truncated = _consume_iter_capped(
+                            trade_iter, max_records
+                        )
+                        if trade_truncated:
+                            msg = f"Replay truncated at {max_records} records"
+                            print(f"[REPLAY_WORKER] {msg} (trade)")
+                            self.sig_error.emit(msg)
                         
                         if raw_trades:
                             raw_trades.sort(key=lambda r: r.local_ts)
@@ -376,9 +479,22 @@ class _ReplayWorker(QObject):
                             t_span = t_max_actual - t_min_actual
                             book_span = end_ns - start_ns
                             
+                            # Time-warp (stretch trade timeline onto book window) is OFF
+                            # by default — it invents timestamps (FIND-P239-01).
+                            # Enable with FLOWMAP_REPLAY_TIME_WARP=1.
+                            import os as _os_tw
+                            do_warp = _os_tw.environ.get("FLOWMAP_REPLAY_TIME_WARP", "").strip() in (
+                                "1", "true", "TRUE", "yes",
+                            )
                             scale_factor = book_span / t_span if t_span > 0 else 1.0
                             for rec in raw_trades:
-                                mapped_ts = int(start_ns + (rec.local_ts - t_min_actual) * scale_factor)
+                                if do_warp:
+                                    mapped_ts = int(
+                                        start_ns + (rec.local_ts - t_min_actual) * scale_factor
+                                    )
+                                else:
+                                    # Keep native trade timestamps (may fall outside book window)
+                                    mapped_ts = int(rec.local_ts)
                                 trend = trade_trends.get(rec.id, getattr(rec, "price", 0.0))
                                 records.append(MappedRecord(rec, mapped_ts, price_shift, trend))
                     except Exception as exc:
@@ -471,7 +587,32 @@ class _ReplayWorker(QObject):
                             # Fallback to static price shift
                             rec.price_shift = price_shift
 
-                print(f"[REPLAY_WORKER] Dynamic price alignment completed. Aligned {aligned_count} trades to order book BBO.")
+                # Dynamic BBO rewrite of trade prices is OFF by default — it
+                # invents fills at BBO and destroys fidelity (FIND-P240).
+                # Enable only with FLOWMAP_REPLAY_REWRITE_PRICES=1.
+                import os as _os
+                if _os.environ.get("FLOWMAP_REPLAY_REWRITE_PRICES", "").strip() in (
+                    "1", "true", "TRUE", "yes",
+                ):
+                    print(
+                        f"[REPLAY_WORKER] Dynamic price alignment ON "
+                        f"(dev). Aligned {aligned_count} trades to BBO."
+                    )
+                else:
+                    # Clear any shifts applied above so raw trade prices play
+                    for rec in records:
+                        if isinstance(rec, MappedRecord):
+                            rec.price_shift = getattr(rec, "price_shift", 0.0) * 0.0
+                            # Keep static AVG shift only if it was pre-set on MappedRecord
+                            # and env FLOWMAP_REPLAY_STATIC_SHIFT=1
+                            if _os.environ.get("FLOWMAP_REPLAY_STATIC_SHIFT", "").strip() not in (
+                                "1", "true", "TRUE", "yes",
+                            ):
+                                rec.price_shift = 0.0
+                    print(
+                        "[REPLAY_WORKER] Trade price rewrite disabled "
+                        "(set FLOWMAP_REPLAY_REWRITE_PRICES=1 to enable)."
+                    )
 
                 prev_ts_ns = None
                 for idx, rec in enumerate(records):
@@ -537,7 +678,12 @@ class _ReplayWorker(QObject):
                     prev_ts_ns = current_ns
 
                 if self._running:
-                    print("[REPLAY_WORKER] Replay finished, auto-looping/restarting from beginning...")
+                    if not records:
+                        # Empty window: back off so we don't spin the CPU (FIND-P219-03)
+                        print("[REPLAY_WORKER] No records in window; sleeping 2s before retry...")
+                        time.sleep(2.0)
+                    else:
+                        print("[REPLAY_WORKER] Replay finished, auto-looping/restarting from beginning...")
                     prev_ts_ns = None
 
         except Exception as exc:
@@ -807,7 +953,10 @@ class CrypcodileReplayProvider(DataProvider):
                 sorted_dates = sorted(list(set(dates)))
                 for date in sorted_dates:
                     df = client.query(
-                        f"SELECT MIN(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
+                        f"SELECT MIN(local_ts) FROM {table} WHERE date = "
+                        + _sql_str(date)
+                        + " AND symbol = "
+                        + _sql_str(symbol)
                     )
                     if df is not None and len(df) > 0:
                         val = df.row(0)[0]
@@ -834,7 +983,10 @@ class CrypcodileReplayProvider(DataProvider):
                         sorted_dates = sorted(list(set(dates)))
                         for date in sorted_dates:
                             df = client.query(
-                                f"SELECT MIN(local_ts) FROM trade WHERE date = '{date}' AND symbol = '{symbol}'"
+                                "SELECT MIN(local_ts) FROM trade WHERE date = "
+                                + _sql_str(date)
+                                + " AND symbol = "
+                                + _sql_str(symbol)
                             )
                             if df is not None and len(df) > 0:
                                 val = df.row(0)[0]
@@ -862,7 +1014,10 @@ class CrypcodileReplayProvider(DataProvider):
                 sorted_dates = sorted(list(set(dates)))
                 for date in reversed(sorted_dates):
                     df = client.query(
-                        f"SELECT MAX(local_ts) FROM {table} WHERE date = '{date}' AND symbol = '{symbol}'"
+                        f"SELECT MAX(local_ts) FROM {table} WHERE date = "
+                        + _sql_str(date)
+                        + " AND symbol = "
+                        + _sql_str(symbol)
                     )
                     if df is not None and len(df) > 0:
                         val = df.row(0)[0]

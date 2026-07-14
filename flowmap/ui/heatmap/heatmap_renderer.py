@@ -267,13 +267,10 @@ class BookmapHeatmap(QWidget):
         vis_rows = self._vis_rows()
 
         if not self._history or not self._levels:
-            print("[Debug PaintEvent] No history or levels")
             p.fillRect(0, 0, ww, wh, QColor(*BG_RGBA))
             p.setPen(QColor(*PRICE_TEXT_COLOR)); p.setFont(QFont('Helvetica Neue', 13))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No data \u2014 Start")
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No data \u2014 press Start")
             p.end(); return
-
-        print(f"[Debug PaintEvent] ww={ww}, wh={wh}, self._qimg={'None' if self._qimg is None else 'Not None'}, isNull={self._qimg.isNull() if self._qimg else 'N/A'}")
         ax_w = self.price_axis_w; hm_left = 0; hm_w = ww - ax_w
         p.fillRect(0, 0, ww, wh, QColor(*BG_RGBA[:3]))
 

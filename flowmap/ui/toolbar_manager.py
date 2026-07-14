@@ -101,61 +101,19 @@ class ToolbarManager(QObject):
             }
         """)
 
-        # ── Source selector ──
-        tb.addWidget(QLabel(" Source: "))
-        self._source_combo = QComboBox()
-        self._source_combo.addItems(["Replay", "Live"])
-        default_index = 0
-        if self._source and self._source.data_source == DataSource.CRYPCODILE_LIVE:
-            default_index = 1
-        self._source_combo.setCurrentIndex(default_index)
-        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
-        self._source_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #14151D;
-                color: #E2E4E9;
-                border: 1px solid #2C3043;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 11px;
-                min-width: 80px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #14151D;
-                color: #E2E4E9;
-                selection-background-color: #1F222F;
-                selection-color: #FFFFFF;
-                border: 1px solid #2C3043;
-            }
-        """)
-        tb.addWidget(self._source_combo)
-
-        tb.addSeparator()
-
         # ── Symbol selector ──
         tb.addWidget(QLabel(" Symbol: "))
         self._symbol_edit = QLineEdit()
         self._symbol_edit.setText(self._source.symbol if self._source else "binance-spot:SOLUSDT")
         self._symbol_edit.setFixedWidth(140)
         self._symbol_edit.setPlaceholderText("binance-spot:SOLUSDT")
+        self._symbol_edit.setAccessibleName("Symbol")
         if self._source:
+            # editingFinished fires on focus loss; returnPressed commits on Enter
+            # so keyboard symbol switches apply without leaving the field.
             self._symbol_edit.editingFinished.connect(self._source.on_symbol_changed)
+            self._symbol_edit.returnPressed.connect(self._source.on_symbol_changed)
         tb.addWidget(self._symbol_edit)
-
-        tb.addSeparator()
-
-        # ── Replay speed spinbox ──
-        tb.addWidget(QLabel(" Replay: "))
-        self._replay_speed_spinner = QDoubleSpinBox()
-        self._replay_speed_spinner.setRange(0.1, 20.0)
-        self._replay_speed_spinner.setValue(20.0)
-        self._replay_speed_spinner.setSingleStep(0.1)
-        self._replay_speed_spinner.setDecimals(1)
-        self._replay_speed_spinner.setSuffix("x")
-        self._replay_speed_spinner.setFixedWidth(80)
-        self._replay_speed_spinner.setEnabled(default_index == 0)
-        self._replay_speed_spinner.valueChanged.connect(self._on_replay_speed_changed)
-        tb.addWidget(self._replay_speed_spinner)
 
         tb.addSeparator()
 
@@ -192,6 +150,10 @@ class ToolbarManager(QObject):
 
     def _on_sidebar_toggled(self, checked: bool) -> None:
         self._window.sidebar.setVisible(checked)
+        if hasattr(self._window, 'show_sidebar_cb') and self._window.show_sidebar_cb is not None:
+            self._window.show_sidebar_cb.blockSignals(True)
+            self._window.show_sidebar_cb.setChecked(checked)
+            self._window.show_sidebar_cb.blockSignals(False)
 
     def set_start_stop_state(self, running: bool) -> None:
         if not self._start_btn:

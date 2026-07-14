@@ -1,7 +1,8 @@
 """
 Density Engine — Bookmap-style heatmap renderer.
-Maintains SEPARATE bid/ask density accumulators per price level.
-Percentile-based adaptive normalization makes accumulation zones GLOW.
+Rasters **current** bid/ask book snapshot sizes per column (instant overwrite).
+No temporal density accumulation or multiplicative decay in the paint path
+(FIND-P207-05). Percentile-based adaptive normalization for contrast.
 Pure NumPy, no Qt imports.
 """
 
@@ -17,7 +18,7 @@ from .normalizer import AdaptiveNormalizer
 
 class DensityEngine:
     """
-    Incremental heatmap renderer with per-side density tracking.
+    Incremental heatmap renderer with per-side snapshot rasterization.
 
     Parameters
     ----------
@@ -26,16 +27,17 @@ class DensityEngine:
     history_width : int, default 600
         Width of the rolling buffer in columns.
     decay : float, default 0.92
-        Multiplicative decay factor per tick (0.5–0.99).
+        Stored for API compatibility only — **not applied** in the paint path
+        (snapshot overwrite; FIND-P207-05). Reserved for future accumulation.
     config : EngineConfig, optional
         Alternative config object; overrides other kwargs when provided.
 
     Key design:
-    - SEPARATE _bid_density[price] and _ask_density[price] accumulators
-    - Each decays independently: density *= decay, then += new_size
-    - Fixed-reference normalization per side (default bid ref=8000, ask ref=8000)
-    - Linear ratio for wide color spread
-    - Buffer scrolls left, rightmost column is CLEARED before drawing new data
+    - Each column stores the **current book snapshot sizes** (no density *= decay)
+    - Bid/ask sides painted separately from current-level arrays
+    - Adaptive percentile normalization for contrast
+    - Buffer scrolls left; every painted column is CLEARED to BG before draw
+      (live edge and historical ``col_idx`` path — FIND-P208-01)
     """
 
     def __init__(self, max_levels=50, history_width=600, decay=0.92,
@@ -53,8 +55,8 @@ class DensityEngine:
             )
 
 
-        self._bid_density: dict[float, float] = {}   # price → accumulated bid density
-        self._ask_density: dict[float, float] = {}   # price → accumulated ask density
+        self._bid_density: dict[float, float] = {}   # price → last snapshot bid size (not used by paint)
+        self._ask_density: dict[float, float] = {}   # price → last snapshot ask size (not used by paint)
         self._bbo: Optional[BBO] = None
         self._levels: list[BookLevel] = []
 
@@ -73,6 +75,10 @@ class DensityEngine:
         self.center_price_ticks: Optional[int] = None
         self._center_price_ticks_float: Optional[float] = None
         self._in_recenter_drift: bool = False
+        # Tick detect: refine with running min() for first N snapshots, then freeze
+        self._tick_size_detected = False
+        self._tick_size_sample_count = 0
+        self._tick_detect_max_samples = 20
 
         # Buffer — starts 1×1, filled with background color
         self._buffer = np.zeros((1, 1, 4), dtype=np.uint8)
@@ -106,6 +112,7 @@ class DensityEngine:
         self._center_price_ticks_float = None
         self._in_recenter_drift = False
         self._tick_size_detected = False
+        self._tick_size_sample_count = 0
         self._bid_normalizer.global_ref = self.config.bid_ref
         self._ask_normalizer.global_ref = self.config.ask_ref
         self._buffer[:] = ColorSystem.BG_COLOR
@@ -116,19 +123,25 @@ class DensityEngine:
         self._levels = levels
         self._bbo = bbo
 
-        # 0. Detect tick size from snapshot levels (keep running minimum to avoid vertical scaling jumps)
-        if not getattr(self, '_tick_size_detected', False):
+        # 0. Detect tick size from snapshot levels.
+        # Honor detect_tick_size=False (skip entirely). While sampling, keep a
+        # running min of positive gaps so a sparse first book can refine over
+        # the next N snapshots before freeze (FIND-P209-01 / FIND-NUM-06).
+        if detect_tick_size and not getattr(self, '_tick_size_detected', False):
             prices = sorted([lv.price for lv in levels])
             if len(prices) >= 2:
                 diffs = np.diff(prices)
                 valid_diffs = diffs[diffs > 0.000001]
                 if len(valid_diffs) > 0:
                     obs_min = round(float(np.min(valid_diffs)), 6)
-                    if not getattr(self, '_tick_size_detected', False):
+                    if self._tick_size_sample_count == 0:
                         self.tick_size = obs_min
-                        self._tick_size_detected = True
                     else:
                         self.tick_size = min(self.tick_size, obs_min)
+                    self._tick_size_sample_count += 1
+                    max_samples = getattr(self, '_tick_detect_max_samples', 20)
+                    if self._tick_size_sample_count >= max_samples:
+                        self._tick_size_detected = True
 
         # 1. Store the current snapshot sizes directly (no accumulation or decay)
         if col_idx is None:
@@ -172,6 +185,10 @@ class DensityEngine:
         if col_idx is not None:
             buf_h, hw = self._buffer.shape[0], self._buffer.shape[1]
             v_rows = vis_rows if vis_rows is not None else buf_h // 5
+            # CLEAR column to BG before paint — _draw_column only writes active
+            # rows; without this, vanished levels leave ghost pixels (FIND-P208-01).
+            if 0 <= col_idx < hw:
+                self._buffer[:, col_idx, :] = ColorSystem.BG_COLOR
             self._draw_column(v_rows, hw, col_idx=col_idx, update_normalizer=update_normalizer)
             return
 
@@ -216,12 +233,16 @@ class DensityEngine:
                         deadband = max(1, int(self.centering_deadband_pct * v_rows))
                         current_mid_ticks_int = int(round(mid_ticks_float))
                         delta_ticks = current_mid_ticks_int - self.center_price_ticks
-                        if abs(delta_ticks) > v_rows // 2:
+                        # Hard snap at deadband (not half-viewport) so lag modes
+                        # cannot leave mid outside the ~15–85% visible band
+                        # (FIND-HIST-01/03).
+                        if abs(delta_ticks) > deadband:
                             new_center_ticks = current_mid_ticks_int
                             self._center_price_ticks_float = float(new_center_ticks)
                             self._in_recenter_drift = False
-                        elif abs(delta_ticks) > deadband or self._in_recenter_drift:
-                            self._in_recenter_drift = True
+                        elif self._in_recenter_drift:
+                            # Residual soft settle only while already drifting
+                            # and still inside the hard band.
                             self._center_price_ticks_float = (
                                 (1.0 - self.centering_ema_alpha) * self._center_price_ticks_float +
                                 self.centering_ema_alpha * mid_ticks_float
@@ -231,6 +252,16 @@ class DensityEngine:
                                 self._in_recenter_drift = False
                         else:
                             self._center_price_ticks_float = float(self.center_price_ticks)
+
+                    # Hard invariant (FIND-HIST-01/02/03): after any mode /
+                    # EMA update, mid must remain within ±deadband_pct of
+                    # center in render-row space (~15–85% of vis rows).
+                    max_lag = max(1, int(self.centering_deadband_pct * v_rows))
+                    mid_i = int(round(mid_ticks_float))
+                    if abs(mid_i - new_center_ticks) > max_lag:
+                        new_center_ticks = mid_i
+                        self._center_price_ticks_float = float(new_center_ticks)
+                        self._in_recenter_drift = False
 
                 delta_ticks = new_center_ticks - self.center_price_ticks
                 if delta_ticks != 0:
@@ -254,6 +285,9 @@ class DensityEngine:
                 self._buffer[:, -1, :] = ColorSystem.BG_COLOR
                 self._draw_column(v_rows, hw, update_normalizer=update_normalizer)
             else:
+                # Defensive (early-return above is the live col_idx path)
+                if 0 <= col_idx < hw:
+                    self._buffer[:, col_idx, :] = ColorSystem.BG_COLOR
                 self._draw_column(v_rows, hw, col_idx=col_idx, update_normalizer=update_normalizer)
 
     def _draw_column(self, vis_rows, hm_width, col_idx: Optional[int] = None, update_normalizer: bool = True):
@@ -304,7 +338,8 @@ class DensityEngine:
                 bid_values[bid_values < self.min_order_size] = 0.0
             bid_rows = (buf_h // 2) - np.round(bid_prices / self.render_tick_size).astype(np.int32) + self.center_price_ticks
             mask = (bid_rows >= 0) & (bid_rows < buf_h)
-            np.maximum.at(bid_arr, bid_rows[mask], bid_values[mask])
+            # Sum stacked levels in the same render row (FIND-P207-02: was max)
+            np.add.at(bid_arr, bid_rows[mask], bid_values[mask])
 
         if ask_prices is not None and len(ask_prices) > 0:
             if self.min_order_size > 0.0:
@@ -312,7 +347,7 @@ class DensityEngine:
                 ask_values[ask_values < self.min_order_size] = 0.0
             ask_rows = (buf_h // 2) - np.round(ask_prices / self.render_tick_size).astype(np.int32) + self.center_price_ticks
             mask = (ask_rows >= 0) & (ask_rows < buf_h)
-            np.maximum.at(ask_arr, ask_rows[mask], ask_values[mask])
+            np.add.at(ask_arr, ask_rows[mask], ask_values[mask])
 
         # Apply vertical smoothing if enabled
         if self.vertical_smoothing > 0.01:
@@ -359,19 +394,16 @@ class DensityEngine:
         np.maximum(norm_bids, norm_asks, out=normalized)
         active_indices = normalized > 0.0005
         
-        is_bid = self._is_bid
-        is_bid.fill(False)
-        mid_price = (self._bbo.bid + self._bbo.ask) / 2.0 if self._bbo else 0.0
-        if mid_price > 0:
-            p_ticks = self.center_price_ticks + (buf_h // 2 - np.arange(buf_h, dtype=np.int32))
-            prices = p_ticks * self.render_tick_size
-            np.less_equal(prices, mid_price, out=is_bid)
-        else:
-            np.greater(bid_arr, ask_arr, out=is_bid)
-        
-        # Separate color mapping for bids and asks to avoid single color heatmap bug
-        active_bids = is_bid & (norm_bids > 0.0005)
-        active_asks = (~is_bid) & (norm_asks > 0.0005)
+        # Color by actual bid/ask arrays — NOT mid-price half-planes.
+        # Mid-mask (old) dropped bid liquidity above mid / ask below mid (FIND-P207-01).
+        active_bids = norm_bids > 0.0005
+        active_asks = norm_asks > 0.0005
+        # Overlap (rare same-row): prefer the larger normalized side
+        both = active_bids & active_asks
+        if np.any(both):
+            prefer_bid = norm_bids >= norm_asks
+            active_asks = active_asks & ~(both & prefer_bid)
+            active_bids = active_bids & ~(both & ~prefer_bid)
 
         if np.any(active_bids):
             bid_idx = np.clip((norm_bids[active_bids] * 255).astype(np.int32), 0, 255)
@@ -527,8 +559,45 @@ class DensityEngine:
 
     @ticks_per_row.setter
     def ticks_per_row(self, value: int) -> None:
+        """Set ticks_per_row and rescale center so mid stays on the same grid.
+
+        center_price_ticks is in render-tick units (price / render_tick_size).
+        Changing tpr without rescale poisons the viewport (FIND-HIST-05).
+        """
+        new_tpr = max(1, int(value))
+        old_tpr = int(getattr(self.config, 'ticks_per_row', 1))
+        if new_tpr == old_tpr:
+            if hasattr(self.config, 'ticks_per_row'):
+                self.config.ticks_per_row = new_tpr
+            return
+
+        # Prefer last mid so mid maps to the same screen row after rescaling.
+        mid = None
+        if self._bbo is not None:
+            bid = float(self._bbo.bid or 0.0)
+            ask = float(self._bbo.ask or 0.0)
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+        if mid is None and self._price_history:
+            last = self._price_history[-1]
+            if last and last > 0:
+                mid = float(last)
+
+        old_rts = self.render_tick_size
         if hasattr(self.config, 'ticks_per_row'):
-            self.config.ticks_per_row = max(1, value)
+            self.config.ticks_per_row = new_tpr
+        else:
+            return
+        new_rts = self.render_tick_size
+
+        if self.center_price_ticks is not None and new_rts > 0:
+            if mid is not None and mid > 0:
+                self.center_price_ticks = int(round(mid / new_rts))
+            elif old_rts > 0:
+                price = self.center_price_ticks * old_rts
+                self.center_price_ticks = int(round(price / new_rts))
+            self._center_price_ticks_float = float(self.center_price_ticks)
+            self._in_recenter_drift = False
 
     @property
     def render_tick_size(self) -> float:
@@ -547,6 +616,7 @@ class DensityEngine:
         return list(self._timestamp_history)
 
     def set_decay(self, d):
+        """Store decay factor only — paint path is instant overwrite (FIND-P207-05)."""
         self.decay = max(0.5, min(0.99, d))
 
     def set_vertical_smoothing(self, val: float):

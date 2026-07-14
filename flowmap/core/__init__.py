@@ -14,6 +14,56 @@ class Side(Enum):
     ASK = auto()
     BUY = auto()
     SELL = auto()
+    # Aggressor/side unknown — neither buy nor sell for CVD (FIND-NUM-05)
+    UNKNOWN = auto()
+
+
+def is_buy_side(side) -> bool:
+    """True for BUY/BID aggressor or book side. False for UNKNOWN/None."""
+    if side is None or side == Side.UNKNOWN:
+        return False
+    if side == Side.BUY or side == Side.BID:
+        return True
+    val = getattr(side, "value", side)
+    if isinstance(val, str):
+        return val.lower() in ("buy", "bid")
+    if hasattr(side, "name") and side.name.lower() in ("buy", "bid"):
+        return True
+    return False
+
+
+def is_sell_side(side) -> bool:
+    """True for SELL/ASK aggressor or book side. False for UNKNOWN/None."""
+    if side is None or side == Side.UNKNOWN:
+        return False
+    if side == Side.SELL or side == Side.ASK:
+        return True
+    val = getattr(side, "value", side)
+    if isinstance(val, str):
+        return val.lower() in ("sell", "ask")
+    if hasattr(side, "name") and side.name.lower() in ("sell", "ask"):
+        return True
+    return False
+
+
+def l2_book_side(side) -> Side | None:
+    """Normalize L2 update side to BID/ASK for the resting book.
+
+    Resting liquidity: BID = buy-side rest, ASK = sell-side rest.
+    If a producer sends aggressor labels (BUY/SELL), map BUY→BID, SELL→ASK
+    (FIND-P203-04). Returns None for unknown sides (skip update).
+    """
+    if side is None or side == Side.UNKNOWN:
+        return None
+    if side == Side.BID or side == Side.BUY:
+        return Side.BID
+    if side == Side.ASK or side == Side.SELL:
+        return Side.ASK
+    if is_buy_side(side):
+        return Side.BID
+    if is_sell_side(side):
+        return Side.ASK
+    return None
 
 
 class OrderType(Enum):

@@ -51,10 +51,35 @@ if use_opengl:
 else:
     print("[Heatmap] Using CPU-based QWidget backend.")
 
-from ..core import BookLevel, BBO, Side, Trade
+from ..core import BookLevel, BBO, Side, Trade, is_buy_side
 from ..engine import DensityEngine, ColorSystem
 from .bubbles import VolumeBubbles
 from .theme import Colors, Fonts
+
+# FIND-P226-01: progressive rebuild freezes mitigation
+REBUILD_IMMEDIATE_MAX_COLS = 256  # full sync path when history slice ≤ this
+REBUILD_CHUNK_SIZE = 96  # columns per progressive frame (64–128 range)
+
+
+def iter_rebuild_column_chunks(
+    n_cols: int,
+    chunk_size: int = REBUILD_CHUNK_SIZE,
+) -> list[tuple[int, int]]:
+    """Return half-open (start, end) index ranges for progressive grid fill.
+
+    Pure helper — no Qt. Empty / non-positive n_cols → [].
+    """
+    if n_cols <= 0 or chunk_size <= 0:
+        return []
+    return [(i, min(i + chunk_size, n_cols)) for i in range(0, n_cols, chunk_size)]
+
+
+def should_rebuild_immediate(
+    n_cols: int,
+    max_immediate: int = REBUILD_IMMEDIATE_MAX_COLS,
+) -> bool:
+    """True when a full rebuild can run synchronously without chunking."""
+    return n_cols <= max_immediate
 
 
 class HeatmapWidget(BaseHeatmapWidget):
@@ -65,6 +90,7 @@ class HeatmapWidget(BaseHeatmapWidget):
     row_height_changed = pyqtSignal(int)
     column_width_changed = pyqtSignal(float)
     view_changed = pyqtSignal()
+    iceberg_detected = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,6 +113,9 @@ class HeatmapWidget(BaseHeatmapWidget):
         self._trade_med_size: float = 1.0
         self._trade_p95_size: float = 2.0
         self._liquidations: deque = deque(maxlen=200)
+        # Event-domain clock for trade overlay age/prune (FIND-NUM-02).
+        # Advances with trade.timestamp so pause/scrub does not expire markers.
+        self._event_clock: float = 0.0
 
         # Volume Bubbles overlay
         self._bubbles = VolumeBubbles()
@@ -109,6 +138,10 @@ class HeatmapWidget(BaseHeatmapWidget):
         self._show_heatmap: bool = True
         self._min_rh: int = 2
         self._max_rh: int = 24
+
+        # Empty-state copy (updated on feed errors so UI is not stuck on
+        # a silent "No data" with no explanation of SSL/connect failures).
+        self._empty_message: str = "No data — press Start"
 
         # Mouse
         self._mx: int = -1
@@ -157,6 +190,12 @@ class HeatmapWidget(BaseHeatmapWidget):
         # Throttling state
         self._last_rebuild_time: float = 0.0
         self._rebuild_pending: bool = False
+
+        # Progressive rebuild state (FIND-P226-01)
+        self._rebuild_in_progress: bool = False
+        self._rebuild_generation: int = 0
+        self._rebuild_coalesce: bool = False
+        self._rebuild_state: Optional[dict] = None
 
         # Static background caching
         self._static_cache: Optional[QPixmap] = None
@@ -343,6 +382,12 @@ class HeatmapWidget(BaseHeatmapWidget):
 
     def push_snapshot(self, levels: list[BookLevel], bbo: Optional[BBO], receive_timestamp: float = 0.0, cvd: float = 0.0) -> None:
         """Feed one tick of data. Called from main window timer."""
+        # First real book levels clear connecting/error empty-state copy so
+        # "Connected — waiting…" never sticks under a live chart.
+        if levels and getattr(self, "_empty_message", "").startswith(
+            ("Connected", "Connecting", "Feed error", "Live feed")
+        ):
+            self._empty_message = "No data — press Start"
         if not levels:
             return
         self._levels = levels
@@ -387,6 +432,12 @@ class HeatmapWidget(BaseHeatmapWidget):
         # Resize/Rebuild engine if needed
         if vr != self._last_vis_rows or target_bw != self._last_hm_w:
             self.rebuild_heatmap()
+        elif self._rebuild_in_progress:
+            # Progressive pass owns the buffer; append-only history already done.
+            # Coalesce so finalize restarts with the latest history.
+            self._rebuild_coalesce = True
+            self._cache_dirty = True
+            self.update()
         elif self.auto_follow:
             self._engine.push_snapshot(
                 levels, bbo, auto_follow=self.auto_follow, vis_rows=vr,
@@ -419,11 +470,32 @@ class HeatmapWidget(BaseHeatmapWidget):
         self._cache_dirty = True
         self.update()
 
-    def add_trade(self, price: float, size: float, side: Side, is_liquidation: bool = False) -> None:
-        """Record a trade for the dot overlay and volume bubbles."""
-        now_ts = time.time()
-        self._trades.append((price, size, side, now_ts, self._frame_count))
-        self._bubbles.add_trade(price, size, side, self._frame_count)
+    def _resolve_trade_ts(self, timestamp: float | None = None) -> float:
+        """Prefer event timestamp; fall back to wall clock when missing/invalid (FIND-NUM-02)."""
+        if timestamp is not None and timestamp > 0:
+            event_ts = float(timestamp)
+        else:
+            event_ts = time.time()
+        if event_ts > self._event_clock:
+            self._event_clock = event_ts
+        return event_ts
+
+    def add_trade(
+        self,
+        price: float,
+        size: float,
+        side: Side,
+        is_liquidation: bool = False,
+        timestamp: float | None = None,
+    ) -> None:
+        """Record a trade for the dot overlay and volume bubbles.
+
+        ``timestamp`` should be the market/event time (``Trade.timestamp``) when
+        available so overlay age follows event time, not wall clock (FIND-NUM-02).
+        """
+        event_ts = self._resolve_trade_ts(timestamp)
+        self._trades.append((price, size, side, event_ts, self._frame_count))
+        self._bubbles.add_trade(price, size, side, self._frame_count, timestamp=event_ts)
         
         if is_liquidation:
             self._liquidations.append({
@@ -436,11 +508,11 @@ class HeatmapWidget(BaseHeatmapWidget):
         # 1. Iceberg detection
         visible = self._last_visible_size.get(price, 0.0)
         if visible > 0.0:
-            vol, last_ts = self._iceberg_accum_data.get(price, (0.0, now_ts))
-            if now_ts - last_ts > 3.0:
+            vol, last_ts = self._iceberg_accum_data.get(price, (0.0, event_ts))
+            if event_ts - last_ts > 3.0:
                 vol = 0.0
             new_vol = vol + size
-            self._iceberg_accum_data[price] = (new_vol, now_ts)
+            self._iceberg_accum_data[price] = (new_vol, event_ts)
             
             hidden_vol = new_vol - visible
             if new_vol > visible * 1.5 and hidden_vol >= 1.0:
@@ -449,7 +521,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                 for marker in self._iceberg_markers:
                     if abs(marker['price'] - price) < 0.000001 and self._frame_count - marker['tick_index'] <= 15:
                         marker['size'] = new_vol
-                        marker['timestamp'] = now_ts
+                        marker['timestamp'] = event_ts
                         marker['tick_index'] = self._frame_count
                         merged = True
                         break
@@ -458,9 +530,16 @@ class HeatmapWidget(BaseHeatmapWidget):
                         'price': price,
                         'size': new_vol,
                         'side': side,
-                        'timestamp': now_ts,
+                        'timestamp': event_ts,
                         'tick_index': self._frame_count
                     })
+                self.iceberg_detected.emit({
+                    'price': price,
+                    'size': new_vol,
+                    'side': side,
+                    'timestamp': event_ts,
+                    'hidden_vol': hidden_vol
+                })
                     
         # 2. Stops tracking (large sudden aggressive trade)
         if size >= self.stop_threshold:
@@ -468,7 +547,7 @@ class HeatmapWidget(BaseHeatmapWidget):
             for marker in self._stop_markers:
                 if abs(marker['price'] - price) < 0.000001 and self._frame_count - marker['tick_index'] <= 15:
                     marker['size'] += size
-                    marker['timestamp'] = now_ts
+                    marker['timestamp'] = event_ts
                     marker['tick_index'] = self._frame_count
                     merged = True
                     break
@@ -477,7 +556,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                     'price': price,
                     'size': size,
                     'side': side,
-                    'timestamp': now_ts,
+                    'timestamp': event_ts,
                     'tick_index': self._frame_count
                 })
 
@@ -488,11 +567,11 @@ class HeatmapWidget(BaseHeatmapWidget):
 
     def add_trades(self, trades: list[Trade]) -> None:
         """Record multiple trades for the dot overlay and volume bubbles in batch."""
-        now_ts = time.time()
         for trade in trades:
             price, size, side = trade.price, trade.size, trade.side
-            self._trades.append((price, size, side, now_ts, self._frame_count))
-            self._bubbles.add_trade(price, size, side, self._frame_count)
+            event_ts = self._resolve_trade_ts(getattr(trade, "timestamp", None))
+            self._trades.append((price, size, side, event_ts, self._frame_count))
+            self._bubbles.add_trade(price, size, side, self._frame_count, timestamp=event_ts)
             
             if trade.is_liquidation:
                 self._liquidations.append({
@@ -505,11 +584,11 @@ class HeatmapWidget(BaseHeatmapWidget):
             # 1. Iceberg detection
             visible = self._last_visible_size.get(price, 0.0)
             if visible > 0.0:
-                vol, last_ts = self._iceberg_accum_data.get(price, (0.0, now_ts))
-                if now_ts - last_ts > 3.0:
+                vol, last_ts = self._iceberg_accum_data.get(price, (0.0, event_ts))
+                if event_ts - last_ts > 3.0:
                     vol = 0.0
                 new_vol = vol + size
-                self._iceberg_accum_data[price] = (new_vol, now_ts)
+                self._iceberg_accum_data[price] = (new_vol, event_ts)
                 
                 hidden_vol = new_vol - visible
                 if new_vol > visible * 1.5 and hidden_vol >= 1.0:
@@ -518,7 +597,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                     for marker in self._iceberg_markers:
                         if abs(marker['price'] - price) < 0.000001 and self._frame_count - marker['tick_index'] <= 15:
                             marker['size'] = new_vol
-                            marker['timestamp'] = now_ts
+                            marker['timestamp'] = event_ts
                             marker['tick_index'] = self._frame_count
                             merged = True
                             break
@@ -527,9 +606,16 @@ class HeatmapWidget(BaseHeatmapWidget):
                             'price': price,
                             'size': new_vol,
                             'side': side,
-                            'timestamp': now_ts,
+                            'timestamp': event_ts,
                             'tick_index': self._frame_count
                         })
+                    self.iceberg_detected.emit({
+                        'price': price,
+                        'size': new_vol,
+                        'side': side,
+                        'timestamp': event_ts,
+                        'hidden_vol': hidden_vol
+                    })
                         
             # 2. Stops tracking (large sudden aggressive trade)
             if size >= self.stop_threshold:
@@ -537,7 +623,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                 for marker in self._stop_markers:
                     if abs(marker['price'] - price) < 0.000001 and self._frame_count - marker['tick_index'] <= 15:
                         marker['size'] += size
-                        marker['timestamp'] = now_ts
+                        marker['timestamp'] = event_ts
                         marker['tick_index'] = self._frame_count
                         merged = True
                         break
@@ -546,7 +632,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                         'price': price,
                         'size': size,
                         'side': side,
-                        'timestamp': now_ts,
+                        'timestamp': event_ts,
                         'tick_index': self._frame_count
                     })
 
@@ -570,12 +656,29 @@ class HeatmapWidget(BaseHeatmapWidget):
             self._trade_p95_size = self._trade_med_size + 1.0
 
     def rebuild_heatmap(self) -> None:
-        """Fully rebuild/re-render the entire heatmap buffer from history."""
+        """Fully rebuild/re-render the entire heatmap buffer from history.
+
+        Large history slices use progressive column chunks (FIND-P226-01) so the
+        GUI thread yields between chunks via QTimer.singleShot(0). Small slices
+        (≤ REBUILD_IMMEDIATE_MAX_COLS) run synchronously for identical visuals.
+        A new call cancels any in-flight progressive pass (generation bump).
+        """
+        # Cancel previous progressive pass; this call owns the new generation.
+        self._rebuild_generation += 1
+        gen = self._rebuild_generation
+        self._rebuild_in_progress = True
+        self._rebuild_coalesce = False
+        self._rebuild_state = None
+
         vr = max(1, self.height() // self.row_height)
         hm_w = max(1, self.width() - self.price_axis_w)
         timeline_w = max(1, hm_w - self.right_margin_w)
         target_bw = max(1, int(timeline_w / self.column_width))
-        
+
+        # Mark size early so live push_snapshot does not thrash-restart rebuild.
+        self._last_vis_rows = vr
+        self._last_hm_w = target_bw
+
         # 1. Clear engine buffer and state
         if hasattr(self._engine, '_bid_density') and self._engine._bid_density:
             self._engine._bid_density.clear()
@@ -583,18 +686,22 @@ class HeatmapWidget(BaseHeatmapWidget):
             self._engine._ask_density.clear()
         self._engine._price_history.clear()
         self._engine._bbo_history.clear()
-        
+        if hasattr(self._engine, '_cvd_history'):
+            self._engine._cvd_history.clear()
+        if hasattr(self._engine, '_timestamp_history'):
+            self._engine._timestamp_history.clear()
+
         # Reset normalizers to starting references
         self._engine._bid_normalizer.global_ref = self._engine.config.bid_ref
         self._engine._ask_normalizer.global_ref = self._engine.config.ask_ref
-        
-        # 2. Re-push all historical snapshots through the engine
+
+        # 2. Slice visible history window
         history_list = list(self._history)
         end_idx = len(history_list) - self._scroll_offset
         start_idx = max(0, end_idx - target_bw)
         end_idx = max(0, end_idx)
         history_slice = history_list[start_idx:end_idx]
-            
+
         start_col = target_bw - len(history_slice)
 
         # Detect tick size from snapshots first
@@ -629,7 +736,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                     render_tick_size = detected_tick_size * self._engine.ticks_per_row
                     if render_tick_size <= 0.0:
                         render_tick_size = 0.05
-                    
+
                     center_ticks = int(round(first_mid / render_tick_size))
                     center_ticks_float = float(center_ticks)
                     in_recenter_drift = False
@@ -710,44 +817,271 @@ class HeatmapWidget(BaseHeatmapWidget):
         self._engine._center_price_ticks_float = final_center_float
         self._engine._in_recenter_drift = final_drift
 
-        # Resize engine buffer to the new size and fill with BG_COLOR
+        # Resize engine buffer to the new size
         self._engine.resize(vr, target_bw)
-        self._engine.get_buffer()[:] = ColorSystem.BG_COLOR
-        
-        print(f"[DEBUG_REBUILD] target_bw={target_bw} history_len={len(history_list)} scroll_offset={self._scroll_offset} slice_len={len(history_slice)} start_col={start_col} auto_follow={self.auto_follow}", flush=True)
-        for idx, entry in enumerate(history_slice):
-            is_last = (idx == len(history_slice) - 1)
+
+        if vr < 1 or target_bw < 1 or self._engine.center_price_ticks is None:
+            self._engine._buffer[:] = ColorSystem.BG_COLOR
+            self._rebuild_in_progress = False
+            self._rebuild_state = None
+            self._sync_vwap()
+            self._cache_dirty = True
+            self.update()
+            self.view_changed.emit()
+            if self._rebuild_coalesce:
+                self._rebuild_coalesce = False
+                self.rebuild_heatmap()
+            return
+
+        # Initialize 2D density grids + histories
+        buf_h = self._engine._buffer.shape[0]
+        bid_grid = np.zeros((buf_h, target_bw), dtype=np.float64)
+        ask_grid = np.zeros((buf_h, target_bw), dtype=np.float64)
+
+        self._engine._price_history.clear()
+        self._engine._bbo_history.clear()
+        if hasattr(self._engine, '_cvd_history'):
+            self._engine._cvd_history.clear()
+        if hasattr(self._engine, '_timestamp_history'):
+            self._engine._timestamp_history.clear()
+
+        min_order_size = self._engine.min_order_size
+        render_tick_size = self._engine.tick_size * self._engine.ticks_per_row
+        if render_tick_size <= 0.0:
+            render_tick_size = 0.05
+
+        center_price_ticks = self._engine.center_price_ticks
+        mids = np.zeros(target_bw, dtype=np.float64)
+        n_cols = len(history_slice)
+
+        state = {
+            "gen": gen,
+            "history_slice": history_slice,
+            "start_col": start_col,
+            "bid_grid": bid_grid,
+            "ask_grid": ask_grid,
+            "mids": mids,
+            "buf_h": buf_h,
+            "target_bw": target_bw,
+            "vr": vr,
+            "min_order_size": min_order_size,
+            "render_tick_size": render_tick_size,
+            "center_price_ticks": center_price_ticks,
+            "n_cols": n_cols,
+            "next_idx": 0,
+        }
+        self._rebuild_state = state
+
+        if should_rebuild_immediate(n_cols):
+            self._rebuild_fill_column_range(0, n_cols)
+            self._rebuild_finalize(gen)
+        else:
+            # First chunk now; remainder via QTimer so the event loop can run.
+            end = min(REBUILD_CHUNK_SIZE, n_cols)
+            self._rebuild_fill_column_range(0, end)
+            state["next_idx"] = end
+            if end >= n_cols:
+                self._rebuild_finalize(gen)
+            else:
+                QTimer.singleShot(0, lambda g=gen: self._rebuild_continue(g))
+
+    def _rebuild_fill_column_range(self, start_i: int, end_i: int) -> None:
+        """Map history_slice[start_i:end_i] into bid/ask grids (and engine histories)."""
+        state = self._rebuild_state
+        if state is None:
+            return
+        history_slice = state["history_slice"]
+        start_col = state["start_col"]
+        bid_grid = state["bid_grid"]
+        ask_grid = state["ask_grid"]
+        mids = state["mids"]
+        buf_h = state["buf_h"]
+        min_order_size = state["min_order_size"]
+        render_tick_size = state["render_tick_size"]
+        center_price_ticks = state["center_price_ticks"]
+
+        for idx in range(start_i, end_i):
+            entry = history_slice[idx]
+            col = start_col + idx
             hist_levels = entry[0]
             hist_bbo = entry[1]
+
+            bid = hist_bbo.bid if hist_bbo else 0.0
+            ask = hist_bbo.ask if hist_bbo else 0.0
+            self._engine._bbo_history.append((bid, ask))
+            mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+            self._engine._price_history.append(mid)
+            mids[col] = mid
+
+            hist_cvd = entry[6] if len(entry) > 6 else 0.0
+            self._engine._cvd_history.append(hist_cvd)
+
+            hist_ts = entry[7] if len(entry) > 7 else (hist_bbo.receive_timestamp if hist_bbo else 0.0)
+            self._engine._timestamp_history.append(hist_ts)
+
             bid_p = entry[2] if len(entry) > 2 else None
             bid_v = entry[3] if len(entry) > 3 else None
+            if bid_p is None or bid_v is None:
+                bids = [(lv.price, lv.bid_size) for lv in hist_levels if lv.bid_size > 0.0]
+                if bids:
+                    bid_p = np.array([x[0] for x in bids], dtype=np.float64)
+                    bid_v = np.array([x[1] for x in bids], dtype=np.float64)
+
+            if bid_p is not None and len(bid_p) > 0:
+                if min_order_size > 0.0:
+                    bid_v = bid_v.copy()
+                    bid_v[bid_v < min_order_size] = 0.0
+                bid_rows = (buf_h // 2) - np.round(bid_p / render_tick_size).astype(np.int32) + center_price_ticks
+                mask = (bid_rows >= 0) & (bid_rows < buf_h)
+                np.maximum.at(bid_grid[:, col], bid_rows[mask], bid_v[mask])
+
             ask_p = entry[4] if len(entry) > 4 else None
             ask_v = entry[5] if len(entry) > 5 else None
-            hist_cvd = entry[6] if len(entry) > 6 else 0.0
-            hist_ts = entry[7] if len(entry) > 7 else (hist_bbo.receive_timestamp if hist_bbo else 0.0)
-            
-            self._engine.push_snapshot(
-                hist_levels,
-                hist_bbo,
-                auto_follow=self.auto_follow,
-                vis_rows=vr,
-                update_normalizer=True,
-                detect_tick_size=is_last,
-                col_idx=start_col + idx,
-                bid_prices=bid_p,
-                bid_values=bid_v,
-                ask_prices=ask_p,
-                ask_values=ask_v,
-                cvd=hist_cvd,
-                timestamp=hist_ts
-            )
-            
+            if ask_p is None or ask_v is None:
+                asks = [(lv.price, lv.ask_size) for lv in hist_levels if lv.ask_size > 0.0]
+                if asks:
+                    ask_p = np.array([x[0] for x in asks], dtype=np.float64)
+                    ask_v = np.array([x[1] for x in asks], dtype=np.float64)
+
+            if ask_p is not None and len(ask_p) > 0:
+                if min_order_size > 0.0:
+                    ask_v = ask_v.copy()
+                    ask_v[ask_v < min_order_size] = 0.0
+                ask_rows = (buf_h // 2) - np.round(ask_p / render_tick_size).astype(np.int32) + center_price_ticks
+                mask = (ask_rows >= 0) & (ask_rows < buf_h)
+                np.maximum.at(ask_grid[:, col], ask_rows[mask], ask_v[mask])
+
+    def _rebuild_continue(self, gen: int) -> None:
+        """Process next progressive chunk; no-op if superseded by a newer rebuild."""
+        if gen != self._rebuild_generation:
+            return
+        state = self._rebuild_state
+        if state is None or state.get("gen") != gen:
+            return
+
+        n_cols = state["n_cols"]
+        start_i = state["next_idx"]
+        end_i = min(start_i + REBUILD_CHUNK_SIZE, n_cols)
+        self._rebuild_fill_column_range(start_i, end_i)
+        state["next_idx"] = end_i
+
+        if end_i >= n_cols:
+            self._rebuild_finalize(gen)
+        else:
+            QTimer.singleShot(0, lambda g=gen: self._rebuild_continue(g))
+
+    def _rebuild_finalize(self, gen: int) -> None:
+        """Smooth, normalize, LUT-map grids into engine buffer; finish progressive pass."""
+        if gen != self._rebuild_generation:
+            return
+        state = self._rebuild_state
+        if state is None or state.get("gen") != gen:
+            return
+
+        bid_grid = state["bid_grid"]
+        ask_grid = state["ask_grid"]
+        mids = state["mids"]
+        buf_h = state["buf_h"]
+        target_bw = state["target_bw"]
+        vr = state["vr"]
+        render_tick_size = state["render_tick_size"]
+        center_price_ticks = state["center_price_ticks"]
+
+        # Vertical smoothing (optional — scipy may be absent in lean envs)
+        if self._engine.vertical_smoothing > 0.01:
+            try:
+                import scipy.ndimage
+                smoothed_bid = scipy.ndimage.gaussian_filter1d(
+                    bid_grid, self._engine.vertical_smoothing, axis=0, mode='nearest'
+                )
+                smoothed_ask = scipy.ndimage.gaussian_filter1d(
+                    ask_grid, self._engine.vertical_smoothing, axis=0, mode='nearest'
+                )
+
+                bid_ref = self._engine._bid_normalizer.global_ref
+                bid_blend = np.clip(bid_grid / (bid_ref + 1e-9), 0.0, 1.0) ** 2.0
+                bid_grid = bid_grid * bid_blend + smoothed_bid * (1.0 - bid_blend)
+
+                ask_ref = self._engine._ask_normalizer.global_ref
+                ask_blend = np.clip(ask_grid / (ask_ref + 1e-9), 0.0, 1.0) ** 2.0
+                ask_grid = ask_grid * ask_blend + smoothed_ask * (1.0 - ask_blend)
+            except ImportError:
+                pass
+
+
+        # Update normalizers in batch
+        active_bids_mask = bid_grid > 0.01
+        if np.any(active_bids_mask):
+            self._engine._bid_normalizer.update(bid_grid[active_bids_mask])
+
+        active_asks_mask = ask_grid > 0.01
+        if np.any(active_asks_mask):
+            self._engine._ask_normalizer.update(ask_grid[active_asks_mask])
+
+        norm_bids = self._engine._bid_normalizer.normalize(bid_grid)
+        norm_asks = self._engine._ask_normalizer.normalize(ask_grid)
+
+        p_ticks = center_price_ticks + (buf_h // 2 - np.arange(buf_h, dtype=np.int32))[:, np.newaxis]
+        prices = p_ticks * render_tick_size
+
+        is_bid = np.zeros((buf_h, target_bw), dtype=bool)
+        has_mid = mids > 0.0
+        if np.any(has_mid):
+            is_bid[:, has_mid] = prices <= mids[np.newaxis, has_mid]
+        if np.any(~has_mid):
+            is_bid[:, ~has_mid] = bid_grid[:, ~has_mid] >= ask_grid[:, ~has_mid]
+
+        self._engine._buffer[:] = ColorSystem.BG_COLOR
+
+        active_bids = is_bid & (norm_bids > 0.0005)
+        active_asks = (~is_bid) & (norm_asks > 0.0005)
+
+        if np.any(active_bids):
+            bid_idx = np.clip((norm_bids[active_bids] * 255).astype(np.int32), 0, 255)
+            self._engine._buffer[active_bids, :] = ColorSystem.BOOKMAP_BID_LUT[bid_idx]
+
+        if np.any(active_asks):
+            ask_idx = np.clip((norm_asks[active_asks] * 255).astype(np.int32), 0, 255)
+            self._engine._buffer[active_asks, :] = ColorSystem.BOOKMAP_ASK_LUT[ask_idx]
+
         self._last_vis_rows = vr
         self._last_hm_w = target_bw
+        self._rebuild_in_progress = False
+        self._rebuild_state = None
         self._sync_vwap()
         self._cache_dirty = True
         self.update()
-        self.view_changed.emit()
+
+        # Live ticks during progressive rebuild requested a catch-up pass.
+        if self._rebuild_coalesce:
+            self._rebuild_coalesce = False
+            self.rebuild_heatmap()
+
+    def _render_single_history_column(self, entry, col, vr, target_bw) -> None:
+        hist_levels = entry[0]
+        hist_bbo = entry[1]
+        bid_p = entry[2] if len(entry) > 2 else None
+        bid_v = entry[3] if len(entry) > 3 else None
+        ask_p = entry[4] if len(entry) > 4 else None
+        ask_v = entry[5] if len(entry) > 5 else None
+        hist_cvd = entry[6] if len(entry) > 6 else 0.0
+        hist_ts = entry[7] if len(entry) > 7 else (hist_bbo.receive_timestamp if hist_bbo else 0.0)
+        
+        self._engine.push_snapshot(
+            hist_levels,
+            hist_bbo,
+            auto_follow=self.auto_follow,
+            vis_rows=vr,
+            update_normalizer=True,
+            detect_tick_size=False,
+            col_idx=col,
+            bid_prices=bid_p,
+            bid_values=bid_v,
+            ask_prices=ask_p,
+            ask_values=ask_v,
+            cvd=hist_cvd,
+            timestamp=hist_ts
+        )
 
     def request_rebuild_throttled(self) -> None:
         """Request a heatmap rebuild, throttled to max 20 FPS (every 50ms) to prevent UI lag during dragging/scrolling."""
@@ -775,6 +1109,15 @@ class HeatmapWidget(BaseHeatmapWidget):
             self._vwap_overlay.row_height = self.row_height
             self._vwap_overlay.price_column_width = self.price_axis_w
 
+    def set_empty_message(self, message: str) -> None:
+        """Set centered empty-state text (no book levels yet)."""
+        text = (message or "").strip() or "No data — press Start"
+        if text == self._empty_message:
+            return
+        self._empty_message = text
+        self._cache_dirty = True
+        self.update()
+
     def reset(self) -> None:
         """Clear all historical state for a new session/symbol."""
         self._history.clear()
@@ -789,6 +1132,7 @@ class HeatmapWidget(BaseHeatmapWidget):
         self._iceberg_markers.clear()
         self._iceberg_accum_data.clear()
         self._stop_markers.clear()
+        self._empty_message = "No data — press Start"
         if hasattr(self, '_vwap_overlay') and self._vwap_overlay is not None:
             self._vwap_overlay.reset()
         self._engine.reset()
@@ -882,6 +1226,14 @@ class HeatmapWidget(BaseHeatmapWidget):
 
     def set_auto_follow(self, e: bool) -> None:
         self.auto_follow = e
+        if e:
+            # Hard-snap back to live edge when re-enabling follow (FIND-P243 / HIST-01)
+            self._scroll_offset = 0
+            try:
+                self.rebuild_heatmap()
+            except Exception:
+                self._cache_dirty = True
+            self.update()
 
     def zoom_in(self) -> None:
         self.zoom_to_height(self.row_height + 1)
@@ -1073,13 +1425,13 @@ class HeatmapWidget(BaseHeatmapWidget):
                     if self.show_bbo and self._bbo:
                         self._draw_bbo_lines(cache_painter, cache_w, cache_h, hm_left)
             else:
-                # No data state
+                # No data state — show last feed error when present
                 cache_painter.setPen(Colors.TEXT_SECONDARY)
                 cache_painter.setFont(Fonts.sans(13))
                 cache_painter.drawText(
-                    QRect(0, 0, cache_w, cache_h),
-                    Qt.AlignmentFlag.AlignCenter,
-                    "No data — Start simulation",
+                    QRect(12, 0, max(1, cache_w - 24), cache_h),
+                    int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap),
+                    self._empty_message,
                 )
 
             # Draw latency overlay in top-right of heatmap
@@ -1252,21 +1604,17 @@ class HeatmapWidget(BaseHeatmapWidget):
     ) -> None:
         """Helper to draw a single vectorized historical price line on the heatmap."""
         import numpy as np
-        buf = self._engine.get_buffer()
-        bh = buf.shape[0]
-        tick_size = self._engine.tick_size
-        center_ticks = self._engine.center_price_ticks
-        y_scale = self.height() / bh
-        y_offset = y_scale / 2.0
-        half_bh = bh / 2.0
-
+        # Use the same screen mapping as BBO overlays (vis_rows + row_height),
+        # not full-buffer height (FIND-P210-01/02).
+        wh = self.height()
         valid = prices_arr > 0
         if not np.any(valid):
             return
 
-        p_ticks = np.round(prices_arr / tick_size)
-        rows = half_bh - (p_ticks - center_ticks)
-        ys = rows * y_scale + y_offset
+        ys = np.array(
+            [self._price_to_screen_y(float(pr), wh) if pr > 0 else -1.0 for pr in prices_arr],
+            dtype=np.float64,
+        )
         cols = np.arange(bw - n_hist, bw)
         xs = cols * (hm_w / bw)
 
@@ -1471,7 +1819,7 @@ class HeatmapWidget(BaseHeatmapWidget):
             r = 2.0 + rel_vol * 12.0
             a = int(30.0 + rel_vol * 190.0)
 
-            if side == Side.BUY:
+            if is_buy_side(side):
                 brush.setColor(QColor(green_r, green_g, green_b, a))
             else:
                 brush.setColor(QColor(red_r, red_g, red_b, a))
@@ -1595,8 +1943,8 @@ class HeatmapWidget(BaseHeatmapWidget):
         if not self.iceberg_enabled or not self._iceberg_markers:
             return
         
-        # Prune expired markers to prevent list accumulation and rendering lag
-        now_ts = time.time()
+        # Prune expired markers (event-domain clock; FIND-NUM-02)
+        now_ts = self._event_clock if self._event_clock > 0 else time.time()
         self._iceberg_markers = [m for m in self._iceberg_markers if now_ts - m['timestamp'] <= 10.0]
         if not self._iceberg_markers:
             return
@@ -1631,7 +1979,7 @@ class HeatmapWidget(BaseHeatmapWidget):
             r = 15.0
             p.setPen(QPen(QColor(Colors.TEXT_BRIGHT.red(), Colors.TEXT_BRIGHT.green(), Colors.TEXT_BRIGHT.blue(), alpha), 1.5))
             
-            if marker['side'] == Side.BUY:
+            if is_buy_side(marker['side']):
                 bg_color = QColor(Colors.ACCENT_GREEN.red(), Colors.ACCENT_GREEN.green(), Colors.ACCENT_GREEN.blue(), alpha)
             else:
                 bg_color = QColor(Colors.ACCENT_RED.red(), Colors.ACCENT_RED.green(), Colors.ACCENT_RED.blue(), alpha)
@@ -1651,8 +1999,8 @@ class HeatmapWidget(BaseHeatmapWidget):
         if not self.stops_enabled or not self._stop_markers:
             return
         
-        # Prune expired markers to prevent list accumulation and rendering lag
-        now_ts = time.time()
+        # Prune expired markers (event-domain clock; FIND-NUM-02)
+        now_ts = self._event_clock if self._event_clock > 0 else time.time()
         self._stop_markers = [m for m in self._stop_markers if now_ts - m['timestamp'] <= 10.0]
         if not self._stop_markers:
             return
@@ -1713,7 +2061,7 @@ class HeatmapWidget(BaseHeatmapWidget):
         
         buy_vol = 0.0
         sell_vol = 0.0
-        now_ts = time.time()
+        now_ts = self._event_clock if self._event_clock > 0 else time.time()
         for t in reversed(self._trades):
             if len(t) == 5:
                 _, sz, side, ts, _ = t
@@ -1721,7 +2069,7 @@ class HeatmapWidget(BaseHeatmapWidget):
                 _, sz, side, ts = t
             if now_ts - ts > 10.0:
                 break
-            if side == Side.BUY:
+            if is_buy_side(side):
                 buy_vol += sz
             else:
                 sell_vol += sz
@@ -1732,8 +2080,8 @@ class HeatmapWidget(BaseHeatmapWidget):
         buy_pct = (buy_vol / tot_vol * 100) if tot_vol > 0.0 else 50.0
         sell_pct = (sell_vol / tot_vol * 100) if tot_vol > 0.0 else 50.0
         
-        active_icebergs = len([m for m in self._iceberg_markers if time.time() - m['timestamp'] <= 10.0])
-        active_stops = len([m for m in self._stop_markers if time.time() - m['timestamp'] <= 10.0])
+        active_icebergs = len([m for m in self._iceberg_markers if now_ts - m['timestamp'] <= 10.0])
+        active_stops = len([m for m in self._stop_markers if now_ts - m['timestamp'] <= 10.0])
 
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         
@@ -1894,9 +2242,30 @@ class HeatmapWidget(BaseHeatmapWidget):
                         else:
                             engine._buffer[:, delta_scroll:, :] = ColorSystem.BG_COLOR
                             
+                        # Incrementally render only the exposed columns from history
+                        history_list = list(self._history)
+                        end_idx = len(history_list) - self._scroll_offset
+                        start_idx = max(0, end_idx - target_bw)
+                        vr = max(1, self.height() // self.row_height)
+                        
+                        if delta_scroll > 0:
+                            for i in range(delta_scroll):
+                                col = i
+                                hist_idx = start_idx + i
+                                if 0 <= hist_idx < len(history_list):
+                                    self._render_single_history_column(history_list[hist_idx], col, vr, target_bw)
+                        else:
+                            abs_delta = abs(delta_scroll)
+                            for i in range(abs_delta):
+                                col = target_bw - abs_delta + i
+                                hist_idx = start_idx + (target_bw - abs_delta + i)
+                                if 0 <= hist_idx < len(history_list):
+                                    self._render_single_history_column(history_list[hist_idx], col, vr, target_bw)
+
+                        self._sync_vwap()
                         self._cache_dirty = True
                         self.view_changed.emit()
-                        self.request_rebuild_throttled()
+                        self.update()
 
         if engine.center_price_ticks is not None and engine.render_tick_size > 0:
             vis_rows = max(1, self.height() // self.row_height)
@@ -2170,8 +2539,17 @@ class HeatmapWidget(BaseHeatmapWidget):
             self._engine.resize(vr, target_bw)
             self._last_vis_rows = vr
             self._last_hm_w = target_bw
-            if self._levels:
-                self._engine.push_snapshot(self._levels, self._bbo, auto_follow=self.auto_follow, vis_rows=vr)
-                self._sync_vwap()
+            # Full rebuild after geometry change — a single push_snapshot only
+            # stamps the live column and leaves history blank/garbled (H15).
+            if self._levels or getattr(self, "_history", None):
+                try:
+                    self.rebuild_heatmap()
+                except Exception:
+                    if self._levels:
+                        self._engine.push_snapshot(
+                            self._levels, self._bbo,
+                            auto_follow=self.auto_follow, vis_rows=vr,
+                        )
+                        self._sync_vwap()
             self._cache_dirty = True
             self.update()
