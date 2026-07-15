@@ -75,6 +75,9 @@ class DomLadder(QWidget):
         # ── Data ──
         self._levels: list[BookLevel] = []
         self._bbo: Optional[BBO] = None
+        # Display window into _levels (ascending price indices); paint reverses for top=high
+        self._window_start: int = 0
+        self._window_count: int = 0
 
         # ── Interaction ──
         self._hovered_price: Optional[float] = None
@@ -107,6 +110,12 @@ class DomLadder(QWidget):
         self._bbo = bbo
         self._trigger_throttled_update()
 
+    def reset(self) -> None:
+        """Clear ladder for symbol/session change."""
+        self._levels = []
+        self._bbo = None
+        self.update()
+
     def _trigger_throttled_update(self) -> None:
         if not self.isVisible():
             return
@@ -130,7 +139,7 @@ class DomLadder(QWidget):
         self._actual_update()
 
     def set_depth(self, depth: int) -> None:
-        """Set how many price levels to show (default 10)."""
+        """Set how many price levels per side of BBO (default 10)."""
         self._depth = max(1, depth)
         self.update()
 
@@ -142,6 +151,78 @@ class DomLadder(QWidget):
     # ──────────────────────────────────────────────
     #  Layout helpers
     # ──────────────────────────────────────────────
+
+    def _bbo_mid_price(self) -> Optional[float]:
+        """Best mid price for ladder centering, or None if unavailable."""
+        if self._bbo is None:
+            return None
+        bid = self._bbo.bid
+        ask = self._bbo.ask
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if bid > 0:
+            return bid
+        if ask > 0:
+            return ask
+        return None
+
+    def _center_index(self, mid: float) -> int:
+        """Index of level closest to mid (levels sorted ascending by price)."""
+        levels = self._levels
+        n = len(levels)
+        if n == 0:
+            return 0
+        # Linear scan is fine for typical book sizes; keeps dependency-free code.
+        best_i = 0
+        best_d = abs(levels[0].price - mid)
+        for i in range(1, n):
+            d = abs(levels[i].price - mid)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    def _select_display_levels(self, widget_height: int) -> list[BookLevel]:
+        """
+        Window levels around BBO mid (not highest-N only).
+
+        visible_count = min(fit-to-height, 2*_depth, n).
+        Returns levels in display order: highest price first (top of ladder).
+        """
+        n = len(self._levels)
+        if n == 0:
+            self._window_start = 0
+            self._window_count = 0
+            return []
+
+        fit_count = max(1, widget_height // self.row_height)
+        # _depth = levels each side of BBO; total window ≈ 2 * depth
+        depth_window = max(1, 2 * self._depth)
+        visible_count = min(n, fit_count, depth_window)
+
+        mid = self._bbo_mid_price()
+        if mid is None:
+            # Fall back: prefer a level with both sides, else book middle
+            center_idx = n // 2
+            for i, lv in enumerate(self._levels):
+                if lv.bid_size > 0 and lv.ask_size > 0:
+                    center_idx = i
+                    break
+        else:
+            center_idx = self._center_index(mid)
+
+        half = visible_count // 2
+        start = center_idx - half
+        if start < 0:
+            start = 0
+        if start + visible_count > n:
+            start = max(0, n - visible_count)
+
+        self._window_start = start
+        self._window_count = visible_count
+        window = self._levels[start : start + visible_count]
+        # Highest price at top (standard DOM)
+        return list(reversed(window))
 
     def _compute_columns(self, widget_width: int) -> tuple[QRect, ...]:
         """Return (bid_qty, bid_bar, price, ask_bar, ask_qty, imbalance) rects.
@@ -188,17 +269,13 @@ class DomLadder(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No market data")
             return
 
-        # ── Determine visible levels ────────────────────
-        visible_count = h // self.row_height + 2
-        # Display levels reversed: highest price (bids) at top,
-        # lowest price (asks) at bottom — standard DOM ladder convention.
-        display_levels = self._levels[-visible_count:]
-        display_levels.reverse()
+        # ── Determine visible levels (BBO-centered window) ──
+        display_levels = self._select_display_levels(h)
 
-        # Max sizes for normalising bar widths
+        # Max sizes for normalising bar widths (visible window only)
         max_bid = 1.0
         max_ask = 1.0
-        for l in self._levels:
+        for l in display_levels:
             if l.bid_size > max_bid:
                 max_bid = l.bid_size
             if l.ask_size > max_ask:
@@ -381,23 +458,25 @@ class DomLadder(QWidget):
     # ──────────────────────────────────────────────
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if not self._levels:
+        if not self._levels or self._window_count <= 0:
             return
 
-        # Map mouse Y back to the reversed display index
+        # Map mouse Y back to the reversed display index within BBO window
         rel_y = event.position().y()
         display_row = int(rel_y // self.row_height)
 
-        # Convert display index to actual level index
-        total = len(self._levels)
-        actual_idx = total - 1 - display_row
-
-        if 0 <= actual_idx < total:
-            prev = self._hovered_price
-            self._hovered_price = self._levels[actual_idx].price
-            self._hovered_row = display_row
-            if self._hovered_price != prev:
-                self.price_hovered.emit(self._hovered_price)
+        # display_row 0 = highest price = last index in ascending window slice
+        if 0 <= display_row < self._window_count:
+            actual_idx = self._window_start + (self._window_count - 1 - display_row)
+            if 0 <= actual_idx < len(self._levels):
+                prev = self._hovered_price
+                self._hovered_price = self._levels[actual_idx].price
+                self._hovered_row = display_row
+                if self._hovered_price != prev:
+                    self.price_hovered.emit(self._hovered_price)
+            else:
+                self._hovered_price = None
+                self._hovered_row = None
         else:
             self._hovered_price = None
             self._hovered_row = None

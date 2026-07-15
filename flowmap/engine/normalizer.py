@@ -20,35 +20,52 @@ import numpy as np
 class AdaptiveNormalizer:
     """Adaptive reference normalizer. Adapts smoothly to order sizes in view.
 
-    Uses a running EMA of the 98th percentile of non-zero order book sizes
-    to dynamically scale colors so that liquidity walls are bright/glowing,
-    while noise is hidden.
+    Uses a running EMA of the **90th** percentile of *non-zero* book sizes
+    (not 98th — a single wall at p98 crushed the entire column to black).
+
+    Soft gamma (``ratio ** 0.55``) lifts mid-book levels so resting liquidity
+    is visible on the heatmap without blowing out walls.  The previous
+    ``** 2.5`` made ratio 0.3 → ~0.05 intensity — empty-looking chart even
+    with live data (frontend Ralph loop finding).
     """
+
+    # Soft perceptual boost for mid-sized levels (0.5 ≈ sqrt, 1.0 = linear).
+    GAMMA = 0.55
 
     def __init__(self, fixed_ref=3000.0):
         self._global_ref = max(float(fixed_ref), 1e-9)
-        self._ema_alpha = 0.05  # Slow adaptation to avoid color flicker
+        self._ema_alpha = 0.08  # Slightly faster adaptation on first minutes of live
         self._initialized = False
 
     def update(self, column_values: np.ndarray) -> None:
-        """Smoothly adapt the reference to the 98th percentile of active sizes in the column."""
+        """Smoothly adapt the reference to the 90th percentile of active sizes."""
         if len(column_values) == 0:
             return
-        p98 = np.percentile(column_values, 98)
-        if p98 > 0.01:
+        active = column_values[column_values > 0.01]
+        if len(active) == 0:
+            return
+        # p90 resists single mega-walls better than p98 while still tracking
+        # the large levels that should saturate the colormap.
+        p_ref = float(np.percentile(active, 90))
+        if p_ref > 0.01:
             if not getattr(self, "_initialized", False):
-                self._global_ref = p98
+                self._global_ref = p_ref
                 self._initialized = True
             else:
-                self._global_ref = (1.0 - self._ema_alpha) * self._global_ref + self._ema_alpha * p98
+                self._global_ref = (
+                    (1.0 - self._ema_alpha) * self._global_ref
+                    + self._ema_alpha * p_ref
+                )
             self._global_ref = max(self._global_ref, 0.1)
 
     def normalize(self, values: np.ndarray) -> np.ndarray:
-        """Ratio clipped to [0, 1] and scaled non-linearly for higher contrast.
-        Replaces NaN/Inf with 0 to prevent propagation into the render buffer."""
+        """Ratio clipped to [0, 1] with soft gamma for mid-level visibility.
+
+        Replaces NaN/Inf with 0 to prevent propagation into the render buffer.
+        """
         safe = np.nan_to_num(values, nan=0.0, posinf=self._global_ref, neginf=0.0)
         ratio = np.clip(safe / self._global_ref, 0.0, 1.0)
-        return ratio ** 2.5
+        return np.power(ratio, self.GAMMA)
 
     def normalize_column(self, values: np.ndarray) -> np.ndarray:
         """Alias for normalize to support backward compatibility."""

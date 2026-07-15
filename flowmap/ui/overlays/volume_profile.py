@@ -92,7 +92,7 @@ class VolumeProfileOverlay(QWidget):
 
     def add_trade(self, price: float, size: float) -> None:
         """Record trade volume at a given price level for SVP."""
-        price_key = round(price, 6)
+        price_key = self._bin_price(price)
         old_vol = self._svp_volumes.get(price_key, 0.0)
         new_vol = old_vol + size
         self._svp_volumes[price_key] = new_vol
@@ -114,7 +114,7 @@ class VolumeProfileOverlay(QWidget):
             return
         for trade in trades:
             price, size = trade.price, trade.size
-            price_key = round(price, 6)
+            price_key = self._bin_price(price)
             old_vol = self._svp_volumes.get(price_key, 0.0)
             new_vol = old_vol + size
             self._svp_volumes[price_key] = new_vol
@@ -164,6 +164,73 @@ class VolumeProfileOverlay(QWidget):
         self.update()
 
     # ── Calculations ───────────────────────────────────────────
+
+    def _render_tick(self) -> float:
+        """Price step of one heatmap row (for binning trades/depth)."""
+        if self._heatmap is not None:
+            eng = getattr(self._heatmap, "_engine", None)
+            if eng is not None:
+                rts = float(getattr(eng, "render_tick_size", 0.0) or 0.0)
+                if rts > 0:
+                    return rts
+        if len(self._levels) >= 2:
+            # Infer from sorted unique spacing of visible levels
+            prices = sorted({float(lv.price) for lv in self._levels})
+            diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+            positive = [d for d in diffs if d > 1e-12]
+            if positive:
+                return min(positive)
+        return 0.01
+
+    def _bin_price(self, price: float) -> float:
+        """Snap a trade/book price onto the heatmap row grid."""
+        tick = self._render_tick()
+        if tick <= 0:
+            return round(float(price), 6)
+        return round(round(float(price) / tick) * tick, 6)
+
+    def _rebinned(self, volumes: dict[float, float]) -> dict[float, float]:
+        """Collapse raw price keys onto the current render-tick grid once."""
+        if not volumes:
+            return {}
+        out: dict[float, float] = {}
+        for p, v in volumes.items():
+            if v <= 0:
+                continue
+            key = self._bin_price(p)
+            out[key] = out.get(key, 0.0) + float(v)
+        return out
+
+    def _volume_on_level(self, volumes: dict[float, float], level_price: float) -> float:
+        """Sum volume keys that map onto this level after binning.
+
+        Trades arrive at exchange ticks (e.g. 75.81) while rows are
+        render-tick aligned (e.g. 75.80 / 75.82). Always rebin — a fast
+        exact-key path would miss sibling keys that snap to the same row.
+        """
+        if not volumes:
+            return 0.0
+        target = self._bin_price(level_price)
+        total = 0.0
+        for p, v in volumes.items():
+            if v > 0 and self._bin_price(p) == target:
+                total += float(v)
+        return total
+
+    @staticmethod
+    def _bar_len(vol: float, max_vol: float, col_w: int, *, min_px: int = 2) -> int:
+        """Map volume → bar width with soft sqrt scale so mid-levels stay visible.
+
+        Linear scale makes a single POC wall crush the rest of the profile to
+        1px ghosts (frontend audit: VP bright ~5% while heatmap ~45%).
+        """
+        if vol <= 0 or col_w <= 0:
+            return 0
+        ref = max(float(max_vol), 1e-9)
+        # sqrt: vol=0.25*max → 0.5 of column (was 0.25 linear)
+        t = (float(vol) / ref) ** 0.5
+        length = int(round(t * col_w))
+        return max(min_px, min(col_w, length))
 
     def _compute_svp_va(self) -> None:
         """Compute POC and Value Area for Session Volume Profile."""
@@ -221,7 +288,7 @@ class VolumeProfileOverlay(QWidget):
             # Format: (price, size, side, ts, tick_index)
             if len(t) >= 4:
                 price, size = t[0], t[1]
-                price_key = round(price, 6)
+                price_key = self._bin_price(price)
                 self._cvp_volumes[price_key] = self._cvp_volumes.get(price_key, 0.0) + size
                 self._cvp_total_volume += size
 
@@ -302,11 +369,11 @@ class VolumeProfileOverlay(QWidget):
             levels_source = self._order_book.get_levels()
 
         for lv in levels_source:
-            price_key = round(lv.price, 6)
+            price_key = self._bin_price(lv.price)
             if lv.bid_size > 0:
-                cob_bids[price_key] = lv.bid_size
+                cob_bids[price_key] = cob_bids.get(price_key, 0.0) + lv.bid_size
             if lv.ask_size > 0:
-                cob_asks[price_key] = lv.ask_size
+                cob_asks[price_key] = cob_asks.get(price_key, 0.0) + lv.ask_size
 
         # Grid geometry parameters
         margin = 4
@@ -314,28 +381,39 @@ class VolumeProfileOverlay(QWidget):
         net_w = w - 2 * margin - (num_cols - 1) * spacing
         col_w = max(10, net_w // num_cols)
 
-        # Normalization constants
+        # Rebin once per paint (O(n) not O(n×levels) per row)
+        cvp_binned = self._rebinned(self._cvp_volumes)
+        svp_binned = self._rebinned(self._svp_volumes)
+
+        # Normalization constants (bin-aware lookup)
         max_cob = 0.0
         for level in self._levels:
-            price_key = round(level.price, 6)
-            max_cob = max(max_cob, cob_bids.get(price_key, 0.0), cob_asks.get(price_key, 0.0))
+            pk = self._bin_price(level.price)
+            max_cob = max(max_cob, cob_bids.get(pk, 0.0), cob_asks.get(pk, 0.0))
         max_cob = max(max_cob, 1.0)
 
-        max_cvp = max(self._cvp_max_volume, 1.0)
-        max_svp = max(self._svp_max_volume, 1.0)
+        max_cvp = max(cvp_binned.values(), default=0.0) or max(self._cvp_max_volume, 1.0)
+        max_svp = max(svp_binned.values(), default=0.0) or max(self._svp_max_volume, 1.0)
+        max_cvp = max(float(max_cvp), 1.0)
+        max_svp = max(float(max_svp), 1.0)
 
-        # Draw the price rows
-        bh = len(self._levels)
+        # Draw the price rows — fixed pitch matching heatmap (not stretch i*h/bh).
+        # Prefer live heatmap.row_height when linked; else self.row_height.
+        if self._heatmap is not None and getattr(self._heatmap, "row_height", None):
+            rh = max(1, int(self._heatmap.row_height))
+        else:
+            rh = max(1, int(self.row_height))
+
         for i, level in enumerate(self._levels):
             price = level.price
-            y_start = int(i * h / bh)
-            y_end = int((i + 1) * h / bh)
-            y_height = y_end - y_start
-            if y_start > h:
+            y_start = i * rh
+            if y_start >= h:
                 break
-
-            price_key = round(price, 6)
+            y_height = rh
+            # Leave 1px gap between rows when row is tall enough (matches visual grid)
             draw_height = max(1, y_height - 1) if y_height > 1 else y_height
+
+            price_key = self._bin_price(price)
 
             for idx, col_name in enumerate(active_cols):
                 x_col_start = margin + idx * (col_w + spacing)
@@ -343,22 +421,25 @@ class VolumeProfileOverlay(QWidget):
                 if col_name == "COB":
                     bid_sz = cob_bids.get(price_key, 0.0)
                     ask_sz = cob_asks.get(price_key, 0.0)
-                    if bid_sz > 0:
-                        bar_len = int((bid_sz / max_cob) * col_w)
-                        bar_len = max(1, min(bar_len, col_w))
-                        # Green bid bar
-                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, QColor(16, 185, 129, 180))
+                    # Draw both sides when present (half-height each) so
+                    # locked/near-mid levels are not dropped by elif.
+                    if bid_sz > 0 and ask_sz > 0:
+                        half = max(1, draw_height // 2)
+                        bl = self._bar_len(bid_sz, max_cob, col_w)
+                        al = self._bar_len(ask_sz, max_cob, col_w)
+                        painter.fillRect(x_col_start, y_start, bl, half, QColor(16, 185, 129, 180))
+                        painter.fillRect(x_col_start, y_start + half, al, draw_height - half, QColor(239, 68, 68, 180))
+                    elif bid_sz > 0:
+                        bl = self._bar_len(bid_sz, max_cob, col_w)
+                        painter.fillRect(x_col_start, y_start, bl, draw_height, QColor(16, 185, 129, 180))
                     elif ask_sz > 0:
-                        bar_len = int((ask_sz / max_cob) * col_w)
-                        bar_len = max(1, min(bar_len, col_w))
-                        # Red ask bar
-                        painter.fillRect(x_col_start, y_start, bar_len, draw_height, QColor(239, 68, 68, 180))
+                        al = self._bar_len(ask_sz, max_cob, col_w)
+                        painter.fillRect(x_col_start, y_start, al, draw_height, QColor(239, 68, 68, 180))
 
                 elif col_name == "CVP":
-                    vol = self._cvp_volumes.get(price_key, 0.0)
+                    vol = cvp_binned.get(price_key, 0.0)
                     if vol > 0:
-                        bar_len = int((vol / max_cvp) * col_w)
-                        bar_len = max(1, min(bar_len, col_w))
+                        bar_len = self._bar_len(vol, max_cvp, col_w)
 
                         in_va = (
                             self._cvp_va_low is not None
@@ -367,7 +448,7 @@ class VolumeProfileOverlay(QWidget):
                         )
                         is_poc = (
                             self._cvp_poc_price is not None
-                            and abs(price_key - self._cvp_poc_price) < 0.000001
+                            and abs(self._bin_price(self._cvp_poc_price) - price_key) < 1e-9
                         )
 
                         if is_poc:
@@ -375,12 +456,12 @@ class VolumeProfileOverlay(QWidget):
                             color = QColor(245, 158, 11)
                         elif in_va:
                             # Value Area: Deep blue intensity
-                            intensity = vol / max_cvp
+                            intensity = (vol / max_cvp) ** 0.5
                             c_idx = max(0, min(255, int(intensity * 255)))
                             color = self._cvp_va_colors[c_idx]
                         else:
                             # Regular: Indigo intensity
-                            intensity = vol / max_cvp
+                            intensity = (vol / max_cvp) ** 0.5
                             c_idx = max(0, min(255, int(intensity * 255)))
                             color = self._cvp_reg_colors[c_idx]
 
@@ -393,10 +474,9 @@ class VolumeProfileOverlay(QWidget):
                             painter.setPen(Qt.PenStyle.NoPen)
 
                 elif col_name == "SVP":
-                    vol = self._svp_volumes.get(price_key, 0.0)
+                    vol = svp_binned.get(price_key, 0.0)
                     if vol > 0:
-                        bar_len = int((vol / max_svp) * col_w)
-                        bar_len = max(1, min(bar_len, col_w))
+                        bar_len = self._bar_len(vol, max_svp, col_w)
 
                         in_va = (
                             self._svp_va_low is not None
@@ -405,7 +485,7 @@ class VolumeProfileOverlay(QWidget):
                         )
                         is_poc = (
                             self._svp_poc_price is not None
-                            and abs(price_key - self._svp_poc_price) < 0.000001
+                            and abs(self._bin_price(self._svp_poc_price) - price_key) < 1e-9
                         )
 
                         if is_poc:
@@ -413,12 +493,12 @@ class VolumeProfileOverlay(QWidget):
                             color = QColor(0, 200, 255)
                         elif in_va:
                             # Value area: Royal purple intensity
-                            intensity = vol / max_svp
+                            intensity = (vol / max_svp) ** 0.5
                             c_idx = max(0, min(255, int(intensity * 255)))
                             color = self._svp_va_colors[c_idx]
                         else:
                             # Regular: Slate intensity
-                            intensity = vol / max_svp
+                            intensity = (vol / max_svp) ** 0.5
                             c_idx = max(0, min(255, int(intensity * 255)))
                             color = self._svp_reg_colors[c_idx]
 
@@ -438,7 +518,8 @@ class VolumeProfileOverlay(QWidget):
         painter.setPen(QPen(QColor(31, 34, 47), 1, Qt.PenStyle.SolidLine))
         painter.drawLine(0, 20, w, 20)
 
-        header_font = QFont('Inter', 8, QFont.Weight.Bold)
+        from ..theme import Fonts
+        header_font = Fonts.sans(8, bold=True)
         painter.setFont(header_font)
 
         for idx, col_name in enumerate(active_cols):
@@ -470,18 +551,30 @@ class VolumeProfileOverlay(QWidget):
 
             painter.setPen(self.text_color)
             txt = ""
+
+            def _fmt_vol(v: float) -> str:
+                if v >= 1_000_000:
+                    return f"{v/1_000_000.0:.1f}M"
+                if v >= 1000.0:
+                    return f"{v/1000.0:.1f}k"
+                return f"{v:.0f}"
+
             if col_name == "COB":
-                txt = "BOOK"
+                # Show peak visible book size so footer is not a dead "BOOK" label
+                # while CVP/SVP show live volume totals.
+                peak = 0.0
+                for lv in self._levels:
+                    pk = self._bin_price(lv.price)
+                    peak = max(
+                        peak,
+                        cob_bids.get(pk, 0.0),
+                        cob_asks.get(pk, 0.0),
+                    )
+                txt = _fmt_vol(peak) if peak > 0 else "BOOK"
             elif col_name == "CVP":
-                if self._cvp_total_volume >= 1000.0:
-                    txt = f"{self._cvp_total_volume/1000.0:.1f}k"
-                else:
-                    txt = f"{self._cvp_total_volume:.0f}"
+                txt = _fmt_vol(self._cvp_total_volume)
             elif col_name == "SVP":
-                if self._svp_total_volume >= 1000.0:
-                    txt = f"{self._svp_total_volume/1000.0:.1f}k"
-                else:
-                    txt = f"{self._svp_total_volume:.0f}"
+                txt = _fmt_vol(self._svp_total_volume)
 
             fm = painter.fontMetrics()
             label_w = fm.horizontalAdvance(txt)

@@ -20,6 +20,18 @@ from .crypcodile_replay import _dispatch_record
 
 log = logging.getLogger(__name__)
 
+# Channels subscribed on every live connector (FIND-P217-07 parity with replay).
+# book_ticker → BBO, liquidation → Trade(is_liquidation=True) via _dispatch_record.
+LIVE_CHANNELS: tuple[str, ...] = (
+    "trade",
+    "book_snapshot",
+    "book_delta",
+    "book_ticker",
+    "liquidation",
+)
+# Alias for tests / external readers that look for CHANNELS.
+CHANNELS = LIVE_CHANNELS
+
 # ── Optional crypcodile imports ──────────────────────────────────────────────
 
 try:
@@ -96,18 +108,14 @@ class _LiveWorker(QObject):
             )
             return
 
+        # Point process CA store at certifi when system certs are empty/broken
+        # (common on python.org macOS installs). FLOWMAP_INSECURE_SSL=1 → no verify.
         try:
-            import aiohttp
-            if not getattr(aiohttp.ClientSession, '_patched_for_flowmap', False):
-                original_ws_connect = aiohttp.ClientSession.ws_connect
-                async def patched_ws_connect(self_session, url, *args, **kwargs):
-                    kwargs['ssl'] = False
-                    return await original_ws_connect(self_session, url, *args, **kwargs)
-                aiohttp.ClientSession.ws_connect = patched_ws_connect
-                aiohttp.ClientSession._patched_for_flowmap = True
-                log.info("Monkeypatched aiohttp.ClientSession.ws_connect to disable SSL verification.")
+            from ..ssl_bootstrap import bootstrap_ssl
+
+            bootstrap_ssl()
         except Exception as e:
-            log.warning(f"Failed to monkeypatch aiohttp: {e}")
+            log.warning("SSL bootstrap failed: %s", e)
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -133,6 +141,13 @@ class _LiveWorker(QObject):
                 )
 
     async def _run(self) -> None:
+        """Connect and run the live feed with bounded reconnect backoff.
+
+        FIND-P217-05: a single ``connector.run()`` failure used to end the
+        worker permanently.  While ``_running`` remains True we recreate the
+        connector/transport up to 5 times with 2s / 4s / 8s (then capped 8s)
+        sleeps between attempts.
+        """
         registry = InstrumentRegistry()
         sink = FlowMapLiveSink(self._on_record)
 
@@ -144,31 +159,77 @@ class _LiveWorker(QObject):
         elif self._exchange == "okx":
             kwargs["region"] = "global"
 
-        try:
-            connector = make_connector(
-                exchange=self._exchange,
-                symbols=[self._symbol_raw],
-                channels=["trade", "book_snapshot", "book_delta"],
-                out=sink,
-                registry=registry,
-                **kwargs,
-            )
-        except Exception as e:
-            self.sig_error.emit(f"Failed to create connector: {e}")
-            return
-
-        if connector.transport is None:
-            connector.transport = AiohttpWsTransport(connector.ws_url)
-
-        self._connector = connector
-        self.sig_connected.emit()
+        # Keep reconnecting while Start is active. Cap backoff so SSL/network
+        # blips recover without leaving the UI stuck on "No data" forever.
+        max_retries = 0  # 0 = unlimited while _running
+        backoffs = (1, 2, 4, 8, 15)
+        attempt = 0
 
         try:
-            await connector.run()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.sig_error.emit(f"Connector run error: {e}")
+            while self._running:
+                try:
+                    connector = make_connector(
+                        exchange=self._exchange,
+                        symbols=[self._symbol_raw],
+                        channels=list(LIVE_CHANNELS),
+                        out=sink,
+                        registry=registry,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    self.sig_error.emit(f"Failed to create connector: {e}")
+                    return
+
+                if connector.transport is None:
+                    try:
+                        from ..ssl_bootstrap import make_ws_transport
+
+                        connector.transport = make_ws_transport(
+                            connector.ws_url, AiohttpWsTransport
+                        )
+                    except Exception as transport_exc:
+                        log.warning(
+                            "SSL-aware transport failed (%s); falling back to default",
+                            transport_exc,
+                        )
+                        connector.transport = AiohttpWsTransport(connector.ws_url)
+
+                self._connector = connector
+                self.sig_connected.emit()
+
+                try:
+                    await connector.run()
+                    # Clean exit of run() — only reconnect if still requested.
+                    if not self._running:
+                        break
+                    raise RuntimeError("connector.run() returned while still running")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.sig_error.emit(f"Connector run error: {e}")
+                    attempt += 1
+                    if not self._running:
+                        break
+                    if max_retries and attempt > max_retries:
+                        log.warning(
+                            "Live connector giving up after %s failed attempt(s)",
+                            attempt,
+                        )
+                        break
+                    delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                    log.warning(
+                        "Live connector reconnect attempt %s in %ss: %s",
+                        attempt,
+                        delay,
+                        e,
+                    )
+                    try:
+                        if self._connector and self._connector.transport:
+                            await self._connector.transport.close()
+                    except Exception:
+                        pass
+                    self._connector = None
+                    await asyncio.sleep(delay)
         finally:
             self.sig_disconnected.emit()
 
@@ -254,8 +315,14 @@ class CrypcodileLiveProvider(DataProvider):
         if self._worker:
             self._worker.stop()
         if self._thread and self._thread.isRunning():
+            # Allow asyncio transport.close() to finish before killing the
+            # loop — otherwise "Task was destroyed but it is pending!" on
+            # live → replay / stop transitions.
             self._thread.quit()
-            self._thread.wait(2000)
+            if not self._thread.wait(5000):
+                log.warning("Live worker thread did not exit within 5s; terminating")
+                self._thread.terminate()
+                self._thread.wait(1000)
         self._worker = None
         self._thread = None
         if self._connected:

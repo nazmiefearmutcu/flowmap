@@ -63,23 +63,72 @@ class Colors:
 # ── Fonts ──
 class Fonts:
     MONO = "JetBrains Mono"
+    # Prefer Inter when installed; otherwise macOS/system sans (avoids Qt
+    # "missing font family Inter" alias cost on every launch).
     SANS = "Inter"
+    # Avoid CSS generics like "sans-serif" — Qt macOS logs missing-family "Sans-serif".
+    _SANS_FALLBACKS = ("SF Pro Text", "Helvetica Neue", "Arial")
+    _MONO_FALLBACKS = ("Menlo", "Courier New", "Monaco")
+    _resolved_sans: str | None = None
+    _resolved_mono: str | None = None
+
+    @classmethod
+    def _pick(cls, preferred: str, fallbacks: tuple[str, ...]) -> str:
+        try:
+            from PyQt6.QtGui import QFontDatabase
+
+            families = set(QFontDatabase.families())
+            if preferred in families:
+                return preferred
+            for name in fallbacks:
+                if name in families:
+                    return name
+        except Exception:
+            pass
+        return preferred
+
+    @classmethod
+    def resolved_sans(cls) -> str:
+        if cls._resolved_sans is None:
+            cls._resolved_sans = cls._pick(cls.SANS, cls._SANS_FALLBACKS)
+        return cls._resolved_sans
+
+    @classmethod
+    def resolved_mono(cls) -> str:
+        if cls._resolved_mono is None:
+            cls._resolved_mono = cls._pick(cls.MONO, cls._MONO_FALLBACKS)
+        return cls._resolved_mono
 
     @staticmethod
     def mono(size: int, bold: bool = False) -> QFont:
         w = QFont.Weight.Bold if bold else QFont.Weight.Normal
-        font = QFont(Fonts.MONO, size)
+        primary = Fonts.resolved_mono()
+        font = QFont(primary, size)
         font.setWeight(w)
-        font.setFamilies([Fonts.MONO, "Menlo", "Courier New", "monospace"])
+        # Only the resolved face — listing missing families makes Qt scan/warn.
+        font.setFamilies([primary])
         return font
 
     @staticmethod
     def sans(size: int, bold: bool = False) -> QFont:
         w = QFont.Weight.Bold if bold else QFont.Weight.Normal
-        font = QFont(Fonts.SANS, size)
+        primary = Fonts.resolved_sans()
+        font = QFont(primary, size)
         font.setWeight(w)
-        font.setFamilies([Fonts.SANS, "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"])
+        font.setFamilies([primary])
         return font
+
+
+def get_main_stylesheet() -> str:
+    """MAIN_STYLESHEET with a concrete sans font that exists on this host."""
+    sans = Fonts.resolved_sans()
+    # Single concrete face first — avoid listing missing Inter/Segoe UI so Qt
+    # does not burn time on font-family alias scans every launch.
+    family = f'"{sans}", "Helvetica Neue", Arial'
+    return MAIN_STYLESHEET.replace(
+        '"Inter", "Segoe UI", "Helvetica Neue", sans-serif',
+        family,
+    )
 
 
 # ── Main Stylesheet ──

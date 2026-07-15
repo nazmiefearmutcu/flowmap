@@ -216,7 +216,8 @@ class MarketPulse(QWidget):
         side : Side
             Aggressor side (BUY or SELL).
         """
-        delta = size if side == Side.BUY else -size
+        from flowmap.core import is_buy_side
+        delta = size if is_buy_side(side) else -size
         self._current_cvd += delta
         self._cvd_values.append(self._current_cvd)
         self._timestamps.append(time.time())
@@ -233,9 +234,10 @@ class MarketPulse(QWidget):
         if not trades:
             return
         now_ts = time.time()
+        from flowmap.core import is_buy_side
         for trade in trades:
             price, size, side = trade.price, trade.size, trade.side
-            delta = size if side == Side.BUY else -size
+            delta = size if is_buy_side(side) else -size
             self._current_cvd += delta
             self._cvd_values.append(self._current_cvd)
             self._timestamps.append(now_ts)
@@ -316,6 +318,46 @@ class MarketPulse(QWidget):
         )
         self._sweeps.append(sweep)
 
+    def _slice_cvd_history(
+        self,
+        scroll_offset: Optional[int] = None,
+        buffer_width: Optional[int] = None,
+    ) -> tuple[list[float], list[float], int]:
+        """
+        Slice engine CVD/timestamp history like the heatmap time window.
+
+        Parameters
+        ----------
+        scroll_offset :
+            Columns back from the live tip. When None, uses
+            ``heatmap._scroll_offset`` (0 if no heatmap).
+        buffer_width :
+            Window length in columns. When None, uses engine buffer width
+            (or local deque length without heatmap).
+
+        Returns
+        -------
+        (cvd_values, timestamps, bw)
+        """
+        if self._heatmap is not None:
+            engine = self._heatmap._engine
+            buf = engine.get_buffer()
+            bw = int(buffer_width) if buffer_width is not None else int(buf.shape[1])
+            history_len = len(engine._cvd_history)
+            if scroll_offset is None:
+                scroll_offset = int(getattr(self._heatmap, "_scroll_offset", 0) or 0)
+            scroll_offset = max(0, int(scroll_offset))
+            slice_end = max(0, history_len - scroll_offset)
+            slice_start = max(0, slice_end - bw)
+            cvd_values = list(itertools.islice(engine._cvd_history, slice_start, slice_end))
+            timestamps = list(itertools.islice(engine._timestamp_history, slice_start, slice_end))
+            return cvd_values, timestamps, bw
+
+        cvd_values = list(self._cvd_values)
+        timestamps = list(self._timestamps)
+        bw = int(buffer_width) if buffer_width is not None else len(cvd_values)
+        return cvd_values, timestamps, bw
+
     # ── Throttle ───────────────────────────────────────────────────
 
     def _on_throttle_tick(self) -> None:
@@ -373,25 +415,17 @@ class MarketPulse(QWidget):
         line_pos, line_neg, fill_pos, fill_neg, sweep_buy, sweep_sell = self._get_colors()
 
         # ── Get CVD history and engine buffer width ──
-        if self._heatmap is not None:
-            engine = self._heatmap._engine
-            buf = engine.get_buffer()
-            bw = buf.shape[1]
-            history_len = len(engine._cvd_history)
-            slice_start = max(0, history_len - bw)
-            cvd_values = list(itertools.islice(engine._cvd_history, slice_start, history_len))
-            timestamps = list(itertools.islice(engine._timestamp_history, slice_start, history_len))
-        else:
-            cvd_values = list(self._cvd_values)
-            timestamps = list(self._timestamps)
-            bw = len(cvd_values)
+        # Align with heatmap time window via optional scroll_offset
+        cvd_values, timestamps, bw = self._slice_cvd_history()
 
+        import math
+        valid_cvd = [v for v in cvd_values if not math.isnan(v)]
         n = len(cvd_values)
-        if n < 2 or bw <= 0:
+        if n < 2 or len(valid_cvd) < 2 or bw <= 0:
             painter.drawText(
                 plot_left, plot_top, plot_w, plot_h,
                 Qt.AlignmentFlag.AlignCenter,
-                "Waiting for data…",
+                "Waiting for trades…",
             )
             painter.end()
             return
@@ -403,15 +437,16 @@ class MarketPulse(QWidget):
             cvd_drawn = cvd_values[::step]
             # Ensure the last element is always included to make the live line look responsive
             if (n - 1) % step != 0:
-                cvd_drawn.append(cvd_values[-1])
+                cvd_drawn.append(next((v for v in reversed(cvd_values) if not math.isnan(v)), 0.0))
         else:
             cvd_drawn = cvd_values
 
         n_drawn = len(cvd_drawn)
 
         # Y range (compute based on the visible/drawn slice to stay tight and correct)
-        min_val = min(cvd_drawn)
-        max_val = max(cvd_drawn)
+        valid_drawn = [v for v in cvd_drawn if not math.isnan(v)]
+        min_val = min(valid_drawn) if valid_drawn else 0.0
+        max_val = max(valid_drawn) if valid_drawn else 0.0
         val_range = max_val - min_val
         if val_range < 0.01:
             val_range = 1.0
@@ -429,25 +464,28 @@ class MarketPulse(QWidget):
         y_scale = plot_h / val_range
         x_scale = plot_w / bw
 
+        # Group non-nan points into contiguous segments
+        segments = []
+        current_segment = []
+        
+        x_scale_fallback = plot_w / (n - 1) if n > 1 else 1.0
+        col_offset = bw - n if self._heatmap is not None else 0
         from PyQt6.QtCore import QPointF
-        if self._heatmap is not None:
-            col_offset = bw - n
-            q_points = [
-                QPointF(
-                    (col_offset + (j * step if j < n_drawn - 1 else n - 1)) * x_scale,
-                    plot_top + plot_h - (val - min_val) * y_scale
-                )
-                for j, val in enumerate(cvd_drawn)
-            ]
-        else:
-            x_scale_fallback = plot_w / (n - 1) if n > 1 else 1.0
-            q_points = [
-                QPointF(
-                    plot_left + (j * step if j < n_drawn - 1 else n - 1) * x_scale_fallback,
-                    plot_top + plot_h - (val - min_val) * y_scale
-                )
-                for j, val in enumerate(cvd_drawn)
-            ]
+        
+        for j, val in enumerate(cvd_drawn):
+            if not math.isnan(val):
+                if self._heatmap is not None:
+                    x = (col_offset + (j * step if j < n_drawn - 1 else n - 1)) * x_scale
+                else:
+                    x = plot_left + (j * step if j < n_drawn - 1 else n - 1) * x_scale_fallback
+                y = plot_top + plot_h - (val - min_val) * y_scale
+                current_segment.append(QPointF(x, y))
+            else:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+        if current_segment:
+            segments.append(current_segment)
 
         # ── Grid ──
         painter.setPen(QPen(self.GRID_COLOR, 1))
@@ -461,43 +499,51 @@ class MarketPulse(QWidget):
             painter.setPen(QPen(self.ZERO_LINE_COLOR, 1, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(plot_left, zero_y_plot), QPointF(plot_right, zero_y_plot))
 
-        # ── Draw filled area and lines using fast clipping instead of slow element-by-element Python loops ──
-        if len(q_points) >= 2:
-            # Create a closed polygon at the zero line
-            polygon_points = [QPointF(q_points[0].x(), zero_y_plot)] + q_points + [QPointF(q_points[-1].x(), zero_y_plot)]
-            poly = QPolygonF(polygon_points)
-            line_poly = QPolygonF(q_points)
+        # ── Draw filled areas and lines for each contiguous segment ──
+        for segment in segments:
+            if len(segment) >= 2:
+                # Create a closed polygon at the zero line
+                polygon_points = [QPointF(segment[0].x(), zero_y_plot)] + segment + [QPointF(segment[-1].x(), zero_y_plot)]
+                poly = QPolygonF(polygon_points)
+                line_poly = QPolygonF(segment)
 
-            # 1. Positive area (above zero line, y < zero_y_plot)
-            painter.save()
-            rect_top = QRectF(plot_left, plot_top, plot_w, max(0.0, zero_y_plot - plot_top))
-            painter.setClipRect(rect_top)
-            # Fill
-            painter.setBrush(QBrush(fill_pos))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawPolygon(poly)
-            # Line
-            painter.setPen(QPen(line_pos, 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPolyline(line_poly)
-            painter.restore()
+                # 1. Positive area (above zero line, y < zero_y_plot)
+                painter.save()
+                rect_top = QRectF(plot_left, plot_top, plot_w, max(0.0, zero_y_plot - plot_top))
+                painter.setClipRect(rect_top)
+                # Fill
+                painter.setBrush(QBrush(fill_pos))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawPolygon(poly)
+                # Line
+                painter.setPen(QPen(line_pos, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolyline(line_poly)
+                painter.restore()
 
-            # 2. Negative area (below zero line, y > zero_y_plot)
-            painter.save()
-            rect_bottom = QRectF(plot_left, zero_y_plot, plot_w, max(0.0, plot_bottom - zero_y_plot))
-            painter.setClipRect(rect_bottom)
-            # Fill
-            painter.setBrush(QBrush(fill_neg))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawPolygon(poly)
-            # Line
-            painter.setPen(QPen(line_neg, 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPolyline(line_poly)
-            painter.restore()
+                # 2. Negative area (below zero line, y > zero_y_plot)
+                painter.save()
+                rect_bottom = QRectF(plot_left, zero_y_plot, plot_w, max(0.0, plot_bottom - zero_y_plot))
+                painter.setClipRect(rect_bottom)
+                # Fill
+                painter.setBrush(QBrush(fill_neg))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawPolygon(poly)
+                # Line
+                painter.setPen(QPen(line_neg, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolyline(line_poly)
+                painter.restore()
+            elif len(segment) == 1:
+                # Draw a single point for single-trade segments
+                painter.save()
+                pt = segment[0]
+                painter.setPen(QPen(line_pos if pt.y() < zero_y_plot else line_neg, 3))
+                painter.drawPoint(pt)
+                painter.restore()
 
         # ── Latest CVD badge (in the axis column: w - 60 to w - 2) ──
-        latest = cvd_values[-1]
+        latest = next((v for v in reversed(cvd_values) if not math.isnan(v)), 0.0)
         latest_y = plot_top + plot_h - (latest - min_val) * y_scale
 
         # ── Sweep markers with fast bisect search and pulse oscillations ──
@@ -520,9 +566,17 @@ class MarketPulse(QWidget):
                         best_idx = check_idx
 
             if best_idx != -1 and min_diff < 1.5:  # must match within 1.5 seconds of data
-                drawn_idx = min(len(q_points) - 1, best_idx // step)
-                sx = q_points[drawn_idx].x()
-                sy = q_points[drawn_idx].y()
+                drawn_idx = min(n_drawn - 1, best_idx // step)
+                val = cvd_drawn[drawn_idx]
+                if not math.isnan(val):
+                    if self._heatmap is not None:
+                        sx = (col_offset + (drawn_idx * step if drawn_idx < n_drawn - 1 else n - 1)) * x_scale
+                    else:
+                        sx = plot_left + (drawn_idx * step if drawn_idx < n_drawn - 1 else n - 1) * x_scale_fallback
+                    sy = plot_top + plot_h - (val - min_val) * y_scale
+                else:
+                    sx = plot_right - 12
+                    sy = latest_y
             else:
                 # If too old or not found, only show near the right edge if we are in live mode (not scrolled)
                 is_live = True

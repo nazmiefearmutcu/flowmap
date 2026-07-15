@@ -5,6 +5,7 @@ Manages three data sources: Simulator | Crypcodile Replay | CCXT Live.
 """
 from __future__ import annotations
 from enum import Enum, auto
+import queue
 import time
 from typing import Optional, TYPE_CHECKING
 
@@ -27,6 +28,106 @@ except ImportError:
     CrypcodileReplayProvider = None  # type: ignore
     CrypcodileLiveProvider = None  # type: ignore
     HAS_CRYPCODILE_REPLAY = False
+
+
+# Bound for GUI market-data queue (FIND-P213-01). Producers use put_nowait +
+# drop-oldest so worker threads never block forever on a stalled GUI.
+QUEUE_MAXSIZE = 50_000
+
+# Per-tick GUI drain bounds (FIND-P214 residual): adapt to backlog, hard-cap burst.
+DRAIN_MIN = 1000
+DRAIN_MAX = 5000
+
+
+def adaptive_drain_limit(
+    qsize: int,
+    min_limit: int = DRAIN_MIN,
+    max_limit: int = DRAIN_MAX,
+) -> int:
+    """Per-tick drain cap from estimated queue depth.
+
+    ``limit = min(max_limit, max(min_limit, qsize + 1))`` so a quiet queue still
+    drains at least *min_limit* and a deep backlog can catch up up to *max_limit*.
+    """
+    try:
+        n = int(qsize)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 0:
+        n = 0
+    return min(max_limit, max(min_limit, n + 1))
+
+
+def parse_queue_item(item, current_session: int):
+    """Normalize a market-data queue item; drop stale session epochs.
+
+    Accepts both shapes for migration (FIND-P222-02):
+      * ``(msg_type, obj)`` — legacy 2-tuple, always accepted
+      * ``(msg_type, obj, session)`` — accepted only if ``session == current_session``
+
+    Returns
+    -------
+    (msg_type, obj) or None
+        ``None`` when the item is invalid or belongs to a previous session.
+    """
+    if not isinstance(item, tuple) or len(item) < 2:
+        return None
+    msg_type, obj = item[0], item[1]
+    if len(item) >= 3:
+        if item[2] != current_session:
+            return None
+    return msg_type, obj
+
+
+class DropOldestQueue(queue.Queue):
+    """Bounded queue; on full, drop the oldest item then enqueue (non-blocking).
+
+    Worker threads call put()/put_nowait(); neither blocks when the queue is full.
+    Dropped items are lost intentionally to cap RSS under burst/max-speed replay.
+    """
+
+    def put(self, item, block=True, timeout=None):
+        try:
+            super().put(item, block=False)
+            return
+        except queue.Full:
+            pass
+        # Drop oldest (best-effort under concurrent producers)
+        try:
+            super().get(block=False)
+        except queue.Empty:
+            pass
+        try:
+            super().put(item, block=False)
+        except queue.Full:
+            pass  # still full after concurrent puts — drop this item
+
+
+class SessionStampQueue:
+    """Proxy queue that stamps 2-tuples with a fixed producer session id.
+
+    Workers keep calling ``put(("snapshot", obj))``; items become
+    ``("snapshot", obj, stamp_session)`` so the GUI can discard messages from a
+    previous epoch after stop/switch (FIND-P222-02).
+
+    *stamp_session* is captured at start and left unchanged on stop so late puts
+    from a dying worker still carry the old epoch and are filtered out.
+    """
+
+    def __init__(self, underlying: queue.Queue, stamp_session: int = 0) -> None:
+        self._q = underlying
+        self.stamp_session = int(stamp_session)
+
+    def _stamp(self, item):
+        if isinstance(item, tuple) and len(item) == 2:
+            return (item[0], item[1], self.stamp_session)
+        return item
+
+    def put(self, item, block=True, timeout=None):
+        return self._q.put(self._stamp(item), block=block, timeout=timeout)
+
+    def put_nowait(self, item):
+        return self._q.put_nowait(self._stamp(item))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -78,20 +179,61 @@ class SourceManager(QObject):
         self._window = window
         self._toolbar = toolbar_mgr
 
-        import queue
-        self._queue = queue.Queue()
+        self._queue = DropOldestQueue(maxsize=QUEUE_MAXSIZE)
+        # Session epoch: GUI accepts only items stamped with current session_id
+        # (FIND-P222-02). Producers write via _producer_queue which stamps puts.
+        self._session_id: int = 0
+        self._producer_queue = SessionStampQueue(self._queue, stamp_session=0)
         self._data_source: DataSource = DataSource.CRYPCODILE_LIVE
         self._provider: Optional[object] = None
         self._symbol: str = "binance-spot:SOLUSDT"
         self._replay_speed: float = 20.0
-        self._replay_data_dir: str = "/Users/nazmi/data"
+        import os
+        _default_data = os.environ.get("FLOWMAP_DATA_DIR") or (
+            os.path.expanduser("~/data")
+            if os.path.isdir(os.path.expanduser("~/data"))
+            else "."
+        )
+        self._replay_data_dir: str = _default_data
         self._running_val: bool = False
         self._sim_speed: float = 2.0
         self._frame_count: int = 0
 
     @property
     def queue(self):
+        """Underlying consumer queue (GUI drain). Producers use producer_queue."""
         return self._queue
+
+    @property
+    def producer_queue(self):
+        """Session-stamping proxy for worker puts."""
+        return self._producer_queue
+
+    @property
+    def session_id(self) -> int:
+        return self._session_id
+
+    def bump_session(self) -> int:
+        """Invalidate in-flight producer messages (stop/switch). Returns new id."""
+        self._session_id += 1
+        return self._session_id
+
+    def capture_session_for_producers(self) -> int:
+        """Stamp subsequent producer puts with the current session_id (on start)."""
+        self._producer_queue.stamp_session = self._session_id
+        return self._session_id
+
+    def _drain_queue(self) -> None:
+        """Drop all pending market-data messages (best-effort)."""
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
+            except Exception:
+                break
 
     # ── Properties ──────────────────────────────────────────────────
 
@@ -101,11 +243,6 @@ class SourceManager(QObject):
 
     @_running.setter
     def _running(self, val: bool) -> None:
-        import traceback
-        import sys
-        print(f"[DEBUG_RUNNING] _running set to {val}", file=sys.stderr, flush=True)
-        traceback.print_stack(limit=5, file=sys.stderr)
-        sys.stderr.flush()
         self._running_val = val
 
     @property
@@ -181,6 +318,9 @@ class SourceManager(QObject):
         self._window._update_status_message()
 
     def stop_current(self) -> None:
+        # Bump epoch first so any late worker puts are stamped with the old
+        # capture and will be filtered by the GUI (FIND-P222-02).
+        self.bump_session()
         if self._provider is not None:
             try:
                 _disconnect_provider_signals(self, self._provider)
@@ -190,14 +330,9 @@ class SourceManager(QObject):
             except Exception:
                 pass
             self._provider = None
-        
-        # Drain the queue to prevent stale updates from leaking
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except Exception:
-                break
+
+        # Drain residual messages from previous session
+        self._drain_queue()
 
         self._running = False
         self._toolbar.set_start_stop_state(False)
@@ -216,10 +351,12 @@ class SourceManager(QObject):
             if not data_dir or data_dir == ".":
                 import os
                 possible_dirs = [
-                    "/Users/nazmi/data",
+                    os.environ.get("FLOWMAP_DATA_DIR") or "",
                     os.path.expanduser("~/data"),
+                    os.path.expanduser("~/crypcodile-data"),
                     ".",
                 ]
+                possible_dirs = [d for d in possible_dirs if d]
                 for d in possible_dirs:
                     exists = os.path.exists(d) and os.path.isdir(d)
                     syms = CrypcodileReplayProvider.load_symbols(d) if exists else []
@@ -253,7 +390,11 @@ class SourceManager(QObject):
                 # Sync symbol field in the toolbar UI
                 self._toolbar._symbol_edit.setText(self._symbol)
 
-            provider = CrypcodileReplayProvider(data_dir=data_dir, queue=self._queue, parent=self._window)
+            # Capture session so worker puts are stamped for this epoch
+            self.capture_session_for_producers()
+            provider = CrypcodileReplayProvider(
+                data_dir=data_dir, queue=self._producer_queue, parent=self._window
+            )
             provider.subscribe(self._symbol)
             provider.on_snapshot.connect(self._on_provider_snapshot)
             provider.on_update.connect(self._on_provider_update)
@@ -294,12 +435,14 @@ class SourceManager(QObject):
             # Sync symbol in editing field
             self._toolbar._symbol_edit.setText(self._symbol)
 
+            # Capture session so worker puts are stamped for this epoch
+            self.capture_session_for_producers()
             provider = CrypcodileLiveProvider(
                 exchange=exchange,
                 symbol_raw=symbol_raw,
                 market=market,
-                queue=self._queue,
-                parent=self._window
+                queue=self._producer_queue,
+                parent=self._window,
             )
             provider.on_snapshot.connect(self._on_provider_snapshot)
             provider.on_update.connect(self._on_provider_update)
@@ -346,6 +489,13 @@ class SourceManager(QObject):
         self._toolbar.set_start_stop_state(True)
         self._toolbar.update_visibility(self._data_source,
             self._provider is not None and getattr(self._provider, 'is_connected', False))
+        if hasattr(self._window, "heatmap") and self._window.heatmap is not None:
+            try:
+                self._window.heatmap.set_empty_message(
+                    "Connected — waiting for book data…"
+                )
+            except Exception:
+                pass
         self._window._update_status_message()
 
     def _on_provider_disconnected(self) -> None:
@@ -355,7 +505,24 @@ class SourceManager(QObject):
         self._window._update_status_message()
 
     def _on_provider_error(self, msg: str) -> None:
-        self._window._status.showMessage(f"Error: {msg}")
+        text = str(msg or "").strip() or "unknown error"
+        self._window._status.showMessage(f"Error: {text}")
+        # Surface feed failures on the main chart so empty heatmap is not silent.
+        if hasattr(self._window, "heatmap") and self._window.heatmap is not None:
+            short = text if len(text) <= 160 else text[:157] + "..."
+            # SSL failures are the common "stuck on no data" case on macOS.
+            if "CERTIFICATE" in text.upper() or "SSL" in text.upper():
+                hint = (
+                    f"Live feed SSL error — {short}\n"
+                    "Tip: restart after FlowMap SSL bootstrap, or set "
+                    "FLOWMAP_INSECURE_SSL=1 (dev only)."
+                )
+            else:
+                hint = f"Feed error — {short}"
+            try:
+                self._window.heatmap.set_empty_message(hint)
+            except Exception:
+                pass
 
     def _on_replay_progress(self, progress: float) -> None:
         if self._window._gui_frame % 30 == 0:
@@ -391,10 +558,11 @@ class SourceManager(QObject):
                 engine.ticks_per_row = 10
                 engine.config.bid_ref = 100.0
                 engine.config.ask_ref = 100.0
-            else: # BTCUSDT
+            else:  # BTCUSDT and peers
+                # $1-ish rows at 0.01 tick; refs seed adaptive normalizer until p90 warms up
                 engine.ticks_per_row = 100
-                engine.config.bid_ref = 5.0
-                engine.config.ask_ref = 5.0
+                engine.config.bid_ref = 50.0
+                engine.config.ask_ref = 50.0
             
             # Synchronize normalizers
             engine._bid_normalizer.global_ref = engine.config.bid_ref
@@ -409,6 +577,18 @@ class SourceManager(QObject):
         if not new_symbol:
             symbol_edit.setText(self._symbol)
             return
+        # returnPressed + editingFinished both fire on Enter; debounce.
+        if getattr(self, "_symbol_change_guard", False):
+            return
+        if new_symbol != self._symbol:
+            self._symbol_change_guard = True
+            try:
+                self._apply_symbol_change(new_symbol)
+            finally:
+                self._symbol_change_guard = False
+
+    def _apply_symbol_change(self, new_symbol: str) -> None:
+        """Body of symbol switch (called once under debounce guard)."""
         if new_symbol != self._symbol:
             was_running = self._running
             if was_running:
@@ -428,6 +608,35 @@ class SourceManager(QObject):
                 self._window.heatmap.reset()
             if hasattr(self._window, 'price_chart') and self._window.price_chart is not None:
                 self._window.price_chart.reset()
+            # Clear side-panel state from previous symbol (stale SOL icebergs
+            # were still visible after switching to BTC — endless-loop audit).
+            if hasattr(self._window, '_clear_iceberg_table'):
+                try:
+                    self._window._clear_iceberg_table()
+                except Exception:
+                    pass
+            if hasattr(self._window, '_llt_table') and self._window._llt_table is not None:
+                try:
+                    self._window._llt_table.setUpdatesEnabled(False)
+                    self._window._llt_table.setRowCount(0)
+                    self._window._llt_table.setUpdatesEnabled(True)
+                except Exception:
+                    pass
+            if hasattr(self._window, '_dom_ladder') and self._window._dom_ladder is not None:
+                try:
+                    self._window._dom_ladder.reset()
+                except Exception:
+                    pass
+            # Keep window chrome in sync with active symbol.
+            try:
+                base = "FlowMap"
+                if type(self._window).__name__ == "FlowmapWindow":
+                    base = f"Crypcodile Flowmap Visualizer - [{self._symbol}]"
+                    self._window.setWindowTitle(base)
+                else:
+                    self._window.setWindowTitle(f"FlowMap — {self._symbol}")
+            except Exception:
+                pass
 
             if self._data_source == DataSource.CRYPCODILE_REPLAY:
                 self._start_replay()
@@ -456,6 +665,9 @@ class SourceManager(QObject):
             if hasattr(self._provider, 'stop_replay'):
                 self._provider.stop_replay()
             self._provider.disconnect()
+            # Bump session + drain so restart doesn't apply stale events (FIND-P222)
+            self.bump_session()
+            self._drain_queue()
             self._running = False
             self._toolbar.set_start_stop_state(False)
             self._window._status.showMessage("Replay stopped")
@@ -477,6 +689,8 @@ class SourceManager(QObject):
                 end_ns = now_ns
 
             if hasattr(self._provider, 'start_replay'):
+                # Capture current session before worker starts putting
+                self.capture_session_for_producers()
                 print(f"[DEBUG] Calling provider.start_replay: symbol={self._symbol} start_ns={start_ns} end_ns={end_ns} speed={self._replay_speed}")
                 self._provider.start_replay(
                     symbol=self._symbol,
@@ -496,10 +710,22 @@ class SourceManager(QObject):
             return
         if self._running:
             self._provider.disconnect()
+            # Bump + drain so reconnect does not apply stale ticks (FIND-P222-02)
+            self.bump_session()
+            self._drain_queue()
             self._running = False
             self._toolbar.set_start_stop_state(False)
             self._window._status.showMessage("Live stopped")
         else:
+            # Capture session for this live run before worker starts
+            self.capture_session_for_producers()
+            if hasattr(self._window, "heatmap") and self._window.heatmap is not None:
+                try:
+                    self._window.heatmap.set_empty_message(
+                        "Connecting to live stream…"
+                    )
+                except Exception:
+                    pass
             self._provider.connect()
             # self._running will be set to True on provider connect (signals connected to _on_provider_connected)
             self._window._status.showMessage("Connecting to live stream...")

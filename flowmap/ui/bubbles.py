@@ -31,17 +31,17 @@ class Bubble:
         self.timestamp = timestamp
         self.tick_index = tick_index
 
-    @property
-    def age(self) -> float:
-        """Seconds since this bubble was last updated/created."""
-        return time.time() - self.timestamp
+    def age(self, now: float | None = None) -> float:
+        """Seconds since this bubble was last updated/created (event-domain when ``now`` provided)."""
+        ref = time.time() if now is None else now
+        return ref - self.timestamp
 
-    def is_alive(self, max_age: float = 2.5) -> bool:
-        return self.age < max_age
+    def is_alive(self, max_age: float = 2.5, now: float | None = None) -> bool:
+        return self.age(now) < max_age
 
-    def alpha(self, max_age: float = 2.5) -> int:
+    def alpha(self, max_age: float = 2.5, now: float | None = None) -> int:
         """Current alpha value (0-255) based on age."""
-        age = self.age
+        age = self.age(now)
         if age >= max_age:
             return 0
         # Cubic ease-out fade: stays bright then fades fast at end
@@ -56,10 +56,11 @@ class Bubble:
         max_age: float = 2.5,
         row_height: int = 4,
         scale_mult: float = 1.0,
-        ticks_per_row: int = 1
+        ticks_per_row: int = 1,
+        now: float | None = None,
     ) -> float:
         """Current radius — scaled by row height, ticks per row, and user scale multiplier."""
-        age = self.age
+        age = self.age(now)
         import math
         
         # Calculate dynamic max radius based on current size (total buy + sell volume)
@@ -98,17 +99,32 @@ class VolumeBubbles:
         self.min_radius: float = 2.5
         self.max_radius: float = 18.0
         self.size_multiplier: float = 1.0  # Controls the bubble size multiplier from toolbar/sidebar
+        # Event-domain clock advanced by trade timestamps (FIND-NUM-02)
+        self._event_clock: float = 0.0
 
-    def add_trade(self, price: float, size: float, side: Side, tick_index: int) -> None:
-        """Record a trade. Aggregates with existing bubbles at the same price and nearby tick index."""
-        now_ts = time.time()
+    def add_trade(
+        self,
+        price: float,
+        size: float,
+        side: Side,
+        tick_index: int,
+        timestamp: float | None = None,
+    ) -> None:
+        """Record a trade. Aggregates with existing bubbles at the same price and nearby tick index.
+
+        Prefer market/event ``timestamp`` when available so age follows event time (FIND-NUM-02).
+        """
+        now_ts = float(timestamp) if timestamp is not None and timestamp > 0 else time.time()
+        if now_ts > self._event_clock:
+            self._event_clock = now_ts
         # Look for a bubble at the same price and within a small tick index distance (e.g. 2 ticks)
         # to aggregate trades that occur in rapid succession
         merged = False
         for b in reversed(self._bubbles):
             if abs(b.price - price) < 0.000001 and abs(b.tick_index - tick_index) <= 2:
                 # Add to sizes
-                if side == Side.BUY:
+                from flowmap.core import is_buy_side
+                if is_buy_side(side):
                     b.buy_size += size
                 else:
                     b.sell_size += size
@@ -120,9 +136,10 @@ class VolumeBubbles:
                 break
         
         if not merged:
-            # Create a new bubble
-            buy_size = size if side == Side.BUY else 0.0
-            sell_size = size if side == Side.SELL else 0.0
+            # Create a new bubble (treat BID as buy aggressor, ASK as sell)
+            from flowmap.core import is_buy_side, is_sell_side
+            buy_size = size if is_buy_side(side) else 0.0
+            sell_size = size if is_sell_side(side) else (0.0 if is_buy_side(side) else size)
             self._bubbles.append(Bubble(price, buy_size, sell_size, now_ts, tick_index))
 
     def draw(
@@ -151,6 +168,7 @@ class VolumeBubbles:
         end_idx = bisect.bisect_right(bubbles_list, end_tick, key=lambda b: b.tick_index)
         visible_bubbles = bubbles_list[start_idx:end_idx]
 
+        clock = self._event_clock if self._event_clock > 0 else time.time()
         for bubble in visible_bubbles:
             # Persistent visual opacity on chart timeline
             alpha = 180
@@ -158,7 +176,8 @@ class VolumeBubbles:
             # Pass row_height, size_multiplier, and ticks_per_row for dynamic scaling
             radius = bubble.current_radius(
                 self.min_radius, self.max_radius, self._max_age,
-                row_height, self.size_multiplier, ticks_per_row
+                row_height, self.size_multiplier, ticks_per_row,
+                now=clock,
             )
             if radius < 0.5:
                 continue
