@@ -96,7 +96,7 @@ class Grid:
 
         self._prev_ts: int | None = None
         self._cur_idx: int | None = None  # current interval index; t0 = idx * dt_ns
-        self._count = 0  # finalized columns so far == next col_seq (never resets)
+        self._count = 0  # next col_seq (may exceed finalized count after a capped gap skip) (never resets)
 
         # Ring storage: float16 [ring_columns, 2, rows] + parallel metadata.
         rc = cfg.ring_columns
@@ -131,7 +131,7 @@ class Grid:
 
         Time-weighted: the PREVIOUS book state is integrated over
         ``(ts_ns - prev_ts)``. May finalize 0..k columns (k > 1 if ts jumps
-        intervals; skipped intervals emit columns with the persisted book
+        intervals; skipped intervals emit columns (capped at ring_columns; older intervals are skipped) with the persisted book
         integrated across them). Returns the finalized columns.
         """
         dt = self._cfg.dt_ns
