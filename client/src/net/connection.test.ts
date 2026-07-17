@@ -74,6 +74,33 @@ function buildHistoryResp(reqId: number, epoch = 3): Uint8Array {
   return frameBytes(MsgType.HISTORY_RESP, payload, 0);
 }
 
+/** A minimal L2 DEPTH_COL (n_rows=1) with a chosen epoch/col_seq/final flag. */
+function buildDepthCol(epoch: number, colSeq: number, final: boolean): Uint8Array {
+  const payload = new Uint8Array(24 + 4 + 4); // header + bid f32 + ask f32
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, epoch, true);
+  dv.setUint32(4, colSeq, true);
+  dv.setBigInt64(8, BigInt(colSeq) * 250_000_000n, true);
+  dv.setUint8(16, 0); // mode L2
+  dv.setUint8(17, final ? 1 : 0);
+  dv.setUint16(18, 0, true); // pad
+  dv.setUint32(20, 1, true); // n_rows
+  dv.setFloat32(24, 5.0, true); // bid[0]
+  dv.setFloat32(28, 4.0, true); // ask[0]
+  return frameBytes(MsgType.DEPTH_COL, payload, 0);
+}
+
+/** A BAR_COL for a chosen epoch/col_seq (no `final` flag exists on bars). */
+function buildBarCol(epoch: number, colSeq: number): Uint8Array {
+  const payload = new Uint8Array(16 + 32 + 40); // <IIq> + <dddd> + <ddddd>
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, epoch, true);
+  dv.setUint32(4, colSeq, true);
+  dv.setBigInt64(8, BigInt(colSeq) * 250_000_000n, true);
+  // OHLC + cumulative fields left zero — the test only checks routing.
+  return frameBytes(MsgType.BAR_COL, payload, 0);
+}
+
 // --- fakes --------------------------------------------------------------------
 
 /** Captures sent frames; lets a test drive open/close/message lifecycle. */
@@ -304,6 +331,49 @@ describe('Connection — message routing', () => {
     const forwarded = onStream.mock.calls[0][0];
     expect(forwarded.type).toBe(MsgType.DEPTH_COL);
     expect(forwarded.col_seq).toBe(41);
+  });
+
+  it('forwards every forming (final=false) depth re-send, then the finalizing one', () => {
+    const { sockets, clock, factory } = harness();
+    const onStream = vi.fn();
+    const conn = new Connection({
+      url: URL, wsFactory: factory,
+      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
+    });
+    conn.connect();
+    sockets[0].open();
+
+    // The live right edge: the same col_seq re-sent as a forming column several
+    // times (20 Hz), then finalized. All must reach the renderer, else the edge
+    // freezes / the final data is lost.
+    sockets[0].deliver(buildDepthCol(3, 42, false));
+    sockets[0].deliver(buildDepthCol(3, 42, false));
+    sockets[0].deliver(buildDepthCol(3, 42, false));
+    sockets[0].deliver(buildDepthCol(3, 42, true)); // finalize
+    expect(onStream).toHaveBeenCalledTimes(4);
+
+    // After finalizing col_seq 42, a reconnect snapshot re-sending it (final) is
+    // the only real duplicate — dropped.
+    sockets[0].deliver(buildDepthCol(3, 42, true));
+    expect(onStream).toHaveBeenCalledTimes(4);
+  });
+
+  it('never drops BarColumn even when it shares a just-finalized depth col_seq', () => {
+    const { sockets, clock, factory } = harness();
+    const onStream = vi.fn();
+    const conn = new Connection({
+      url: URL, wsFactory: factory,
+      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
+    });
+    conn.connect();
+    sockets[0].open();
+
+    // Server sends depth(final) then bar for the same col_seq; the bar must not
+    // be swallowed by the depth's dedup cursor (they are separate channels).
+    sockets[0].deliver(buildDepthCol(5, 10, true));
+    sockets[0].deliver(buildBarCol(5, 10));
+    expect(onStream).toHaveBeenCalledTimes(2);
+    expect(onStream.mock.calls[1][0].type).toBe(MsgType.BAR_COL);
   });
 });
 

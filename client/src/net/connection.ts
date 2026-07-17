@@ -368,8 +368,18 @@ export class Connection {
         this.resolveHistory(msg);
         return;
       case MsgType.DEPTH_COL:
+        // Forming columns (final=false) are re-sent every flush for the live
+        // right edge — always forward them. Only a FINALIZED depth column that
+        // we've already finalized (a reconnect snapshot re-send) is a true
+        // duplicate. The renderer keys tiles by (epoch, col_seq), so any
+        // forwarded re-delivery overwrites idempotently.
+        if (this.isDuplicateFinalizedDepth(msg)) return;
+        this.handlers.onStream?.(msg);
+        return;
       case MsgType.BAR_COL:
-        if (this.isDuplicateColumn(msg)) return;
+        // BarColumn has no `final` flag; forming + final + reconnect all resolve
+        // idempotently at the renderer (same (epoch, col_seq) series slot), and
+        // forming bars carry the live CVD/VWAP edge — forward unconditionally.
         this.handlers.onStream?.(msg);
         return;
       case MsgType.TRADE:
@@ -391,9 +401,10 @@ export class Connection {
     this.handlers.onHello?.(hello);
   }
 
-  private isDuplicateColumn(msg: DepthColumn | BarColumn): boolean {
+  private isDuplicateFinalizedDepth(msg: DepthColumn): boolean {
+    if (!msg.final) return false; // forming edge — never a duplicate
     const last = this.lastColSeq.get(msg.epoch);
-    if (last !== undefined && msg.col_seq <= last) return true;
+    if (last !== undefined && msg.col_seq <= last) return true; // reconnect re-send
     this.lastColSeq.set(msg.epoch, msg.col_seq);
     return false;
   }

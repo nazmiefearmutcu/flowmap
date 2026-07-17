@@ -102,6 +102,30 @@ interface JsonReviverContext {
  * `context.source`, Node 21+/modern browsers). This keeps nanosecond fields
  * (e.g. Marker.ts_ns) exact where a plain JSON.parse would silently round them.
  */
+/**
+ * Verify the runtime can preserve i64 nanosecond precision across the cold-JSON
+ * boundary — i.e. `JSON.parse`'s reviver exposes `context.source` (V8 source
+ * access, Chrome 114+/Safari 17.4+/Firefox 128+/Node 21+). Without it, large ns
+ * integer literals would silently round to the nearest double (a 112 ns error on
+ * a real timestamp). We fail LOUDLY at module load rather than corrupt timestamps
+ * silently. `encode.ts` already hard-requires `JSON.rawJSON`, so this keeps both
+ * directions consistent about the runtime floor.
+ */
+function assertLosslessJsonSupport(): void {
+  let sawSource = false;
+  JSON.parse('1', (_k, v, ctx?: JsonReviverContext) => {
+    if (ctx !== undefined && typeof ctx.source === 'string') sawSource = true;
+    return v;
+  });
+  if (!sawSource || typeof (JSON as { rawJSON?: unknown }).rawJSON !== 'function') {
+    throw new WireError(
+      'runtime lacks lossless-JSON support (JSON.parse source access / JSON.rawJSON); ' +
+        'nanosecond timestamps would be corrupted — a newer browser/runtime is required',
+    );
+  }
+}
+assertLosslessJsonSupport();
+
 function parseJsonLossless(text: string): unknown {
   const reviver = (_key: string, value: unknown, context?: JsonReviverContext): unknown => {
     if (
