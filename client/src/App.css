@@ -1,0 +1,75 @@
+:root {
+  --bg: #05070a;
+  --bg-bar: #0b0e14;
+  --border: #1a1f2b;
+  --fg: #e6edf3;
+  --fg-dim: #5b6675;
+  --accent: #1fb6a6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 40px;
+  padding: 0 14px;
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.topbar__brand {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--fg);
+}
+
+.topbar__symbol {
+  height: 24px;
+  width: 160px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: #10141c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.topbar__symbol:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+
+.gl-canvas {
+  flex: 1 1 auto;
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+}

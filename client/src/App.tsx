@@ -1,0 +1,43 @@
+import { useEffect, useRef } from 'react';
+
+/**
+ * M2 shell skeleton. A placeholder top bar over a full-viewport GL canvas.
+ * The WebGL2 renderer, protocol, and UI panels arrive in later tasks — this
+ * task only stands up the terminal-looking shell so the layout is in place.
+ */
+export function App() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Keep the canvas backing store matched to its CSS size (device pixels).
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const { clientWidth, clientHeight } = canvas;
+      canvas.width = Math.max(1, Math.round(clientWidth * dpr));
+      canvas.height = Math.max(1, Math.round(clientHeight * dpr));
+    };
+
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <span className="topbar__brand">FlowMap v2</span>
+        <input
+          className="topbar__symbol"
+          type="text"
+          placeholder="Symbol"
+          aria-label="Symbol"
+          disabled
+        />
+      </header>
+      <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+    </div>
+  );
+}
