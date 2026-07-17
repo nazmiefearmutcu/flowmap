@@ -11,12 +11,22 @@ clock); files land under pytest ``tmp_path``. The tests pin:
 6. multi-flush part files merge in order
 7. hourly file split on an hour boundary
 8. columns spanning two epochs -> both epochs in TailData
+9. restart continues part numbering (no collisions, merged load)
+10. orphaned epochs (pruned/deleted) -> load_tail None
+11. corrupt parquet skipped with a warning; all-corrupt -> None
+12. partial flush failure + retry writes no duplicate col_seqs
+13. ranged reads never open files outside the hour window
+14. retention exempts epochs files and the newest columns part per symbol
 """
 
+import logging
 import math
+from pathlib import Path
 
 import msgspec
 import numpy as np
+import polars as pl
+import pytest
 
 from flowmap_server.core.record import Recorder
 from flowmap_server.feeds.sim import SimFeed
@@ -278,3 +288,193 @@ def test_columns_from_two_epochs_bring_both_epochs(tmp_path):
                           now_ns=20 * DT_NS, limit_cols=5)
     assert tail2 is not None
     assert tail2.epochs == [epoch1]
+
+
+# 9. restart part-counter continuation ----------------------------------------
+
+
+def test_restart_continues_part_numbering(tmp_path):
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    cols = SimFeed.generate_history(seed=3, n_cols=20)
+
+    s1 = rec.open_session(MARKET, SYMBOL)
+    s1.record_epoch(EPOCH0)
+    for c in cols[:10]:
+        s1.record_column(c)
+    s1.flush()
+    s1.close()
+    parts1 = {int(f.stem.rsplit("-", 1)[-1]) for f in sym_dir(base).glob("*.parquet")}
+
+    s2 = rec.open_session(MARKET, SYMBOL)  # simulated restart, same symbol
+    for c in cols[10:]:
+        s2.record_column(c)
+    s2.flush()
+    s2.close()
+    parts2 = {int(f.stem.rsplit("-", 1)[-1]) for f in sym_dir(base).glob("*.parquet")} - parts1
+    assert parts2 and min(parts2) > max(parts1)  # continued past disk, no collision
+
+    tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=20 * DT_NS, limit_cols=20)
+    assert tail is not None
+    assert [c.col_seq for c in tail.columns] == list(range(20))
+
+
+# 10. orphaned epochs ---------------------------------------------------------
+
+
+def test_orphaned_epochs_return_none(tmp_path):
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    record_all(rec, SimFeed.generate_history(seed=3, n_cols=10))
+    (ep_file,) = sym_dir(base).glob("*-epochs-*.parquet")
+    ep_file.unlink()  # columns survive but cannot be placed on a price grid
+
+    assert rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=10 * DT_NS, limit_cols=10) is None
+
+
+# 11. corrupt parquet tolerance -----------------------------------------------
+
+
+def test_corrupt_parquet_skipped_with_warning(tmp_path, caplog):
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    cols = SimFeed.generate_history(seed=3, n_cols=20)
+    s = rec.open_session(MARKET, SYMBOL)
+    s.record_epoch(EPOCH0)
+    for c in cols[:10]:
+        s.record_column(c)
+    s.flush()
+    for c in cols[10:]:
+        s.record_column(c)
+    s.flush()
+    s.close()
+    parts = sorted(sym_dir(base).glob("*-columns-*.parquet"), key=lambda p: p.name)
+    assert len(parts) == 2
+    parts[1].write_bytes(b"not a parquet file")  # newest part truncated/corrupt
+
+    with caplog.at_level(logging.WARNING, logger="flowmap_server.core.record"):
+        tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                             now_ns=20 * DT_NS, limit_cols=20)
+    assert "skipping unreadable recording file" in caplog.text
+    assert tail is not None  # intact older part still served
+    assert [c.col_seq for c in tail.columns] == list(range(10))
+
+    parts[0].write_bytes(b"also garbage")  # every columns part unreadable
+    assert rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=20 * DT_NS, limit_cols=20) is None
+
+
+# 12. partial flush failure ---------------------------------------------------
+
+
+def test_partial_flush_failure_retry_no_duplicates(tmp_path, monkeypatch):
+    hour_ns = 3_600 * 10**9
+    start = hour_ns - 10 * DT_NS  # two hour-groups inside one flush
+    cols = SimFeed.generate_history(seed=3, n_cols=20, start_ns=start)
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    s = rec.open_session(MARKET, SYMBOL)
+    s.record_epoch(EPOCH0)
+    for c in cols:
+        s.record_column(c)
+
+    real = pl.DataFrame.write_parquet
+    calls = {"n": 0}
+
+    def flaky(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the second columns hour-group
+            raise OSError("disk full (injected)")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        s.flush()
+    s.flush()  # retry (only call 2 is flaky) must write ONLY the failed group
+    s.close()
+
+    col_files = sorted(sym_dir(base).glob("*-columns-*.parquet"), key=lambda p: p.name)
+    assert len(col_files) == 2  # the landed group was not rewritten
+    on_disk = [seq for f in col_files for seq in pl.read_parquet(f)["col_seq"].to_list()]
+    assert sorted(on_disk) == list(range(20))  # every col_seq exactly once
+    assert not list(sym_dir(base).glob("*.tmp"))  # failed temp cleaned up
+
+    tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=start + 20 * DT_NS, limit_cols=20)
+    assert tail is not None
+    assert [c.col_seq for c in tail.columns] == list(range(20))
+
+
+# 13. ranged reads ------------------------------------------------------------
+
+
+def test_ranged_reads_skip_out_of_window_files(tmp_path, monkeypatch):
+    hour_ns = 3_600 * 10**9
+    start = hour_ns - 10 * DT_NS
+    cols = SimFeed.generate_history(seed=3, n_cols=20, start_ns=start)
+    trades = [
+        Trade(ts_ns=start + DT_NS // 2, price=100.0, size=1.0,
+              side=SIDE_BUY, side_src=SIDE_SRC_EXCHANGE, venue="sim"),  # hour 00
+        Trade(ts_ns=hour_ns + DT_NS // 2, price=100.5, size=2.0,
+              side=SIDE_SELL, side_src=SIDE_SRC_EXCHANGE, venue="sim"),  # hour 01
+    ]
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    record_all(rec, cols, trades=trades)
+    for kind in ("columns", "trades"):  # sanity: both kinds split by hour
+        hours = {f.name[:11] for f in sym_dir(base).glob(f"*-{kind}-*.parquet")}
+        assert hours == {"19700101-00", "19700101-01"}, kind
+
+    opened: list[str] = []
+    real = pl.read_parquet
+
+    def counting(path, *a, **k):
+        opened.append(Path(path).name)
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(pl, "read_parquet", counting)
+    # Age cutoff exactly at the hour boundary: hour-00 files are out of range
+    # for both the columns cutoff and the trades window — never opened.
+    tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10 * DT_NS,
+                         now_ns=start + 20 * DT_NS, limit_cols=20)
+    assert tail is not None
+    assert [c.t0_ns for c in tail.columns] == [hour_ns + i * DT_NS for i in range(10)]
+    assert [t.ts_ns for t in tail.trades] == [hour_ns + DT_NS // 2]
+    assert opened
+    assert not any(n.startswith("19700101-00-columns") for n in opened)
+    assert not any(n.startswith("19700101-00-trades") for n in opened)
+
+
+# 14. retention exemptions ----------------------------------------------------
+
+
+def test_retention_exempts_epochs_and_newest_columns(tmp_path):
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    cols = SimFeed.generate_history(seed=3, n_cols=30)
+    s = rec.open_session(MARKET, SYMBOL)
+    s.record_epoch(EPOCH0)
+    for i in range(3):
+        for c in cols[i * 10:(i + 1) * 10]:
+            s.record_column(c)
+        s.flush()
+    s.close()
+    all_files = sorted(sym_dir(base).glob("*.parquet"), key=lambda p: p.name)
+    col_files = [f for f in all_files if "-columns-" in f.name]
+    (ep_file,) = [f for f in all_files if "-epochs-" in f.name]
+    assert len(col_files) == 3
+
+    # Cap 0 prunes everything eligible — but never epochs, never the newest
+    # columns part of the symbol.
+    pruned = Recorder(base, 0.0).enforce_retention()
+    assert pruned == col_files[:2]
+    survivors = sorted(sym_dir(base).glob("*.parquet"), key=lambda p: p.name)
+    assert survivors == [col_files[2], ep_file]
+
+    # The surviving tail is still fully loadable (no orphan pathology).
+    tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=30 * DT_NS, limit_cols=30)
+    assert tail is not None
+    assert [c.col_seq for c in tail.columns] == list(range(20, 30))
