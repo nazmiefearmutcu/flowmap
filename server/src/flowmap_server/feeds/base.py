@@ -23,7 +23,7 @@ from typing import Protocol, runtime_checkable
 import msgspec
 import numpy as np
 
-from flowmap_server.proto.events import Marker, Trade
+from flowmap_server.proto.events import BBO, Marker, Trade
 
 __all__ = ["BookState", "Feed", "FeedEvent"]
 
@@ -43,7 +43,7 @@ class BookState(msgspec.Struct):
     ask_sz: np.ndarray
 
 
-FeedEvent = BookState | Trade | Marker
+FeedEvent = BookState | Trade | Marker | BBO
 
 
 @runtime_checkable

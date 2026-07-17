@@ -202,10 +202,10 @@ class SimFeed:
         self._start_ns = start_ns
         self._realtime = realtime
         self.capability: dict[str, object] = {
-            "l2": True,
-            "trades": True,
+            "depth": "L2",
+            "tape": "tick",
             "trade_side": "exchange",
-            "liquidations": True,
+            "markers": ["liquidation", "gap"],
         }
 
     async def events(self) -> AsyncIterator[FeedEvent]:
@@ -259,8 +259,10 @@ class SimFeed:
 
         Same deterministic core as ``events()``, but one book state per
         interval boundary drives a private :class:`Grid` in a tight loop
-        (walls/structure identical; only the intra-interval size flicker is
-        skipped). ``start_ns`` should be a multiple of ``dt_ns`` so ``t0``
+        (walls/structure statistically identical — NOT the same trajectory
+        as ``events()`` for the same seed, since ``events()`` consumes extra
+        rng draws for sub-interval cadence; each path is individually
+        deterministic). ``start_ns`` should be a multiple of ``dt_ns`` so ``t0``
         lands on the boundaries. 10k columns at rows=2048 build in well
         under 2 s.
         """
