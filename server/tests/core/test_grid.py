@@ -10,6 +10,7 @@ import time
 import warnings
 
 import numpy as np
+import pytest
 
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.proto import wire
@@ -71,7 +72,6 @@ def test_no_reanchor_inside_band():
     assert Grid(CFG).maybe_reanchor(mid=106.0) is None
 
 def test_update_cost_under_2ms():
-    import time
     g = Grid(GridCfg(tick=0.5, tick_multiple=1, dt_ns=250_000_000, p0=0.0, rows=4096,
                      ring_columns=1024, mode=0))
     rng = np.random.default_rng(0)
@@ -454,8 +454,6 @@ def test_epoch_params_table_survives_reanchors():
 
 # --- preload (spec §8.1 rehydration; M1 T11) ---------------------------------
 
-import pytest
-
 DT = CFG.dt_ns
 
 
@@ -519,9 +517,14 @@ def test_preload_restores_multi_epoch_table_and_frame():
     cols = list(src.on_book(DT, *book(100.0, 5.0)))
     p_one = src.maybe_reanchor(mid=140.0)
     assert p_one is not None
-    src.on_book(2 * DT, *book(140.0, 5.0))
+    # Capture EVERY finalized column: a real re-anchored tail is contiguous
+    # (re-anchor never skips a col_seq), which preload now requires.
+    cols += src.on_book(2 * DT, *book(140.0, 5.0))
     cols += src.on_book(3 * DT, *book(140.0, 5.0))
     assert {c.epoch for c in cols} == {0, 1}
+    assert [c.col_seq for c in cols] == list(
+        range(cols[0].col_seq, cols[-1].col_seq + 1)
+    )
 
     g = Grid(CFG)
     g.preload(cols, [src.epoch_params_for(0), p_one])
@@ -562,6 +565,15 @@ def test_preload_validation():
     # Strictly increasing col_seq/t0.
     with pytest.raises(ValueError):
         Grid(CFG).preload([cols[1], cols[0]], [ep0])
+
+    # Non-contiguous (increasing but gapped) col_seq is rejected — history()
+    # would otherwise dereference the unwritten slot between them. This is the
+    # cross-restart hazard when a prior gap-cap skip leaves a hole; _apply_tail
+    # turns this ValueError into a §8.1 cold start rather than crashing attach.
+    src5, cols5 = _driven_cols(5)
+    ep0b = src5.epoch_params_for(0)
+    with pytest.raises(ValueError, match="contiguous"):
+        Grid(CFG).preload([cols5[0], cols5[2], cols5[3]], [ep0b])
 
     # Row-count mismatch.
     short = FinalizedColumn(epoch=0, col_seq=99, t0_ns=99 * DT,

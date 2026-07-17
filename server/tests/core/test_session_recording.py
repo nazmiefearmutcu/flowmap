@@ -25,7 +25,6 @@ import asyncio
 import logging
 
 import numpy as np
-import pytest
 
 import flowmap_server.core.session as session_mod
 from flowmap_server.core.grid import Grid, GridCfg
@@ -39,7 +38,7 @@ from flowmap_server.proto.events import (
     SIDE_BUY,
     SIDE_SRC_EXCHANGE,
     DepthColumn,
-    EpochParams,
+    EpochStart,
     Hello,
     Marker,
     Trade,
@@ -424,3 +423,94 @@ async def test_mismatched_tail_degrades_to_cold_start(tmp_path, caplog):
     assert sess._rec is not None  # recording itself is still on
     feed.q.put_nowait(None)
     await asyncio.wait_for(sess.run_task, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# f. live re-anchor is recorded and rehydrates as a multi-epoch tail
+
+
+async def test_live_reanchor_recorded_and_rehydrated(tmp_path):
+    """A re-anchor fired by the live feed (mid drifts out of band) records
+    epoch 1, and a fresh session rehydrates BOTH epochs — the exact path the
+    live Binance run exercised (epochs [0, 1])."""
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "rec-f", feed=feed, grid=Grid(_cfg()), recorder=root, timer=FakeTimer()
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+
+    # Band for _cfg() is ~[55.2, 144.8); mid 160 forces a re-anchor to epoch 1.
+    feed.q.put_nowait(BookState(0, *_book(100.0)))
+    feed.q.put_nowait(BookState(DT, *_book(100.0)))  # finalize epoch-0 col
+    feed.q.put_nowait(BookState(2 * DT, *_book(160.0)))  # triggers re-anchor
+    feed.q.put_nowait(BookState(3 * DT, *_book(160.0)))  # finalize epoch-1 col
+    feed.q.put_nowait(BookState(4 * DT, *_book(160.0)))
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    # Recorded tail spans both epochs.
+    now = 5 * DT
+    tail = root.load_tail(
+        MARKET, SYMBOL, max_age_ns=10**18, now_ns=now, limit_cols=100
+    )
+    assert tail is not None
+    assert {c.epoch for c in tail.columns} == {0, 1}
+    assert {e.epoch for e in tail.epochs} == {0, 1}
+
+    # A brand-new session rehydrates the multi-epoch tail: its snapshot
+    # announces EpochStart for BOTH epochs before their columns.
+    newest_t0 = tail.columns[-1].t0_ns
+    sess2 = Session(
+        "rec-f2",
+        feed=DrivenFeed(),
+        grid=Grid(_cfg()),
+        recorder=Recorder(tmp_path / "rec", 20.0),
+        wall_clock=lambda: newest_t0 + 10 * DT,
+        timer=FakeTimer(),
+    )
+    await sess2.start()
+    c2 = ClientTx()
+    snap = _decode_frames(sess2.attach(c2))
+    epochs_announced = [e.epoch for e in snap if isinstance(e, EpochStart)]
+    assert set(epochs_announced) == {0, 1}
+    snap_cols = [e for e in snap if isinstance(e, DepthColumn)]
+    assert {c.epoch for c in snap_cols} == {0, 1}
+    # Every column's epoch was announced before that column in the stream.
+    seen: set[int] = set()
+    for e in snap:
+        if isinstance(e, EpochStart):
+            seen.add(e.epoch)
+        elif isinstance(e, DepthColumn):
+            assert e.epoch in seen
+
+
+# ---------------------------------------------------------------------------
+# g. a feed-delivered Marker is recorded
+
+
+async def test_feed_marker_is_recorded(tmp_path):
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "rec-g", feed=feed, grid=Grid(_cfg()), recorder=root, timer=FakeTimer()
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+
+    feed.q.put_nowait(BookState(0, *_book(100.0)))
+    liq = Marker(ts_ns=DT // 2, kind="liquidation", price=100.0, size=3.0, text="")
+    feed.q.put_nowait(liq)
+    feed.q.put_nowait(BookState(DT, *_book(100.0)))
+    feed.q.put_nowait(BookState(2 * DT, *_book(100.0)))
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    tail = root.load_tail(
+        MARKET, SYMBOL, max_age_ns=10**18, now_ns=3 * DT, limit_cols=100
+    )
+    assert tail is not None
+    assert any(m.kind == "liquidation" and m.size == 3.0 for m in tail.markers)

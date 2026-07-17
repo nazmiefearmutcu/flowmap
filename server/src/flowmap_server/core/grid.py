@@ -194,8 +194,20 @@ class Grid:
         for c in columns:
             if len(c.bid) != cfg.rows or len(c.ask) != cfg.rows:
                 raise ValueError(f"column seq={c.col_seq} has wrong row count")
-            if prev is not None and (c.col_seq <= prev.col_seq or c.t0_ns <= prev.t0_ns):
-                raise ValueError("columns must be strictly increasing in col_seq and t0_ns")
+            if prev is not None:
+                # Contiguity — not just monotonicity — is load-bearing: history()
+                # and _column_from_ring assume every seq in [oldest, _count) was
+                # written. A gap-cap skip in a prior session can make load_tail
+                # return a non-contiguous window (e.g. ring_columns raised between
+                # runs); reject it so _apply_tail degrades to a cold start (§8.1)
+                # instead of crashing the first attach with a missing-bar assert.
+                if c.col_seq != prev.col_seq + 1:
+                    raise ValueError(
+                        f"columns must be contiguous to rehydrate; "
+                        f"seq {prev.col_seq} -> {c.col_seq}"
+                    )
+                if c.t0_ns <= prev.t0_ns:
+                    raise ValueError("columns must be strictly increasing in t0_ns")
             prev = c
 
         rc = cfg.ring_columns

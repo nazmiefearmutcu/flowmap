@@ -376,8 +376,13 @@ class Session:
         async with self._start_lock:
             if self.run_task is None or self.run_task.done():
                 if not self._boot_done:
-                    self._boot_done = True
+                    # Set the flag only AFTER boot returns: if the awaiting
+                    # subscriber is cancelled inside the load_tail executor
+                    # (CancelledError bypasses _boot's except Exception), the
+                    # flag stays False so a later subscriber retries boot
+                    # instead of running with recording/rehydration silently off.
                     await self._boot()
+                    self._boot_done = True
                 self.run_task = asyncio.create_task(
                     self.run(), name=f"session-{self.session_id}"
                 )
