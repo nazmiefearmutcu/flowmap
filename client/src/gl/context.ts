@@ -34,6 +34,13 @@ export interface InitGLOptions {
    * is needed and the backend lacks the extension.
    */
   requireColorBufferFloat?: boolean;
+  /**
+   * Keep the drawing buffer contents after compositing (default false). The
+   * live renderer (T5) draws only on dirty frames; without this the compositor
+   * clears the buffer between draws and idle frames would flash blank. Costs
+   * some driver-side optimization, so only the display path sets it.
+   */
+  preserveDrawingBuffer?: boolean;
 }
 
 const GL_ERROR_NAMES: Record<number, string> = {
@@ -72,6 +79,7 @@ export function initGL(canvas: HTMLCanvasElement, opts: InitGLOptions = {}): GLC
     // Depth/stencil are useless for a 2D heatmap; skip the allocation.
     depth: false,
     stencil: false,
+    preserveDrawingBuffer: opts.preserveDrawingBuffer ?? false,
   });
   if (!gl) {
     throw new Error('flowmap/gl: WebGL2 is not available in this browser/context');
