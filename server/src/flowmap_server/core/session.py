@@ -49,6 +49,7 @@ import numpy as np
 from flowmap_server.config import Config
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.feeds.base import BookState, Feed
+from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
 from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import events, wire
 
@@ -619,7 +620,13 @@ class SessionManager:
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
         if sub.market == "sim":
             return SimFeed(seed=42, dt_ns=self._cfg.dt_crypto_ns, start_ns=0)
-        raise NotImplementedError(f"market {sub.market!r} feeds land in T9+ (M1 has sim only)")
+        if sub.market in CRYPTO_MARKETS:
+            # "<exchange>-<market>" ("binance-usdm") or bare "<exchange>" ("okx").
+            exchange, _, market = sub.market.partition("-")
+            return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=market, cfg=self._cfg)
+        raise NotImplementedError(
+            f"market {sub.market!r} has no feed (M1: 'sim' + crypto {sorted(CRYPTO_MARKETS)})"
+        )
 
     def _grid_for(self, feed: Feed) -> Grid:
         rows = min(_SIM_ROWS, self._cfg.max_rows)
