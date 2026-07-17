@@ -288,11 +288,16 @@ class CryptoFeed:
         self._cfg = cfg
         self._connector_factory = connector_factory or self._default_connector
         self._transport_factory = transport_factory
+        # markers reflect the actual subscription (spec §7 honesty rule):
+        # liquidation streams exist only on futures markets.
+        markers = ["gap"]
+        if market in ("usdm", "coinm"):
+            markers.insert(0, "liquidation")
         self.capability: dict[str, object] = {
             "depth": "L2",
             "tape": "tick",
             "trade_side": "exchange",
-            "markers": ["liquidation", "gap"],
+            "markers": markers,
         }
 
     def _channels(self) -> list[str]:
