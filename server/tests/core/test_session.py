@@ -692,7 +692,7 @@ async def test_feed_crash_degraded_then_recovered_status():
     sess = Session("flaky", feed=FlakyFeed(), grid=grid, restart_backoff_base_s=0.001)
     client = ClientTx()
     sess.attach(client)
-    sess.start()
+    await sess.start()
     await asyncio.wait_for(sess.run_task, timeout=5)
 
     statuses = [m for m in _drain_all(client) if isinstance(m, Status)]
@@ -706,7 +706,7 @@ async def test_flapping_feed_keeps_escalating_backoff():
     feed = FlapperFeed()
     sess = Session("flap", feed=feed, grid=grid, restart_backoff_base_s=0.005)
     sess.attach(ClientTx())
-    sess.start()
+    await sess.start()
     while feed.calls < 5:
         await asyncio.sleep(0.005)
     sess.run_task.cancel()
@@ -727,7 +727,7 @@ async def test_feed_crash_is_logged_and_restarts(caplog):
     )
     sess.attach(ClientTx())
     with caplog.at_level(logging.ERROR, logger="flowmap_server.core.session"):
-        sess.start()
+        await sess.start()
         await asyncio.wait_for(sess.run_task, timeout=5)
     recs = [r for r in caplog.records if "feed crashed" in r.getMessage()]
     assert recs and recs[0].exc_info is not None  # full traceback attached
@@ -749,7 +749,7 @@ async def test_degraded_broadcast_failure_still_restarts(monkeypatch, caplog):
 
     monkeypatch.setattr(sess, "_set_feed_state", boom)
     with caplog.at_level(logging.ERROR, logger="flowmap_server.core.session"):
-        sess.start()
+        await sess.start()
         await asyncio.wait_for(sess.run_task, timeout=5)
     assert feed.calls == 2  # the failed Status broadcast did not kill the restart
     assert any("degraded Status" in r.getMessage() for r in caplog.records)
@@ -812,7 +812,7 @@ async def test_unknown_feed_event_warns_and_continues(caplog):
     )
     sess.attach(ClientTx())
     with caplog.at_level(logging.WARNING, logger="flowmap_server.core.session"):
-        sess.start()
+        await sess.start()
         await asyncio.wait_for(sess.run_task, timeout=5)  # no crash: ends normally
     assert any(
         "unknown feed event type str" in r.getMessage() for r in caplog.records

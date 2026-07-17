@@ -52,10 +52,11 @@ def port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-async def server(port):
-    """Real in-process uvicorn over create_app(Config); readiness-polled."""
-    cfg = Config(port=port)
+async def _boot_server(cfg: Config):
+    """Start a real in-process uvicorn over create_app(cfg); readiness-polled.
+
+    Returns ``(app, srv, task)``; the caller owns shutdown.
+    """
     app = create_app(cfg)
     srv = uvicorn.Server(
         uvicorn.Config(app, host=cfg.host, port=cfg.port, log_level="warning")
@@ -64,7 +65,7 @@ async def server(port):
     async with httpx.AsyncClient() as probe:
         for _ in range(200):
             try:
-                r = await probe.get(f"http://127.0.0.1:{port}/api/health")
+                r = await probe.get(f"http://127.0.0.1:{cfg.port}/api/health")
                 if r.status_code == 200:
                     break
             except httpx.TransportError:
@@ -73,7 +74,10 @@ async def server(port):
         else:
             task.cancel()
             raise RuntimeError("uvicorn did not become ready")
-    yield port
+    return app, srv, task
+
+
+async def _stop_server(app, srv, task) -> None:
     srv.should_exit = True
     await task
     # Feed tasks outlive disconnects by the 60 s teardown grace; cancel them
@@ -82,6 +86,24 @@ async def server(port):
         if session.run_task is not None:
             session.run_task.cancel()
     await asyncio.sleep(0)
+
+
+@pytest.fixture
+async def server(port, tmp_path):
+    """Default-config server; recordings isolated under tmp_path."""
+    cfg = Config(port=port, data_dir=str(tmp_path / "rec"))
+    app, srv, task = await _boot_server(cfg)
+    yield port
+    await _stop_server(app, srv, task)
+
+
+@pytest.fixture
+async def server_one_session(port, tmp_path):
+    """max_sessions=1 server for the 1013 session-limit refusal."""
+    cfg = Config(port=port, max_sessions=1, data_dir=str(tmp_path / "rec"))
+    app, srv, task = await _boot_server(cfg)
+    yield port
+    await _stop_server(app, srv, task)
 
 
 async def test_subscribe_live_stream_and_history(server):
@@ -175,6 +197,50 @@ async def test_subscribe_live_stream_and_history(server):
         assert 1 <= len(resp.depth_cols) <= 32
         assert len(resp.bar_cols) == len(resp.depth_cols)
         assert all(c.final for c in resp.depth_cols)
+
+
+async def test_session_limit_second_key_gets_status_and_1013(server_one_session):
+    """§6.3/§11: a Subscribe that would exceed max_sessions gets a refusal
+    Status{feed_state=degraded} and close code 1013 (try again later); the
+    existing session's client is unaffected."""
+    port = server_one_session
+    ws1 = await connect(f"ws://127.0.0.1:{port}/ws")
+    try:
+        await ws1.send(
+            wire.encode(events.Subscribe(market="sim", symbol="SIM-A", mode="live"))
+        )
+        # Wait for Hello: session 1 occupies the single slot.
+        async with asyncio.timeout(10):
+            while not any(
+                isinstance(e, events.Hello) for e in decode_frame(await ws1.recv())
+            ):
+                pass
+
+        statuses: list[events.Status] = []
+        async with connect(f"ws://127.0.0.1:{port}/ws") as ws2:
+            await ws2.send(
+                wire.encode(events.Subscribe(market="sim", symbol="SIM-B", mode="live"))
+            )
+            with pytest.raises(ConnectionClosed) as ei:
+                async with asyncio.timeout(5):
+                    while True:
+                        for ev in decode_frame(await ws2.recv()):
+                            if isinstance(ev, events.Status):
+                                statuses.append(ev)
+        assert ei.value.rcvd is not None
+        assert ei.value.rcvd.code == 1013
+        assert any(s.feed_state == "degraded" for s in statuses)
+
+        # The first client keeps streaming (its session was untouched).
+        got_col = False
+        async with asyncio.timeout(10):
+            while not got_col:
+                got_col = any(
+                    isinstance(e, events.DepthColumn)
+                    for e in decode_frame(await ws1.recv())
+                )
+    finally:
+        await ws1.close()
 
 
 async def test_malformed_frame_closes_1002(server):

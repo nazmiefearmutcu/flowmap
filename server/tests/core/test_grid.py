@@ -450,3 +450,128 @@ def test_epoch_params_table_survives_reanchors():
         pass
     else:  # pragma: no cover
         raise AssertionError("expected KeyError for an unknown epoch")
+
+
+# --- preload (spec §8.1 rehydration; M1 T11) ---------------------------------
+
+import pytest
+
+DT = CFG.dt_ns
+
+
+def _driven_cols(n=10, with_trades=True):
+    """Drive a source grid and harvest its finalized columns + epoch params."""
+    src = Grid(CFG)
+    src.on_book(0, *book(100.0, 5.0))
+    cols = []
+    for i in range(1, n + 1):
+        if with_trades:
+            src.on_trade(i * DT - 1, 100.0, 2.0, SIDE_BUY)
+        cols += src.on_book(i * DT, *book(100.0, 5.0))
+    return src, cols
+
+
+def test_preload_restores_ring_counters_and_continuity():
+    src, cols = _driven_cols(10)
+    g = Grid(CFG)
+    g.preload(cols, [src.epoch_params_for(0)])
+
+    hist = g.history(before_t_ns=10**18, n=100)
+    assert [c.col_seq for c in hist] == [c.col_seq for c in cols]
+    assert all(np.array_equal(a.bid, b.bid) and np.array_equal(a.ask, b.ask)
+               for a, b in zip(hist, cols))
+    assert [g.to_depth(c).final for c in hist] == [True] * len(cols)
+    assert g.oldest_retained_t0_ns() == cols[0].t0_ns
+    assert g.current_epoch_params().epoch == 0
+    assert g.current_partial() is None  # not anchored until live on_book
+
+    # Live continues: fresh wall-anchored t0, col_seq = last + 1 (no overlap;
+    # the seq<->t0 affinity intentionally breaks across the restart gap).
+    t_live = cols[-1].t0_ns + 100 * DT
+    g.on_book(t_live, *book(100.0, 5.0))
+    (col,) = g.on_book(t_live + DT, *book(100.0, 5.0))
+    assert col.col_seq == cols[-1].col_seq + 1
+    assert col.t0_ns == (t_live // DT) * DT > cols[-1].t0_ns
+    # Session-cumulative accumulators continue from the tail's last bar.
+    assert col.bar.cvd_cum == cols[-1].bar.cvd_cum
+    assert col.bar.vwap_den_cum == cols[-1].bar.vwap_den_cum
+    # prev_close carries across the restart (no-trade interval keeps o==c).
+    assert col.bar.o == cols[-1].bar.c
+    # history now interleaves tail + live chronologically.
+    hist2 = g.history(before_t_ns=10**18, n=100)
+    assert [c.col_seq for c in hist2] == [*(c.col_seq for c in cols), col.col_seq]
+
+
+def test_preload_mid_sequence_tail_never_serves_unwritten_slots():
+    """A tail that starts mid-sequence (limit_cols cut its head) must not make
+    history()/oldest_retained dereference never-written ring slots."""
+    src, cols = _driven_cols(10)
+    g = Grid(CFG)
+    g.preload(cols[6:], [src.epoch_params_for(0)])
+    hist = g.history(before_t_ns=10**18, n=100)
+    assert [c.col_seq for c in hist] == [c.col_seq for c in cols[6:]]
+    assert g.oldest_retained_t0_ns() == cols[6].t0_ns
+
+
+def test_preload_restores_multi_epoch_table_and_frame():
+    src = Grid(CFG)
+    src.on_book(0, *book(100.0, 5.0))
+    cols = list(src.on_book(DT, *book(100.0, 5.0)))
+    p_one = src.maybe_reanchor(mid=140.0)
+    assert p_one is not None
+    src.on_book(2 * DT, *book(140.0, 5.0))
+    cols += src.on_book(3 * DT, *book(140.0, 5.0))
+    assert {c.epoch for c in cols} == {0, 1}
+
+    g = Grid(CFG)
+    g.preload(cols, [src.epoch_params_for(0), p_one])
+    assert g.current_epoch_params() is not None
+    assert g.current_epoch_params().epoch == 1
+    assert g.current_epoch_params().p0 == p_one.p0  # live frame = tail's frame
+    assert g.epoch_params_for(0).p0 == CFG.p0  # old epoch retrievable
+    # A live re-anchor continues the epoch numbering past the tail's.
+    g.on_book(10 * DT, *book(140.0, 5.0))
+    p_two = g.maybe_reanchor(mid=190.0)
+    assert p_two is not None and p_two.epoch == 2
+
+
+def test_preload_validation():
+    src, cols = _driven_cols(3)
+    ep0 = src.epoch_params_for(0)
+
+    # Only valid on a virgin grid.
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    with pytest.raises(RuntimeError):
+        g.preload(cols, [ep0])
+    g2 = Grid(CFG)
+    g2.on_trade(5, 100.0, 1.0, SIDE_BUY)  # trade-anchored counts too
+    with pytest.raises(RuntimeError):
+        g2.preload(cols, [ep0])
+
+    # Every referenced epoch must be provided.
+    with pytest.raises(ValueError):
+        Grid(CFG).preload(cols, [])
+
+    # Epoch params must match the grid cfg (dt/rows/tick/multiple).
+    import msgspec
+    bad = msgspec.structs.replace(ep0, dt_ns=CFG.dt_ns * 2)
+    with pytest.raises(ValueError):
+        Grid(CFG).preload(cols, [bad])
+
+    # Strictly increasing col_seq/t0.
+    with pytest.raises(ValueError):
+        Grid(CFG).preload([cols[1], cols[0]], [ep0])
+
+    # Row-count mismatch.
+    short = FinalizedColumn(epoch=0, col_seq=99, t0_ns=99 * DT,
+                            bid=np.zeros(8, np.float16), ask=np.zeros(8, np.float16),
+                            bar=cols[0].bar)
+    with pytest.raises(ValueError):
+        Grid(CFG).preload([short], [ep0])
+
+    # Empty tail is a no-op, grid stays virgin.
+    g3 = Grid(CFG)
+    g3.preload([], [ep0])
+    assert g3.history(before_t_ns=10**18, n=10) == []
+    assert g3.oldest_retained_t0_ns() is None

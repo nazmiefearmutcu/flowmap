@@ -8,10 +8,12 @@ any ``FLOWMAP_HOST`` outside ``("127.0.0.1", "localhost")`` is rejected with
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 import msgspec
 
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+_DEFAULT_DATA_DIR = "~/.flowmap/recordings"
 
 
 class Config(msgspec.Struct, frozen=True):
@@ -23,6 +25,10 @@ class Config(msgspec.Struct, frozen=True):
     max_sessions: int = 4
     recording_gb_cap: float = 20.0
     recording_enabled: bool = True
+    # Recording root (spec §7 self-recording). from_env expands "~"; direct
+    # construction may carry an unexpanded default — consumers should
+    # ``Path(cfg.data_dir).expanduser()`` defensively.
+    data_dir: str = _DEFAULT_DATA_DIR
     alpaca_key: str | None = None
     alpaca_secret: str | None = None
     finnhub_key: str | None = None
@@ -55,6 +61,9 @@ class Config(msgspec.Struct, frozen=True):
             recording_gb_cap=float(env.get("FLOWMAP_RECORDING_GB_CAP", "20.0")),
             recording_enabled=env.get("FLOWMAP_RECORDING_ENABLED", "1")
             not in ("0", "false", "False"),
+            data_dir=str(
+                Path(env.get("FLOWMAP_DATA_DIR", _DEFAULT_DATA_DIR)).expanduser()
+            ),
             alpaca_key=alpaca_key,
             alpaca_secret=alpaca_secret,
             finnhub_key=env.get("FINNHUB_API_KEY"),

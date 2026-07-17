@@ -111,6 +111,11 @@ class Grid:
         self._prev_ts: int | None = None
         self._cur_idx: int | None = None  # current interval index; t0 = idx * dt_ns
         self._count = 0  # next col_seq (may exceed finalized count after a capped gap skip) (never resets)
+        # Oldest col_seq ever placed in the ring. 0 for a cold grid; a
+        # :meth:`preload` of a recorded tail that starts mid-sequence raises it
+        # so history()/oldest_retained_t0_ns() never dereference ring slots
+        # that were never written (their bars are None).
+        self._oldest_seq = 0
 
         # Ring storage: float16 [ring_columns, 2, rows] + parallel metadata.
         rc = cfg.ring_columns
@@ -130,6 +135,90 @@ class Grid:
         self._cvd_cum = 0.0
         self._vwap_num_cum = 0.0
         self._vwap_den_cum = 0.0
+
+    @property
+    def cfg(self) -> GridCfg:
+        """The immutable grid configuration (read-only)."""
+        return self._cfg
+
+    # -- rehydration (spec §8.1 restart) ---------------------------------------
+
+    def preload(self, columns: list[FinalizedColumn], epochs: list[EpochParams]) -> None:
+        """Seed the ring from a recorded tail (spec §8.1 restart rehydration).
+
+        Only valid on a *virgin* grid — before any :meth:`on_book` or
+        :meth:`on_trade` has anchored time (raises ``RuntimeError``
+        otherwise). Restores:
+
+        - the ring contents (densities, t0, epoch, col_seq, bars),
+        - the col_seq counter (``columns[-1].col_seq + 1`` is the next seq),
+        - the epoch params table, the current epoch and its ``p0`` frame,
+        - bar continuity (``prev_close`` and the session-cumulative
+          cvd/vwap accumulators continue from the tail's last bar).
+
+        ``columns`` must be chronological with strictly increasing
+        ``col_seq``/``t0_ns`` (what :meth:`Recorder.load_tail` returns) and
+        ``epochs`` must cover every epoch they reference; every epoch must
+        match this grid's ``(tick, tick_multiple, dt_ns, rows)`` (``p0`` is
+        per-epoch by design). ``ValueError`` otherwise.
+
+        Live columns then continue at ``col_seq = columns[-1].col_seq + 1``
+        with wall-anchored ``t0`` — the seq<->t0 affinity intentionally
+        breaks across the restart gap (there was no data; the session emits
+        a ``Marker{kind=gap}`` there). The ring stays seq-contiguous, which
+        is what :meth:`history` and the snapshot path rely on.
+        """
+        if self._cur_idx is not None or self._count != 0:
+            raise RuntimeError("preload is only valid before any on_book/on_trade")
+        if not columns:
+            return
+        cfg = self._cfg
+        ep_map = {e.epoch: e for e in epochs}
+        missing = {c.epoch for c in columns} - ep_map.keys()
+        if missing:
+            raise ValueError(f"columns reference unknown epochs {sorted(missing)}")
+        for e in ep_map.values():
+            if (e.tick, e.tick_multiple, e.dt_ns, e.rows) != (
+                cfg.tick,
+                cfg.tick_multiple,
+                cfg.dt_ns,
+                cfg.rows,
+            ):
+                raise ValueError(
+                    f"epoch {e.epoch} params {e} do not match grid cfg "
+                    f"(tick={cfg.tick}, tick_multiple={cfg.tick_multiple}, "
+                    f"dt_ns={cfg.dt_ns}, rows={cfg.rows})"
+                )
+        columns = columns[-cfg.ring_columns :]
+        prev = None
+        for c in columns:
+            if len(c.bid) != cfg.rows or len(c.ask) != cfg.rows:
+                raise ValueError(f"column seq={c.col_seq} has wrong row count")
+            if prev is not None and (c.col_seq <= prev.col_seq or c.t0_ns <= prev.t0_ns):
+                raise ValueError("columns must be strictly increasing in col_seq and t0_ns")
+            prev = c
+
+        rc = cfg.ring_columns
+        for c in columns:
+            i = c.col_seq % rc
+            self._ring[i, 0] = np.asarray(c.bid, dtype=np.float16)
+            self._ring[i, 1] = np.asarray(c.ask, dtype=np.float16)
+            self._ring_epoch[i] = c.epoch
+            self._ring_t0[i] = c.t0_ns
+            self._ring_seq[i] = c.col_seq
+            self._ring_bars[i] = c.bar
+        last = columns[-1]
+        self._count = last.col_seq + 1
+        self._oldest_seq = columns[0].col_seq
+        self._epoch = last.epoch
+        self._epoch_params.update(ep_map)
+        self._p0 = ep_map[last.epoch].p0
+        # Bar continuity across the restart.
+        self._prev_close = last.bar.c
+        self._o = self._h = self._l = self._c = last.bar.c
+        self._cvd_cum = last.bar.cvd_cum
+        self._vwap_num_cum = last.bar.vwap_num_cum
+        self._vwap_den_cum = last.bar.vwap_den_cum
 
     # -- book / density --------------------------------------------------------
 
@@ -470,7 +559,7 @@ class Grid:
         ``None`` when no column has been finalized yet. This is what
         ``HistoryResponse.oldest_available_t_ns`` reports for the RAM ring."""
         rc = self._cfg.ring_columns
-        retained = min(self._count, rc)
+        retained = min(self._count - self._oldest_seq, rc)
         if retained == 0:
             return None
         return int(self._ring_t0[(self._count - retained) % rc])
@@ -482,7 +571,7 @@ class Grid:
         Only columns still retained in the ring are served; arrays are copies.
         """
         rc = self._cfg.ring_columns
-        retained = min(self._count, rc)
+        retained = min(self._count - self._oldest_seq, rc)
         if retained == 0 or n <= 0:
             return []
         seqs = np.arange(self._count - retained, self._count, dtype=np.int64)

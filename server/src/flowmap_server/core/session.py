@@ -28,10 +28,26 @@ Design spec §6.3 and §11. The load-bearing semantics:
   after the last detach plus a 60 s grace (injectable timer). A crashed feed
   restarts with exponential backoff (cap 30 s) and reports transitions via
   ``Status``; other sessions are unaffected.
+- **Recording + rehydration** (§7/§8.1, M1 T11): a live-mode session with a
+  :class:`~flowmap_server.core.record.Recorder` self-records epoch params
+  (initial + every re-anchor), every finalized column, trades and markers.
+  Flush cadence: every ``REC_FLUSH_COLS`` recorded columns, when the feed
+  loop exits (server shutdown), and on teardown (``close()``); each flush is
+  followed by ``enforce_retention()``. Every recorder call is wrapped: on
+  exception it is logged and recording is disabled for the session —
+  recording failures NEVER kill the feed loop. Before the feed task starts,
+  ``start()`` rehydrates the grid ring from the newest recording via
+  ``load_tail`` (run in the default executor so the event loop — and other
+  sessions' attaches — never block on Parquet IO) and emits a
+  ``Marker{kind=gap}`` between the recorded tail and live; a stale/absent/
+  unusable tail means a cold start. Because rehydration only happens when a
+  Recorder is wired in (SessionManager default: none), deterministic sim
+  tests never depend on a previous run's recordings.
 
-Everything is asyncio, single-threaded, no locks: attach/snapshot/broadcast
-never await between observing grid state and enqueueing, so per-client frame
-order is exactly stream order.
+Everything is asyncio, single-threaded, no locks (the only lock serializes
+``start()``'s boot phase): attach/snapshot/broadcast never await between
+observing grid state and enqueueing, so per-client frame order is exactly
+stream order.
 """
 
 from __future__ import annotations
@@ -48,6 +64,7 @@ import numpy as np
 
 from flowmap_server.config import Config
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
+from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.feeds.base import BookState, Feed
 from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
 from flowmap_server.feeds.sim import SimFeed
@@ -66,6 +83,7 @@ LAG_DROP_NS = 2_000_000_000  # oldest-unsent column age that triggers drops
 NONCOL_CAP = 1000  # bounded non-column queue (latest-wins)
 GRACE_S = 60.0  # teardown grace after last detach
 FLUSH_INTERVAL_NS = 50_000_000  # right-edge partial re-send cadence (20 Hz)
+REC_FLUSH_COLS = 64  # recording flush cadence (finalized columns)
 _BACKOFF_CAP_S = 30.0
 # Backoff resets to base only once a restarted feed proves stable: it has run
 # for >=5 s (injectable clock) or delivered >=100 events, whichever first. A
@@ -305,6 +323,8 @@ class Session:
         flush_interval_ns: int = FLUSH_INTERVAL_NS,
         restart_backoff_base_s: float = 1.0,
         grace_s: float = GRACE_S,
+        recorder: Recorder | None = None,
+        wall_clock: Clock = time.time_ns,
     ) -> None:
         self.session_id = session_id
         self.run_task: asyncio.Task | None = None
@@ -317,6 +337,16 @@ class Session:
         self._backoff_base_s = restart_backoff_base_s
         self._backoff_s = restart_backoff_base_s
         self._grace_s = grace_s
+
+        # Recording (module docstring): the root opens the per-symbol writer
+        # and serves load_tail at boot; wall_clock (injectable) is the §8.1
+        # freshness reference — recorded timestamps are UTC wall ns.
+        self._recorder_root = recorder
+        self._wall_clock = wall_clock
+        self._rec: SessionRecorder | None = None
+        self._cols_since_flush = 0
+        self._boot_done = False
+        self._start_lock = asyncio.Lock()
 
         self._clients: set[ClientTx] = set()
         self._grace_handle: TimerHandle | None = None
@@ -333,10 +363,148 @@ class Session:
 
     # -- lifecycle -------------------------------------------------------------
 
-    def start(self) -> asyncio.Task:
-        if self.run_task is None or self.run_task.done():
-            self.run_task = asyncio.create_task(self.run(), name=f"session-{self.session_id}")
+    async def start(self) -> asyncio.Task:
+        """Boot (open recorder + rehydrate, once) and start the feed task.
+
+        Idempotent and restart-safe. The boot phase runs BEFORE the run task
+        exists and before the caller attaches, so the first subscriber's
+        snapshot already contains the rehydrated tail; the lock makes a
+        concurrent second subscriber wait for the same boot instead of racing
+        it. ``load_tail`` executes in the default executor — the event loop
+        (other sessions, other clients) never blocks on Parquet IO.
+        """
+        async with self._start_lock:
+            if self.run_task is None or self.run_task.done():
+                if not self._boot_done:
+                    self._boot_done = True
+                    await self._boot()
+                self.run_task = asyncio.create_task(
+                    self.run(), name=f"session-{self.session_id}"
+                )
         return self.run_task
+
+    async def _boot(self) -> None:
+        """Open the session recorder and rehydrate the grid (spec §8.1).
+
+        Any failure here is logged and degrades to a cold start with
+        recording disabled — never propagated into subscribe/attach.
+        """
+        if self._recorder_root is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            rec, tail = await loop.run_in_executor(None, self._boot_blocking)
+        except Exception:
+            logger.exception(
+                "recording boot failed; recording disabled for session %s",
+                self.session_id,
+            )
+            return
+        self._rec = rec
+        if tail is not None:
+            self._apply_tail(tail)
+        # Initial epoch params (cold: epoch 0; rehydrated: the tail's current
+        # epoch — duplicates across part files are fine, load dedups by key).
+        params = self._grid.current_epoch_params()
+        self._record(lambda r: r.record_epoch(params))
+
+    def _boot_blocking(self) -> tuple[SessionRecorder, TailData | None]:
+        """Blocking recorder IO for :meth:`_boot` (runs in the executor)."""
+        assert self._recorder_root is not None
+        market, symbol = self._feed.market, self._feed.symbol
+        rec = self._recorder_root.open_session(market, symbol)
+        cfg = self._grid.cfg
+        tail = self._recorder_root.load_tail(
+            market,
+            symbol,
+            max_age_ns=cfg.ring_columns * cfg.dt_ns,
+            now_ns=self._wall_clock(),
+            limit_cols=cfg.ring_columns,
+        )
+        return rec, tail
+
+    def _apply_tail(self, tail: TailData) -> None:
+        """Seed grid/tape/markers from a recorded tail + emit the gap Marker."""
+        try:
+            self._grid.preload(tail.columns, tail.epochs)
+        except Exception:
+            # Unusable tail (e.g. grid shape changed between runs): §8.1
+            # says cold start — never fail the session over it.
+            logger.exception(
+                "rehydration preload failed; cold start for session %s",
+                self.session_id,
+            )
+            return
+        self._tape.extend(tail.trades)
+        self._markers.extend(tail.markers)
+        dt = self._grid.cfg.dt_ns
+        end_ns = tail.newest_t0_ns + dt
+        # ts is the last ns of the recorded range so the marker is inside the
+        # snapshot's [first_t0, last_t0+dt) marker window from the very first
+        # attach (live columns only ever extend that window rightward).
+        gap = events.Marker(
+            ts_ns=end_ns - 1,
+            kind="gap",
+            text=f"restart: recording ends {end_ns}, live resumes ~{self._wall_clock()}",
+        )
+        self._markers.append(gap)
+        self._record(lambda r: r.record_marker(gap))
+        logger.info(
+            "session %s rehydrated %d columns (tail t0 %d..%d)",
+            self.session_id,
+            len(tail.columns),
+            tail.columns[0].t0_ns,
+            tail.newest_t0_ns,
+        )
+
+    # -- recording (all wrapped: failures disable recording, never the feed) ---
+
+    def _record(self, op: Callable[[SessionRecorder], None]) -> None:
+        if self._rec is None:
+            return
+        try:
+            op(self._rec)
+        except Exception:
+            logger.exception(
+                "recording failed; disabled for session %s", self.session_id
+            )
+            self._rec = None
+
+    def _flush_recording(self) -> None:
+        if self._rec is None:
+            return
+        try:
+            self._rec.flush()
+        except Exception:
+            logger.exception(
+                "recording flush failed; disabled for session %s", self.session_id
+            )
+            self._rec = None
+            return
+        self._cols_since_flush = 0
+        self._enforce_retention()
+
+    def _close_recording(self) -> None:
+        if self._rec is None:
+            return
+        rec, self._rec = self._rec, None
+        try:
+            rec.close()
+        except Exception:
+            logger.exception(
+                "recording close failed for session %s", self.session_id
+            )
+            return
+        self._enforce_retention()
+
+    def _enforce_retention(self) -> None:
+        # Retention failure is non-fatal: recording itself stays enabled.
+        if self._recorder_root is None:
+            return
+        try:
+            self._recorder_root.enforce_retention()
+        except Exception:
+            logger.exception("recording retention enforcement failed")
 
     def attach(self, client: ClientTx) -> list[bytes]:
         """Register a client and return the pre-encoded snapshot frames.
@@ -371,6 +539,10 @@ class Session:
         self._grace_handle = None
         if self.run_task is not None:
             self.run_task.cancel()
+        # Teardown closes the recorder (flushes any buffered rows). The
+        # cancelled run task's finally also flushes — idempotent, whichever
+        # runs second sees an already-cleared recorder.
+        self._close_recording()
         if self._on_teardown is not None:
             self._on_teardown()
 
@@ -379,22 +551,33 @@ class Session:
     async def run(self) -> None:
         """Drain ``feed.events()`` into the grid and broadcast; restart the
         feed with exponential backoff (cap 30 s) on crash, reporting
-        transitions via ``Status``. Returns when the feed ends normally."""
-        while True:
-            try:
-                await self._consume()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("feed crashed, restarting in %.1fs", self._backoff_s)
+        transitions via ``Status``. Returns when the feed ends normally.
+
+        On ANY exit (normal end, cancellation — teardown or server shutdown)
+        buffered recording rows are flushed so the on-disk tail stays fresh
+        for the next §8.1 rehydration. The flush is synchronous; it only
+        runs when the loop is stopping anyway."""
+        try:
+            while True:
                 try:
-                    self._set_feed_state("degraded")
+                    await self._consume()
+                    return
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    # A broadcast/encode failure must not kill the restart loop.
-                    logger.exception("failed to broadcast degraded Status")
-                await asyncio.sleep(self._backoff_s)
-                self._backoff_s = min(self._backoff_s * 2.0, _BACKOFF_CAP_S)
+                    logger.exception("feed crashed, restarting in %.1fs", self._backoff_s)
+                    try:
+                        self._set_feed_state("degraded")
+                    except Exception:
+                        # A broadcast/encode failure must not kill the restart loop.
+                        logger.exception("failed to broadcast degraded Status")
+                    await asyncio.sleep(self._backoff_s)
+                    self._backoff_s = min(self._backoff_s * 2.0, _BACKOFF_CAP_S)
+        finally:
+            if self._closed:
+                self._close_recording()
+            else:
+                self._flush_recording()
 
     async def _consume(self) -> None:
         async for ev in self._feed.events():
@@ -416,9 +599,11 @@ class Session:
             elif isinstance(ev, events.Trade):
                 self._grid.on_trade(ev.ts_ns, ev.price, ev.size, ev.side)
                 self._tape.append(ev)
+                self._record(lambda r, t=ev: r.record_trade(t))
                 self._broadcast(wire.encode(ev), col=False)
             elif isinstance(ev, events.Marker):
                 self._markers.append(ev)
+                self._record(lambda r, m=ev: r.record_marker(m))
                 self._broadcast(wire.encode(ev), col=False)
             elif isinstance(ev, events.BBO):
                 self._bbo = ev
@@ -440,6 +625,7 @@ class Session:
             if params is not None:
                 # EpochStart FIRST: broadcast before any new-epoch column
                 # message (the columns emitted above carry the old epoch).
+                self._record(lambda r, p=params: r.record_epoch(p))
                 start = events.EpochStart(epoch=params.epoch, epoch_params=params)
                 self._broadcast(wire.encode(start), col=False)
 
@@ -451,9 +637,13 @@ class Session:
             if self._last_col_seq is not None and col.col_seq <= self._last_col_seq:
                 continue
             self._last_col_seq = col.col_seq
+            self._record(lambda r, c=col: r.record_column(c))
+            self._cols_since_flush += 1
             self._broadcast(wire.encode(self._grid.to_depth(col)), col=True, t0_ns=col.t0_ns)
             self._broadcast(wire.encode(col.bar), col=True, t0_ns=col.t0_ns)
             emitted = True
+        if self._rec is not None and self._cols_since_flush >= REC_FLUSH_COLS:
+            self._flush_recording()
         if emitted:
             # Re-seed the right edge immediately after a column closes so the
             # client always has the in-progress column (plus the periodic
@@ -610,11 +800,18 @@ class SessionManager:
         clock: Clock = time.monotonic_ns,
         timer: Timer = _default_timer,
         feed_factory: Callable[[events.Subscribe], Feed] | None = None,
+        recorder: Recorder | None = None,
+        wall_clock: Clock = time.time_ns,
     ) -> None:
         self._cfg = cfg
         self._clock = clock
         self._timer = timer
         self._feed_factory = feed_factory or self._default_feed_factory
+        # Recording root shared by all live sessions (None: no recording and
+        # no rehydration — the default for deterministic tests; create_app
+        # wires one in from Config for the real server).
+        self._recorder = recorder
+        self._wall_clock = wall_clock
         self._sessions: dict[tuple[str, str, str, str | None], Session] = {}
 
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
@@ -664,13 +861,17 @@ class SessionManager:
                 grid=self._grid_for(feed),
                 clock=self._clock,
                 timer=self._timer,
+                # Live mode only: replay sessions (M3) never self-record.
+                recorder=self._recorder if sub.mode == "live" else None,
+                wall_clock=self._wall_clock,
             )
             session._on_teardown = self._make_remover(key, session)
             self._sessions[key] = session
         # Unconditional (start() is idempotent/restart-safe): a session whose
         # feed ended normally must not be handed out as a zombie — a new
-        # subscriber restarts the run task.
-        session.start()
+        # subscriber restarts the run task. First start boots (rehydrates)
+        # BEFORE attach below, so the snapshot includes the recorded tail.
+        await session.start()
         frames = session.attach(client)
         for frame in frames:
             # Snapshot frames ride the non-column path (no column lag-drops)
