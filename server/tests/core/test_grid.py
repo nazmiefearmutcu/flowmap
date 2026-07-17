@@ -1,0 +1,294 @@
+"""Density grid tests (design spec §8.1–8.2).
+
+The first six tests are the frozen contract from the M1 plan (verbatim).
+The rest pin down trade/bar semantics, ring wraparound, history slicing,
+partial emission, out-of-range handling, and re-anchor behavior.
+"""
+
+import math
+import time
+
+import numpy as np
+
+from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
+from flowmap_server.proto.events import (
+    SIDE_BUY,
+    SIDE_SELL,
+    SIDE_UNKNOWN,
+    BarColumn,
+    DepthColumn,
+)
+
+CFG = GridCfg(tick=0.5, tick_multiple=1, dt_ns=1_000_000_000, p0=90.0, rows=64,
+              ring_columns=128, mode=0)
+
+def book(mid, sz):  # 3-level symmetric book helper
+    px = np.array([mid-1.0, mid-0.5, mid], dtype=np.float64)
+    return (px - 0.0, np.full(3, sz), px + 0.5, np.full(3, sz))
+
+def test_time_weighted_identical_across_cadence():
+    g1, g2 = Grid(CFG), Grid(CFG)
+    t0 = 0
+    g1.on_book(t0, *book(100.0, 5.0))
+    g2.on_book(t0, *book(100.0, 5.0))
+    for i in range(1, 11):
+        g2.on_book(t0 + i * 100_000_000, *book(100.0, 5.0))
+    c1 = g1.on_book(t0 + 1_000_000_000, *book(100.0, 5.0))
+    c2 = g2.on_book(t0 + 1_000_000_000, *book(100.0, 5.0))
+    assert len(c1) == len(c2) == 1
+    assert np.array_equal(c1[0].bid, c2[0].bid) and np.array_equal(c1[0].ask, c2[0].ask)
+
+def test_half_interval_weighting():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 4.0))
+    g.on_book(500_000_000, *book(100.0, 8.0))
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 8.0))
+    row = round((100.0 - 0.5 - CFG.p0) / 0.5)
+    assert col.bid[row] == np.float16(6.0)
+
+def test_gap_emits_empty_columns():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    cols = g.on_book(3_500_000_000, *book(100.0, 5.0))
+    assert len(cols) == 3
+    assert cols[1].bid.max() > 0
+
+def test_reanchor_preserves_history():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_book(1_000_000_000, *book(100.0, 5.0))
+    before = g.history(before_t_ns=2_000_000_000, n=10)
+    params = g.maybe_reanchor(mid=140.0)
+    assert params is not None and params.epoch == 1
+    assert params.p0 % (CFG.tick * CFG.tick_multiple) == 0
+    after = g.history(before_t_ns=2_000_000_000, n=10)
+    assert all(np.array_equal(a.bid, b.bid) for a, b in zip(before, after))
+    assert after[0].epoch == 0
+
+def test_no_reanchor_inside_band():
+    assert Grid(CFG).maybe_reanchor(mid=106.0) is None
+
+def test_update_cost_under_2ms():
+    import time
+    g = Grid(GridCfg(tick=0.5, tick_multiple=1, dt_ns=250_000_000, p0=0.0, rows=4096,
+                     ring_columns=1024, mode=0))
+    rng = np.random.default_rng(0)
+    px = np.sort(rng.uniform(10, 2000, 2000)); sz = rng.uniform(0.1, 50, 2000)
+    g.on_book(0, px, sz, px + 0.5, sz)
+    t = time.perf_counter()
+    for i in range(1, 101):
+        g.on_book(i * 10_000_000, px, sz, px + 0.5, sz)
+    assert (time.perf_counter() - t) / 100 < 0.002
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): trade/bar semantics
+# --------------------------------------------------------------------------
+
+
+def test_trade_side_routing_and_cumulative_bars():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_trade(100_000_000, 100.0, 2.0, SIDE_BUY)
+    g.on_trade(200_000_000, 101.0, 1.0, SIDE_SELL)
+    g.on_trade(300_000_000, 102.0, 4.0, SIDE_UNKNOWN)
+    (col0,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    b0 = col0.bar
+    assert isinstance(b0, BarColumn)
+    assert (b0.epoch, b0.col_seq, b0.t0_ns) == (0, 0, 0)
+    assert (b0.o, b0.h, b0.l, b0.c) == (100.0, 102.0, 100.0, 102.0)
+    assert b0.vol_buy == 2.0 and b0.vol_sell == 1.0
+    # unknown side: neither vol bucket, cvd unchanged, but vwap sums count it
+    assert b0.cvd_cum == 1.0  # +2 (buy) - 1 (sell) + 0 (unknown)
+    assert b0.vwap_num_cum == 2 * 100.0 + 1 * 101.0 + 4 * 102.0  # 709.0
+    assert b0.vwap_den_cum == 7.0
+
+    # second interval: per-interval fields reset, *_cum fields carry forward
+    g.on_trade(1_500_000_000, 103.0, 3.0, SIDE_BUY)
+    (col1,) = g.on_book(2_000_000_000, *book(100.0, 5.0))
+    b1 = col1.bar
+    assert (b1.epoch, b1.col_seq, b1.t0_ns) == (0, 1, 1_000_000_000)
+    assert (b1.o, b1.h, b1.l, b1.c) == (103.0, 103.0, 103.0, 103.0)
+    assert b1.vol_buy == 3.0 and b1.vol_sell == 0.0
+    assert b1.cvd_cum == 4.0
+    assert b1.vwap_num_cum == 709.0 + 3 * 103.0  # 1018.0
+    assert b1.vwap_den_cum == 10.0
+
+
+def test_bar_carry_forward_close_on_empty_intervals():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_trade(100_000_000, 102.0, 1.0, SIDE_BUY)
+    cols = g.on_book(3_500_000_000, *book(100.0, 5.0))
+    assert len(cols) == 3
+    # intervals 1 and 2 have no trades: o=h=l=c=prev_close, zero volume
+    for col in cols[1:]:
+        b = col.bar
+        assert (b.o, b.h, b.l, b.c) == (102.0, 102.0, 102.0, 102.0)
+        assert b.vol_buy == 0.0 and b.vol_sell == 0.0
+        assert b.cvd_cum == 1.0 and b.vwap_den_cum == 1.0  # cums frozen, not reset
+
+
+def test_bar_nan_before_any_trade():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    b = col.bar
+    assert math.isnan(b.o) and math.isnan(b.h) and math.isnan(b.l) and math.isnan(b.c)
+    assert b.vol_buy == 0.0 and b.vol_sell == 0.0
+    assert b.cvd_cum == 0.0 and b.vwap_num_cum == 0.0 and b.vwap_den_cum == 0.0
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): ring wraparound + history slicing
+# --------------------------------------------------------------------------
+
+
+def test_ring_wraparound_retains_only_last_columns():
+    cfg = GridCfg(tick=0.5, tick_multiple=1, dt_ns=1_000_000_000, p0=90.0, rows=64,
+                  ring_columns=4, mode=0)
+    g = Grid(cfg)
+    g.on_book(0, *book(100.0, 5.0))
+    cols = g.on_book(10_000_000_000, *book(100.0, 5.0))
+    assert len(cols) == 10  # col_seq 0..9 finalized; ring keeps only the last 4
+    h = g.history(before_t_ns=10_000_000_000, n=100)
+    assert [c.col_seq for c in h] == [6, 7, 8, 9]
+    assert [c.t0_ns for c in h] == [6_000_000_000, 7_000_000_000,
+                                    8_000_000_000, 9_000_000_000]
+    row = round((99.5 - cfg.p0) / 0.5)
+    assert all(c.bid[row] == np.float16(5.0) for c in h)
+
+
+def test_history_before_t_is_exclusive_and_n_takes_most_recent():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_book(2_000_000_000, *book(100.0, 5.0))  # finalizes t0=0 and t0=1e9
+    # before_t_ns is EXCLUSIVE: a column with t0_ns == before_t_ns is not returned
+    h = g.history(before_t_ns=1_000_000_000, n=10)
+    assert [c.t0_ns for c in h] == [0]
+    h = g.history(before_t_ns=1_000_000_001, n=10)
+    assert [c.t0_ns for c in h] == [0, 1_000_000_000]  # chronological order
+    # n limits to the MOST RECENT n qualifying columns
+    h = g.history(before_t_ns=2_000_000_000, n=1)
+    assert [c.t0_ns for c in h] == [1_000_000_000]
+    assert g.history(before_t_ns=0, n=10) == []
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): partial emission
+# --------------------------------------------------------------------------
+
+
+def test_current_partial_depth_column():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 4.0))
+    g.on_book(500_000_000, *book(100.0, 8.0))
+    p = g.current_partial()
+    assert isinstance(p, DepthColumn)
+    assert p.final is False
+    assert p.mode == CFG.mode
+    assert (p.epoch, p.col_seq, p.t0_ns) == (0, 0, 0)
+    assert p.bid.dtype == np.float32 and p.ask.dtype == np.float32
+    row = round((99.5 - CFG.p0) / 0.5)
+    # partial integral so far: 4 sz * 0.5 s / 1.0 s dt = 2.0
+    assert p.bid[row] == np.float32(2.0)
+
+
+def test_bar_partial_reflects_current_interval():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_trade(100_000_000, 100.0, 2.0, SIDE_BUY)
+    b = g.bar_partial()
+    assert isinstance(b, BarColumn)
+    assert (b.epoch, b.col_seq, b.t0_ns) == (0, 0, 0)
+    assert (b.o, b.c) == (100.0, 100.0)
+    assert b.vol_buy == 2.0 and b.cvd_cum == 2.0
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): out-of-range levels
+# --------------------------------------------------------------------------
+
+
+def test_out_of_range_levels_dropped_without_error():
+    g = Grid(CFG)  # span [90.0, 122.0)
+    px = np.array([50.0, 100.0, 500.0])
+    sz = np.array([7.0, 3.0, 9.0])
+    g.on_book(0, px, sz, px, sz)
+    (col,) = g.on_book(1_000_000_000, px, sz, px, sz)
+    row = round((100.0 - CFG.p0) / 0.5)
+    assert col.bid[row] == np.float16(3.0)
+    assert float(col.bid.astype(np.float64).sum()) == 3.0  # 50 and 500 dropped
+    assert float(col.ask.astype(np.float64).sum()) == 3.0
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): re-anchor
+# --------------------------------------------------------------------------
+
+
+def test_reanchor_p0_value_and_params():
+    params = Grid(CFG).maybe_reanchor(mid=140.0)
+    assert params is not None
+    # span=32.0, p0_new = snap(140 - 16) = 124.0 on the tick*multiple grid
+    assert params.p0 == 124.0
+    assert params.epoch == 1
+    assert params.tick == CFG.tick
+    assert params.tick_multiple == CFG.tick_multiple
+    assert params.dt_ns == CFG.dt_ns
+    assert params.rows == CFG.rows
+
+
+def test_post_reanchor_columns_carry_new_epoch_and_new_mapping():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_book(1_000_000_000, *book(100.0, 5.0))
+    params = g.maybe_reanchor(mid=140.0)
+    assert params.p0 == 124.0
+    # old book (mid 100) is entirely below the new span [124, 156): empty column
+    (col1,) = g.on_book(2_000_000_000, *book(140.0, 5.0))
+    assert col1.epoch == 1 and col1.bar.epoch == 1
+    assert col1.bid.max() == 0
+    # new book maps against the new p0
+    (col2,) = g.on_book(3_000_000_000, *book(140.0, 5.0))
+    assert col2.epoch == 1
+    assert col2.col_seq == 2  # monotonic across epochs, never resets
+    bid_row = round((139.5 - 124.0) / 0.5)
+    ask_row = round((140.5 - 124.0) / 0.5)
+    assert col2.bid[bid_row] == np.float16(5.0)
+    assert col2.ask[ask_row] == np.float16(5.0)
+    assert col2.bar.t0_ns == col2.t0_ns
+
+
+def test_reanchor_shifts_partial_accumulator():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_book(1_500_000_000, *book(100.0, 5.0))  # interval 1 holds 0.5 s of book@5
+    params = g.maybe_reanchor(mid=94.0)  # below central band [94.8, 117.2)
+    assert params is not None and params.p0 == 78.0  # snap(94 - 16)
+    (col1,) = g.on_book(2_000_000_000, *book(100.0, 5.0))
+    assert col1.epoch == 1
+    row = round((99.5 - 78.0) / 0.5)
+    # 0.5 s accumulated pre-reanchor (shifted) + 0.5 s post = full 5.0
+    assert col1.bid[row] == np.float16(5.0)
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): duplicate-timestamp boundary idempotency
+# --------------------------------------------------------------------------
+
+
+def test_duplicate_ts_at_boundary_reemits_same_column():
+    """A zero-span on_book at exactly the just-finalized boundary re-returns
+    that column (same col_seq; ring/state untouched). Callers dedup by col_seq.
+    A zero-span call NOT at a boundary returns nothing."""
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    (a,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    (b,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    assert isinstance(a, FinalizedColumn) and isinstance(b, FinalizedColumn)
+    assert a.col_seq == b.col_seq == 0
+    assert np.array_equal(a.bid, b.bid)
+    assert g.history(before_t_ns=10**18, n=10)[0].col_seq == 0  # stored once
+    assert g.on_book(1_200_000_000, *book(100.0, 5.0)) == []
+    assert g.on_book(1_200_000_000, *book(100.0, 5.0)) == []
