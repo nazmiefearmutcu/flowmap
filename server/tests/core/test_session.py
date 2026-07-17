@@ -459,8 +459,9 @@ def test_handle_history_serves_cols_before_t():
     before = 150 * DT  # exclusive: col 150's own t0
     frame = sess.handle_history(HistoryRequest(req_id=9, before_t=before, n_cols=64))
     msgs = _decode_frame(frame)
-    assert len(msgs) == 1  # ONE HistoryResponse frame
-    resp = msgs[0]
+    # ONE frame: EpochStart announcements batched ahead of the response.
+    assert all(isinstance(m, EpochStart) for m in msgs[:-1])
+    resp = msgs[-1]
     assert isinstance(resp, HistoryResponse)
     assert resp.req_id == 9
     assert resp.epoch == 0
@@ -473,15 +474,95 @@ def test_handle_history_serves_cols_before_t():
 
     # n_cols is clamped to 256.
     resp2 = _decode_frame(sess.handle_history(
-        HistoryRequest(req_id=10, before_t=2**62, n_cols=500)))[0]
+        HistoryRequest(req_id=10, before_t=2**62, n_cols=500)))[-1]
     assert len(resp2.depth_cols) == 256
 
 
 # ---------------------------------------------------------------------------
-# bonus: feed crash -> degraded -> recovery
+# multi-epoch snapshot / history announcements
+
+
+def _reanchored_grid() -> Grid:
+    """20 epoch-0 columns, a re-anchor, then ~21 epoch-1 columns."""
+    grid = _mk_grid(rows=64, ring_columns=1024, p0=84.0)
+    _drive_synthetic(grid, 20)
+    params = grid.maybe_reanchor(115.0)  # outside central band [88.8, 111.2]
+    assert params is not None and params.epoch == 1
+    _drive_synthetic(grid, 20, start_idx=21)
+    return grid
+
+
+def test_snapshot_announces_all_epochs_present():
+    grid = _reanchored_grid()
+    sess = Session("epochs", feed=IdleFeed(), grid=grid)
+    frames = sess.attach(ClientTx())
+    flat = [m for f in frames for m in _decode_frame(f)]
+
+    hello = flat[0]
+    assert isinstance(hello, Hello) and hello.grid_epoch == 1
+
+    starts = [m for m in flat if isinstance(m, EpochStart)]
+    assert [s.epoch for s in starts] == [0, 1]  # every epoch, ascending
+    for s in starts:
+        assert s.epoch_params == grid.epoch_params_for(s.epoch)
+
+    # Client-side reconstruction possible: each EpochStart precedes the
+    # first column of its epoch, and both epochs really appear as columns.
+    col_epochs = {m.epoch for m in flat if isinstance(m, DepthColumn)}
+    assert col_epochs == {0, 1}
+    for e in (0, 1):
+        i_start = next(
+            i for i, m in enumerate(flat) if isinstance(m, EpochStart) and m.epoch == e
+        )
+        i_col = next(
+            i for i, m in enumerate(flat) if isinstance(m, DepthColumn) and m.epoch == e
+        )
+        assert i_start < i_col
+
+
+def test_handle_history_announces_epochs_in_range():
+    grid = _reanchored_grid()
+    sess = Session("hist-epochs", feed=IdleFeed(), grid=grid)
+    frame = sess.handle_history(HistoryRequest(req_id=1, before_t=2**62, n_cols=256))
+    msgs = _decode_frame(frame)
+    assert [type(m) for m in msgs] == [EpochStart, EpochStart, HistoryResponse]
+    assert msgs[0].epoch == 0 and msgs[1].epoch == 1
+    assert msgs[0].epoch_params == grid.epoch_params_for(0)
+    assert msgs[1].epoch_params == grid.epoch_params_for(1)
+    assert {d.epoch for d in msgs[2].depth_cols} == {0, 1}
+
+
+# ---------------------------------------------------------------------------
+# protected snapshot frames
+
+
+async def test_snapshot_frames_survive_noncolumn_cap_flood():
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=64, dt_crypto_ns=DT)
+    mgr = SessionManager(cfg, timer=FakeTimer(), feed_factory=lambda sub: IdleFeed())
+    client = ClientTx(clock=FakeClock())
+    sub = Subscribe(market="sim", symbol="IDLE", mode="live", source=None, start_t=None)
+    sess = await mgr.subscribe(sub, client)
+
+    for i in range(1001):  # one over the cap: eviction must hit BBOs, not Hello
+        frame = wire.encode(BBO(ts_ns=i, bid_px=1.0, bid_sz=1.0, ask_px=2.0, ask_sz=1.0))
+        client.offer(frame, col_msg=False, t0_ns=None)
+
+    msgs = _drain_all(client)
+    assert isinstance(msgs[0], Hello)  # snapshot frame still first out of drain
+    bbos = [m for m in msgs if isinstance(m, BBO)]
+    assert len(bbos) == 1000 and bbos[0].ts_ns == 1  # oldest unprotected evicted
+
+    sess.run_task.cancel()
+    await asyncio.gather(sess.run_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# feed crash -> degraded -> recovery, and backoff reset guard
 
 
 class FlakyFeed:
+    """Crashes after one event, then delivers a stable run (>=100 events)."""
+
     market = "sim"
     symbol = "FLAKY"
     capability: dict[str, object] = {"depth": "L2"}
@@ -494,12 +575,28 @@ class FlakyFeed:
         if self.calls == 1:
             yield BookState(0, *_BOOK)
             raise RuntimeError("boom")
-        for i in range(1, 5):
+        for i in range(1, 102):
             yield BookState(i * DT, *_BOOK)
 
 
+class FlapperFeed:
+    """Yields exactly one event then crashes, every restart, forever."""
+
+    market = "sim"
+    symbol = "FLAP"
+    capability: dict[str, object] = {"depth": "L2"}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def events(self):
+        self.calls += 1
+        yield BookState(self.calls * DT, *_BOOK)
+        raise RuntimeError("flap")
+
+
 async def test_feed_crash_degraded_then_recovered_status():
-    grid = _mk_grid(rows=64, ring_columns=128, p0=84.0)
+    grid = _mk_grid(rows=64, ring_columns=256, p0=84.0)
     sess = Session("flaky", feed=FlakyFeed(), grid=grid, restart_backoff_base_s=0.001)
     client = ClientTx()
     sess.attach(client)
@@ -508,3 +605,21 @@ async def test_feed_crash_degraded_then_recovered_status():
 
     statuses = [m for m in _drain_all(client) if isinstance(m, Status)]
     assert [s.feed_state for s in statuses] == ["degraded", "live"]
+    # The restarted feed ran >=100 events: backoff reset to base.
+    assert sess._backoff_s == 0.001
+
+
+async def test_flapping_feed_keeps_escalating_backoff():
+    grid = _mk_grid(rows=64, ring_columns=128, p0=84.0)
+    feed = FlapperFeed()
+    sess = Session("flap", feed=feed, grid=grid, restart_backoff_base_s=0.005)
+    sess.attach(ClientTx())
+    sess.start()
+    while feed.calls < 5:
+        await asyncio.sleep(0.005)
+    sess.run_task.cancel()
+    await asyncio.gather(sess.run_task, return_exceptions=True)
+
+    # Every restart yielded an event, but never reached stability (>=5 s or
+    # >=100 events) — backoff must keep escalating, never reset to base.
+    assert sess._backoff_s >= 0.005 * 2**4

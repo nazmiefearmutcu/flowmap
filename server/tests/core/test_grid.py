@@ -423,3 +423,30 @@ def test_duplicate_ts_at_boundary_reemits_same_column():
     assert g.history(before_t_ns=10**18, n=10)[0].col_seq == 0  # stored once
     assert g.on_book(1_200_000_000, *book(100.0, 5.0)) == []
     assert g.on_book(1_200_000_000, *book(100.0, 5.0)) == []
+
+
+def test_epoch_params_table_survives_reanchors():
+    """Per-epoch params table (spec §6.3): epoch 0 present at construction,
+    every re-anchor recorded, old epochs retrievable, current matches."""
+    g = Grid(CFG)
+    p_zero = g.epoch_params_for(0)
+    assert p_zero.epoch == 0 and p_zero.p0 == CFG.p0 and p_zero.dt_ns == CFG.dt_ns
+    assert g.current_epoch_params() is p_zero
+
+    g.on_book(0, *book(100.0, 5.0))
+    p_one = g.maybe_reanchor(mid=140.0)
+    assert p_one is not None and p_one.epoch == 1
+    p_two = g.maybe_reanchor(mid=190.0)
+    assert p_two is not None and p_two.epoch == 2
+
+    assert g.epoch_params_for(0) is p_zero  # old epochs stay retrievable
+    assert g.epoch_params_for(1) is p_one
+    assert g.epoch_params_for(2) is p_two
+    assert g.current_epoch_params() is p_two
+
+    try:
+        g.epoch_params_for(99)
+    except KeyError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected KeyError for an unknown epoch")

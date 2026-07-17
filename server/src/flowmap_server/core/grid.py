@@ -84,6 +84,20 @@ class Grid:
         self._step = cfg.tick * cfg.tick_multiple
         self._p0 = cfg.p0
         self._epoch = 0
+        # Per-epoch params table (spec §6.3): snapshot/history must be able to
+        # announce EVERY epoch still present in the ring, not just the current
+        # one. Populated here (epoch 0) and on every re-anchor; kept for the
+        # session lifetime (re-anchors are rare, entries are tiny).
+        self._epoch_params: dict[int, EpochParams] = {
+            0: EpochParams(
+                epoch=0,
+                tick=cfg.tick,
+                tick_multiple=cfg.tick_multiple,
+                dt_ns=cfg.dt_ns,
+                p0=cfg.p0,
+                rows=cfg.rows,
+            )
+        }
 
         rows = cfg.rows
         # Current-interval accumulator and dense book state, [2, rows] f64
@@ -408,7 +422,7 @@ class Grid:
             bid_px, bid_sz, ask_px, ask_sz = self._last_book
             self._state[0] = self._map_levels(bid_px, bid_sz)
             self._state[1] = self._map_levels(ask_px, ask_sz)
-        return EpochParams(
+        params = EpochParams(
             epoch=self._epoch,
             tick=cfg.tick,
             tick_multiple=cfg.tick_multiple,
@@ -416,6 +430,19 @@ class Grid:
             p0=new_p0,
             rows=cfg.rows,
         )
+        self._epoch_params[self._epoch] = params
+        return params
+
+    def epoch_params_for(self, epoch: int) -> EpochParams:
+        """Params of any epoch this grid has lived through.
+
+        Raises ``KeyError`` for epochs the grid never entered.
+        """
+        return self._epoch_params[epoch]
+
+    def current_epoch_params(self) -> EpochParams:
+        """Params of the live (current) epoch."""
+        return self._epoch_params[self._epoch]
 
     def _shift_rows(self, a: np.ndarray, offset: int) -> None:
         """In-place row shift along the last axis: ``new[r] = old[r + offset]``.

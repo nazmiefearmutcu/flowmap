@@ -5,11 +5,13 @@ Design spec §6.3 and §11. The load-bearing semantics:
 - A :class:`Session` is one per ``(market, symbol, mode[, source])`` key. It
   owns the feed task and the :class:`~flowmap_server.core.grid.Grid`; send
   queues, lag and drop state are strictly per-client (:class:`ClientTx`).
-- **Snapshot on attach** (§6.3): ``Hello`` first, then ``EpochStart`` for the
-  current epoch, then the last ≤512 finalized depth+bar columns chunked into
-  ≤64-column frames, then Markers in that column range, then the last ≤500
-  trades (tape warm-up), then the current BBO if known. All frames are
-  pre-encoded bytes; a frame is the ``b"".join`` of its messages.
+- **Snapshot on attach** (§6.3): ``Hello`` first, then an ``EpochStart`` for
+  EVERY distinct epoch present in the snapshot's columns (plus the current
+  one, ascending), then the last ≤512 finalized depth+bar columns chunked
+  into ≤64-column frames, then Markers in that column range, then the last
+  ≤500 trades (tape warm-up), then the current BBO if known. All frames are
+  pre-encoded bytes; a frame is the ``b"".join`` of its messages. History
+  responses announce their epochs the same way.
 - **Backpressure** (§6.3): depth/bar column frames are never coalesced. When
   the oldest queued column has sat unsent for >2 s (injectable monotonic
   clock), whole columns are dropped oldest-first and ONE ``Marker{kind=gap}``
@@ -57,6 +59,11 @@ NONCOL_CAP = 1000  # bounded non-column queue (latest-wins)
 GRACE_S = 60.0  # teardown grace after last detach
 FLUSH_INTERVAL_NS = 50_000_000  # right-edge partial re-send cadence (20 Hz)
 _BACKOFF_CAP_S = 30.0
+# Backoff resets to base only once a restarted feed proves stable: it has run
+# for >=5 s (injectable clock) or delivered >=100 events, whichever first. A
+# yield-one-then-crash flapper therefore keeps escalating to the 30 s cap.
+_STABLE_NS = 5_000_000_000
+_STABLE_EVENTS = 100
 _MARKERS_CAP = 1024  # bounded marker memory for snapshot/history
 _T_MAX = 2**63 - 1
 # big_trades note: HistoryResponse.big_trades stays [] at M1 — the rolling-
@@ -77,37 +84,25 @@ def _default_timer(delay_s: float, cb: Callable[[], None]) -> TimerHandle:
     return asyncio.get_running_loop().call_later(delay_s, cb)
 
 
-def _grid_epoch_params(grid: Grid) -> events.EpochParams:
-    """Current epoch params of a live grid.
-
-    M1 shim: Grid's public API (frozen in T5) exposes no live-epoch accessor,
-    and this task must not edit T5's file mid parallel build — so read the
-    private fields here, in exactly one place. Deriving fresh (instead of
-    caching at Session construction) keeps pre-driven/re-anchored grids
-    correct at snapshot time.
-    """
-    cfg = grid._cfg  # noqa: SLF001
-    return events.EpochParams(
-        epoch=grid._epoch,  # noqa: SLF001
-        tick=cfg.tick,
-        tick_multiple=cfg.tick_multiple,
-        dt_ns=cfg.dt_ns,
-        p0=grid._p0,  # noqa: SLF001
-        rows=cfg.rows,
-    )
-
-
 # --- per-client bounded queue ---------------------------------------------------
 
 
 class _Frame:
-    __slots__ = ("col", "data", "enq_ns", "t0_ns")
+    __slots__ = ("col", "data", "enq_ns", "protected", "t0_ns")
 
-    def __init__(self, data: bytes, col: bool, t0_ns: int | None, enq_ns: int) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        col: bool,
+        t0_ns: int | None,
+        enq_ns: int,
+        protected: bool = False,
+    ) -> None:
         self.data = data
         self.col = col
         self.t0_ns = t0_ns
         self.enq_ns = enq_ns
+        self.protected = protected
 
 
 class _Gap:
@@ -147,19 +142,30 @@ class ClientTx:
     def __len__(self) -> int:
         return len(self._q)
 
-    def offer(self, msg_bytes: bytes, *, col_msg: bool, t0_ns: int | None = None) -> None:
+    def offer(
+        self,
+        msg_bytes: bytes,
+        *,
+        col_msg: bool,
+        t0_ns: int | None = None,
+        protected: bool = False,
+    ) -> None:
         now = self._clock()
         if col_msg:
             if t0_ns is None:
                 raise ValueError("column frames must carry t0_ns")
             self._evict_lagged(now)
-            self._q.append(_Frame(msg_bytes, True, t0_ns, now))
+            self._q.append(_Frame(msg_bytes, True, t0_ns, now, protected))
             return
-        self._q.append(_Frame(msg_bytes, False, t0_ns, now))
+        self._q.append(_Frame(msg_bytes, False, t0_ns, now, protected))
+        if protected:
+            # Snapshot frames: exempt from (and not counted toward) the
+            # non-column cap — a tape/BBO flood must never evict Hello.
+            return
         self._noncol += 1
         if self._noncol > self._noncol_cap:
             for i, e in enumerate(self._q):
-                if isinstance(e, _Frame) and not e.col:
+                if isinstance(e, _Frame) and not e.col and not e.protected:
                     del self._q[i]
                     self._noncol -= 1
                     break
@@ -225,7 +231,7 @@ class ClientTx:
             out.append(data)
             total += len(data)
             taken += 1
-            if isinstance(e, _Frame) and not e.col:
+            if isinstance(e, _Frame) and not e.col and not e.protected:
                 self._noncol -= 1
         del self._q[:taken]
         return out
@@ -275,6 +281,8 @@ class Session:
         self._last_col_seq: int | None = None  # dedup: grid may re-return a column
         self._last_flush_ns = clock()
         self._feed_state: str = "live"
+        self._recovery_start_ns = clock()
+        self._recovery_events = 0
         self._tape: deque[events.Trade] = deque(maxlen=SNAPSHOT_TAPE)
         self._markers: deque[events.Marker] = deque(maxlen=_MARKERS_CAP)
         self._bbo: events.BBO | None = None
@@ -341,8 +349,18 @@ class Session:
     async def _consume(self) -> None:
         async for ev in self._feed.events():
             if self._feed_state != "live":  # first event after a restart
-                self._backoff_s = self._backoff_base_s
+                self._recovery_start_ns = self._clock()
+                self._recovery_events = 0
                 self._set_feed_state("live")
+            if self._backoff_s != self._backoff_base_s:
+                # Reset only after the restarted feed proves stable (see
+                # _STABLE_NS/_STABLE_EVENTS): flappers must keep escalating.
+                self._recovery_events += 1
+                if (
+                    self._recovery_events >= _STABLE_EVENTS
+                    or self._clock() - self._recovery_start_ns >= _STABLE_NS
+                ):
+                    self._backoff_s = self._backoff_base_s
             if isinstance(ev, BookState):
                 self._on_book(ev)
             elif isinstance(ev, events.Trade):
@@ -426,8 +444,20 @@ class Session:
             return 1.0
         return float(np.percentile(vals, 99.0))
 
+    def _epoch_start_msgs(self, epochs: set[int]) -> list[bytes]:
+        """One encoded EpochStart per epoch, ascending. Duplicate EpochStarts
+        across snapshot/history responses are harmless: the client's epoch
+        table is idempotent (spec §6.3)."""
+        return [
+            wire.encode(
+                events.EpochStart(epoch=e, epoch_params=self._grid.epoch_params_for(e))
+            )
+            for e in sorted(epochs)
+        ]
+
     def _snapshot_frames(self) -> list[bytes]:
-        ep = _grid_epoch_params(self._grid)
+        ep = self._grid.current_epoch_params()
+        cols = self._grid.history(_T_MAX, SNAPSHOT_COLS)
         hello = events.Hello(
             protocol_version=wire.PROTO_VER,
             session_id=self.session_id,
@@ -436,10 +466,11 @@ class Session:
             capability=self._feed.capability,
             norm_seed=self._norm_seed(),
         )
-        epoch_start = events.EpochStart(epoch=ep.epoch, epoch_params=ep)
-        frames = [wire.encode(hello) + wire.encode(epoch_start)]
-
-        cols = self._grid.history(_T_MAX, SNAPSHOT_COLS)
+        # Hello first, then EpochStart for EVERY distinct epoch appearing in
+        # the snapshot's columns (plus the current one), ascending — the
+        # client must hold params for each epoch before decoding its columns.
+        announce = self._epoch_start_msgs({c.epoch for c in cols} | {ep.epoch})
+        frames = [b"".join([wire.encode(hello), *announce])]
         for i in range(0, len(cols), SNAPSHOT_CHUNK_COLS):
             chunk = cols[i : i + SNAPSHOT_CHUNK_COLS]
             frames.append(
@@ -460,10 +491,16 @@ class Session:
         return frames
 
     def handle_history(self, req: events.HistoryRequest) -> bytes:
-        """Serve a HistoryRequest from the grid ring as ONE encoded frame."""
+        """Serve a HistoryRequest from the grid ring as ONE encoded frame.
+
+        The frame batches an EpochStart for every distinct epoch in the
+        response (ascending) ahead of the HistoryResponse — batched messages
+        per WS frame are protocol-valid (§6.2), and this lets the client
+        reconstruct columns of epochs it never saw live.
+        """
         n = max(0, min(req.n_cols, HISTORY_MAX_COLS))
         cols = self._grid.history(req.before_t, n)
-        ep = _grid_epoch_params(self._grid)
+        ep = self._grid.current_epoch_params()
         markers: list[events.Marker] = []
         if cols:
             lo, hi = cols[0].t0_ns, cols[-1].t0_ns + ep.dt_ns
@@ -477,7 +514,8 @@ class Session:
             markers=markers,
             big_trades=[],  # M1: see big_trades note at module top
         )
-        return wire.encode(resp)
+        announce = self._epoch_start_msgs({c.epoch for c in cols})
+        return b"".join([*announce, wire.encode(resp)])
 
 
 # --- manager --------------------------------------------------------------------
@@ -558,9 +596,9 @@ class SessionManager:
             session.start()
         frames = session.attach(client)
         for frame in frames:
-            # Snapshot frames ride the non-column path: they must not trip
-            # column lag-drops. ≤ ~10 frames, far under the non-column cap.
-            client.offer(frame, col_msg=False, t0_ns=None)
+            # Snapshot frames ride the non-column path (no column lag-drops)
+            # and are protected: cap eviction must never drop Hello.
+            client.offer(frame, col_msg=False, t0_ns=None, protected=True)
         return session
 
     def _make_remover(
