@@ -15,11 +15,26 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // WebGL2 must actually render in headless CI. Force ANGLE→SwiftShader
+        // (software GL) so the heatmap renders even without a real GPU; the
+        // unsafe-swiftshader flag opts into SwiftShader WebGL on recent Chromium.
+        launchOptions: {
+          args: [
+            '--use-gl=angle',
+            '--use-angle=swiftshader',
+            '--enable-unsafe-swiftshader',
+            '--ignore-gpu-blocklist',
+          ],
+        },
+      },
     },
   ],
   webServer: {
-    command: 'npm run dev',
+    // Pin to IPv4 — vite otherwise binds [::1] only, which the 127.0.0.1
+    // baseURL/url below cannot reach (webServer readiness would time out).
+    command: 'npm run dev -- --host 127.0.0.1',
     url: 'http://127.0.0.1:5173',
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

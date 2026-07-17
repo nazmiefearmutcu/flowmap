@@ -13,6 +13,19 @@ export function App() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // Dev-only heatmap e2e hook: `?test=heatmap` installs window.__flowmapTest
+    // (T4 verification) and owns the canvas size itself, so skip DPR resize.
+    // Guarded by the query param so production is untouched.
+    if (new URLSearchParams(window.location.search).get('test') === 'heatmap') {
+      let disposed = false;
+      void import('./gl/testHook').then((m) => {
+        if (!disposed) m.installHeatmapTestHook(canvas);
+      });
+      return () => {
+        disposed = true;
+      };
+    }
+
     const resize = () => {
       const dpr = window.devicePixelRatio || 1;
       const { clientWidth, clientHeight } = canvas;
