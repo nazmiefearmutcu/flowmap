@@ -1,5 +1,7 @@
 import struct
 
+import pytest
+
 from flowmap_server.proto import wire, events
 
 
@@ -69,6 +71,79 @@ def test_multi_message_frame_iteration():
         ev, off = wire.decode(frame, off)
         seen.append(type(ev).__name__)
     assert seen == ["Ping", "BBO", "Trade"] and off == len(frame)
+
+
+def test_truncated_envelope_raises():
+    buf = wire.encode(events.Ping(server_send_ns=1))
+    with pytest.raises(ValueError):
+        wire.decode(buf[:5], 0)
+
+
+def test_truncated_payload_raises():
+    buf = wire.encode(events.BBO(ts_ns=1, bid_px=1.0, bid_sz=1.0, ask_px=1.0, ask_sz=1.0))
+    with pytest.raises(ValueError):
+        wire.decode(buf[:12], 0)  # full envelope (plen=40), payload cut short
+
+
+def test_version_mismatch_raises():
+    buf = bytearray(wire.encode(events.Ping(server_send_ns=1)))
+    buf[1] = wire.PROTO_VER + 1
+    with pytest.raises(ValueError):
+        wire.decode(bytes(buf), 0)
+
+
+def test_lying_bar_plen_raises_not_neighbor_decode():
+    # BAR_COL envelope claiming plen=4 in a batched frame must NOT silently
+    # decode the neighboring Ping's bytes as bar fields.
+    frame = (struct.pack("<BBHI", 0x04, wire.PROTO_VER, 0, 4) + b"\x00" * 4
+             + wire.encode(events.Ping(server_send_ns=1)))
+    with pytest.raises(ValueError):
+        wire.decode(frame, 0)
+
+
+def test_depth_n_rows_plen_mismatch_raises():
+    # header claims n_rows=64 but plen=24: must not read 512 neighbor bytes
+    hdr = struct.pack("<IIqBBHI", 0, 0, 0, 0, 1, 0, 64)
+    frame = struct.pack("<BBHI", 0x03, wire.PROTO_VER, 0, 24) + hdr + b"\x00" * 512
+    with pytest.raises(ValueError):
+        wire.decode(frame, 0)
+
+
+def test_trade_vlen_overrun_raises():
+    buf = bytearray(wire.encode(events.Trade(ts_ns=1, price=1.0, size=1.0,
+                                             side=0, side_src=0, venue="okx")))
+    buf[36] = 200  # venue length byte (offset 8 envelope + 28 fixed header)
+    with pytest.raises(ValueError):
+        wire.decode(bytes(buf), 0)
+
+
+def test_encoder_validations_raise():
+    import numpy as np
+    with pytest.raises(ValueError):  # venue > 255 UTF-8 bytes
+        wire.encode(events.Trade(ts_ns=1, price=1.0, size=1.0, side=0, side_src=0,
+                                 venue="v" * 256))
+    with pytest.raises(ValueError):  # bid/ask length mismatch
+        wire.encode(events.DepthColumn(epoch=0, col_seq=0, t0_ns=0, mode=0, final=True,
+                                       bid=np.ones(4, dtype=np.float32),
+                                       ask=np.ones(3, dtype=np.float32)))
+    with pytest.raises(ValueError):  # SYNTH_PROFILE must not carry ask
+        wire.encode(events.DepthColumn(epoch=0, col_seq=0, t0_ns=0, mode=2, final=True,
+                                       bid=np.ones(4, dtype=np.float32),
+                                       ask=np.ones(4, dtype=np.float32)))
+    with pytest.raises(ValueError):  # non-SYNTH modes require ask
+        wire.encode(events.DepthColumn(epoch=0, col_seq=0, t0_ns=0, mode=0, final=True,
+                                       bid=np.ones(4, dtype=np.float32), ask=None))
+
+
+def test_zero_row_depth_roundtrip():
+    import numpy as np
+    ev = events.DepthColumn(epoch=1, col_seq=0, t0_ns=0, mode=0, final=False,
+                            bid=np.zeros(0, dtype=np.float32),
+                            ask=np.zeros(0, dtype=np.float32))
+    buf = wire.encode(ev)
+    out, nxt = wire.decode(buf, 0)
+    assert nxt == len(buf) == 32  # envelope 8 + fixed header 24, no f32 data
+    assert len(out.bid) == 0 and out.ask is not None and len(out.ask) == 0 and not out.final
 
 
 def test_golden_vectors_stable():

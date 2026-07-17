@@ -25,6 +25,18 @@ which keeps DEPTH_COL's f32 arrays (absolute offset 32 within the message:
 8-byte envelope + 24-byte fixed header) aligned for zero-copy Float32Array
 views on the client.
 
+Deliberate leniency: ``decode`` reads exactly ``payload_len`` payload bytes,
+so a FINAL message in a buffer whose trailing pad bytes were stripped still
+decodes fine; in that case ``next_offset`` may exceed ``len(buf)`` (iteration
+loops still terminate, since ``next_offset > len(buf)``). The TS mirror must
+replicate this behavior deliberately.
+
+Error taxonomy: ALL malformed input (truncated envelope/payload, version
+mismatch, payload_len inconsistent with the type's layout, venue/count
+overruns, bad UTF-8/JSON) raises ``ValueError`` — never a raw struct.error,
+IndexError, or UnicodeDecodeError. Unknown msg_types are NOT errors: they are
+skipped via payload_len (``decode`` returns ``(None, next_offset)``).
+
 Payload layouts (little-endian throughout)
 ------------------------------------------
 DEPTH_COL   <IIqBBHI> epoch, col_seq, t0_ns, mode, final, _pad(u16)=0, n_rows
@@ -167,7 +179,16 @@ def _enc_history(ev: events.HistoryResponse) -> bytes:
 
 
 def _dec_depth(buf: bytes, off: int, plen: int) -> events.DepthColumn:
+    if plen < _DEPTH_HDR.size:
+        raise ValueError(f"DEPTH_COL payload too short: {plen} < {_DEPTH_HDR.size}")
     epoch, col_seq, t0_ns, mode, final, _pad, n_rows = _DEPTH_HDR.unpack_from(buf, off)
+    channels = 1 if mode == events.MODE_SYNTH_PROFILE else 2
+    expected = _DEPTH_HDR.size + 4 * n_rows * channels
+    if plen != expected:
+        raise ValueError(
+            f"DEPTH_COL payload_len mismatch: {plen} != {expected} "
+            f"(n_rows={n_rows}, mode={mode})"
+        )
     f32_off = off + _DEPTH_HDR.size
     # .copy() so the returned arrays do not pin the (potentially large) frame buffer
     bid = np.frombuffer(buf, dtype="<f4", count=n_rows, offset=f32_off).copy()
@@ -180,6 +201,8 @@ def _dec_depth(buf: bytes, off: int, plen: int) -> events.DepthColumn:
 
 
 def _dec_bar(buf: bytes, off: int, plen: int) -> events.BarColumn:
+    if plen != _BAR.size:
+        raise ValueError(f"BAR_COL payload_len mismatch: {plen} != {_BAR.size}")
     (epoch, col_seq, t0_ns, o, h, l, c,
      vol_buy, vol_sell, cvd_cum, vwap_num_cum, vwap_den_cum) = _BAR.unpack_from(buf, off)
     return events.BarColumn(epoch=epoch, col_seq=col_seq, t0_ns=t0_ns, o=o, h=h, l=l, c=c,
@@ -188,30 +211,44 @@ def _dec_bar(buf: bytes, off: int, plen: int) -> events.BarColumn:
 
 
 def _dec_trade(buf: bytes, off: int, plen: int) -> events.Trade:
+    if plen < _TRADE_HDR.size + 1:
+        raise ValueError(f"TRADE payload too short: {plen} < {_TRADE_HDR.size + 1}")
     ts_ns, price, size, side, side_src, _p1, _p2 = _TRADE_HDR.unpack_from(buf, off)
     vlen_off = off + _TRADE_HDR.size
     vlen = buf[vlen_off]
+    if _TRADE_HDR.size + 1 + vlen > plen:
+        raise ValueError(
+            f"TRADE venue overruns payload_len: {_TRADE_HDR.size + 1}+{vlen} > {plen}"
+        )
     venue = bytes(buf[vlen_off + 1:vlen_off + 1 + vlen]).decode("utf-8")
     return events.Trade(ts_ns=ts_ns, price=price, size=size,
                         side=side, side_src=side_src, venue=venue)
 
 
 def _dec_bbo(buf: bytes, off: int, plen: int) -> events.BBO:
+    if plen != _BBO.size:
+        raise ValueError(f"BBO payload_len mismatch: {plen} != {_BBO.size}")
     ts_ns, bid_px, bid_sz, ask_px, ask_sz = _BBO.unpack_from(buf, off)
     return events.BBO(ts_ns=ts_ns, bid_px=bid_px, bid_sz=bid_sz, ask_px=ask_px, ask_sz=ask_sz)
 
 
 def _dec_ping(buf: bytes, off: int, plen: int) -> events.Ping:
+    if plen != _PING.size:
+        raise ValueError(f"PING payload_len mismatch: {plen} != {_PING.size}")
     (server_send_ns,) = _PING.unpack_from(buf, off)
     return events.Ping(server_send_ns=server_send_ns)
 
 
 def _dec_pong(buf: bytes, off: int, plen: int) -> events.Pong:
+    if plen != _PONG.size:
+        raise ValueError(f"PONG payload_len mismatch: {plen} != {_PONG.size}")
     echo_ns, client_recv_ns = _PONG.unpack_from(buf, off)
     return events.Pong(echo_ns=echo_ns, client_recv_ns=client_recv_ns)
 
 
 def _dec_history(buf: bytes, off: int, plen: int) -> events.HistoryResponse:
+    if plen < _HIST_HDR.size:
+        raise ValueError(f"HISTORY_RESP payload too short: {plen} < {_HIST_HDR.size}")
     req_id, epoch, oldest, n_depth, n_bar, n_marker, n_trade = _HIST_HDR.unpack_from(buf, off)
     cursor = off + _HIST_HDR.size
     end = off + plen
@@ -220,7 +257,16 @@ def _dec_history(buf: bytes, off: int, plen: int) -> events.HistoryResponse:
                             (n_marker, events.Marker), (n_trade, events.Trade)):
         group = []
         for _ in range(count):
+            # Bail BEFORE decoding: a lying count must not consume messages
+            # that belong to the surrounding frame.
+            if cursor + _ENVELOPE.size > end:
+                raise ValueError(
+                    "HistoryResponse: nested counts overrun payload_len "
+                    f"(cursor={cursor - off}, payload_len={plen})"
+                )
             nested, cursor = decode(buf, cursor)
+            if cursor > end:
+                raise ValueError("HistoryResponse: nested message overruns payload_len")
             if not isinstance(nested, expected):
                 raise ValueError(
                     f"HistoryResponse: expected nested {expected.__name__}, "
@@ -228,8 +274,6 @@ def _dec_history(buf: bytes, off: int, plen: int) -> events.HistoryResponse:
                 )
             group.append(nested)
         groups.append(group)
-    if cursor > end:
-        raise ValueError("HistoryResponse nested messages overrun payload_len")
     return events.HistoryResponse(req_id=req_id, epoch=epoch, oldest_available_t_ns=oldest,
                                   depth_cols=groups[0], bar_cols=groups[1],
                                   markers=groups[2], big_trades=groups[3])
@@ -308,11 +352,15 @@ def decode(buf, offset: int = 0):
         cold = _COLD_BY_ID.get(msg_type)
         if cold is None:
             return None, next_offset
+        # msgspec.DecodeError subclasses ValueError, satisfying the module taxonomy.
         return msgspec.json.decode(bytes(buf[payload_off:payload_off + plen]), type=cold), next_offset
     hot = _HOT_DECODERS.get(msg_type)
     if hot is None:
         return None, next_offset
-    return hot(buf, payload_off, plen), next_offset
+    try:
+        return hot(buf, payload_off, plen), next_offset
+    except (struct.error, IndexError, UnicodeDecodeError) as exc:
+        raise ValueError(f"malformed 0x{msg_type:02X} payload: {exc}") from exc
 
 
 def payload_f32_offset(buf, offset: int = 0) -> int:
