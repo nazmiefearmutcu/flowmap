@@ -130,7 +130,7 @@ class DepthColumn(msgspec.Struct):
     ask: np.ndarray | None  # float32, length n_rows; None iff mode == MODE_SYNTH_PROFILE
 
 
-class BarColumn(msgspec.Struct):
+class BarColumn(msgspec.Struct, frozen=True):
     epoch: int
     col_seq: int
     t0_ns: int

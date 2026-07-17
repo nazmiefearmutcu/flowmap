@@ -149,6 +149,30 @@ class Grid:
         cursor = self._prev_ts
         ts_eff = max(ts_ns, cursor)
 
+        # Gap cap: a huge ts jump (e.g. weekend reconnect) would otherwise
+        # finalize gap/dt columns — ~900k columns / ~14 GiB of return list for
+        # a weekend at dt=250ms — only for all but the last ring_columns of
+        # them to be immediately evicted. If the jump crosses more than
+        # ring_columns + 1 whole intervals: finalize the current (partial)
+        # interval normally, then skip straight to the last ring_columns
+        # intervals before ts. col_seq advances by the number of SKIPPED
+        # intervals so (col_seq delta == t0 delta / dt_ns) stays true across
+        # the gap and t0<->col_seq bookkeeping can rely on monotonicity;
+        # skipped seqs are never written to the ring and history() treats
+        # them as evicted (a capped call always overwrites the whole ring).
+        rc = self._cfg.ring_columns
+        if ts_eff // dt - self._cur_idx > rc + 1:
+            end = (self._cur_idx + 1) * dt
+            span = end - cursor
+            if span > 0:
+                self._acc += self._state * span
+            out.append(self._finalize_current())
+            self._cur_idx += 1
+            new_idx = ts_eff // dt - rc
+            self._count += new_idx - self._cur_idx  # skipped interval count
+            self._cur_idx = new_idx
+            cursor = new_idx * dt
+
         while True:
             end = (self._cur_idx + 1) * dt
             if ts_eff < end:
@@ -194,16 +218,19 @@ class Grid:
         """Scatter price levels into a dense [rows] float64 profile.
 
         ``row = round((px - p0) / (tick * tick_multiple))``; out-of-range
-        levels are dropped (they return after a re-anchor).
+        levels are dropped (they return after a re-anchor). Non-finite prices
+        or sizes (NaN/inf) are dropped BEFORE the rint/int cast — they would
+        otherwise poison the density texels and raise RuntimeWarnings.
         """
         rows = self._cfg.rows
-        r = np.rint((np.asarray(px, dtype=np.float64) - self._p0) / self._step).astype(np.int64)
+        px64 = np.asarray(px, dtype=np.float64)
+        sz64 = np.asarray(sz, dtype=np.float64)
+        finite = np.isfinite(px64) & np.isfinite(sz64)
+        px64 = px64[finite]
+        sz64 = sz64[finite]
+        r = np.rint((px64 - self._p0) / self._step).astype(np.int64)
         mask = (r >= 0) & (r < rows)
-        return np.bincount(
-            r[mask],
-            weights=np.asarray(sz, dtype=np.float64)[mask],
-            minlength=rows,
-        )
+        return np.bincount(r[mask], weights=sz64[mask], minlength=rows)
 
     def _finalize_current(self) -> FinalizedColumn:
         assert self._cur_idx is not None
@@ -302,24 +329,52 @@ class Grid:
 
     # -- partial (right-edge) emission -----------------------------------------
 
-    def current_partial(self) -> DepthColumn:
+    def _make_depth(
+        self,
+        epoch: int,
+        col_seq: int,
+        t0_ns: int,
+        bid: np.ndarray,
+        ask: np.ndarray,
+        final: bool,
+    ) -> DepthColumn:
+        """Single owner of the density->wire conversion: cast to float32 and
+        drop the ask channel in SYNTH_PROFILE mode."""
+        synth = self._cfg.mode == MODE_SYNTH_PROFILE
+        return DepthColumn(
+            epoch=epoch,
+            col_seq=col_seq,
+            t0_ns=t0_ns,
+            mode=self._cfg.mode,
+            final=final,
+            bid=bid.astype(np.float32),
+            ask=None if synth else ask.astype(np.float32),
+        )
+
+    def to_depth(self, col: FinalizedColumn) -> DepthColumn:
+        """Convert a finalized (f16 ring) column to a wire DepthColumn
+        (float32, ``final=True``, ask dropped in SYNTH_PROFILE mode)."""
+        return self._make_depth(col.epoch, col.col_seq, col.t0_ns, col.bid, col.ask, final=True)
+
+    def current_partial(self) -> DepthColumn | None:
         """Progressive right-edge emit: the in-progress column so far.
 
         The partial integral (accumulated through the latest ``on_book``
         timestamp) is divided by the full ``dt_ns``, so the value converges to
-        the finalized column as the interval fills.
+        the finalized column as the interval fills. Returns ``None`` before the
+        grid has been anchored by any event; after a trade-only anchor the
+        density is all zeros but the column (t0/col_seq) is already meaningful.
         """
+        if self._cur_idx is None:
+            return None
         density = self._acc / float(self._cfg.dt_ns)
-        t0 = 0 if self._cur_idx is None else self._cur_idx * self._cfg.dt_ns
-        synth = self._cfg.mode == MODE_SYNTH_PROFILE
-        return DepthColumn(
-            epoch=self._epoch,
-            col_seq=self._count,
-            t0_ns=t0,
-            mode=self._cfg.mode,
+        return self._make_depth(
+            self._epoch,
+            self._count,
+            self._cur_idx * self._cfg.dt_ns,
+            density[0],
+            density[1],
             final=False,
-            bid=density[0].astype(np.float32),
-            ask=None if synth else density[1].astype(np.float32),
         )
 
     def bar_partial(self) -> BarColumn:
@@ -382,6 +437,16 @@ class Grid:
             a[..., :k] = 0.0
 
     # -- history ---------------------------------------------------------------
+
+    def oldest_retained_t0_ns(self) -> int | None:
+        """``t0_ns`` of the oldest column still retained in the ring, or
+        ``None`` when no column has been finalized yet. This is what
+        ``HistoryResponse.oldest_available_t_ns`` reports for the RAM ring."""
+        rc = self._cfg.ring_columns
+        retained = min(self._count, rc)
+        if retained == 0:
+            return None
+        return int(self._ring_t0[(self._count - retained) % rc])
 
     def history(self, before_t_ns: int, n: int) -> list[FinalizedColumn]:
         """The most recent ``n`` retained columns with ``t0_ns < before_t_ns``.

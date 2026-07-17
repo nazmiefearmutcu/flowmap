@@ -7,10 +7,12 @@ partial emission, out-of-range handling, and re-anchor behavior.
 
 import math
 import time
+import warnings
 
 import numpy as np
 
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
+from flowmap_server.proto import wire
 from flowmap_server.proto.events import (
     SIDE_BUY,
     SIDE_SELL,
@@ -149,7 +151,10 @@ def test_ring_wraparound_retains_only_last_columns():
                   ring_columns=4, mode=0)
     g = Grid(cfg)
     g.on_book(0, *book(100.0, 5.0))
-    cols = g.on_book(10_000_000_000, *book(100.0, 5.0))
+    # two sub-cap jumps (<= ring_columns + 1 intervals each) so every column
+    # is genuinely emitted and the ring wraps; the capped path has its own test
+    cols = g.on_book(5_000_000_000, *book(100.0, 5.0))
+    cols += g.on_book(10_000_000_000, *book(100.0, 5.0))
     assert len(cols) == 10  # col_seq 0..9 finalized; ring keeps only the last 4
     h = g.history(before_t_ns=10_000_000_000, n=100)
     assert [c.col_seq for c in h] == [6, 7, 8, 9]
@@ -271,6 +276,132 @@ def test_reanchor_shifts_partial_accumulator():
     row = round((99.5 - 78.0) / 0.5)
     # 0.5 s accumulated pre-reanchor (shifted) + 0.5 s post = full 5.0
     assert col1.bid[row] == np.float16(5.0)
+
+
+# --------------------------------------------------------------------------
+# Additional tests (own): gap cap, robustness, API polish
+# --------------------------------------------------------------------------
+
+
+def test_gap_finalization_capped_at_ring_columns():
+    """A 1-hour gap at dt=250ms (14 400 intervals) must not return 14 400
+    columns: the cap finalizes the current partial + the last ring_columns
+    intervals, with col_seq advanced across the skip so col_seq == t0/dt."""
+    dt = 250_000_000
+    cfg = GridCfg(tick=0.5, tick_multiple=1, dt_ns=dt, p0=90.0, rows=64,
+                  ring_columns=128, mode=0)
+    g = Grid(cfg)
+    g.on_book(0, *book(100.0, 5.0))
+    cols = g.on_book(3_600_000_000_000, *book(100.0, 5.0))  # +1 hour
+    assert len(cols) <= 129
+    assert len(cols) == 129  # 1 partial + ring_columns persisted-book columns
+    assert cols[0].col_seq == 0 and cols[0].t0_ns == 0
+    assert cols[1].col_seq == 14_400 - 128  # skip jumps straight to ring window
+    assert cols[-1].col_seq == 14_399
+    assert cols[-1].t0_ns == 3_600_000_000_000 - dt
+    # col_seq <-> t0 stays consistent across the skipped range
+    assert all(c.col_seq == c.t0_ns // dt for c in cols)
+    # ring intact: exactly the last ring_columns columns retained, book persisted
+    h = g.history(before_t_ns=10**18, n=10_000)
+    assert len(h) == 128
+    assert [c.col_seq for c in h] == [c.col_seq for c in cols[-128:]]
+    assert all(c.bid.max() > 0 for c in h)
+    assert g.oldest_retained_t0_ns() == (14_400 - 128) * dt
+
+
+def test_nonfinite_levels_dropped_cleanly():
+    g = Grid(CFG)
+    px = np.array([99.0, np.nan, 100.0, np.inf])
+    sz = np.array([2.0, 3.0, np.nan, 1.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any RuntimeWarning fails the test
+        g.on_book(0, px, sz, px, sz)
+        (col,) = g.on_book(1_000_000_000, px, sz, px, sz)
+    # only (99.0, 2.0) survives: NaN price, NaN size and inf price are dropped
+    row = round((99.0 - CFG.p0) / 0.5)
+    assert col.bid[row] == np.float16(2.0)
+    assert float(col.bid.astype(np.float64).sum()) == 2.0
+    assert float(col.ask.astype(np.float64).sum()) == 2.0
+
+
+def test_to_depth_roundtrips_through_wire():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    d = g.to_depth(col)
+    assert isinstance(d, DepthColumn)
+    assert d.final is True and d.mode == CFG.mode
+    assert d.bid.dtype == np.float32 and d.ask.dtype == np.float32
+    out, _ = wire.decode(wire.encode(d), 0)
+    assert (out.epoch, out.col_seq, out.t0_ns) == (col.epoch, col.col_seq, col.t0_ns)
+    assert out.final is True
+    assert np.array_equal(out.bid, d.bid) and np.array_equal(out.ask, d.ask)
+    # f16 ring values are exactly representable in f32: no further loss
+    assert np.array_equal(out.bid, col.bid.astype(np.float32))
+
+
+def test_current_partial_none_before_any_event():
+    assert Grid(CFG).current_partial() is None
+
+
+def test_oldest_retained_t0_ns():
+    cfg = GridCfg(tick=0.5, tick_multiple=1, dt_ns=1_000_000_000, p0=90.0, rows=64,
+                  ring_columns=4, mode=0)
+    g = Grid(cfg)
+    assert g.oldest_retained_t0_ns() is None
+    g.on_book(0, *book(100.0, 5.0))
+    assert g.oldest_retained_t0_ns() is None  # nothing finalized yet
+    g.on_book(2_000_000_000, *book(100.0, 5.0))  # finalizes t0=0, t0=1e9
+    assert g.oldest_retained_t0_ns() == 0
+    g.on_book(6_000_000_000, *book(100.0, 5.0))  # 6 columns total, ring keeps 4
+    assert g.oldest_retained_t0_ns() == 2_000_000_000
+
+
+def test_reanchor_after_ring_wraparound_mixed_epoch_history():
+    cfg = GridCfg(tick=0.5, tick_multiple=1, dt_ns=1_000_000_000, p0=90.0, rows=64,
+                  ring_columns=4, mode=0)
+    g = Grid(cfg)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_book(6_000_000_000, *book(100.0, 5.0))  # cols 0..5; ring wrapped to 2..5
+    params = g.maybe_reanchor(mid=140.0)
+    assert params is not None and params.epoch == 1 and params.p0 == 124.0
+    g.on_book(7_000_000_000, *book(140.0, 5.0))  # col 6: old book out of range
+    g.on_book(8_000_000_000, *book(140.0, 5.0))  # col 7: new book, new mapping
+    h = g.history(before_t_ns=10**18, n=10)
+    assert [c.col_seq for c in h] == [4, 5, 6, 7]
+    assert [c.epoch for c in h] == [0, 0, 1, 1]  # history NEVER rewritten
+    old_row = round((99.5 - 90.0) / 0.5)
+    new_row = round((139.5 - 124.0) / 0.5)
+    assert h[0].bid[old_row] == np.float16(5.0)  # epoch-0 rows still vs p0=90
+    assert h[2].bid.max() == 0                   # gap column right after re-anchor
+    assert h[3].bid[new_row] == np.float16(5.0)  # epoch-1 rows vs p0=124
+
+
+def test_on_trade_before_any_on_book_anchors_interval():
+    g = Grid(CFG)
+    g.on_trade(1_500_000_000, 100.0, 2.0, SIDE_BUY)  # anchors interval 1
+    b = g.bar_partial()
+    assert b.t0_ns == 1_000_000_000 and b.vol_buy == 2.0 and b.c == 100.0
+    p = g.current_partial()
+    assert p is not None and p.t0_ns == 1_000_000_000
+    assert float(p.bid.max()) == 0.0  # no book yet: zero density
+    (col,) = g.on_book(2_000_000_000, *book(100.0, 5.0))
+    assert col.t0_ns == 1_000_000_000 and col.col_seq == 0
+    assert col.bid.max() == 0  # book arrived at the boundary: zero state integrated
+    assert col.bar.vol_buy == 2.0 and col.bar.c == 100.0
+
+
+def test_non_monotonic_ts_clamped_to_zero_span():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 4.0))
+    g.on_book(500_000_000, *book(100.0, 8.0))
+    # late update: clamped to zero span (nothing integrated at size 8),
+    # but the book state IS replaced
+    assert g.on_book(400_000_000, *book(100.0, 2.0)) == []
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 2.0))
+    row = round((99.5 - CFG.p0) / 0.5)
+    # [0, 0.5s) at size 4, [0.5s, 1.0s) at size 2 -> time-weighted mean 3.0
+    assert col.bid[row] == np.float16(3.0)
 
 
 # --------------------------------------------------------------------------
