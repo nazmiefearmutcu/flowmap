@@ -59,11 +59,18 @@ export function App() {
       };
     }
 
-    const renderer = new Renderer(canvas, useFlowMapStore);
-    useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
+    // Perf harness mode (T6 §10 gates): the renderer is preloaded with synthetic
+    // history via __flowmapLive.renderer.preloadSynthetic — do NOT open the live
+    // feed, which would fight the preloaded ring. Otherwise wire the sim feed.
+    const perfMode = new URLSearchParams(window.location.search).get('perf') === '1';
 
-    // Read-only diagnostics handle for the live-sim e2e (dev/preview only).
-    if (import.meta.env.DEV) {
+    const renderer = new Renderer(canvas, useFlowMapStore);
+    if (!perfMode) {
+      useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
+    }
+
+    // Read-only diagnostics handle for the live-sim / perf e2e (dev/preview only).
+    if (import.meta.env.DEV || perfMode) {
       (window as unknown as { __flowmapLive: unknown }).__flowmapLive = {
         renderer,
         store: useFlowMapStore,

@@ -126,4 +126,13 @@ body,
   width: 100%;
   height: 100%;
   background: var(--bg);
+  /* Canvas is focusable (keyboard pan/zoom, T6); suppress the focus ring and
+     let drag-pan own the pointer without text-selection / touch-scroll fighting. */
+  outline: none;
+  cursor: grab;
+  touch-action: none;
+}
+
+.gl-canvas:active {
+  cursor: grabbing;
 }
