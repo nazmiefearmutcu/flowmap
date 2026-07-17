@@ -48,7 +48,15 @@ FeedEvent = BookState | Trade | Marker | BBO
 
 @runtime_checkable
 class Feed(Protocol):
-    """Minimal contract every feed (sim, crypto, equity) implements."""
+    """Minimal contract every feed (sim, crypto, equity) implements.
+
+    Restart contract: ``events()`` MUST be re-callable after a crash — the
+    session layer restarts a crashed (or normally-ended) feed by calling
+    ``events()`` again on the same instance. On re-call the feed SHOULD
+    resume from current/live data, not replay history. SimFeed replays
+    deterministically from ``start_ns``, which is acceptable for the sim;
+    real feeds (T9 crypto) must reconnect and resume live.
+    """
 
     market: str
     symbol: str

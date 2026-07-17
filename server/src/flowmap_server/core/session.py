@@ -12,14 +12,18 @@ Design spec §6.3 and §11. The load-bearing semantics:
   ≤500 trades (tape warm-up), then the current BBO if known. All frames are
   pre-encoded bytes; a frame is the ``b"".join`` of its messages. History
   responses announce their epochs the same way.
-- **Backpressure** (§6.3): depth/bar column frames are never coalesced. When
-  the oldest queued column has sat unsent for >2 s (injectable monotonic
-  clock), whole columns are dropped oldest-first and ONE ``Marker{kind=gap}``
-  is enqueued per contiguous drop run (runs merge across offers while the
-  drop point stays adjacent to the previous run's marker). Dropped columns
-  remain in the grid ring, recoverable via ``HistoryRequest``. Non-column
-  messages (tape/BBO/markers/status) are capped at 1000 with silent
-  drop-oldest — latest-wins is acceptable at M1.
+- **Backpressure** (§6.3): FINALIZED depth/bar column frames are never
+  coalesced; PARTIAL right-edge re-emissions coalesce latest-wins per
+  ``t0_ns``. When the oldest queued column has sat unsent for >2 s
+  (injectable monotonic clock), whole columns are dropped oldest-first and
+  ONE ``Marker{kind=gap}`` is enqueued per contiguous drop run (runs merge
+  across offers while the drop point stays adjacent to the previous run's
+  marker). The marker count is real COLUMNS: the depth+bar pair sharing a
+  ``t0_ns`` counts once, and dropped stale partials never count (their final
+  frame may still be delivered). Dropped columns remain in the grid ring,
+  recoverable via ``HistoryRequest``. Non-column messages
+  (tape/BBO/markers/status) are capped at 1000 with silent drop-oldest —
+  latest-wins is acceptable at M1.
 - **Lifecycle** (§11): sessions are refcounted by subscribers; teardown fires
   after the last detach plus a 60 s grace (injectable timer). A crashed feed
   restarts with exponential backoff (cap 30 s) and reports transitions via
@@ -33,6 +37,7 @@ order is exactly stream order.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections import deque
@@ -48,6 +53,8 @@ from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import events, wire
 
 __all__ = ["ClientTx", "Session", "SessionLimitError", "SessionManager"]
+
+logger = logging.getLogger(__name__)
 
 # --- spec §6.3 / §11 constants --------------------------------------------------
 SNAPSHOT_COLS = 512  # last N finalized columns in the attach snapshot
@@ -88,7 +95,7 @@ def _default_timer(delay_s: float, cb: Callable[[], None]) -> TimerHandle:
 
 
 class _Frame:
-    __slots__ = ("col", "data", "enq_ns", "protected", "t0_ns")
+    __slots__ = ("col", "data", "enq_ns", "is_partial", "protected", "t0_ns")
 
     def __init__(
         self,
@@ -97,17 +104,24 @@ class _Frame:
         t0_ns: int | None,
         enq_ns: int,
         protected: bool = False,
+        is_partial: bool = False,
     ) -> None:
         self.data = data
         self.col = col
         self.t0_ns = t0_ns
         self.enq_ns = enq_ns
         self.protected = protected
+        self.is_partial = is_partial
 
 
 class _Gap:
     """Placeholder for a contiguous run of dropped columns; encoded lazily at
-    drain time so a run growing across offers still yields ONE Marker."""
+    drain time so a run growing across offers still yields ONE Marker.
+
+    ``count`` is real COLUMNS, not frames: a finalized column arrives as two
+    frames (depth+bar sharing ``t0_ns``) and is counted once, via the
+    ``last_t0_ns`` dedup in ``_evict_lagged``. Partial re-emissions never
+    reach a gap run at all."""
 
     __slots__ = ("count", "first_t0_ns", "last_t0_ns")
 
@@ -120,9 +134,15 @@ class _Gap:
 class ClientTx:
     """Per-client bounded send queue with lag/drop state (spec §6.3).
 
-    Entries stay FIFO across column and non-column frames. Column frames are
-    never coalesced; they are dropped whole (oldest-first) once their unsent
-    age exceeds ``lag_ns``, leaving one gap Marker per contiguous drop run.
+    Entries stay FIFO across column and non-column frames. FINALIZED column
+    frames are never coalesced; they are dropped whole (oldest-first) once
+    their unsent age exceeds ``lag_ns``, leaving one gap Marker per contiguous
+    drop run whose count is real columns (a depth+bar pair sharing ``t0_ns``
+    counts once). PARTIAL column frames (``is_partial=True``, the 20 Hz
+    right-edge re-emissions) coalesce latest-wins per ``t0_ns``: at most one
+    undrained depth+bar partial pair stays queued per column, and a
+    lag-dropped partial is never counted as a lost column (its final frame
+    may still be delivered).
     Non-column frames are capped at ``noncol_cap`` with silent drop-oldest.
     """
 
@@ -149,13 +169,28 @@ class ClientTx:
         col_msg: bool,
         t0_ns: int | None = None,
         protected: bool = False,
+        is_partial: bool = False,
     ) -> None:
         now = self._clock()
         if col_msg:
             if t0_ns is None:
                 raise ValueError("column frames must carry t0_ns")
             self._evict_lagged(now)
-            self._q.append(_Frame(msg_bytes, True, t0_ns, now, protected))
+            if is_partial:
+                # Latest-wins per t0: at most one partial pair (depth+bar)
+                # stays queued per column. Beyond two frames the oldest is
+                # superseded and removed — flushes always emit depth-then-bar,
+                # so FIFO eviction keeps replacements kind-paired.
+                first_i: int | None = None
+                n_same = 0
+                for i, e in enumerate(self._q):
+                    if isinstance(e, _Frame) and e.is_partial and e.t0_ns == t0_ns:
+                        if first_i is None:
+                            first_i = i
+                        n_same += 1
+                if n_same >= 2 and first_i is not None:
+                    del self._q[first_i]
+            self._q.append(_Frame(msg_bytes, True, t0_ns, now, protected, is_partial))
             return
         self._q.append(_Frame(msg_bytes, False, t0_ns, now, protected))
         if protected:
@@ -178,6 +213,12 @@ class ClientTx:
         immediately preceding gap run (one Marker per contiguous run, even
         when the run grows across many offers); gap markers themselves and
         non-column frames are never lag-dropped.
+
+        Gap accounting is per COLUMN, not per frame: consecutive finalized
+        frames sharing ``t0_ns`` (the depth+bar pair) bump the run count once.
+        Evicted PARTIAL frames are stale right-edge re-emissions — superseded
+        data, not lost columns (the final may still be delivered) — so they
+        are dropped silently and never counted toward a gap run.
         """
         threshold = now_ns - self._lag_ns
         q = self._q
@@ -191,14 +232,17 @@ class ClientTx:
                     break  # everything after is newer
                 if e.col:
                     assert e.t0_ns is not None
-                    tail = out[-1] if out else None
-                    if isinstance(tail, _Gap):
-                        tail.last_t0_ns = e.t0_ns
-                        tail.count += 1
-                    else:
-                        out.append(_Gap(e.t0_ns))
                     dropped = True
                     idx += 1
+                    if e.is_partial:
+                        continue  # stale partial: drop, never a gap column
+                    tail = out[-1] if out else None
+                    if isinstance(tail, _Gap):
+                        if tail.last_t0_ns != e.t0_ns:  # depth+bar: count once
+                            tail.last_t0_ns = e.t0_ns
+                            tail.count += 1
+                    else:
+                        out.append(_Gap(e.t0_ns))
                     continue
             out.append(e)
             idx += 1
@@ -274,7 +318,6 @@ class Session:
         self._grace_s = grace_s
 
         self._clients: set[ClientTx] = set()
-        self._refs = 0
         self._grace_handle: TimerHandle | None = None
         self._closed = False
 
@@ -306,21 +349,22 @@ class Session:
         if self._grace_handle is not None:
             self._grace_handle.cancel()
             self._grace_handle = None
-        self._refs += 1
         self._clients.add(client)
         return self._snapshot_frames()
 
     def detach(self, client: ClientTx) -> None:
+        # Idempotent: the refcount IS len(_clients), so a double-detach of the
+        # same client cannot decrement twice and orphan a live subscriber.
+        if client not in self._clients:
+            return
         self._clients.discard(client)
-        if self._refs > 0:
-            self._refs -= 1
-        if self._refs == 0 and not self._closed:
+        if not self._clients and not self._closed:
             if self._grace_handle is not None:
                 self._grace_handle.cancel()
             self._grace_handle = self._timer(self._grace_s, self._teardown)
 
     def _teardown(self) -> None:
-        if self._refs > 0 or self._closed:  # re-attached during grace / already down
+        if self._clients or self._closed:  # re-attached during grace / already down
             return
         self._closed = True
         self._grace_handle = None
@@ -342,7 +386,12 @@ class Session:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._set_feed_state("degraded")
+                logger.exception("feed crashed, restarting in %.1fs", self._backoff_s)
+                try:
+                    self._set_feed_state("degraded")
+                except Exception:
+                    # A broadcast/encode failure must not kill the restart loop.
+                    logger.exception("failed to broadcast degraded Status")
                 await asyncio.sleep(self._backoff_s)
                 self._backoff_s = min(self._backoff_s * 2.0, _BACKOFF_CAP_S)
 
@@ -373,6 +422,10 @@ class Session:
             elif isinstance(ev, events.BBO):
                 self._bbo = ev
                 self._broadcast(wire.encode(ev), col=False)
+            else:
+                # Forward-compat: a feed speaking a newer FeedEvent dialect
+                # must not crash the session — log and skip.
+                logger.warning("ignoring unknown feed event type %s", type(ev).__name__)
             now = self._clock()
             if now - self._last_flush_ns >= self._flush_interval_ns:
                 self._flush_partial(now)
@@ -411,8 +464,15 @@ class Session:
         if partial is None:
             return
         self._last_flush_ns = self._clock() if now_ns is None else now_ns
-        self._broadcast(wire.encode(partial), col=True, t0_ns=partial.t0_ns)
-        self._broadcast(wire.encode(self._grid.bar_partial()), col=True, t0_ns=partial.t0_ns)
+        # is_partial: re-emissions coalesce latest-wins per t0 in each ClientTx
+        # (always depth then bar, so FIFO replacement stays kind-paired).
+        self._broadcast(wire.encode(partial), col=True, t0_ns=partial.t0_ns, is_partial=True)
+        self._broadcast(
+            wire.encode(self._grid.bar_partial()),
+            col=True,
+            t0_ns=partial.t0_ns,
+            is_partial=True,
+        )
 
     def _set_feed_state(self, state: str) -> None:
         if state == self._feed_state:
@@ -426,9 +486,16 @@ class Session:
         )
         self._broadcast(wire.encode(status), col=False)
 
-    def _broadcast(self, frame: bytes, *, col: bool, t0_ns: int | None = None) -> None:
+    def _broadcast(
+        self,
+        frame: bytes,
+        *,
+        col: bool,
+        t0_ns: int | None = None,
+        is_partial: bool = False,
+    ) -> None:
         for client in self._clients:
-            client.offer(frame, col_msg=col, t0_ns=t0_ns)
+            client.offer(frame, col_msg=col, t0_ns=t0_ns, is_partial=is_partial)
 
     # -- snapshot / history ----------------------------------------------------
 
@@ -593,7 +660,10 @@ class SessionManager:
             )
             session._on_teardown = self._make_remover(key, session)
             self._sessions[key] = session
-            session.start()
+        # Unconditional (start() is idempotent/restart-safe): a session whose
+        # feed ended normally must not be handed out as a zombie — a new
+        # subscriber restarts the run task.
+        session.start()
         frames = session.attach(client)
         for frame in frames:
             # Snapshot frames ride the non-column path (no column lag-drops)

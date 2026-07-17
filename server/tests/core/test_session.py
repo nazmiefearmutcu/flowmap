@@ -9,6 +9,7 @@ Plus one bonus: feed crash -> degraded Status -> recovery.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from flowmap_server.config import Config
 from flowmap_server.core.grid import Grid, GridCfg
 from flowmap_server.core.session import (
+    LAG_DROP_NS,
     ClientTx,
     Session,
     SessionLimitError,
@@ -282,6 +284,22 @@ async def test_refcount_grace_teardown_and_fresh_session():
     await asyncio.gather(fresh.run_task, return_exceptions=True)
 
 
+def test_detach_is_idempotent_refcount_is_membership():
+    timer = FakeTimer()
+    sess = Session(
+        "idem", feed=IdleFeed(), grid=_mk_grid(rows=64, ring_columns=128), timer=timer
+    )
+    a, b = ClientTx(), ClientTx()
+    sess.attach(a)
+    sess.attach(b)
+    sess.detach(a)
+    sess.detach(a)  # double detach of the same client: must be a no-op
+    assert not timer.entries  # B still attached -> no grace scheduled
+    assert not sess._closed and b in sess._clients
+    sess.detach(b)
+    assert len(timer.entries) == 1  # grace only after the LAST client leaves
+
+
 # ---------------------------------------------------------------------------
 # 3. Backpressure: column lag-drop + gap markers + recoverability
 
@@ -330,6 +348,80 @@ def test_backpressure_lag_drop_gap_markers_recoverable():
     for seq in sample:
         got = grid.history(seq * DT + 1, 1)
         assert len(got) == 1 and got[0].col_seq == seq
+
+
+# ---------------------------------------------------------------------------
+# 3b. Gap accounting is per COLUMN; partials coalesce and never count
+
+
+def test_gap_marker_counts_columns_not_frames():
+    """10 dropped columns offered as depth+bar pairs (plus stacked partial
+    re-emissions) must yield ONE gap Marker counting 10 columns, not 20+
+    frames — and the stale partials of the surviving column never count."""
+    clock = FakeClock()
+    client = ClientTx(clock=clock)
+    n = 10
+    for i in range(n):
+        t0 = i * DT
+        client.offer(b"d%d" % i, col_msg=True, t0_ns=t0)
+        client.offer(b"b%d" % i, col_msg=True, t0_ns=t0)
+        # 20 Hz re-emissions of the NEXT in-progress column stack frames on
+        # one t0; they coalesce latest-wins to a single depth+bar pair.
+        nxt = (i + 1) * DT
+        for _ in range(3):
+            client.offer(b"pd", col_msg=True, t0_ns=nxt, is_partial=True)
+            client.offer(b"pb", col_msg=True, t0_ns=nxt, is_partial=True)
+
+    clock.advance(LAG_DROP_NS + 1)  # everything queued is now lagged out
+    client.offer(b"dF", col_msg=True, t0_ns=n * DT)  # final of column n arrives
+    client.offer(b"bF", col_msg=True, t0_ns=n * DT)
+
+    frames = client.drain(1 << 30)
+    assert frames[1:] == [b"dF", b"bF"]  # final pair delivered after the gap
+    (gap,) = _decode_frame(frames[0])
+    assert isinstance(gap, Marker) and gap.kind == "gap"
+    assert gap.ts_ns == 0  # first REAL dropped column
+    # 10 columns: depth+bar pairs counted once each; the dropped stale
+    # partials of column n (whose final was just delivered) count zero.
+    assert "dropped 10 columns" in gap.text
+
+
+def test_partial_reemissions_coalesce_latest_wins():
+    client = ClientTx(clock=FakeClock())
+    client.offer(b"final", col_msg=True, t0_ns=0)
+    for k in range(5):
+        client.offer(b"pd%d" % k, col_msg=True, t0_ns=DT, is_partial=True)
+        client.offer(b"pb%d" % k, col_msg=True, t0_ns=DT, is_partial=True)
+    assert len(client) == 3  # final + ONE coalesced partial pair
+    assert client.drain(1 << 30) == [b"final", b"pd4", b"pb4"]
+
+
+def test_dropped_stale_partial_yields_no_gap_marker():
+    """A lag-dropped partial whose final is later delivered is superseded
+    data, not a lost column: the client must see NO gap Marker."""
+    clock = FakeClock()
+    client = ClientTx(clock=clock)
+    client.offer(b"partial", col_msg=True, t0_ns=0, is_partial=True)
+    clock.advance(LAG_DROP_NS + 1)
+    client.offer(b"final-d", col_msg=True, t0_ns=0)
+    client.offer(b"final-b", col_msg=True, t0_ns=0)
+    assert client.drain(1 << 30) == [b"final-d", b"final-b"]
+
+
+# ---------------------------------------------------------------------------
+# 3c. drain() byte budget
+
+
+def test_drain_byte_budget_fifo_and_anti_wedge():
+    client = ClientTx(clock=FakeClock())
+    frames = [bytes([65 + i]) * 100 for i in range(4)]  # four 100-byte frames
+    for i, f in enumerate(frames):
+        client.offer(f, col_msg=True, t0_ns=i * DT)
+
+    assert client.drain(250) == frames[:2]  # 2.5-frame budget -> exactly 2, FIFO
+    assert client.drain(50) == [frames[2]]  # budget < one frame -> 1 (anti-wedge)
+    assert client.drain(1 << 30) == [frames[3]]
+    assert client.drain(1 << 30) == []
 
 
 # ---------------------------------------------------------------------------
@@ -623,3 +715,105 @@ async def test_flapping_feed_keeps_escalating_backoff():
     # Every restart yielded an event, but never reached stability (>=5 s or
     # >=100 events) — backoff must keep escalating, never reset to base.
     assert sess._backoff_s >= 0.005 * 2**4
+
+
+async def test_feed_crash_is_logged_and_restarts(caplog):
+    feed = FlakyFeed()
+    sess = Session(
+        "log",
+        feed=feed,
+        grid=_mk_grid(rows=64, ring_columns=256, p0=84.0),
+        restart_backoff_base_s=0.001,
+    )
+    sess.attach(ClientTx())
+    with caplog.at_level(logging.ERROR, logger="flowmap_server.core.session"):
+        sess.start()
+        await asyncio.wait_for(sess.run_task, timeout=5)
+    recs = [r for r in caplog.records if "feed crashed" in r.getMessage()]
+    assert recs and recs[0].exc_info is not None  # full traceback attached
+    assert feed.calls == 2  # crashed once, restarted, ran to completion
+
+
+async def test_degraded_broadcast_failure_still_restarts(monkeypatch, caplog):
+    feed = FlakyFeed()
+    sess = Session(
+        "robust",
+        feed=feed,
+        grid=_mk_grid(rows=64, ring_columns=256, p0=84.0),
+        restart_backoff_base_s=0.001,
+    )
+    sess.attach(ClientTx())
+
+    def boom(state: str) -> None:
+        raise RuntimeError("encode exploded")
+
+    monkeypatch.setattr(sess, "_set_feed_state", boom)
+    with caplog.at_level(logging.ERROR, logger="flowmap_server.core.session"):
+        sess.start()
+        await asyncio.wait_for(sess.run_task, timeout=5)
+    assert feed.calls == 2  # the failed Status broadcast did not kill the restart
+    assert any("degraded Status" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# zombie session: feed ended normally -> new subscriber restarts it
+
+
+class EndingFeed:
+    """Ends normally after one book event; counts ``events()`` calls."""
+
+    market = "sim"
+    symbol = "END"
+    capability: dict[str, object] = {"depth": "L2"}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def events(self):
+        self.calls += 1
+        yield BookState(self.calls * DT, *_BOOK)
+
+
+async def test_ended_feed_session_restarts_on_new_subscriber():
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=64, dt_crypto_ns=DT)
+    feed = EndingFeed()
+    mgr = SessionManager(cfg, timer=FakeTimer(), feed_factory=lambda sub: feed)
+    sub = Subscribe(market="sim", symbol="END", mode="live", source=None, start_t=None)
+
+    sess = await mgr.subscribe(sub, ClientTx())
+    await asyncio.wait_for(sess.run_task, timeout=5)  # feed ends normally
+    assert feed.calls == 1 and sess.run_task.done()
+
+    # A new subscriber to the existing key must NOT get a zombie session:
+    # subscribe() restarts the run task (start() is idempotent).
+    assert await mgr.subscribe(sub, ClientTx()) is sess
+    assert not sess.run_task.done()
+    await asyncio.wait_for(sess.run_task, timeout=5)
+    assert feed.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# unknown FeedEvent type: warn, never raise (forward-compat)
+
+
+class AlienEventFeed:
+    market = "sim"
+    symbol = "ALIEN"
+    capability: dict[str, object] = {"depth": "L2"}
+
+    async def events(self):
+        yield "not-a-feed-event"
+        yield BookState(DT, *_BOOK)
+
+
+async def test_unknown_feed_event_warns_and_continues(caplog):
+    sess = Session(
+        "alien", feed=AlienEventFeed(), grid=_mk_grid(rows=64, ring_columns=128, p0=84.0)
+    )
+    sess.attach(ClientTx())
+    with caplog.at_level(logging.WARNING, logger="flowmap_server.core.session"):
+        sess.start()
+        await asyncio.wait_for(sess.run_task, timeout=5)  # no crash: ends normally
+    assert any(
+        "unknown feed event type str" in r.getMessage() for r in caplog.records
+    )
