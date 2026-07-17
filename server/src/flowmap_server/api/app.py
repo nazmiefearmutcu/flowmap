@@ -49,7 +49,7 @@ def _realtime_sim_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
 def create_app(cfg: Config, manager: SessionManager | None = None) -> FastAPI:
     if manager is None:
         manager = SessionManager(cfg, feed_factory=_realtime_sim_factory(cfg))
-    app = FastAPI(title="flowmap-server", version=__version__, docs_url=None, redoc_url=None)
+    app = FastAPI(title="flowmap-server", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.cfg = cfg
     app.state.manager = manager
     app.add_middleware(
