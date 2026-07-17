@@ -1,0 +1,510 @@
+"""Session / subscription / backpressure tests (M1 plan Task 7).
+
+Covers the eight frozen behaviors from the plan: snapshot shape, refcount +
+grace teardown, column lag-dropping with gap markers, the non-column cap,
+max_sessions, col_seq dedup, the live loop end-to-end, and handle_history.
+Plus one bonus: feed crash -> degraded Status -> recovery.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import numpy as np
+import pytest
+
+from flowmap_server.config import Config
+from flowmap_server.core.grid import Grid, GridCfg
+from flowmap_server.core.session import (
+    ClientTx,
+    Session,
+    SessionLimitError,
+    SessionManager,
+)
+from flowmap_server.feeds.base import BookState
+from flowmap_server.feeds.sim import SimFeed
+from flowmap_server.proto import wire
+from flowmap_server.proto.events import (
+    BBO,
+    MODE_L2,
+    BarColumn,
+    DepthColumn,
+    EpochStart,
+    Hello,
+    HistoryRequest,
+    HistoryResponse,
+    Marker,
+    Status,
+    Subscribe,
+    Trade,
+)
+
+DT = 250_000_000  # 250 ms
+
+# ---------------------------------------------------------------------------
+# helpers
+
+
+class FakeClock:
+    """Injectable monotonic-ns clock."""
+
+    def __init__(self, t_ns: int = 0) -> None:
+        self.t_ns = t_ns
+
+    def __call__(self) -> int:
+        return self.t_ns
+
+    def advance(self, ns: int) -> None:
+        self.t_ns += ns
+
+
+class _FakeHandle:
+    def __init__(self, delay_s: float, cb) -> None:
+        self.delay_s = delay_s
+        self.cb = cb
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.cb()
+
+
+class FakeTimer:
+    """Injectable timer: records (delay, cb) pairs; fired manually."""
+
+    def __init__(self) -> None:
+        self.entries: list[_FakeHandle] = []
+
+    def __call__(self, delay_s: float, cb) -> _FakeHandle:
+        h = _FakeHandle(delay_s, cb)
+        self.entries.append(h)
+        return h
+
+
+class IdleFeed:
+    """Feed that never yields (for lifecycle tests: no event flood)."""
+
+    market = "sim"
+    symbol = "IDLE"
+    capability: dict[str, object] = {"depth": "L2"}
+
+    async def events(self):
+        await asyncio.sleep(3600)
+        if False:  # pragma: no cover - makes this an async generator
+            yield None
+
+
+class CappedFeed:
+    """Wraps a feed, stopping after ``max_events`` (deterministic e2e cap)."""
+
+    def __init__(self, inner, max_events: int) -> None:
+        self._inner = inner
+        self._max = max_events
+        self.market = inner.market
+        self.symbol = inner.symbol
+        self.capability = inner.capability
+
+    async def events(self):
+        n = 0
+        async for ev in self._inner.events():
+            yield ev
+            n += 1
+            if n >= self._max:
+                return
+
+
+def _mk_grid(rows: int = 256, ring_columns: int = 1024, p0: float | None = None) -> Grid:
+    tick = 0.5
+    if p0 is None:
+        p0 = 100.0 - rows * tick / 2  # sim mid ~100 centered
+    return Grid(
+        GridCfg(
+            tick=tick,
+            tick_multiple=1,
+            dt_ns=DT,
+            p0=p0,
+            rows=rows,
+            ring_columns=ring_columns,
+            mode=MODE_L2,
+        )
+    )
+
+
+async def _predrive_grid(grid: Grid, seed: int, n_cols: int) -> None:
+    """Drive ``grid`` from SimFeed events until ``n_cols`` columns finalized."""
+    feed = SimFeed(seed=seed, dt_ns=DT, start_ns=0)
+    done = 0
+    async for ev in feed.events():
+        if isinstance(ev, BookState):
+            done += len(grid.on_book(ev.ts_ns, ev.bid_px, ev.bid_sz, ev.ask_px, ev.ask_sz))
+        elif isinstance(ev, Trade):
+            grid.on_trade(ev.ts_ns, ev.price, ev.size, ev.side)
+        if done >= n_cols:
+            return
+
+
+def _decode_frame(buf: bytes) -> list:
+    out = []
+    off = 0
+    while off < len(buf):
+        ev, off = wire.decode(buf, off)
+        out.append(ev)
+    return out
+
+
+def _drain_all(client: ClientTx) -> list:
+    msgs = []
+    while True:
+        frames = client.drain(1 << 30)
+        if not frames:
+            return msgs
+        for f in frames:
+            msgs.extend(_decode_frame(f))
+
+
+_BOOK = (
+    np.array([100.0]),
+    np.array([2.0]),
+    np.array([100.5]),
+    np.array([3.0]),
+)
+
+
+def _drive_synthetic(grid: Grid, n_cols: int, start_idx: int = 0) -> list:
+    """Finalize ``n_cols`` columns with a fixed one-level book."""
+    cols = []
+    for i in range(start_idx, start_idx + n_cols + 1):
+        cols.extend(grid.on_book(i * DT, *_BOOK))
+    return cols[:n_cols]
+
+
+# ---------------------------------------------------------------------------
+# 1. Snapshot shape
+
+
+async def test_snapshot_shape_over_sim_history():
+    grid = _mk_grid(rows=256, ring_columns=1024)
+    await _predrive_grid(grid, seed=1, n_cols=700)
+
+    feed = SimFeed(seed=1, dt_ns=DT, start_ns=0)  # capability donor; never started
+    sess = Session("snap-test", feed=feed, grid=grid)
+    client = ClientTx()
+    frames = sess.attach(client)
+
+    # First frame's first message is Hello.
+    first = _decode_frame(frames[0])
+    hello = first[0]
+    assert isinstance(hello, Hello)
+    assert hello.protocol_version == 1
+    assert hello.session_id == "snap-test"
+    assert hello.grid_epoch == 0
+    assert hello.epoch_params.rows == 256
+    assert hello.epoch_params.dt_ns == DT
+    assert hello.capability == feed.capability
+    assert hello.norm_seed > 0.0  # non-empty history -> percentile hint
+
+    # EpochStart precedes any DepthColumn (flattened across frames, in order).
+    flat = [m for f in frames for m in _decode_frame(f)]
+    kinds = [type(m) for m in flat]
+    assert EpochStart in kinds and DepthColumn in kinds
+    assert kinds.index(EpochStart) < kinds.index(DepthColumn)
+
+    # 512 depth columns total (700 available), <=64 per chunk frame.
+    depth_total = 0
+    for f in frames:
+        msgs = _decode_frame(f)  # decodes cleanly end-to-end (raises otherwise)
+        n_depth = sum(isinstance(m, DepthColumn) for m in msgs)
+        assert n_depth <= 64
+        depth_total += n_depth
+    assert depth_total == 512
+    assert len(frames) == 1 + 8  # hello frame + 8 chunk frames (no tape/markers/bbo)
+
+    # Columns are final, consecutive, and each is paired with its BarColumn.
+    depths = [m for m in flat if isinstance(m, DepthColumn)]
+    bars = [m for m in flat if isinstance(m, BarColumn)]
+    assert all(d.final for d in depths)
+    seqs = [d.col_seq for d in depths]
+    assert all(b - a == 1 for a, b in zip(seqs, seqs[1:]))
+    assert [b.col_seq for b in bars] == seqs
+
+
+async def test_snapshot_empty_grid_norm_seed_is_one():
+    sess = Session("empty", feed=IdleFeed(), grid=_mk_grid(rows=64, ring_columns=128))
+    frames = sess.attach(ClientTx())
+    hello = _decode_frame(frames[0])[0]
+    assert isinstance(hello, Hello)
+    assert hello.norm_seed == 1.0
+
+
+# ---------------------------------------------------------------------------
+# 2. Refcount / grace teardown
+
+
+async def test_refcount_grace_teardown_and_fresh_session():
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=64, dt_crypto_ns=DT)
+    timer = FakeTimer()
+    mgr = SessionManager(cfg, timer=timer, feed_factory=lambda sub: IdleFeed())
+    sub = Subscribe(market="sim", symbol="IDLE", mode="live", source=None, start_t=None)
+    c1, c2 = ClientTx(), ClientTx()
+
+    sess = await mgr.subscribe(sub, c1)
+    assert await mgr.subscribe(sub, c2) is sess  # same key -> same session
+
+    await mgr.unsubscribe(sess, c1)
+    assert not timer.entries  # one ref left: no grace scheduled
+    await mgr.unsubscribe(sess, c2)
+    assert len(timer.entries) == 1 and timer.entries[0].delay_s == 60.0
+
+    # Alive during grace: run task still pending, still registered.
+    assert sess.run_task is not None and not sess.run_task.done()
+    assert sess in mgr._sessions.values()
+
+    # Re-attach during grace cancels the pending teardown.
+    assert await mgr.subscribe(sub, c1) is sess
+    assert timer.entries[0].cancelled
+    await mgr.unsubscribe(sess, c1)
+    assert len(timer.entries) == 2
+
+    # Grace fires -> feed task cancelled, session deregistered.
+    timer.entries[1].fire()
+    await asyncio.gather(sess.run_task, return_exceptions=True)
+    assert sess.run_task.cancelled()
+    assert sess not in mgr._sessions.values()
+
+    # Re-subscribe after teardown creates a FRESH session.
+    fresh = await mgr.subscribe(sub, c1)
+    assert fresh is not sess
+    assert fresh.session_id != sess.session_id
+    fresh.run_task.cancel()
+    await asyncio.gather(fresh.run_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# 3. Backpressure: column lag-drop + gap markers + recoverability
+
+
+def test_backpressure_lag_drop_gap_markers_recoverable():
+    grid = _mk_grid(rows=64, ring_columns=8192, p0=84.0)
+    cols = _drive_synthetic(grid, 5000)
+    assert len(cols) == 5000
+    frames = {c.col_seq: wire.encode(grid.to_depth(c)) for c in cols}
+
+    clock = FakeClock()
+    client = ClientTx(clock=clock)
+
+    def offer_range(lo: int, hi: int) -> None:
+        for c in cols[lo:hi]:
+            clock.advance(DT)  # 250 ms of "transmission lag" per column
+            client.offer(frames[c.col_seq], col_msg=True, t0_ns=c.t0_ns)
+            assert len(client) <= 16  # queue stays bounded throughout
+
+    # Phase A: two drop runs separated by a full drain.
+    offer_range(0, 3000)
+    msgs_a = _drain_all(client)
+    offer_range(3000, 5000)
+    msgs_b = _drain_all(client)
+
+    def split(msgs):
+        gaps = [m for m in msgs if isinstance(m, Marker) and m.kind == "gap"]
+        kept = {m.col_seq for m in msgs if isinstance(m, DepthColumn)}
+        return gaps, kept
+
+    gaps_a, kept_a = split(msgs_a)
+    gaps_b, kept_b = split(msgs_b)
+
+    # ONE gap Marker per contiguous drop run.
+    assert len(gaps_a) == 1 and len(gaps_b) == 1
+    assert gaps_a[0].ts_ns == cols[0].t0_ns  # first dropped column of run A
+    assert gaps_b[0].ts_ns == cols[3000].t0_ns  # first dropped column of run B
+
+    dropped = (set(range(0, 3000)) - kept_a) | (set(range(3000, 5000)) - kept_b)
+    assert dropped  # lag really dropped columns
+    # Dropped set is contiguous-prefix per phase (oldest-first drops).
+    assert kept_a == set(range(max(dropped & set(range(3000))) + 1, 3000))
+
+    # Every dropped column remains recoverable from the grid ring.
+    sample = sorted(dropped)[:: max(1, len(dropped) // 7)][:7]
+    for seq in sample:
+        got = grid.history(seq * DT + 1, 1)
+        assert len(got) == 1 and got[0].col_seq == seq
+
+
+# ---------------------------------------------------------------------------
+# 4. Non-column cap
+
+
+def test_noncolumn_cap_keeps_newest_1000():
+    client = ClientTx(clock=FakeClock())
+    for i in range(2000):
+        frame = wire.encode(BBO(ts_ns=i, bid_px=1.0, bid_sz=1.0, ask_px=2.0, ask_sz=1.0))
+        client.offer(frame, col_msg=False, t0_ns=None)
+    msgs = _drain_all(client)
+    bbos = [m for m in msgs if isinstance(m, BBO)]
+    assert len(bbos) == 1000  # cap
+    assert bbos[0].ts_ns == 1000 and bbos[-1].ts_ns == 1999  # newest kept, FIFO order
+
+
+def test_column_offer_requires_t0():
+    client = ClientTx(clock=FakeClock())
+    with pytest.raises(ValueError):
+        client.offer(b"x", col_msg=True, t0_ns=None)
+
+
+# ---------------------------------------------------------------------------
+# 5. max_sessions
+
+
+async def test_max_sessions_limit_and_existing_key_reuse():
+    cfg = Config(max_sessions=2, ring_columns=256, max_rows=64, dt_crypto_ns=DT)
+    mgr = SessionManager(cfg, timer=FakeTimer(), feed_factory=lambda sub: IdleFeed())
+    c = ClientTx()
+
+    def sub(sym: str) -> Subscribe:
+        return Subscribe(market="sim", symbol=sym, mode="live", source=None, start_t=None)
+
+    s_a = await mgr.subscribe(sub("A"), c)
+    s_b = await mgr.subscribe(sub("B"), c)
+    with pytest.raises(SessionLimitError):
+        await mgr.subscribe(sub("C"), ClientTx())
+    # Re-subscribing an existing key does not count as a new session.
+    assert await mgr.subscribe(sub("A"), ClientTx()) is s_a
+
+    for s in (s_a, s_b):
+        s.run_task.cancel()
+    await asyncio.gather(s_a.run_task, s_b.run_task, return_exceptions=True)
+
+
+async def test_unknown_market_raises_not_implemented():
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=64, dt_crypto_ns=DT)
+    mgr = SessionManager(cfg, timer=FakeTimer())
+    bad = Subscribe(market="crypto", symbol="BTCUSDT", mode="live", source=None, start_t=None)
+    with pytest.raises(NotImplementedError):
+        await mgr.subscribe(bad, ClientTx())
+
+
+# ---------------------------------------------------------------------------
+# 6. Dedup by col_seq
+
+
+def test_broadcast_dedups_boundary_reemitted_columns():
+    grid = _mk_grid(rows=64, ring_columns=128, p0=84.0)
+    (col,) = _drive_synthetic(grid, 1)
+    sess = Session("dedup", feed=IdleFeed(), grid=grid)
+    client = ClientTx()
+    sess.attach(client)
+
+    sess._emit_finalized([col, col])  # boundary re-emission within one batch
+    sess._emit_finalized([col])  # ... and across batches
+    msgs = _drain_all(client)
+
+    finals = [m for m in msgs if isinstance(m, DepthColumn) and m.final]
+    assert len(finals) == 1 and finals[0].col_seq == col.col_seq
+    assert sum(isinstance(m, BarColumn) and m.col_seq == col.col_seq for m in msgs) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 7. Live loop e2e
+
+
+async def test_live_loop_end_to_end_sim():
+    cfg = Config(max_sessions=4, ring_columns=2048, max_rows=128, dt_crypto_ns=DT)
+    mgr = SessionManager(
+        cfg,
+        feed_factory=lambda sub: CappedFeed(SimFeed(seed=42, dt_ns=DT, start_ns=0), 1500),
+    )
+    client = ClientTx()
+    sub = Subscribe(market="sim", symbol="SIM-DEMO", mode="live", source=None, start_t=None)
+    sess = await mgr.subscribe(sub, client)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    msgs = _drain_all(client)
+    assert isinstance(msgs[0], Hello)
+    assert msgs[0].norm_seed == 1.0  # grid empty at subscribe time
+    kinds = [type(m) for m in msgs]
+    assert kinds.index(EpochStart) < len(kinds)
+
+    first_depth = next(i for i, m in enumerate(msgs) if isinstance(m, DepthColumn))
+    assert kinds.index(EpochStart) < first_depth  # EpochStart precedes columns
+
+    finals = [m for m in msgs if isinstance(m, DepthColumn) and m.final]
+    partials = [m for m in msgs if isinstance(m, DepthColumn) and not m.final]
+    assert len(finals) >= 1
+    assert len(partials) >= 1
+    fseqs = [m.col_seq for m in finals]
+    assert all(b > a for a, b in zip(fseqs, fseqs[1:]))  # strictly increasing
+
+    # Bars: cumulative vwap denominator is non-decreasing in stream order.
+    # (The plan says "non-decreasing cvd", but cvd_cum is signed and
+    # non-monotone by design — grid docstring; vwap_den_cum is the monotone
+    # cumulative bar field.)
+    bars = [m for m in msgs if isinstance(m, BarColumn)]
+    assert bars
+    dens = [b.vwap_den_cum for b in bars]
+    assert all(b >= a for a, b in zip(dens, dens[1:]))
+    assert any(isinstance(m, Trade) for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# 8. handle_history
+
+
+def test_handle_history_serves_cols_before_t():
+    grid = _mk_grid(rows=64, ring_columns=1024, p0=84.0)
+    _drive_synthetic(grid, 300)
+    sess = Session("hist", feed=IdleFeed(), grid=grid)
+
+    before = 150 * DT  # exclusive: col 150's own t0
+    frame = sess.handle_history(HistoryRequest(req_id=9, before_t=before, n_cols=64))
+    msgs = _decode_frame(frame)
+    assert len(msgs) == 1  # ONE HistoryResponse frame
+    resp = msgs[0]
+    assert isinstance(resp, HistoryResponse)
+    assert resp.req_id == 9
+    assert resp.epoch == 0
+    assert resp.oldest_available_t_ns == grid.oldest_retained_t0_ns()
+    assert 0 < len(resp.depth_cols) <= 64
+    assert all(d.t0_ns < before for d in resp.depth_cols)
+    assert resp.depth_cols[-1].t0_ns == before - DT  # ends strictly before before_t
+    assert [b.col_seq for b in resp.bar_cols] == [d.col_seq for d in resp.depth_cols]
+    assert resp.big_trades == []
+
+    # n_cols is clamped to 256.
+    resp2 = _decode_frame(sess.handle_history(
+        HistoryRequest(req_id=10, before_t=2**62, n_cols=500)))[0]
+    assert len(resp2.depth_cols) == 256
+
+
+# ---------------------------------------------------------------------------
+# bonus: feed crash -> degraded -> recovery
+
+
+class FlakyFeed:
+    market = "sim"
+    symbol = "FLAKY"
+    capability: dict[str, object] = {"depth": "L2"}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def events(self):
+        self.calls += 1
+        if self.calls == 1:
+            yield BookState(0, *_BOOK)
+            raise RuntimeError("boom")
+        for i in range(1, 5):
+            yield BookState(i * DT, *_BOOK)
+
+
+async def test_feed_crash_degraded_then_recovered_status():
+    grid = _mk_grid(rows=64, ring_columns=128, p0=84.0)
+    sess = Session("flaky", feed=FlakyFeed(), grid=grid, restart_backoff_base_s=0.001)
+    client = ClientTx()
+    sess.attach(client)
+    sess.start()
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    statuses = [m for m in _drain_all(client) if isinstance(m, Status)]
+    assert [s.feed_state for s in statuses] == ["degraded", "live"]
