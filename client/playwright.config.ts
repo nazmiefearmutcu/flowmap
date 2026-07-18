@@ -50,6 +50,10 @@ export default defineConfig({
         FLOWMAP_PORT: '8720',
         FLOWMAP_RECORDING_ENABLED: '0',
         FLOWMAP_LOG_LEVEL: 'warning',
+        // Fast sim cadence (25 ms → 40 cols/s) so the T8 scroll-back spec
+        // overruns the client's full-res budget in seconds instead of minutes.
+        // Other specs only benefit (more columns, faster live scroll).
+        FLOWMAP_DT_CRYPTO_NS: '25000000',
       },
       url: 'http://127.0.0.1:8720/api/health',
       reuseExistingServer: !process.env.CI,

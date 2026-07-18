@@ -59,18 +59,27 @@ export function App() {
       };
     }
 
+    const params = new URLSearchParams(window.location.search);
     // Perf harness mode (T6 §10 gates): the renderer is preloaded with synthetic
     // history via __flowmapLive.renderer.preloadSynthetic — do NOT open the live
     // feed, which would fight the preloaded ring. Otherwise wire the sim feed.
-    const perfMode = new URLSearchParams(window.location.search).get('perf') === '1';
+    const perfMode = params.get('perf') === '1';
 
-    const renderer = new Renderer(canvas, useFlowMapStore);
+    // Scroll-back e2e (T8): a small full-res budget so the live sim overruns it
+    // quickly and panning left exercises the HistoryRequest backfill path.
+    const scrollbackMode = params.get('scrollback') === '1';
+    const budgetParam = params.get('budget');
+    const rendererOpts = scrollbackMode
+      ? { capacityColsTarget: budgetParam ? Number.parseInt(budgetParam, 10) : 512 }
+      : {};
+
+    const renderer = new Renderer(canvas, useFlowMapStore, rendererOpts);
     if (!perfMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
     }
 
-    // Read-only diagnostics handle for the live-sim / perf e2e (dev/preview only).
-    if (import.meta.env.DEV || perfMode) {
+    // Read-only diagnostics handle for the live-sim / perf / scroll-back e2e.
+    if (import.meta.env.DEV || perfMode || scrollbackMode) {
       (window as unknown as { __flowmapLive: unknown }).__flowmapLive = {
         renderer,
         store: useFlowMapStore,

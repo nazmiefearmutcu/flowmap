@@ -24,16 +24,25 @@
  * `preserveDrawingBuffer` so a skipped frame keeps the last image on screen.
  *
  * Bar/Trade/BBO/Marker stream messages are ignored here (overlays are T10) but
- * never crash the renderer. Mips (T7) and history backfill (T8) are out of scope.
+ * never crash the renderer.
+ *
+ * T8 deep scroll-back: the ring is a bounded full-res window over history. When
+ * the user pans LEFT past the oldest resident column, the {@link HistoryLoader}
+ * fetches older columns and splices them at their true absolute col_seq (the
+ * ring slides its window back, evicting the live edge — see gl/tileRing). While
+ * the user is scrolled back, live columns at the right edge are NOT written
+ * (they'd steal the ring from the viewed region); they resume on go-live. A
+ * `webglcontextlost` recreates every GL object and re-fetches the visible range.
  */
 
 import { COLS_PER_TILE, TileRing } from './tileRing';
-import { Heatmap, type HeatmapView } from './heatmap';
+import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
 import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import { Camera, limitsFor } from './camera';
 import { attachGestures, type CameraController } from '../input/gestures';
+import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
 import { MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
@@ -68,7 +77,15 @@ export interface PerfResult {
   frames: number;
 }
 
-const DEFAULT_CAPACITY_COLS = 1024;
+/**
+ * Full-res residency budget (§8.3): 16 384 recent columns = 64 tile layers ×
+ * 256 cols. At RG16F (4 B/texel) one column is rows·4 B, so the ring is
+ * 16384·rows·4 B — 134 MiB at the sim's 2048 rows, 268 MiB at the production
+ * 4096-row grid, both ≤ the §10 300 MB GPU-memory gate. Older ranges are not
+ * held full-res; scroll-back re-fetches them (net/history) and deep zoom-out
+ * renders from the SUM-mips.
+ */
+const DEFAULT_CAPACITY_COLS = 16_384;
 const DEFAULT_COLUMN_PX = 3;
 const DEFAULT_MAX_VISIBLE = 512;
 const MIN_VISIBLE_COLS = 32;
@@ -105,8 +122,9 @@ export class Renderer {
   private readonly store: RendererStore;
   private readonly opts: Required<RendererOptions>;
 
-  private readonly ctx: GLContext;
-  private readonly lut: WebGLTexture;
+  // Rebuilt on `webglcontextrestored`, hence not readonly.
+  private ctx: GLContext;
+  private lut: WebGLTexture;
   private readonly camera: Camera;
 
   // Created lazily on the first column, once the row count is known.
@@ -117,13 +135,28 @@ export class Renderer {
   /** Per-slot non-zero row extent (lo/hi), -1 = empty. Sized to ring capacity. */
   private extentLo: Int32Array | null = null;
   private extentHi: Int32Array | null = null;
+  /** Ring geometry, remembered so context-restore can rebuild identically. */
+  private ringRows = 0;
+  private ringLayers = 0;
+
+  /** Deep scroll-back backfill (T8). Created with the ring. */
+  private history: HistoryLoader | null = null;
 
   private newestSeq = -1;
   private view: HeatmapView;
 
   private dirty = false;
+  /** The view moved this frame → ask the HistoryLoader to ensure visible range. */
+  private viewMoved = false;
   private running = true;
   private rafId = 0;
+
+  // Context-loss lifecycle (§8.3): recreate GL + re-fetch on restore.
+  private contextLost = false;
+  private contextLostCountN = 0;
+  private contextRestoredCountN = 0;
+  /** WEBGL_lose_context handle kept from the pre-loss ctx (e2e-driven loss). */
+  private lostCtxExt: { loseContext(): void; restoreContext(): void } | null = null;
 
   // Perf instrumentation (test hooks): draw bookkeeping + a scripted run.
   private drawCountN = 0;
@@ -165,6 +198,11 @@ export class Renderer {
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(canvas);
 
+    // Context-loss recovery (§8.3): preventDefault on lost so the browser will
+    // fire `restored`, where we rebuild every GL object + re-fetch the view.
+    canvas.addEventListener('webglcontextlost', this.onContextLost as EventListener, false);
+    canvas.addEventListener('webglcontextrestored', this.onContextRestored as EventListener, false);
+
     this.gesturesDispose = attachGestures(canvas, this.makeController());
 
     this.unsubscribeStream = store.getState().onStream(this.onMessage);
@@ -192,10 +230,63 @@ export class Renderer {
     return { ...this.view };
   }
 
+  /** Full-res residency budget in columns (ring capacity). Diagnostics / e2e. */
+  get residentBudgetCols(): number {
+    return this.ring?.budgetCols ?? 0;
+  }
+
+  /** Whether an absolute col_seq is resident full-res. Diagnostics / e2e. */
+  isResidentFullRes(colSeq: number): boolean {
+    return this.ring?.isResidentFullRes(colSeq) ?? false;
+  }
+
+  /** Scroll-back backfill counters (or null before the ring exists). e2e hook. */
+  historyStats(): {
+    requestCount: number;
+    inFlight: boolean;
+    startOfHistory: boolean;
+    error: string | null;
+  } | null {
+    if (!this.history) return null;
+    return {
+      requestCount: this.history.requestCount,
+      inFlight: this.history.inFlight,
+      startOfHistory: this.history.startOfHistory,
+      error: this.history.error,
+    };
+  }
+
+  /** Context-loss/restore counters. e2e recovery hook. */
+  get contextLostCount(): number {
+    return this.contextLostCountN;
+  }
+  get contextRestoredCount(): number {
+    return this.contextRestoredCountN;
+  }
+
+  /** Force a WebGL context loss via WEBGL_lose_context (e2e only). */
+  loseContextForTest(): boolean {
+    const ext = this.ctx.gl.getExtension('WEBGL_lose_context');
+    if (!ext) return false;
+    this.lostCtxExt = ext;
+    ext.loseContext();
+    return true;
+  }
+
+  /** Restore a context lost via {@link loseContextForTest} (e2e only). */
+  restoreContextForTest(): void {
+    this.lostCtxExt?.restoreContext();
+  }
+
   dispose(): void {
     this.running = false;
     cancelAnimationFrame(this.rafId);
     this.resizeObserver.disconnect();
+    this.canvas.removeEventListener('webglcontextlost', this.onContextLost as EventListener);
+    this.canvas.removeEventListener(
+      'webglcontextrestored',
+      this.onContextRestored as EventListener,
+    );
     this.gesturesDispose();
     this.unsubscribeStream();
     this.mips?.dispose();
@@ -253,8 +344,12 @@ export class Renderer {
       },
       goLive: () => {
         this.camera.reset(this.residentRange(), this.ring?.rows);
+        // Leaving scroll-back: allow live appends to re-anchor the ring at the
+        // live edge and let the loader probe again on the next pan.
+        this.history?.reset();
         this.updateView();
         this.dirty = true;
+        this.viewMoved = true;
       },
     };
   }
@@ -263,6 +358,7 @@ export class Renderer {
   private onCameraChanged(): void {
     this.view = this.camera.toView();
     this.dirty = true;
+    this.viewMoved = true;
   }
 
   // --- stream handling ----------------------------------------------------------
@@ -274,6 +370,9 @@ export class Renderer {
   };
 
   private onDepthColumn(col: DepthColumn): void {
+    // A lost context has no valid textures; drop until restore re-fetches.
+    if (this.glLost()) return;
+
     const params = this.store.getState().epochs.get(col.epoch);
     const rows = params?.rows ?? col.bid.length;
 
@@ -281,26 +380,27 @@ export class Renderer {
     const ring = this.ring!;
 
     if (rows !== ring.rows || col.bid.length !== rows) {
-      // A per-epoch row-count change needs a fresh ring (T8); until then a
-      // mismatched column is dropped rather than corrupting the upload.
+      // A per-epoch row-count change needs a fresh ring; until then a mismatched
+      // column is dropped rather than corrupting the upload.
       console.warn(
         `[flowmap] depth column rows ${rows} (bid ${col.bid.length}) ≠ ring rows ${ring.rows}; skipping`,
       );
       return;
     }
 
-    ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows);
-    // Incremental SUM-mip regen for the affected 4/16-column group (T7). This is
-    // append-time work, not per-frame — the draw stays O(1) in history.
-    this.mips?.updateFrom(ring, col.col_seq);
-
-    const cap = ring.capacityCols;
-    const slot = ((col.col_seq % cap) + cap) % cap;
-    const [lo, hi] = columnExtent(col.bid, col.ask, rows);
-    this.extentLo![slot] = lo;
-    this.extentHi![slot] = hi;
-
     if (col.col_seq > this.newestSeq) this.newestSeq = col.col_seq;
+
+    // Deep scroll-back gate (T8): when the user has panned back into history
+    // (follow off) and this live column sits past the resident window's right
+    // edge, DON'T write it — it would wrap-evict the region being viewed. The
+    // column stays on the server and is recoverable on go-live; the resident
+    // window keeps tracking the scrolled-back region the loader is filling.
+    const range = ring.residentRange();
+    if (!this.camera.follow && range !== null && col.col_seq > range.newest + 1) {
+      return;
+    }
+
+    this.writeColumn(col, rows);
 
     // Normalization: the server's per-session norm_seed (p99 of recent nonzero
     // density) is the right ramp divisor; floor it so a small seed can't wash out.
@@ -316,6 +416,44 @@ export class Renderer {
     this.dirty = true;
   }
 
+  /**
+   * Splice a backfilled history column (T8 loader sink). Same physical write as
+   * a live append — the ring addresses by absolute col_seq, so an older column
+   * lands in its true slot and slides the resident window backward.
+   */
+  private spliceColumn = (col: DepthColumn): void => {
+    if (this.glLost()) return;
+    const ring = this.ring;
+    if (ring === null) return;
+    const params = this.store.getState().epochs.get(col.epoch);
+    const rows = params?.rows ?? col.bid.length;
+    if (rows !== ring.rows || col.bid.length !== rows) {
+      console.warn(`[flowmap] history column rows ${rows} ≠ ring rows ${ring.rows}; skipping`);
+      return;
+    }
+    this.writeColumn(col, rows);
+    this.dirty = true;
+  };
+
+  /**
+   * The shared column write: upload the texel column, regenerate the affected
+   * SUM-mip group (append-time, O(1) in history), refresh the per-slot non-zero
+   * extent, and record (col_seq → t0_ns) for the loader's before_t mapping.
+   */
+  private writeColumn(col: DepthColumn, rows: number): void {
+    const ring = this.ring!;
+    ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows);
+    this.mips?.updateFrom(ring, col.col_seq);
+
+    const cap = ring.capacityCols;
+    const slot = ((col.col_seq % cap) + cap) % cap;
+    const [lo, hi] = columnExtent(col.bid, col.ask, rows);
+    this.extentLo![slot] = lo;
+    this.extentHi![slot] = hi;
+
+    this.history?.noteColumn(col.col_seq, col.t0_ns);
+  }
+
   private createRing(rows: number): void {
     if (rows > this.ctx.caps.maxTextureSize) {
       throw new Error(
@@ -326,6 +464,8 @@ export class Renderer {
     const wantLayers = Math.ceil(this.opts.capacityColsTarget / COLS_PER_TILE);
     const layers = clamp(wantLayers, 2, maxLayers);
 
+    this.ringRows = rows;
+    this.ringLayers = layers;
     this.ring = new TileRing(this.ctx.gl, rows, layers);
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
     this.mips?.dispose();
@@ -335,9 +475,36 @@ export class Renderer {
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
 
+    this.history = this.createHistoryLoader();
+
     // Real geometry known: update the camera's clamps and (re)frame live.
     this.camera.setLimits(limitsFor(rows, cap));
     this.camera.reset(this.ring.residentRange(), rows);
+  }
+
+  /** Wire a {@link HistoryLoader} to the store transport + this ring/mips. */
+  private createHistoryLoader(): HistoryLoader {
+    return new HistoryLoader({
+      requestHistory: (before_t, n) => this.store.getState().requestHistory(before_t, n),
+      spliceColumn: this.spliceColumn,
+      residentRange: () => this.ring?.residentRange() ?? null,
+      budgetCols: () => this.ring?.budgetCols ?? 0,
+      dtNs: () => this.currentDtNs(),
+      onSpliced: () => {
+        this.dirty = true;
+        // Re-arm the per-frame guard: if the visible range still isn't fully
+        // resident (a wide pan needs several pages), the next frame fetches the
+        // next page. Self-terminates once the left edge is covered — still O(1).
+        this.viewMoved = true;
+      },
+    });
+  }
+
+  /** Current epoch's column interval (ns) for the loader's before_t fallback. */
+  private currentDtNs(): number {
+    const st = this.store.getState();
+    const ep = st.gridEpoch !== null ? st.epochs.get(st.gridEpoch) : undefined;
+    return ep?.dt_ns ?? 250_000_000;
   }
 
   /**
@@ -423,10 +590,89 @@ export class Renderer {
     // Visible-column count depends on CSS width; refit (follow) and repaint.
     this.updateView();
     this.dirty = true;
+    this.viewMoved = true;
+  }
+
+  /** SUM-mip level the current view would sample (0/1/2) — drives backfill
+   *  suppression on deep zoom-out (§8.3: level-2 renders from mips). */
+  private currentLevel(): number {
+    const maxLevel = this.mips ? this.mips.maxLevel : 0;
+    const h = Math.max(1, this.ctx.gl.drawingBufferHeight);
+    return selectLevel(this.view.rowScale / h, maxLevel).level;
+  }
+
+  // --- context-loss lifecycle (§8.3) --------------------------------------------
+
+  /** GL context lost: preventDefault so the browser will restore it, then stop
+   *  touching the (now invalid) GL objects until `restored` rebuilds them. */
+  private onContextLost = (e: Event): void => {
+    e.preventDefault();
+    this.contextLost = true;
+    this.contextLostCountN += 1;
+    this.perf = null; // any in-flight perf run is void
+  };
+
+  /** GL context restored: rebuild every GL object and re-fetch the visible range
+   *  (the ring came back empty). Live appends also resume repopulating. */
+  private onContextRestored = (): void => {
+    this.contextRestoredCountN += 1;
+    this.recreateGL();
+    this.contextLost = false;
+    this.dirty = true;
+    this.viewMoved = true;
+  };
+
+  /** Rebuild ctx + LUT + ring + heatmap + mips after a restore, preserving the
+   *  camera view, then re-fetch the columns the viewport needs. */
+  private recreateGL(): void {
+    // getContext on the restored canvas returns the same (now-revived) context;
+    // re-obtain extension handles + caps and rebuild all GPU resources.
+    this.ctx = initGL(this.canvas, {
+      requireColorBufferFloat: this.opts.requireColorBufferFloat,
+      preserveDrawingBuffer: true,
+    });
+    this.lut = createLUTTexture(this.ctx.gl);
+
+    const gl = this.ctx.gl;
+    this.resize();
+    gl.clearColor(BG[0], BG[1], BG[2], BG[3]);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    if (this.ringRows > 0) {
+      // Rebuild the ring/heatmap/mips at the same geometry; the ring is empty.
+      this.mips = null;
+      this.heatmap = null;
+      this.ring = new TileRing(gl, this.ringRows, this.ringLayers);
+      this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+      this.mips = this.createMips(this.ringRows, this.ringLayers);
+      this.heatmap.mips = this.mips;
+      const cap = this.ring.capacityCols;
+      this.extentLo = new Int32Array(cap).fill(-1);
+      this.extentHi = new Int32Array(cap).fill(-1);
+      this.history = this.createHistoryLoader();
+      this.camera.setLimits(limitsFor(this.ringRows, cap));
+      // Recover by re-following the live edge: the ring came back empty and the
+      // live feed is still flowing, so live appends re-populate the visible
+      // range from the server within a couple of columns. (A deep-scroll-back
+      // view is re-fetched again by the loader as soon as the user pans.)
+      this.camera.reset(null, this.ringRows);
+      this.updateView();
+    }
+  }
+
+  /** True while the GL context is lost — including the window between the
+   *  WEBGL_lose_context call and the `webglcontextlost` event firing. */
+  private glLost(): boolean {
+    return this.contextLost || this.ctx.gl.isContextLost();
   }
 
   private frame = (ts: number): void => {
     if (!this.running) return;
+    // A lost context can't draw; wait for `restored` to rebuild GL.
+    if (this.glLost()) {
+      this.rafId = requestAnimationFrame(this.frame);
+      return;
+    }
 
     const perf = this.perf;
     if (perf) {
@@ -434,6 +680,18 @@ export class Renderer {
       perf.lastTs = ts;
       this.stepPerf(perf);
       this.dirty = true; // force a redraw every frame while measuring
+    }
+
+    // T8: on frames where the view moved, ask the loader to ensure the visible
+    // range is populated. This guard is O(1) (visible-left vs resident-oldest) —
+    // never O(history) — so the §10 perf gate stays green.
+    if (this.viewMoved && this.history !== null && this.ring !== null) {
+      this.viewMoved = false;
+      this.history.ensureVisible({
+        leftCol: Math.floor(this.view.colOffset),
+        span: this.view.colScale,
+        level: this.currentLevel(),
+      });
     }
 
     if (this.dirty && this.heatmap !== null) {
@@ -484,6 +742,31 @@ export class Renderer {
     return this.lastDrawEndTsN;
   }
 
+  /** SUM-mip level the current view samples (0/1/2). e2e scroll-back hook. */
+  get currentMipLevel(): number {
+    return this.currentLevel();
+  }
+
+  /** Deterministic time pan by `dCols` absolute columns (disables follow, like a
+   *  drag). Drives the real T8 backfill on the next frame. e2e only. */
+  panColumnsForTest(dCols: number): void {
+    this.camera.pan(dCols, 0);
+    this.onCameraChanged();
+  }
+
+  /** Deterministic price zoom (factor>1 = zoom out → coarser mip). e2e only. */
+  zoomPriceForTest(factor: number): void {
+    this.camera.zoomPrice(factor, this.camera.state.rowCenter);
+    this.onCameraChanged();
+  }
+
+  /** Deterministic time zoom (factor>1 = zoom out; clamps at the ring width).
+   *  e2e only. Used to reach the whole-ring deep-zoom-out (no-backfill) state. */
+  zoomTimeForTest(factor: number): void {
+    this.camera.zoomTime(factor, this.camera.state.colCenter);
+    this.onCameraChanged();
+  }
+
   /**
    * Preload `count` deterministic synthetic columns (wall + noise) straight into
    * a fresh ring sized to hold them at `rows` height — bypassing the network so
@@ -506,6 +789,8 @@ export class Renderer {
     this.mips = null;
     this.heatmap = null;
     this.ring = null;
+    // Perf harness bypasses the network — no scroll-back backfill in this mode.
+    this.history = null;
 
     const wantLayers = Math.ceil(count / COLS_PER_TILE);
     const layers = clamp(wantLayers, 2, this.ctx.caps.maxArrayTextureLayers);

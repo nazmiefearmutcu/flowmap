@@ -57,6 +57,10 @@ class Config(msgspec.Struct, frozen=True):
             host=host,
             port=int(env.get("FLOWMAP_PORT", "8720")),
             ring_columns=int(env.get("FLOWMAP_RING_COLUMNS", "32768")),
+            # Column cadence for the sim + crypto grid. Overridable so the T8
+            # scroll-back e2e can drive the sim fast enough to overrun the
+            # client's full-res budget in seconds. Default 250 ms (4 cols/s).
+            dt_crypto_ns=int(env.get("FLOWMAP_DT_CRYPTO_NS", str(250_000_000))),
             max_sessions=int(env.get("FLOWMAP_MAX_SESSIONS", "4")),
             recording_gb_cap=float(env.get("FLOWMAP_RECORDING_GB_CAP", "20.0")),
             recording_enabled=env.get("FLOWMAP_RECORDING_ENABLED", "1")
