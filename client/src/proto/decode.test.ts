@@ -178,7 +178,7 @@ describe('golden vectors — cold (JSON) messages decode byte-exact', () => {
       epoch: 3,
       tick: 0.01,
       tick_multiple: 5,
-      dt_ns: 250_000_000,
+      dt_ns: 250_000_000, // interval, stays number (not an absolute timestamp)
       p0: 100.0,
       rows: 2048,
     });
@@ -386,6 +386,21 @@ describe('encode ↔ decode round-trip (control messages)', () => {
     const msg = roundTrip(encodeSeek(t));
     assertType(msg, MsgType.SEEK);
     expect(msg.t).toBe(t);
+  });
+
+  it('ns fields stay bigint even for small values (type-honesty)', () => {
+    // A small ns value must NOT decode to a plain number — that mismatch
+    // (bigint type, number runtime) crashed the overlay render loop (T10).
+    const msg = roundTrip(encodeSeek(1000n));
+    assertType(msg, MsgType.SEEK);
+    expect(typeof msg.t).toBe('bigint');
+    expect(msg.t).toBe(1000n);
+    // Non-ns small integers stay number.
+    const hr = roundTrip(encodeHistoryRequest({ req_id: 7, before_t: 5n, n_cols: 3 }));
+    assertType(hr, MsgType.HISTORY_REQ);
+    expect(typeof hr.before_t).toBe('bigint');
+    expect(typeof hr.req_id).toBe('number');
+    expect(typeof hr.n_cols).toBe('number');
   });
 
   it('SetSpeed', () => {
