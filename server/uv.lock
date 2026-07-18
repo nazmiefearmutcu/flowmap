@@ -318,7 +318,7 @@ wheels = [
 [[package]]
 name = "crypcodile"
 version = "0.1.45"
-source = { editable = "../../../../../Users/nazmi/Crypcodile" }
+source = { git = "https://github.com/nazmiefearmutcu/Crypcodile.git?rev=93b48d099977a9a2e12ad77083ce3ed63dc7dd58#93b48d099977a9a2e12ad77083ce3ed63dc7dd58" }
 dependencies = [
     { name = "aiohttp" },
     { name = "duckdb" },
@@ -331,43 +331,6 @@ dependencies = [
     { name = "rich" },
     { name = "typer" },
     { name = "websockets" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9" },
-    { name = "crypcodile", extras = ["gui", "ml", "web", "onchain"], marker = "extra == 'full'" },
-    { name = "crypcodile", extras = ["onchain"], marker = "extra == 'web'" },
-    { name = "duckdb", specifier = ">=1.0" },
-    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.100.0" },
-    { name = "matplotlib", marker = "extra == 'gui'", specifier = ">=3.7.0" },
-    { name = "mmh3", specifier = ">=5.2.1" },
-    { name = "msgspec", specifier = ">=0.18" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "polars", specifier = ">=1.0" },
-    { name = "prompt-toolkit", specifier = ">=3.0" },
-    { name = "pyarrow", specifier = ">=16" },
-    { name = "pyqt6", marker = "extra == 'gui'", specifier = ">=6.0.0" },
-    { name = "pyqtgraph", marker = "extra == 'gui'", specifier = ">=0.13.0" },
-    { name = "rich", specifier = ">=13" },
-    { name = "scipy", marker = "extra == 'ml'", specifier = ">=1.10.0" },
-    { name = "streamlit", marker = "extra == 'web'", specifier = ">=1.58.0" },
-    { name = "typer", specifier = ">=0.12" },
-    { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.20.0" },
-    { name = "web3", marker = "extra == 'onchain'", specifier = ">=6.0.0" },
-    { name = "websockets", specifier = ">=12" },
-    { name = "xgboost", marker = "extra == 'ml'", specifier = ">=1.7.0" },
-]
-provides-extras = ["gui", "ml", "web", "onchain", "full"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.11" },
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=5" },
-    { name = "pytest-timeout", specifier = ">=2" },
-    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]
@@ -466,12 +429,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "crypcodile", editable = "../../../../../Users/nazmi/Crypcodile" },
+    { name = "crypcodile", git = "https://github.com/nazmiefearmutcu/Crypcodile.git?rev=93b48d099977a9a2e12ad77083ce3ed63dc7dd58" },
     { name = "fastapi", specifier = ">=0.111" },
     { name = "msgspec", specifier = ">=0.18" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "polars", specifier = ">=1.0" },
-    { name = "stockodile", editable = "../../../../../Users/nazmi/stockodile" },
+    { name = "stockodile", git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=476caeda94e3a1874ecb40166be08b970ffef010" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 
@@ -1322,7 +1285,7 @@ wheels = [
 [[package]]
 name = "stockodile"
 version = "0.1.2"
-source = { editable = "../../../../../Users/nazmi/stockodile" }
+source = { git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=476caeda94e3a1874ecb40166be08b970ffef010#476caeda94e3a1874ecb40166be08b970ffef010" }
 dependencies = [
     { name = "aiohttp" },
     { name = "beautifulsoup4" },
@@ -1338,41 +1301,6 @@ dependencies = [
     { name = "typer" },
     { name = "websockets" },
     { name = "yfinance" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9" },
-    { name = "beautifulsoup4", specifier = ">=4.12" },
-    { name = "duckdb", specifier = ">=1.0" },
-    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.100.0" },
-    { name = "mmh3", specifier = ">=5.2.1" },
-    { name = "msgspec", specifier = ">=0.18" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "polars", specifier = ">=1.0" },
-    { name = "prompt-toolkit", specifier = ">=3.0.52" },
-    { name = "pyarrow", specifier = ">=16" },
-    { name = "python-dateutil", specifier = ">=2.9" },
-    { name = "rich", specifier = ">=13" },
-    { name = "stockodile", extras = ["onchain"], marker = "extra == 'web'" },
-    { name = "stockodile", extras = ["onchain", "web"], marker = "extra == 'full'" },
-    { name = "typer", specifier = ">=0.12" },
-    { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.20.0" },
-    { name = "web3", marker = "extra == 'onchain'", specifier = ">=6.0.0" },
-    { name = "websockets", specifier = ">=12" },
-    { name = "yfinance", specifier = ">=1.4.1" },
-]
-provides-extras = ["onchain", "web", "full"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "eth-account", specifier = ">=0.13" },
-    { name = "mypy", specifier = ">=1.11" },
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=5" },
-    { name = "pytest-timeout", specifier = ">=2" },
-    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]
