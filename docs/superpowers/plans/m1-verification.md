@@ -1,4 +1,4 @@
-# FlowMap v2 — M1 (Server Core) Verification
+# FlowMap — M1 (Server Core) Verification
 
 **Date:** 2026-07-18 · **Branch:** `v2` · **Scope:** M1 server core (Tasks 1–11)
 
@@ -140,7 +140,7 @@ start + gap" contract, verified against a real cross-restart recording.
 
 ## M1 status: COMPLETE
 
-The gateway serves a live, correct, Bookmap-standard order-flow stream for both the sim and real
+The gateway serves a live, correct, professional order-flow stream for both the sim and real
 crypto markets over the binary protocol the M2 WebGL2 client will consume, with self-recording
 and restart rehydration proven end-to-end. Next: **M2 — client GL renderer** (tile-array +
 sum-mips + residency, the §10 60 fps perf gates on the sim feed).

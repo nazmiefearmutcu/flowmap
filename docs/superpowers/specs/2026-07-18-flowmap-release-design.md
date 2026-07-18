@@ -2,13 +2,13 @@
 
 **Date:** 2026-07-18 · **Status:** Approved (user) · **Branch:** `main` (== v2 after the cutover)
 
-Prepare FlowMap for public release: strip the internal `v2` milestone label and the "Bookmap"
+Prepare FlowMap for public release: strip the internal `v2` milestone label and the retired brand
 name from everything shipped, ship a double-clickable macOS `.dmg`, design a crafted app icon,
 make the code publicly installable, and publish (push + GitHub release).
 
 ## Goals
 - **G1 — Clean product identity:** the product is "FlowMap" everywhere. No "v2" in the logo/title,
-  no "Bookmap" name anywhere in shipped code, UI, docs, or README. A real public version (`1.0.0`).
+  no retired brand name anywhere in shipped code, UI, docs, or README. A real public version (`1.0.0`).
 - **G2 — Installable macOS app:** a `FlowMap.dmg` that installs `FlowMap.app` — double-click to
   run, no separate Python/Node install required by the user.
 - **G3 — Crafted app icon:** a hand-authored (not AI-generated) icon, order-flow heatmap motif,
@@ -28,16 +28,16 @@ make the code publicly installable, and publish (push + GitHub release).
 ## Workstreams
 
 ### 1. Identity cleanup (mechanical, low-risk)
-- **Remove "v2" from the logo/title:** `client/src/ui/TopBar.tsx` (`FlowMap v2` → `FlowMap`),
-  `client/index.html` (`<title>FlowMap v2</title>` → `FlowMap`). Keep the internal package/version
+- **Remove "v2" from the logo/title:** `client/src/ui/TopBar.tsx` (logo reads `FlowMap`),
+  `client/index.html` (`<title>` reads `FlowMap`). Keep the internal package/version
   numbers separate (see versioning).
-- **Remove the "Bookmap" name** from every tracked file that contains it (README.md,
+- **Remove the retired brand name** from every tracked file that contains it (README.md,
   `client/src/gl/mips.ts`, `client/src/ui/theme.css`, `client/src/gl/**` comments,
   `client/tests/e2e/mips.spec.ts`, `server/src/flowmap_server/proto/__init__.py`,
   `server/tests/core/test_session.py`, and the `docs/superpowers/specs|plans/**` design docs).
   Replace with market-neutral language: "order-flow heatmap", "liquidity heatmap",
   "professional order-flow terminal", "tick-grouping". Preserve meaning; only the brand name goes.
-  Verify with `git grep -i bookmap` → 0 hits at the end.
+  Verify the retired brand name greps to 0 hits at the end.
 - **Name consistency:** "FlowMap" (one word, capital F/M) everywhere user-facing. Any stray
   "Flowmap"/"flow map" fixed. (Package/dir identifiers like `flowmap_server`, `flowmap-client`,
   the repo dir stay as-is — those are code identifiers, not the display name.)
@@ -98,7 +98,7 @@ make the code publicly installable, and publish (push + GitHub release).
     release; still confirm the exact push + release action at execution time.
 
 ## Testing / verification
-- After identity cleanup: `git grep -i bookmap` → 0; the client + server suites still pass
+- After identity cleanup: the retired brand name greps to 0; the client + server suites still pass
   (240 vitest + 18 e2e; 152 pytest); `npm run build` clean; the UI shows "FlowMap" with no "v2".
 - DMG: build it, install `FlowMap.app` from the DMG on this machine, launch it, confirm the
   window shows the live heatmap (sim + a market switch), the bundled server started (health), and
@@ -120,7 +120,7 @@ make the code publicly installable, and publish (push + GitHub release).
   personal public repo; noted.
 
 ## Milestones (implementation order)
-1. **Identity** (rename/Bookmap/version) — fast, low-risk, verifiable first.
+1. **Identity** (rename/brand/version) — fast, low-risk, verifiable first.
 2. **Icon** (SVG → icns) — needed by the Tauri bundle.
 3. **De-localize deps + fresh-clone smoke** — unblocks public install, independent of the DMG.
 4. **Tauri app + Python sidecar + DMG** — the big one; build + install + run-verify locally.

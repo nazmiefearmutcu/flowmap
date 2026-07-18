@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 shell styles (§9, T12). Consumes the design tokens in ui/theme.css.
+ * FlowMap shell styles (§9, T12). Consumes the design tokens in ui/theme.css.
  * The heatmap + panels are the star; this chrome frames them without crowding.
  */
 
@@ -69,15 +69,6 @@ body,
   letter-spacing: 0.02em;
   color: var(--text);
   white-space: nowrap;
-}
-
-.topbar__brand em {
-  font-style: normal;
-  font-size: var(--fs-2xs);
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  color: var(--accent);
-  transform: translateY(-1px);
 }
 
 .topbar__spacer {

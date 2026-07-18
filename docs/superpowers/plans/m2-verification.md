@@ -1,9 +1,9 @@
-# FlowMap v2 — M2 (Client GL Renderer) Verification
+# FlowMap — M2 (Client GL Renderer) Verification
 
 **Date:** 2026-07-18 · **Branch:** `v2` · **Scope:** M2 client renderer (Tasks 1–13)
 
 M2 delivers the visible product: a TypeScript + WebGL2 web client that renders the M1 server's
-canonical order-flow stream as a Bookmap-standard liquidity heatmap — with the original
+canonical order-flow stream as a professional liquidity heatmap — with the original
 product-killing bug (pan/zoom collapsing to ~1 fps) **structurally eliminated**, plus the full
 overlay/panel/UI-shell terminal. Every task went implementer → review, with Playwright pixel/
 behaviour verification against the real server at each gate.
@@ -100,7 +100,7 @@ through the full stack (client WS → server session → Crypcodile bridge → r
 ## M2 status: COMPLETE
 
 The visible product is delivered: a fast (history-independent pan/zoom), correct, polished
-Bookmap-standard order-flow terminal that renders the sim feed and **live crypto (real Binance
+professional order-flow terminal that renders the sim feed and **live crypto (real Binance
 BTCUSDT)** through the exact same market-agnostic renderer. The original 1-fps bug is structurally
 eliminated.
 

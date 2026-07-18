@@ -1,4 +1,4 @@
-"""FlowMap v2 wire framing (design spec §6.2).
+"""FlowMap wire framing (design spec §6.2).
 
 Envelope
 --------

@@ -1,4 +1,4 @@
-"""Canonical FlowMap v2 events (design spec §6.1).
+"""Canonical FlowMap events (design spec §6.1).
 
 These msgspec Structs are the **in-process representation only**. The wire
 encoding lives in :mod:`flowmap_server.proto.wire`:

@@ -4,7 +4,7 @@
  * When the price axis is zoomed OUT, many rows collapse into one screen pixel.
  * A plain average-downsampled mip (what `generateMipmap` produces) would render
  * a 500-lot liquidity wall surrounded by empty ticks as ~500/16 — walls DILUTE
- * exactly when you zoom out, the opposite of what a Bookmap-style heatmap must
+ * exactly when you zoom out, the opposite of what an order-flow heatmap must
  * show. Tick-grouping requires the SUMMED resting size, so mips are SUMS, not
  * averages, and `generateMipmap` is NEVER used.
  *

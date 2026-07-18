@@ -1,11 +1,11 @@
-# FlowMap v2
+# FlowMap
 
-**A Bookmap-standard, dual-market order-flow visualizer — real-time liquidity heatmap, DOM
+**An institutional-grade, dual-market order-flow visualizer — real-time liquidity heatmap, DOM
 ladder, time & sales, and order-flow overlays for crypto and US equities, in one renderer.**
 
-FlowMap v2 is a ground-up rebuild. The old PyQt6 desktop app (v1) re-rasterized the entire visible
+FlowMap is a ground-up rebuild of an earlier PyQt6 desktop app that re-rasterized the entire visible
 history on the CPU every pan/zoom frame, so scrolling back through history collapsed to ~1 fps.
-v2 puts history in a WebGL2 texture and makes pan/zoom a pure view transform — **interaction cost
+FlowMap puts history in a WebGL2 texture and makes pan/zoom a pure view transform — **interaction cost
 is independent of history depth**. It unifies two market-data engines
 ([Crypcodile](https://github.com/nazmiefearmutcu/Crypcodile) for crypto,
 stockodile for US equities) behind one market-agnostic renderer.
@@ -14,9 +14,9 @@ stockodile for US equities) behind one market-agnostic renderer.
 
 - **60 fps pan/zoom at any history depth.** A column, once uploaded to the GPU, is never
   re-rasterized; pan and both zoom axes only change a uniform. Measured: draw cost is ~0.2 ms
-  whether 200 or 10 000 columns are resident (history-independent — the v1 1-fps bug is
+  whether 200 or 10 000 columns are resident (history-independent — the old 1-fps bug is
   structurally gone).
-- **Bookmap-standard order flow:** liquidity heatmap (thermal, with correct SUM-mip zoom-out so
+- **Professional order flow:** liquidity heatmap (thermal, with correct SUM-mip zoom-out so
   walls don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
   event markers, crosshair with exact liquidity readout, deep scroll-back, replay transport.
 - **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities

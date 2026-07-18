@@ -1,4 +1,4 @@
-# FlowMap v2 — Bookmap-Standard Dual-Market Order-Flow Visualizer
+# FlowMap — Dual-Market Order-Flow Visualizer
 
 **Date:** 2026-07-17
 **Status:** Approved for implementation (autonomous session; user directive: full rebuild, do not
@@ -28,7 +28,7 @@ rebuild.
 
 - **G1 — Perf:** 60 fps pan/zoom/scale at any history depth. Interaction cost must be
   **independent of history size** (transform-only rendering). Hard gates in §10.
-- **G2 — Bookmap standard:** liquidity heatmap, DOM ladder, volume bubbles, time & sales,
+- **G2 — Order-flow standard:** liquidity heatmap, DOM ladder, volume bubbles, time & sales,
   CVD, VWAP, volume profile, imbalance, large-lot/iceberg markers, event markers, crosshair
   liquidity readout, auto-follow, replay.
 - **G3 — Dual market, honest feature parity:** crypto (Crypcodile) and US equities (stockodile).
@@ -52,7 +52,7 @@ rebuild.
 | | Approach | Verdict |
 |---|---|---|
 | A | PyQt6 + real GPU (VisPy/GLSL inside Qt) | Single-process, but GLSL-in-Qt tooling is painful, UI polish ceiling is low, automated UI/perf testing is weak. Repeats v1's ecosystem trap. |
-| B | **Web client (TypeScript + WebGL2) + Python asyncio gateway** | **Chosen.** GPU texture rendering makes pan/zoom transform-only (structurally solves G1). Best design ceiling (G4). Fully automatable in-browser perf/e2e testing (G5). Python gateway imports Crypcodile/stockodile in-process (both are Python ≥3.12 libraries with the same Sink/collect architecture). Proven model (Bookmap Web, TradingLite). |
+| B | **Web client (TypeScript + WebGL2) + Python asyncio gateway** | **Chosen.** GPU texture rendering makes pan/zoom transform-only (structurally solves G1). Best design ceiling (G4). Fully automatable in-browser perf/e2e testing (G5). Python gateway imports Crypcodile/stockodile in-process (both are Python ≥3.12 libraries with the same Sink/collect architecture). Proven model (professional web-based order-flow terminals). |
 | C | Native Rust/wgpu | Max raw perf but slowest to build and cannot import the Python data layer in-process; IPC needed anyway. Perf headroom of B is already far above target. |
 
 Packaging note: run as `server + browser window` first. The user's showMe project proves the
@@ -196,7 +196,7 @@ from zoneinfo) is the authority. Columns advance only 04:00–20:00 ET; extended
 shaded (IEX prints are RTH-only — noted in the capability descriptor). Outside the window:
 `Status{feed_state=closed, next_open_ts}`, UI banner + countdown, **no empty-column
 accumulation**. Session boundaries emit `Marker{kind=session_break}` and render as labeled breaks
-in the time axis (Bookmap-style compressed gap). Crypto runs 24/7 with no session logic.
+in the time axis (order-flow-style compressed gap). Crypto runs 24/7 with no session logic.
 
 ## 8. The renderer core (G1 mechanism)
 

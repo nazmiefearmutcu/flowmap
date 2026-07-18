@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the FlowMap v2 client for production (static bundle in client/dist).
+# Build the FlowMap client for production (static bundle in client/dist).
 # The server runs from source via `uv run python -m flowmap_server`. A native
 # desktop shell (Tauri + Python sidecar) is a future option — the web stack keeps
 # that door open; nothing here blocks it.

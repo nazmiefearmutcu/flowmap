@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 wire decoder — the byte-for-byte TS mirror of
+ * FlowMap wire decoder — the byte-for-byte TS mirror of
  * flowmap_server.proto.wire.decode. It MUST decode the committed golden vectors
  * identically to the server, because these bytes are the cross-language stream
  * contract.

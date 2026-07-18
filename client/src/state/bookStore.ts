@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 book/tape buffer (M2 T11) — the module-scoped high-frequency store
+ * FlowMap book/tape buffer (M2 T11) — the module-scoped high-frequency store
  * for the DOM ladder + time & sales panels.
  *
  * The panels update at high frequency (book ~4-20/s, trades ~5-120/s). Pushing

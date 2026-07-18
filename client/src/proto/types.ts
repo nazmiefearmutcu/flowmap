@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 wire types — the TypeScript mirror of the server's canonical
+ * FlowMap wire types — the TypeScript mirror of the server's canonical
  * events (server/src/flowmap_server/proto/events.py) and framing constants
  * (proto/wire.py). Field names match events.py EXACTLY so the two languages
  * describe one contract; the golden vectors under tests/golden/ freeze it.

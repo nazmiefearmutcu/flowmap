@@ -1,4 +1,4 @@
-# FlowMap v2 — M3 (Equity feed + dual-market parity) Verification
+# FlowMap — M3 (Equity feed + dual-market parity) Verification
 
 **Date:** 2026-07-18 · **Branch:** `v2` · **Scope:** M3 (Tasks 1–4) — stockodile equity feed,
 equity session routing, SYNTH-profile client rendering, and the two-market parity matrix (the §G3

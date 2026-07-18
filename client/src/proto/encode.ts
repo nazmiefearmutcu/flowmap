@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 wire encoder — the client→server direction. Mirrors the framing in
+ * FlowMap wire encoder — the client→server direction. Mirrors the framing in
  * flowmap_server.proto.wire so encoded control messages decode cleanly on the
  * server (and, in tests, round-trip through this module's own decoder).
  *

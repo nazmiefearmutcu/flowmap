@@ -10,7 +10,7 @@ import { expect, test } from '@playwright/test';
  * The failure this guards against: with a plain average-downsampled mip, a
  * 500-lot wall surrounded by empty ticks renders as ~500/16 when price zooms out
  * (many rows collapse per pixel) — walls DILUTE exactly when a heatmap must show
- * them most. Bookmap tick-grouping needs the SUMMED resting size, so the mips are
+ * them most. Order-flow tick-grouping needs the SUMMED resting size, so the mips are
  * SUMS and `generateMipmap` is never used.
  *
  * Setup: a single bright wall row (size 500) surrounded by empty rows, in many

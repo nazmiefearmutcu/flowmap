@@ -1,4 +1,4 @@
-"""Probe a RUNNING FlowMap v2 server's ``/ws`` and summarize the stream.
+"""Probe a RUNNING FlowMap server's ``/ws`` and summarize the stream.
 
 Connects, subscribes to ``--market``/``--symbol``, decodes every binary frame
 for ``--duration`` seconds, and prints a message-type histogram plus the

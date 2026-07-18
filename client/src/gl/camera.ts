@@ -1,7 +1,7 @@
 /**
  * View transform — the pan/zoom camera (§8.3, M2 T6).
  *
- * This module is the reason FlowMap v2 does not have the v1 1-fps bug. v1
+ * This module is the reason FlowMap does not have the v1 1-fps bug. v1
  * re-rasterized all resident history on the CPU every frame it panned; here the
  * camera is nothing but five scalars, and every pan/zoom is O(1) — it mutates
  * those scalars and produces the four `HeatmapView` uniforms. A column, once

@@ -917,7 +917,7 @@ async def test_equity_subscribe_synth_grid_and_closed_status():
     assert closed[0].capability["depth"] == "SYNTH_PROFILE"
     assert closed[0].next_open_ts == _eq_et_ns(2026, 7, 20, 9, 30)
 
-    # session_break marker (Bookmap-style compressed gap) from the last session.
+    # session_break marker (order-flow-style compressed gap) from the last session.
     breaks = [m for m in msgs if isinstance(m, Marker) and m.kind == "session_break"]
     assert len(breaks) == 1
 

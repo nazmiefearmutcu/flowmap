@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 WebSocket client — binary transport + connection/session state.
+ * FlowMap WebSocket client — binary transport + connection/session state.
  *
  * Owns one WebSocket to the server's `/ws` endpoint and:
  * - sends the encoded Subscribe on every (re)connect and swaps subscriptions

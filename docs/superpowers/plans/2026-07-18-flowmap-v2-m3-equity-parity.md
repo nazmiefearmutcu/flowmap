@@ -1,8 +1,8 @@
-# FlowMap v2 — M3: Equity (stockodile) feed + dual-market parity
+# FlowMap — M3: Equity (stockodile) feed + dual-market parity
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Read the
 > design spec §7 (capability tiers, equity session model §7.1) at
-> `docs/superpowers/specs/2026-07-17-flowmap-v2-bookmap-design.md` BEFORE any task — it is the
+> `docs/superpowers/specs/2026-07-17-flowmap-design.md` BEFORE any task — it is the
 > authority for how equities render honestly.
 
 **Goal:** Complete the user's "works in BOTH markets" requirement — wire the stockodile US-equity

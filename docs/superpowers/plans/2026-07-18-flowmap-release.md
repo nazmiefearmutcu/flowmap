@@ -8,7 +8,7 @@
 > non-interactive session — run `semgrep --config auto` on changed files as the sanctioned
 > fallback and note 0 findings). NO Claude co-author trailer on any commit.
 
-**Goal:** Ship FlowMap as a public product: strip the internal `v2` label and the "Bookmap" name,
+**Goal:** Ship FlowMap as a public product: strip the internal `v2` label and the retired brand name,
 build a double-clickable macOS `.dmg` with a crafted icon, make the source publicly installable,
 and publish (push + GitHub release).
 
@@ -22,45 +22,47 @@ present), `python-build-standalone`, `rsvg-convert`/`sips`/`iconutil`, `gh` CLI.
 
 ---
 
-### Task 1: Identity cleanup — remove "v2", remove "Bookmap", version 1.0.0
+### Task 1: Identity cleanup — remove "v2", remove the retired brand name, version 1.0.0
 
 **Files:**
-- Modify: `client/src/ui/TopBar.tsx` (the `FlowMap v2` logo), `client/index.html` (`<title>`),
+- Modify: `client/src/ui/TopBar.tsx` (the `FlowMap` logo), `client/index.html` (`<title>`),
   `client/src/gl/mips.ts`, `client/src/ui/theme.css`, `client/tests/e2e/mips.spec.ts`,
   `server/src/flowmap_server/proto/__init__.py`, `server/tests/core/test_session.py`,
-  and any other tracked file matched by `git grep -il bookmap` (incl. `README.md`,
+  and any other tracked file that still names the retired brand (incl. `README.md`,
   `docs/superpowers/**`). Version: `server/pyproject.toml`, `client/package.json`,
   `server/src/flowmap_server/__init__.py`.
 
 - [ ] **Step 1: Enumerate the references.**
-  Run `cd /Users/nazmi/flowmap && git grep -in 'bookmap' && echo '---' && git grep -in 'FlowMap v2\|flowmap v2' && grep -rn 'v2' client/src/ui/TopBar.tsx client/index.html`.
+  Enumerate: grep the tree (case-insensitive) for the retired brand name, for the
+  milestone-labelled logo/title string, and for any stray `v2` in `client/src/ui/TopBar.tsx`
+  and `client/index.html`.
   Record every hit; each must be resolved below.
 
 - [ ] **Step 2: Logo/title — drop "v2".**
   In `client/src/ui/TopBar.tsx`, change the logo markup `FlowMap <em>v2</em>` (and its CSS hook if
   the `<em>` is now empty/unused) to just `FlowMap`. In `client/index.html` change
-  `<title>FlowMap v2</title>` → `<title>FlowMap</title>`. If `TopBar.tsx` has a test asserting the
+  the `<title>` to `<title>FlowMap</title>`. If `TopBar.tsx` has a test asserting the
   "v2" text, update it to assert "FlowMap".
 
-- [ ] **Step 3: Remove the "Bookmap" name everywhere.**
-  For each `git grep -il bookmap` hit, replace the brand term with market-neutral wording:
-  "Bookmap-standard" → "professional order-flow" / "institutional-grade order-flow";
-  "Bookmap-style" → "order-flow heatmap"; "like Bookmap" → "order-flow terminals"; bare "Bookmap"
-  in a comment → "order-flow heatmap tools". Preserve the sentence's technical meaning. Applies to
-  code comments, `theme.css` comments, test docstrings/names (rename a test like
-  `test_bookmap_*` → `test_orderflow_*` and update references), the proto `__init__` docstring,
-  README, and the `docs/superpowers/**` specs/plans (historical, but the repo is public — clean
-  them too).
+- [ ] **Step 3: Remove the retired brand name everywhere.**
+  For each tracked file that still names the retired brand, replace the brand term with
+  market-neutral wording: "<brand>-standard" → "professional order-flow" /
+  "institutional-grade order-flow"; "<brand>-style" → "order-flow heatmap"; "like <brand>" →
+  "order-flow terminals"; a bare mention in a comment → "order-flow heatmap tools". Preserve the
+  sentence's technical meaning. Applies to code comments, `theme.css` comments, test
+  docstrings/names (rename a test like `test_<brand>_*` → `test_orderflow_*` and update
+  references), the proto `__init__` docstring, README, and the `docs/superpowers/**` specs/plans
+  (historical, but the repo is public — clean them too).
 
 - [ ] **Step 4: Version → 1.0.0.**
   `server/pyproject.toml`: `version = "1.0.0"`. `client/package.json`: `"version": "1.0.0"`.
   `server/src/flowmap_server/__init__.py`: `__version__ = "1.0.0"` (the REST `/api/health` returns
   it — the `test_rest.py` health test asserts the version string; update that test to `1.0.0`).
-  Search for any other `2.0.0a0` occurrence (`git grep -n '2.0.0a0'`) and update.
+  Search for any other occurrence of the old pre-release version string and update.
 
 - [ ] **Step 5: Verify + tests.**
-  Run `cd /Users/nazmi/flowmap && git grep -in bookmap` → **no output** (0 hits).
-  `git grep -in 'FlowMap v2'` → no output. Then:
+  Grep the tree (case-insensitive) for the retired brand name → **no output** (0 hits).
+  The milestone-labelled logo/title string → no output. Then:
   `cd server && uv run python -m pytest -q` → all pass (health test now 1.0.0);
   `cd ../client && npm test` → all pass; `npm run build` → clean.
   Boot the app briefly (`cd server && FLOWMAP_PORT=8720 uv run python -m flowmap_server &` +
@@ -68,7 +70,7 @@ present), `python-build-standalone`, `rsvg-convert`/`sips`/`iconutil`, `gh` CLI.
   screenshot, kill servers.
 
 - [ ] **Step 6: Commit** (Opsera two-step; semgrep fallback):
-  `git add -A && git commit -m "feat: FlowMap 1.0.0 identity — drop v2 label, remove Bookmap name"`.
+  `git add -A && git commit -m "feat: FlowMap 1.0.0 identity — drop v2 label, remove legacy brand name"`.
 
 ### Task 2: App icon — hand-authored SVG → .icns
 
@@ -201,12 +203,12 @@ present), `python-build-standalone`, `rsvg-convert`/`sips`/`iconutil`, `gh` CLI.
   Add a "Download" section: the DMG (from the GitHub Release), the first-run Gatekeeper bypass
   (right-click → Open, or `xattr -cr /Applications/FlowMap.app`, because the app is unsigned/
   unnotarized — no paid Apple Developer ID), and the existing run-from-source path
-  (`./scripts/dev.sh`). Keep the honest keyless-equity + weekend-closed notes. `git grep -i bookmap`
-  still 0.
+  (`./scripts/dev.sh`). Keep the honest keyless-equity + weekend-closed notes. The retired brand
+  name stays at 0 hits.
 
 - [ ] **Step 2: Final pre-publish verification.**
   `cd server && uv run pytest -q` (152+), `cd client && npm test && npm run build && npm run e2e`
-  (all green), `git grep -in 'bookmap\|FlowMap v2'` → 0. Confirm the DMG exists and installs
+  (all green), the retired brand name and the milestone-labelled logo/title grep to 0. Confirm the DMG exists and installs
   (Task 4 Step 5). Commit the README: `git add README.md && git commit -m "docs: install-from-DMG + Gatekeeper + run-from-source"`.
 
 - [ ] **Step 3: PUBLISH — after the user's final confirmation (outward-facing).**

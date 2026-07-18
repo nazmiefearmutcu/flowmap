@@ -1,13 +1,13 @@
-# FlowMap v2 — M2: Client GL Renderer Implementation Plan
+# FlowMap — M2: Client GL Renderer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Steps use
 > checkbox (`- [ ]`) syntax. Read the design spec §6/§8.3/§9/§10 at
-> `docs/superpowers/specs/2026-07-17-flowmap-v2-bookmap-design.md` BEFORE any task — it is the
+> `docs/superpowers/specs/2026-07-17-flowmap-design.md` BEFORE any task — it is the
 > authority. The wire contract is the committed golden vectors in
 > `server/tests/proto/golden/*.bin` (12 files); the TS decoder MUST decode them byte-for-byte.
 
 **Goal:** A TypeScript + WebGL2 web client that renders the server's canonical order-flow stream
-as a Bookmap-standard liquidity heatmap at 60 fps, with pan/zoom cost independent of history size
+as a professional liquidity heatmap at 60 fps, with pan/zoom cost independent of history size
 (the whole point of the rebuild), plus the overlays, panels, and UI shell.
 
 **Architecture:** Vite + React + TypeScript + zustand. The heatmap lives in a WebGL2

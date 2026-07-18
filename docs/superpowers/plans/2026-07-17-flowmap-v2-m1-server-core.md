@@ -1,15 +1,15 @@
-# FlowMap v2 — M1: Server Core Implementation Plan
+# FlowMap — M1: Server Core Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A running FlowMap v2 gateway server: binary WS protocol with golden vectors, the
+**Goal:** A running FlowMap gateway server: binary WS protocol with golden vectors, the
 time-weighted density grid with epochs, a deterministic sim feed, session management with
 backpressure, and the Crypcodile live-crypto bridge — all tested.
 
 **Architecture:** Python 3.13 asyncio gateway (`server/`) per the spec at
-`docs/superpowers/specs/2026-07-17-flowmap-v2-bookmap-design.md` (§5, §6, §8.1, §8.2, §11).
+`docs/superpowers/specs/2026-07-17-flowmap-design.md` (§5, §6, §8.1, §8.2, §11).
 Read the spec BEFORE starting any task. Canonical events are msgspec structs in-process,
 hand-packed binary on the wire (hybrid: hot messages packed, cold messages JSON-flagged).
 
@@ -84,7 +84,7 @@ to optional groups; keep the core streaming set mandatory.
 
 **Files:**
 - Create: `/Users/nazmi/flowmap/server/pyproject.toml`
-- Create: `/Users/nazmi/flowmap/server/src/flowmap_server/__init__.py` (`__version__ = "2.0.0a0"`)
+- Create: `/Users/nazmi/flowmap/server/src/flowmap_server/__init__.py` (`__version__ = "1.0.0"`)
 - Create: `/Users/nazmi/flowmap/server/src/flowmap_server/config.py`
 - Create: `/Users/nazmi/flowmap/server/tests/test_config.py`
 
@@ -93,7 +93,7 @@ to optional groups; keep the core streaming set mandatory.
 ```toml
 [project]
 name = "flowmap-server"
-version = "2.0.0a0"
+version = "1.0.0"
 requires-python = ">=3.13"
 dependencies = [
   "crypcodile",

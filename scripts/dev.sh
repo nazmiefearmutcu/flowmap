@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Boot the FlowMap v2 gateway (:8720) + the client dev server (:5173) together.
+# Boot the FlowMap gateway (:8720) + the client dev server (:5173) together.
 # Ctrl-C stops both. Requires: uv (Python 3.13), npm (Node 22).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${FLOWMAP_PORT:-8720}"
 
-echo "FlowMap v2 — booting server (:$PORT) + client (:5173)"
+echo "FlowMap — booting server (:$PORT) + client (:5173)"
 
 cleanup() {
   echo; echo "stopping…"

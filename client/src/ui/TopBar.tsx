@@ -74,7 +74,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
   return (
     <header className="topbar">
       <span className="topbar__brand">
-        FlowMap <em>v2</em>
+        FlowMap
       </span>
 
       <SymbolSearch ref={searchRef} current={`${market}:${symbol}`} onSelect={onSelectSymbol} />

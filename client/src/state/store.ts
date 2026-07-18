@@ -1,5 +1,5 @@
 /**
- * FlowMap v2 session store (zustand).
+ * FlowMap session store (zustand).
  *
  * Holds ONLY low-frequency connection/session metadata — connection status,
  * capability, session id, epoch geometry, the current subscription. This is the
