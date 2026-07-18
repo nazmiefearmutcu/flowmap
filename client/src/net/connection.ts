@@ -23,7 +23,16 @@
  */
 
 import { decodeFrame } from '../proto/decode';
-import { encodeHistoryRequest, encodePong, encodeSubscribe, encodeUnsubscribe } from '../proto/encode';
+import {
+  encodeHistoryRequest,
+  encodePause,
+  encodePong,
+  encodeResume,
+  encodeSeek,
+  encodeSetSpeed,
+  encodeSubscribe,
+  encodeUnsubscribe,
+} from '../proto/encode';
 import {
   MsgType,
   type BarColumn,
@@ -233,6 +242,40 @@ export class Connection {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  // --- replay transport control (§9 / §11) -------------------------------------
+  // Cold control messages for a replay session: the server owns the replay clock
+  // and honours these live. No-ops (dropped) when the socket is not open — the UI
+  // guards on mode/status, and a closed socket has nothing to steer.
+
+  /** Seek the replay clock to absolute ns `t` (server bumps epoch + resnapshots). */
+  seek(t: bigint): void {
+    this.sendControl(encodeSeek(t));
+  }
+
+  /** Set the replay playback speed multiplier (1–100×). */
+  setSpeed(x: number): void {
+    this.sendControl(encodeSetSpeed(x));
+  }
+
+  /** Pause the replay clock. */
+  pause(): void {
+    this.sendControl(encodePause());
+  }
+
+  /** Resume the replay clock. */
+  resume(): void {
+    this.sendControl(encodeResume());
+  }
+
+  private sendControl(bytes: Uint8Array): void {
+    if (this.socket === null || !this.socketOpen) return;
+    try {
+      this.rawSend(bytes);
+    } catch (err) {
+      console.warn('[flowmap] failed to send control message', err);
+    }
   }
 
   /** Intentional close: no reconnect; pending history waiters are rejected. */

@@ -1,0 +1,90 @@
+/**
+ * FlowMap v2 design system (§9, T12).
+ *
+ * One cohesive token set for the whole shell — a professional trading-terminal
+ * aesthetic (Bookmap / TradingLite lineage): layered near-black surfaces, hairline
+ * cool-grey borders, a single teal buy accent against a red sell counter-accent,
+ * amber for the replay/caution channel, and tabular monospace numerics throughout.
+ *
+ * The teal/red pair is pinned to #1fb6a6 / #d3524f — the exact hues the GL heatmap
+ * overlays and the DOM ladder / tape already paint, so the CSS chrome and the
+ * WebGL surface read as ONE instrument (the tape's buy/sell colours are asserted
+ * against these RGB values in panels.spec — do not drift them).
+ */
+
+:root {
+  /* --- layered surfaces (deepest → elevated) --- */
+  --bg: #050709; /* the canvas void */
+  --bg-1: #0a0d13; /* top bar, right rail, timeline */
+  --bg-2: #0e121a; /* panel headers, inputs, axis gutters */
+  --bg-3: #141a26; /* hover / elevated chips */
+  --bg-inset: #080b11; /* recessed wells (price column, scrubber track) */
+  --scrim: rgba(3, 5, 8, 0.66); /* drawer / dropdown backdrop */
+
+  /* --- structure --- */
+  --line: #1a2030; /* hairline dividers */
+  --line-2: #232c3e; /* stronger separators */
+  --line-soft: rgba(26, 32, 48, 0.55);
+
+  /* --- text --- */
+  --text: #e6edf3;
+  --text-2: #93a1b4; /* secondary labels */
+  --text-3: #5b6675; /* dim / placeholder */
+  --text-money: #f2f6fa; /* bright numerics */
+
+  /* --- accent pair (pinned; see file header) --- */
+  --accent: #1fb6a6; /* teal — buy / bid / live */
+  --accent-bright: #33d6c4;
+  --accent-dim: #0f2a27;
+  --accent-line: #1c3b37;
+  --accent-glow: rgba(31, 182, 166, 0.5);
+  --sell: #d3524f; /* red — sell / ask */
+  --sell-bright: #e8635f;
+  --sell-dim: #2f1a1a;
+  --sell-line: #3b1f1f;
+
+  /* --- semantic channels --- */
+  --warn: #d6a13a; /* amber — connecting / replay / caution */
+  --warn-dim: #33290f;
+  --warn-line: #3a3016;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale (px) --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts (all-mono: authentic terminal, no network dependency) --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: dark;
+}

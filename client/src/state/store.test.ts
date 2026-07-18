@@ -6,8 +6,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { SocketLike } from '../net/connection';
 import type { StreamMsg } from '../net/connection';
-import { MsgType } from '../proto/types';
+import { decodeFrame } from '../proto/decode';
+import { MsgType, type Msg } from '../proto/types';
 import { setFlowMapTransport, useFlowMapStore } from './store';
+
+/** Decode a single-message control frame the FakeWebSocket captured. */
+function sentMsg(bytes: Uint8Array): Msg {
+  return decodeFrame(bytes)[0];
+}
 
 const GOLDEN_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'tests', 'golden');
 
@@ -105,5 +111,64 @@ describe('FlowMap store', () => {
 
     unsub();
     unsubStore();
+  });
+});
+
+describe('FlowMap store — replay transport', () => {
+  it('subscribes in replay mode and sends the right control messages', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('binance-spot', 'BTCUSDT', 'replay');
+    expect(store.getState().subscription).toEqual({
+      market: 'binance-spot',
+      symbol: 'BTCUSDT',
+      mode: 'replay',
+    });
+    sockets[0].open();
+
+    // The subscribe carries mode=replay.
+    const first = sentMsg(sockets[0].sent[0]);
+    expect(first.type).toBe(MsgType.SUBSCRIBE);
+    expect((first as Extract<Msg, { type: MsgType.SUBSCRIBE }>).mode).toBe('replay');
+
+    store.getState().setSpeed(5);
+    store.getState().pause();
+    store.getState().resume();
+    store.getState().seek(1234n);
+
+    const types = sockets[0].sent.map((b) => sentMsg(b).type);
+    expect(types).toEqual([
+      MsgType.SUBSCRIBE,
+      MsgType.SET_SPEED,
+      MsgType.PAUSE,
+      MsgType.RESUME,
+      MsgType.SEEK,
+    ]);
+
+    const setSpeed = sentMsg(sockets[0].sent[1]);
+    expect((setSpeed as Extract<Msg, { type: MsgType.SET_SPEED }>).x).toBe(5);
+    const seek = sentMsg(sockets[0].sent[4]);
+    expect((seek as Extract<Msg, { type: MsgType.SEEK }>).t).toBe(1234n);
+
+    // Low-frequency UI state tracked the transport.
+    expect(store.getState().speed).toBe(5);
+    expect(store.getState().paused).toBe(false); // pause() then resume()
+  });
+
+  it('resets speed/paused on a fresh subscription', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('sim', 'SIM-DEMO', 'replay');
+    sockets[0].open();
+    store.getState().setSpeed(50);
+    store.getState().pause();
+    expect(store.getState().speed).toBe(50);
+    expect(store.getState().paused).toBe(true);
+
+    store.getState().connectAndSubscribe('sim', 'SIM-DEMO', 'live');
+    expect(store.getState().speed).toBe(1);
+    expect(store.getState().paused).toBe(false);
   });
 });

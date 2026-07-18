@@ -215,6 +215,8 @@ export class Renderer {
   private readonly unsubscribeStream: () => void;
   private readonly resizeObserver: ResizeObserver;
   private readonly gesturesDispose: () => void;
+  /** The camera-control surface the gestures drive; also the app-keyboard target. */
+  private readonly controller: CameraController;
 
   constructor(canvas: HTMLCanvasElement, store: RendererStore, options: RendererOptions = {}) {
     this.canvas = canvas;
@@ -260,7 +262,8 @@ export class Renderer {
     canvas.addEventListener('webglcontextlost', this.onContextLost as EventListener, false);
     canvas.addEventListener('webglcontextrestored', this.onContextRestored as EventListener, false);
 
-    this.gesturesDispose = attachGestures(canvas, this.makeController());
+    this.controller = this.makeController();
+    this.gesturesDispose = attachGestures(canvas, this.controller);
 
     this.unsubscribeStream = store.getState().onStream(this.onMessage);
 
@@ -379,6 +382,40 @@ export class Renderer {
   setBubbleMinSize(minSize: number): void {
     this.overlays.setBubbleMinSize(minSize);
     this.dirty = true;
+  }
+
+  /**
+   * Read-only timeline geometry for the minimap + replay seek (§9, T12): the
+   * resident column extent, the current visible window in absolute columns, and
+   * the column⇄time base (anchor + dt) so a scrubber fraction maps to a real ns.
+   * Null before the first column. Cheap — the Timeline polls it at ≤4 Hz.
+   */
+  timeline(): {
+    oldestSeq: number;
+    newestSeq: number;
+    viewStartCol: number;
+    viewEndCol: number;
+    timeBase: { anchorSeq: number; anchorT0Ns: bigint; dtNs: number } | null;
+  } | null {
+    const range = this.residentRange();
+    if (range === null) return null;
+    return {
+      oldestSeq: range.oldest,
+      newestSeq: range.newest,
+      viewStartCol: this.view.colOffset,
+      viewEndCol: this.view.colOffset + this.view.colScale,
+      timeBase: this.overlayTimeMap(),
+    };
+  }
+
+  /** `Space` (live mode) / `F`: toggle auto-follow of the live right edge. */
+  toggleFollow(): void {
+    this.controller.toggleFollow();
+  }
+
+  /** Reset the view + re-enable follow (the `R` / Go-Live control). */
+  goLive(): void {
+    this.controller.goLive();
   }
 
   // --- gesture control (input/gestures → Camera) --------------------------------

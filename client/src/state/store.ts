@@ -45,10 +45,18 @@ export interface FlowMapState {
   clockSkewMs: number | null;
   epochs: Map<number, EpochParams>;
   subscription: Subscription | null;
+  /** Replay transport (low-frequency UI state; ignored in live mode). */
+  speed: number;
+  paused: boolean;
 
   // --- actions ---
   connectAndSubscribe: (market: string, symbol: string, mode?: StreamMode) => void;
   requestHistory: (before_t: bigint, n: number) => Promise<HistoryResponse>;
+  /** Replay transport controls — send the matching control message + track UI state. */
+  setSpeed: (x: number) => void;
+  pause: () => void;
+  resume: () => void;
+  seek: (t: bigint) => void;
   disconnect: () => void;
   /** Subscribe to the raw high-frequency stream; returns an unsubscribe fn. */
   onStream: (handler: (msg: StreamMsg) => void) => () => void;
@@ -90,6 +98,8 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   clockSkewMs: null,
   epochs: new Map(),
   subscription: null,
+  speed: 1,
+  paused: false,
 
   connectAndSubscribe(market, symbol, mode = 'live') {
     if (conn === null) {
@@ -125,7 +135,9 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         onConnStatus: (status) => set({ status }),
       });
     }
-    set({ subscription: { market, symbol, mode } });
+    // A fresh subscription resets the transport (a new replay clock starts at 1×,
+    // playing; live mode ignores these but they must not carry over stale state).
+    set({ subscription: { market, symbol, mode }, speed: 1, paused: false });
     conn.subscribe(market, symbol, mode);
   },
 
@@ -134,6 +146,25 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
       return Promise.reject(new Error('flowmap: not connected'));
     }
     return conn.requestHistory(before_t, n);
+  },
+
+  setSpeed(x) {
+    conn?.setSpeed(x);
+    set({ speed: x });
+  },
+
+  pause() {
+    conn?.pause();
+    set({ paused: true });
+  },
+
+  resume() {
+    conn?.resume();
+    set({ paused: false });
+  },
+
+  seek(t) {
+    conn?.seek(t);
   },
 
   disconnect() {
