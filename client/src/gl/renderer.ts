@@ -37,7 +37,7 @@
 
 import { COLS_PER_TILE, TileRing } from './tileRing';
 import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
-import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
+import { createLUTTexture, rampForMode, RAMP_THERMAL } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import { Camera, limitsFor, screenToGrid } from './camera';
@@ -47,7 +47,7 @@ import { attachGestures, type CameraController } from '../input/gestures';
 import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
-import { MODE_L2, MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
+import { MODE_L2, MsgType, type DepthColumn } from '../proto/types';
 import { OverlayManager } from './overlays/manager';
 import type { OverlayVisibility } from './overlays/frame';
 import type { PriceMap, TimeMap } from './overlays/coords';
@@ -288,6 +288,15 @@ export class Renderer {
   /** A copy of the current view uniforms. Diagnostics / e2e. */
   get viewSnapshot(): HeatmapView {
     return { ...this.view };
+  }
+
+  /**
+   * Active colormap row (RAMP_THERMAL 0 / RAMP_SYNTH 1) — the heatmap encoding's
+   * ramp when a heatmap exists, else the mode selected by the last column.
+   * Diagnostics / e2e (asserts a SYNTH_PROFILE session renders the amber ramp).
+   */
+  get currentRamp(): number {
+    return this.heatmap?.encoding.ramp ?? this.ramp;
   }
 
   /** Full-res residency budget in columns (ring capacity). Diagnostics / e2e. */
@@ -644,7 +653,13 @@ export class Renderer {
       }
     }
     // Colormap follows the column's density mode (synth profile → amber ramp).
-    this.ramp = col.mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL;
+    // Apply it to the heatmap encoding right away so the ramp is correct even on
+    // a frame where the viewport normalizer has no data yet (updateNormalization
+    // early-returns then); it re-affirms the same ramp once histograms exist.
+    this.ramp = rampForMode(col.mode);
+    if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
+      this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
+    }
 
     this.updateView();
     this.dirty = true;
@@ -1424,6 +1439,20 @@ export class Renderer {
   /** Overlay data counts + last profile result. e2e diagnostics. */
   overlayDebugForTest(): ReturnType<OverlayManager['debug']> {
     return this.overlays.debug();
+  }
+
+  /**
+   * The BBO the overlay would draw for the CURRENT session (capability + newest
+   * book), or null when it honestly draws nothing. e2e: a SYNTH_PROFILE keyless
+   * equity session MUST return null — no fabricated bid/ask quote (§7).
+   */
+  overlayEffectiveBboForTest(): ReturnType<OverlayManager['effectiveBboForTest']> {
+    const newest = this.newestSeq >= 0 ? this.columnCache.arrays(this.newestSeq) : null;
+    return this.overlays.effectiveBboForTest(
+      this.store.getState().capability,
+      this.overlayPriceMap(),
+      newest,
+    );
   }
 
   /** Canvas CSS px y of a price row edge (for BBO / axis line sampling). e2e. */

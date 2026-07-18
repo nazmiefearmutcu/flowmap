@@ -15,6 +15,29 @@ function sentMsg(bytes: Uint8Array): Msg {
   return decodeFrame(bytes)[0];
 }
 
+// Cold-JSON envelope (mirrors proto/wire + encode.ts `coldFrame`): 8-byte
+// header (<BBHI> msg_type, ver, flags=FLAG_JSON, payload_len) + UTF-8 JSON,
+// bigints as bare integer literals, padded to a 4-byte boundary. Lets the store
+// test deliver server→client cold messages (Status / EpochStart) the client has
+// no encoder for, exercising the store's onStatus / onEpochStart wiring.
+const FLAG_JSON = 0x0001;
+const PROTO_VER = 1;
+function coldFrameBytes(msgType: number, value: unknown): Uint8Array {
+  const json = JSON.stringify(value, (_k, v) =>
+    typeof v === 'bigint' ? (JSON as { rawJSON(s: string): unknown }).rawJSON(v.toString()) : v,
+  );
+  const payload = new TextEncoder().encode(json);
+  const padded = (payload.length + 3) & ~3;
+  const out = new Uint8Array(8 + padded);
+  const dv = new DataView(out.buffer);
+  dv.setUint8(0, msgType);
+  dv.setUint8(1, PROTO_VER);
+  dv.setUint16(2, FLAG_JSON, true);
+  dv.setUint32(4, payload.length, true);
+  out.set(payload, 8);
+  return out;
+}
+
 const GOLDEN_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'tests', 'golden');
 
 function goldenU8(name: string): Uint8Array {
@@ -111,6 +134,71 @@ describe('FlowMap store', () => {
 
     unsub();
     unsubStore();
+  });
+
+  it('surfaces a closed Status (feed_state + next_open_ts) for the banner', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('equity', 'AAPL');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    expect(store.getState().feedState).toBeNull();
+    expect(store.getState().nextOpenTs).toBeNull();
+
+    // Terminal closed Status (spec §7.1): equity RTH window shut on a weekend.
+    const nextOpen = 1_752_710_400_000_000_000n;
+    sockets[0].deliver(
+      coldFrameBytes(MsgType.STATUS, {
+        feed_state: 'closed',
+        capability: { depth: 'SYNTH_PROFILE', tape: 'poll', vwap: 'approx' },
+        latency_ms: 0.0,
+        clock_skew_ms: 0.0,
+        next_open_ts: nextOpen,
+      }),
+    );
+
+    const s = store.getState();
+    expect(s.feedState).toBe('closed');
+    expect(s.nextOpenTs).toBe(nextOpen); // exact bigint, no ns rounding
+    expect(s.capability).toMatchObject({ depth: 'SYNTH_PROFILE', tape: 'poll' });
+
+    // A later live Status clears the stale countdown target.
+    sockets[0].deliver(
+      coldFrameBytes(MsgType.STATUS, {
+        feed_state: 'live',
+        capability: { depth: 'SYNTH_PROFILE', tape: 'poll', vwap: 'approx' },
+        latency_ms: 1.0,
+        clock_skew_ms: 0.0,
+        next_open_ts: null,
+      }),
+    );
+    expect(store.getState().feedState).toBe('live');
+    expect(store.getState().nextOpenTs).toBeNull();
+  });
+
+  it('advances gridEpoch on a re-anchor EpochStart but never regresses it', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('equity', 'AAPL');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello')); // grid_epoch 3
+    expect(store.getState().gridEpoch).toBe(3);
+
+    // Mid-stream re-anchor (equity grid jumps from nominal $100 p0 to the real
+    // price): a fresh, higher epoch must become the current grid frame.
+    const params4 = { epoch: 4, tick: 0.01, tick_multiple: 1, dt_ns: 10_000_000_000, p0: 159.52, rows: 4096 };
+    sockets[0].deliver(coldFrameBytes(MsgType.EPOCH_START, { epoch: 4, epoch_params: params4 }));
+    expect(store.getState().gridEpoch).toBe(4);
+    expect(store.getState().epochs.get(4)).toMatchObject({ epoch: 4, p0: 159.52 });
+
+    // A history response batches EpochStarts for OLDER epochs — these must NOT
+    // pull the live price frame backward.
+    const params2 = { epoch: 2, tick: 0.01, tick_multiple: 1, dt_ns: 10_000_000_000, p0: 79.52, rows: 4096 };
+    sockets[0].deliver(coldFrameBytes(MsgType.EPOCH_START, { epoch: 2, epoch_params: params2 }));
+    expect(store.getState().gridEpoch).toBe(4); // held at the newest
+    expect(store.getState().epochs.get(2)).toMatchObject({ epoch: 2 }); // still recorded
   });
 });
 

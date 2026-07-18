@@ -10,7 +10,7 @@ import {
   type BookSnapshot,
 } from '../state/bookStore';
 import { useFlowMapStore } from '../state/store';
-import { DomLadder, buildLadder, depthTier, priceDecimals } from './DomLadder';
+import { DomLadder, buildLadder, depthTier, fmtSz, priceDecimals } from './DomLadder';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -93,6 +93,22 @@ describe('depthTier', () => {
     expect(depthTier(null, MODE_L2)).toBe('L2');
     expect(depthTier(null, MODE_SYNTH_PROFILE)).toBe('SYNTH');
     expect(depthTier(null, null)).toBeNull();
+  });
+});
+
+describe('fmtSz', () => {
+  it('formats finite sizes compactly and blanks non-positive', () => {
+    expect(fmtSz(0)).toBe('');
+    expect(fmtSz(2.5)).toBe('2.50');
+    expect(fmtSz(150)).toBe('150.0');
+    expect(fmtSz(1500)).toBe('1500');
+  });
+
+  it('renders an over-range glyph for a non-finite density (never "Infinity"/"NaN")', () => {
+    // Upstream f16-overflowed SYNTH volume buckets arrive as +inf; the ladder
+    // must show an honest over-range marker, not the raw JS string.
+    expect(fmtSz(Number.POSITIVE_INFINITY)).toBe('∞');
+    expect(fmtSz(Number.NaN)).toBe('');
   });
 });
 

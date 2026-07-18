@@ -36,6 +36,8 @@ export interface FlowMapState {
   // --- low-frequency session/connection metadata (React-rendered) ---
   status: ConnStatus;
   feedState: FeedState | null;
+  /** Next RTH open (UTC ns) from a `Status{feed_state='closed'}`; else null. Drives the closed banner countdown. */
+  nextOpenTs: bigint | null;
   capability: Record<string, unknown> | null;
   sessionId: string | null;
   protocolVersion: number | null;
@@ -89,6 +91,7 @@ function fanoutStream(msg: StreamMsg): void {
 export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   status: 'idle',
   feedState: null,
+  nextOpenTs: null,
   capability: null,
   sessionId: null,
   protocolVersion: null,
@@ -122,11 +125,21 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         onEpochStart: (ev) => {
           const epochs = new Map(get().epochs);
           epochs.set(ev.epoch, ev.epoch_params);
-          set({ epochs });
+          // Advance the grid epoch to the newest re-anchored frame so the price
+          // axis + overlays follow it (e.g. an equity grid re-anchoring from its
+          // nominal $100 p0 to the symbol's real price mid-stream). Only ever
+          // advance: history responses batch EpochStarts for OLDER epochs (§6.3)
+          // and must not regress the live price frame.
+          const cur = get().gridEpoch;
+          const gridEpoch = cur === null ? ev.epoch : Math.max(cur, ev.epoch);
+          set({ epochs, gridEpoch });
         },
         onStatus: (status) => {
           set({
             feedState: status.feed_state,
+            // Only a closed Status carries a next open; a live/degraded Status
+            // clears any stale countdown target.
+            nextOpenTs: status.next_open_ts ?? null,
             capability: status.capability,
             latencyMs: status.latency_ms,
             clockSkewMs: status.clock_skew_ms,

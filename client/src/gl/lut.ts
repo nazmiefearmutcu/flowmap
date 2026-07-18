@@ -12,11 +12,24 @@
  * Uint8Array) so the ramp shape is unit-testable without a GL context.
  */
 
+import { MODE_SYNTH_PROFILE } from '../proto/types';
+
 export const LUT_SIZE = 256;
 
 /** Atlas rows — the `u_ramp` uniform in the fragment shader indexes these. */
 export const RAMP_THERMAL = 0;
 export const RAMP_SYNTH = 1;
+
+/**
+ * Colormap row for a DepthColumn's density mode (§7 / §8.3): a SYNTH_PROFILE
+ * (keyless equity volume-at-price, bid-only) renders in the single-hue amber
+ * ramp so synthetic density reads as visually distinct from real L2/L1 depth;
+ * everything else uses the thermal ramp. Pure so the mode→ramp selection is
+ * unit-testable without a GL context.
+ */
+export function rampForMode(mode: number): number {
+  return mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL;
+}
 
 interface Stop {
   /** Normalized position along the ramp, 0..1. */

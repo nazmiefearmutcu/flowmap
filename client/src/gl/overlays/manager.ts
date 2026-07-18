@@ -216,6 +216,19 @@ export class OverlayManager {
     }
   }
 
+  /**
+   * The BBO the overlay WOULD draw for the given session state, or null when it
+   * draws nothing (honesty e2e): a keyless/SYNTH equity session has no channel
+   * BBO and is not L2, so this MUST be null — no fabricated inside quote.
+   */
+  effectiveBboForTest(
+    capability: Record<string, unknown> | null,
+    price: PriceMap | null,
+    newestArrays: { bid: Float32Array; ask: Float32Array | null } | null,
+  ): BboState | null {
+    return this.effectiveBbo({ capability, price, newestArrays } as OverlayDrawContext);
+  }
+
   /** Channel BBO if the feed carries it, else the L2-derived inside quote. */
   private effectiveBbo(ctx: OverlayDrawContext): BboState | null {
     if (this.hasChannelBbo) return this.channelBbo;

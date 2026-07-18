@@ -457,6 +457,45 @@ body,
   overflow: hidden;
 }
 
+/* --- closed-market banner (§7.1) — near-black, amber accent, unobtrusive --- */
+.closed-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: 5px;
+  background: rgba(10, 12, 16, 0.9);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.closed-banner__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+}
+.closed-banner__label {
+  text-transform: uppercase;
+}
+.closed-banner__countdown {
+  color: var(--text-2);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
 .price-axis {
   grid-column: 2;
   grid-row: 1;

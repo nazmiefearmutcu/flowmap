@@ -217,7 +217,11 @@ export function buildLadder(
 }
 
 /** Compact size formatting (matches the crosshair readout). */
-function fmtSz(v: number): string {
+export function fmtSz(v: number): string {
+  // Never render the raw JS "Infinity"/"NaN" strings: a non-finite density is
+  // over-range/unusable (e.g. an upstream f16-overflowed SYNTH volume bucket) —
+  // show an honest over-range glyph, not a fabricated number.
+  if (!Number.isFinite(v)) return v > 0 ? '∞' : '';
   if (v <= 0) return '';
   if (v >= 1000) return v.toFixed(0);
   if (v >= 100) return v.toFixed(1);

@@ -4,6 +4,7 @@ import { Renderer } from './gl/renderer';
 import { attachGlobalKeys } from './input/keys';
 import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
+import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { DomLadder } from './ui/DomLadder';
 import { PriceAxis } from './ui/PriceAxis';
@@ -281,6 +282,7 @@ export function App() {
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+            <ClosedBanner />
           </div>
           <PriceAxis canvasRef={priceAxisRef} />
           <TimeAxis canvasRef={timeAxisRef} />

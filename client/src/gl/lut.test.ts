@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildLUTAtlas, buildSynthLUT, buildThermalLUT, LUT_SIZE } from './lut';
+import {
+  buildLUTAtlas,
+  buildSynthLUT,
+  buildThermalLUT,
+  LUT_SIZE,
+  rampForMode,
+  RAMP_SYNTH,
+  RAMP_THERMAL,
+} from './lut';
+import { MODE_L1_BAND, MODE_L2, MODE_SYNTH_PROFILE } from '../proto/types';
 
 // Rec.601 luma — a stand-in for perceived brightness. Both ramps are designed
 // to brighten monotonically with density, which is what makes "hotter = higher
@@ -70,6 +79,21 @@ describe('synth (amber) LUT', () => {
     for (let k = 0; k < marks.length - 1; k++) {
       expect(luma(lut, marks[k + 1])).toBeGreaterThan(luma(lut, marks[k]));
     }
+  });
+});
+
+describe('rampForMode (§7 mode → colormap)', () => {
+  it('maps SYNTH_PROFILE density to the amber ramp', () => {
+    expect(rampForMode(MODE_SYNTH_PROFILE)).toBe(RAMP_SYNTH);
+  });
+
+  it('maps real L2 / L1 depth to the thermal ramp', () => {
+    expect(rampForMode(MODE_L2)).toBe(RAMP_THERMAL);
+    expect(rampForMode(MODE_L1_BAND)).toBe(RAMP_THERMAL);
+  });
+
+  it('defaults an unknown mode to thermal (never fabricates the synth look)', () => {
+    expect(rampForMode(99)).toBe(RAMP_THERMAL);
   });
 });
 
