@@ -120,6 +120,14 @@ body,
   border-radius: 3px;
 }
 
+/* Positioned container so the crosshair overlay can sit exactly over the canvas. */
+.stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
 .gl-canvas {
   flex: 1 1 auto;
   display: block;

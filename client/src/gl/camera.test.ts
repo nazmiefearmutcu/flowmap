@@ -10,7 +10,9 @@ import {
   MIN_ROW_SPAN,
   pan,
   reset,
+  screenToGrid,
   toView,
+  viewToGrid,
   zoomPrice,
   zoomTime,
   type CameraLimits,
@@ -46,6 +48,51 @@ describe('camera view mapping', () => {
   it('maps center+span to the shader edge/scale uniforms', () => {
     const v = toView({ colCenter: 100, colSpan: 40, rowCenter: 200, rowSpan: 80, follow: false });
     expect(v).toEqual({ colOffset: 80, colScale: 40, rowOffset: 160, rowScale: 80 });
+  });
+});
+
+describe('viewToGrid / screenToGrid — the crosshair inverse (T9)', () => {
+  const view = toView({ colCenter: 1000, colSpan: 200, rowCenter: 256, rowSpan: 120, follow: false });
+  // colOffset=900, colScale=200, rowOffset=196, rowScale=120.
+
+  it('is the exact algebraic inverse of the shader forward map', () => {
+    // uv center (0.5,0.5) → the view centers.
+    expect(viewToGrid(view, 0.5, 0.5)).toEqual({ colf: 1000, rowf: 256 });
+    // uv (0,0) → left edge / bottom row.
+    expect(viewToGrid(view, 0, 0)).toEqual({ colf: 900, rowf: 196 });
+    // uv (1,1) → right edge / top row.
+    expect(viewToGrid(view, 1, 1)).toEqual({ colf: 1100, rowf: 316 });
+  });
+
+  it('round-trips: forward (shader) then inverse recovers the uv', () => {
+    for (const [uvX, uvY] of [
+      [0.1, 0.2],
+      [0.73, 0.42],
+      [1, 0],
+    ]) {
+      const { colf, rowf } = viewToGrid(view, uvX, uvY);
+      const backX = (colf - view.colOffset) / view.colScale;
+      const backY = (rowf - view.rowOffset) / view.rowScale;
+      expect(backX).toBeCloseTo(uvX, 12);
+      expect(backY).toBeCloseTo(uvY, 12);
+    }
+  });
+
+  it('screenToGrid flips DOM-y (top-down) to the shader bottom-up uv', () => {
+    const cssW = 400;
+    const cssH = 300;
+    // Cursor at the TOP of the canvas (cssY=0) → uvY=1 → the top row.
+    expect(screenToGrid(view, 0, 0, cssW, cssH).rowf).toBeCloseTo(316, 12);
+    // Cursor at the BOTTOM (cssY=cssH) → uvY=0 → the bottom row.
+    expect(screenToGrid(view, 0, cssH, cssW, cssH).rowf).toBeCloseTo(196, 12);
+    // Horizontal center → colCenter.
+    expect(screenToGrid(view, cssW / 2, cssH / 2, cssW, cssH).colf).toBeCloseTo(1000, 12);
+  });
+
+  it('guards a zero-sized canvas (no divide-by-zero)', () => {
+    const p = screenToGrid(view, 10, 10, 0, 0);
+    expect(Number.isFinite(p.colf)).toBe(true);
+    expect(Number.isFinite(p.rowf)).toBe(true);
   });
 });
 

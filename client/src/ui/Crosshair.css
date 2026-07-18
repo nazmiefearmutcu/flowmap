@@ -1,0 +1,90 @@
+/* Crosshair overlay (§9 trading-terminal look, T9). The wrapper sits over the
+   canvas and never eats pointer events — the GL canvas keeps the gestures. */
+
+.crosshair {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+  overflow: hidden;
+}
+
+/* Thin cursor lines — 1px, low-alpha teal so structure stays readable under them. */
+.crosshair__vline,
+.crosshair__hline {
+  position: absolute;
+  background: rgba(31, 182, 166, 0.55);
+}
+
+.crosshair__vline {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+
+.crosshair__hline {
+  left: 0;
+  right: 0;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
+
+/* Compact near-black readout box, monospace numerics. */
+.crosshair__box {
+  position: absolute;
+  min-width: 132px;
+  padding: 6px 8px;
+  background: rgba(3, 5, 8, 0.92);
+  border: 1px solid var(--border, #1a1f2b);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg, #e6edf3);
+}
+
+.crosshair__line {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  white-space: nowrap;
+}
+
+.crosshair__line--dim {
+  color: var(--fg-dim, #5b6675);
+}
+
+.crosshair__key {
+  color: var(--fg-dim, #5b6675);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.crosshair__key--bid {
+  color: #1fb6a6;
+}
+
+.crosshair__key--ask {
+  color: #c65454;
+}
+
+.crosshair__val {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.crosshair__val--price {
+  color: #e6edf3;
+  font-weight: 600;
+}
+
+.crosshair__val--bid {
+  color: #4fd6c7;
+}
+
+.crosshair__val--ask {
+  color: #e08585;
+}

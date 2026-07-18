@@ -186,6 +186,48 @@ export function toView(s: CameraState): HeatmapView {
   };
 }
 
+/** Fractional absolute grid coordinate under a viewport point (crosshair). */
+export interface GridPoint {
+  /** Fractional absolute column (floor → the col_seq the shader painted). */
+  colf: number;
+  /** Fractional absolute row (floor → the row index; row 0 = bottom of grid). */
+  rowf: number;
+}
+
+/**
+ * Inverse of the view transform (screen → grid), the crosshair's reverse of the
+ * shader's `col = colOffset + colScale·uv.x`, `row = rowOffset + rowScale·uv.y`.
+ * `uvX`/`uvY` are normalized viewport coordinates in [0,1] with **uvY measured
+ * from the BOTTOM** (uv.y = 0 at the bottom of the price grid, matching the
+ * shader and the gesture code's `uvY = 1 - cursorY/cssH`). Pure + testable — the
+ * exact algebraic inverse of {@link toView}, so mapping a cursor back through it
+ * lands on the same cell the fragment shader filled at that pixel.
+ */
+export function viewToGrid(view: HeatmapView, uvX: number, uvY: number): GridPoint {
+  return {
+    colf: view.colOffset + view.colScale * uvX,
+    rowf: view.rowOffset + view.rowScale * uvY,
+  };
+}
+
+/**
+ * Screen→grid straight from CSS pixels on the canvas. `cssX` grows right, `cssY`
+ * grows DOWN (DOM convention); this flips y to the shader's bottom-up uv before
+ * delegating to {@link viewToGrid}. Points outside the canvas simply extrapolate
+ * (the caller decides whether the result is in the resident range).
+ */
+export function screenToGrid(
+  view: HeatmapView,
+  cssX: number,
+  cssY: number,
+  cssW: number,
+  cssH: number,
+): GridPoint {
+  const w = cssW > 0 ? cssW : 1;
+  const h = cssH > 0 ? cssH : 1;
+  return viewToGrid(view, cssX / w, 1 - cssY / h);
+}
+
 /**
  * Imperative wrapper the renderer holds: current state + limits, delegating to
  * the pure ops above. Gestures call these; each mutation lets the renderer mark

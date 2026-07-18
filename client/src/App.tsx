@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 
 import { Renderer } from './gl/renderer';
+import { Crosshair } from './ui/Crosshair';
 import { useFlowMapStore } from './state/store';
 
 /**
@@ -38,6 +39,9 @@ function capabilityBadges(capability: Record<string, unknown> | null): string[] 
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Held so the Crosshair overlay can call renderer.probeAt (null in the
+  // ?test=heatmap hook mode, which owns the canvas itself).
+  const rendererRef = useRef<Renderer | null>(null);
   const status = useFlowMapStore((s) => s.status);
   const feedState = useFlowMapStore((s) => s.feedState);
   const capability = useFlowMapStore((s) => s.capability);
@@ -65,6 +69,11 @@ export function App() {
     // feed, which would fight the preloaded ring. Otherwise wire the sim feed.
     const perfMode = params.get('perf') === '1';
 
+    // Normalization e2e (T9): like perf — no live feed — the spec preloads two
+    // fixed density regions + a known wall via preloadNormalizeScenario and drives
+    // the real normalizer + crosshair.
+    const normalizeMode = params.get('normalize') === '1';
+
     // Scroll-back e2e (T8): a small full-res budget so the live sim overruns it
     // quickly and panning left exercises the HistoryRequest backfill path.
     const scrollbackMode = params.get('scrollback') === '1';
@@ -74,12 +83,13 @@ export function App() {
       : {};
 
     const renderer = new Renderer(canvas, useFlowMapStore, rendererOpts);
-    if (!perfMode) {
+    rendererRef.current = renderer;
+    if (!perfMode && !normalizeMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
     }
 
-    // Read-only diagnostics handle for the live-sim / perf / scroll-back e2e.
-    if (import.meta.env.DEV || perfMode || scrollbackMode) {
+    // Read-only diagnostics handle for the live-sim / perf / scroll-back / T9 e2e.
+    if (import.meta.env.DEV || perfMode || scrollbackMode || normalizeMode) {
       (window as unknown as { __flowmapLive: unknown }).__flowmapLive = {
         renderer,
         store: useFlowMapStore,
@@ -88,6 +98,7 @@ export function App() {
 
     return () => {
       renderer.dispose();
+      rendererRef.current = null;
       useFlowMapStore.getState().disconnect();
       if (import.meta.env.DEV) {
         delete (window as unknown as { __flowmapLive?: unknown }).__flowmapLive;
@@ -117,7 +128,10 @@ export function App() {
           ))}
         </span>
       </header>
-      <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+      <div className="stage">
+        <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+        <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+      </div>
     </div>
   );
 }

@@ -40,12 +40,14 @@ import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
 import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
-import { Camera, limitsFor } from './camera';
+import { Camera, limitsFor, screenToGrid } from './camera';
+import { ViewportNormalizer } from './normalize';
+import { ColumnCache } from './columnCache';
 import { attachGestures, type CameraController } from '../input/gestures';
 import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
-import { MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
+import { MODE_L2, MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
 
 /** The renderer only needs the store's imperative surface, not the React hook. */
 interface RendererStore {
@@ -78,6 +80,33 @@ export interface PerfResult {
 }
 
 /**
+ * Crosshair liquidity readout at a hovered pixel (§8.3, T9). Sizes come from the
+ * exact CPU {@link ColumnCache}, NEVER from GPU-filtered/mip texels; price from
+ * the epoch's row→price affine. `hasData` is false when the hovered column is not
+ * cached (deep history) — the UI then shows the price but "—" for size.
+ */
+export interface CrosshairReadout {
+  /** Absolute col_seq under the cursor (floor of the fractional column). */
+  colSeq: number;
+  /** Absolute row under the cursor (row 0 = bottom of the price grid). */
+  row: number;
+  /** Number of rows summed into the size (tick-grouping / mip block = 4^level). */
+  group: number;
+  /** Price at the hovered row via `p0 + row·tick·tick_multiple`, or null off-grid. */
+  price: number | null;
+  /** Price-format decimals derived from the tick, for the UI. */
+  priceDecimals: number;
+  /** Exact summed bid size at the (grouped) cell, or null when not cached. */
+  bid: number | null;
+  /** Exact summed ask size at the (grouped) cell, or null when not cached. */
+  ask: number | null;
+  /** Column start time (ns) from the cache, or null when not cached. */
+  timeNs: bigint | null;
+  /** Whether the cursor is over a resident column and an on-grid row. */
+  inRange: boolean;
+}
+
+/**
  * Full-res residency budget (§8.3): 16 384 recent columns = 64 tile layers ×
  * 256 cols. At RG16F (4 B/texel) one column is rows·4 B, so the ring is
  * 16384·rows·4 B — 134 MiB at the sim's 2048 rows, 268 MiB at the production
@@ -93,8 +122,6 @@ const ROW_PAD_FRACTION = 0.08;
 const MIN_ROW_PAD = 3;
 /** Floor on the normalization divisor so a tiny norm_seed can't blow out intensity. */
 const NORM_FLOOR = 6;
-/** Fallback norm when the server hasn't sent a norm_seed yet. */
-const DEFAULT_NORM = 24;
 /** Keyboard pan step as a fraction of the current viewport span. */
 const KEY_PAN_FRAC = 0.15;
 /** Near-black clear color (matches the CSS --bg so the canvas has no seam). */
@@ -142,6 +169,17 @@ export class Renderer {
   /** Deep scroll-back backfill (T8). Created with the ring. */
   private history: HistoryLoader | null = null;
 
+  /** Viewport-percentile normalization (T9): per-tile histograms → u_norm. */
+  private readonly normalizer: ViewportNormalizer;
+  /** Exact CPU column cache (T9): the crosshair readout + instant-recovery data. */
+  private readonly columnCache: ColumnCache;
+  /** norm_seed applied once, the first time the server sends it. */
+  private normSeeded = false;
+  /** Fixed per-instrument decode scale (capability-driven; 1 for the sim). */
+  private decodeScale = 1;
+  /** Current colormap row (thermal / synth), set per column mode. */
+  private ramp = RAMP_THERMAL;
+
   private newestSeq = -1;
   private view: HeatmapView;
 
@@ -187,6 +225,11 @@ export class Renderer {
     // Provisional limits until the first column reveals the row count; follow ON.
     this.camera = new Camera(limitsFor(1, this.opts.capacityColsTarget));
     this.view = this.camera.toView();
+
+    // T9 CPU state (no GL) — histograms + exact column cache survive a context
+    // loss, so they're built once here and kept across ring rebuilds.
+    this.normalizer = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    this.columnCache = new ColumnCache();
 
     // Match the backing store to the CSS box, then paint the background once so
     // the pre-data canvas is the terminal near-black, not transparent garbage.
@@ -402,15 +445,18 @@ export class Renderer {
 
     this.writeColumn(col, rows);
 
-    // Normalization: the server's per-session norm_seed (p99 of recent nonzero
-    // density) is the right ramp divisor; floor it so a small seed can't wash out.
-    const seed = this.store.getState().normSeed;
-    const norm = seed && seed > 1 ? Math.max(seed, NORM_FLOOR) : DEFAULT_NORM;
-    this.heatmap!.encoding = {
-      decodeScale: 1,
-      norm,
-      ramp: col.mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL,
-    };
+    // Normalization (T9): seed the viewport normalizer once from the server's
+    // per-session norm_seed (p99 of recent nonzero density) — thereafter u_norm
+    // is the VIEWPORT percentile, recomputed per frame in updateNormalization().
+    if (!this.normSeeded) {
+      const seed = this.store.getState().normSeed;
+      if (seed && seed > 0) {
+        this.normalizer.seed(Math.max(seed, NORM_FLOOR));
+        this.normSeeded = true;
+      }
+    }
+    // Colormap follows the column's density mode (synth profile → amber ramp).
+    this.ramp = col.mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL;
 
     this.updateView();
     this.dirty = true;
@@ -450,6 +496,12 @@ export class Renderer {
     const [lo, hi] = columnExtent(col.bid, col.ask, rows);
     this.extentLo![slot] = lo;
     this.extentHi![slot] = hi;
+
+    // T9: feed the exact CPU cache (crosshair readout) and the per-tile
+    // histogram (viewport normalization). The DepthColumn arrays are fresh,
+    // immutable copies (decode.ts), so the cache holds references directly.
+    this.columnCache.put(col.col_seq, col.bid, col.ask, col.t0_ns, col.epoch);
+    this.normalizer.addColumn(col.col_seq, col.bid, col.ask);
 
     this.history?.noteColumn(col.col_seq, col.t0_ns);
   }
@@ -601,6 +653,98 @@ export class Renderer {
     return selectLevel(this.view.rowScale / h, maxLevel).level;
   }
 
+  /**
+   * Recompute u_norm from the VISIBLE window (T9): merge the covered tiles'
+   * histograms, extract the percentile, EMA-smooth, and fold the mip scaling.
+   * O(tiles in view) — never O(history). Skipped when the normalizer has no data
+   * (the perf preload path sets its own fixed norm and never feeds histograms),
+   * so the §10 perf gate is untouched. When the EMA is still gliding this keeps
+   * the frame dirty so the contrast settles smoothly (~0.3 s) instead of snapping.
+   */
+  private updateNormalization(): void {
+    const ring = this.ring;
+    const heatmap = this.heatmap;
+    if (ring === null || heatmap === null || !this.normalizer.hasData()) return;
+
+    const range = ring.residentRange();
+    if (range === null) return;
+
+    // Visible absolute column span, clamped to the resident window so the tile
+    // merge stays bounded even on a whole-ring zoom-out (≤ ring layers).
+    const left = Math.floor(this.view.colOffset);
+    const right = Math.floor(this.view.colOffset + this.view.colScale);
+    const oldest = Math.max(range.oldest, Math.min(left, right));
+    const newest = Math.min(range.newest, Math.max(left, right));
+    if (newest < oldest) return;
+
+    const rowLo = Math.max(0, Math.floor(this.view.rowOffset));
+    const rowHi = Math.min(ring.rows - 1, Math.floor(this.view.rowOffset + this.view.rowScale));
+    const level = this.currentLevel();
+
+    const norm = this.normalizer.updateNorm(
+      { oldest, newest },
+      { lo: rowLo, hi: rowHi },
+      level,
+    );
+    heatmap.encoding = { decodeScale: this.decodeScale, norm, ramp: this.ramp };
+    // Note: re-dirtying to keep the EMA gliding is done in frame() AFTER the
+    // draw block clears `dirty` — setting it here would be overwritten.
+  }
+
+  /** Whether the viewport norm is still gliding toward its target (settle loop). */
+  private normSettling(): boolean {
+    return this.heatmap !== null && this.normalizer.hasData() && !this.normalizer.settled;
+  }
+
+  /**
+   * Crosshair readout at a canvas CSS pixel (T9). Maps the pixel back through the
+   * camera inverse to (col_seq, row), reads the EXACT summed size from the CPU
+   * {@link ColumnCache} (never GPU/mip texels), and the price from the epoch's
+   * row→price affine. Returns null before the first column. Grouped rows are
+   * summed to match a tick-grouped / zoomed-out view (block = 4^level).
+   */
+  probeAt(cssX: number, cssY: number): CrosshairReadout | null {
+    const ring = this.ring;
+    if (ring === null) return null;
+
+    const cssW = Math.max(1, this.canvas.clientWidth);
+    const cssH = Math.max(1, this.canvas.clientHeight);
+    const { colf, rowf } = screenToGrid(this.view, cssX, cssY, cssW, cssH);
+    const colSeq = Math.floor(colf);
+    const row = Math.floor(rowf);
+    const rows = ring.rows;
+    const onGrid = row >= 0 && row < rows;
+
+    const range = ring.residentRange();
+    const inRange =
+      range !== null && colSeq >= range.oldest && colSeq <= range.newest && onGrid;
+
+    // Epoch geometry for row→price (single-epoch sim; per-column epoch when known).
+    const st = this.store.getState();
+    const epoch = this.columnCache.epochAt(colSeq) ?? st.gridEpoch ?? 0;
+    const params = st.epochs.get(epoch);
+    const step = params ? params.tick * params.tick_multiple : 0;
+    const price = params && onGrid ? params.p0 + row * step : null;
+    const priceDecimals = step > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(step)))) : 2;
+
+    // Exact grouped size (block = 4^level rows, aligned like the shader).
+    const blk = 4 ** this.currentLevel();
+    const rowStart = Math.floor(row / blk) * blk;
+    const size = onGrid ? this.columnCache.sizeAt(colSeq, rowStart, blk) : null;
+
+    return {
+      colSeq,
+      row,
+      group: blk,
+      price,
+      priceDecimals,
+      bid: size ? size.bid : null,
+      ask: size ? size.ask : null,
+      timeNs: this.columnCache.timeAt(colSeq),
+      inRange,
+    };
+  }
+
   // --- context-loss lifecycle (§8.3) --------------------------------------------
 
   /** GL context lost: preventDefault so the browser will restore it, then stop
@@ -695,6 +839,9 @@ export class Renderer {
     }
 
     if (this.dirty && this.heatmap !== null) {
+      // T9: refresh u_norm from the visible window before drawing (O(tiles),
+      // outside the measured draw cost; a no-op during the perf preload run).
+      this.updateNormalization();
       const t0 = performance.now();
       this.heatmap.draw(this.view);
       if (perf) {
@@ -705,6 +852,12 @@ export class Renderer {
       this.dirty = false;
       this.drawCountN++;
       this.lastDrawEndTsN = performance.now();
+
+      // Keep redrawing until the viewport norm reaches its target so the contrast
+      // glides into a new regime (~0.3 s) instead of snapping. O(tiles)/frame for
+      // the handful of settle frames; a no-op once converged and in the perf
+      // preload path (no histogram data).
+      if (this.normSettling()) this.dirty = true;
     }
 
     if (perf && ts >= perf.deadline) {
@@ -823,6 +976,150 @@ export class Renderer {
     // RG16F storage: colsPerTile × rows × layers texels × 2 channels × 2 bytes.
     const ringBytes = COLS_PER_TILE * rows * layers * 2 * 2;
     return { rows, layers, capacityCols: cap, ringBytes, resident: n };
+  }
+
+  /**
+   * Preload the T9 normalization/crosshair e2e scenario (network bypassed): two
+   * equal-shaped density regions whose scales differ ×50 (a DIM overnight-style
+   * region and a BRIGHT live-edge-style region), plus one KNOWN wall cell with a
+   * distinctive exact size for the crosshair assertion. Columns go through the
+   * REAL {@link writeColumn} path, so the ring, the per-tile histograms
+   * (normalizer) AND the exact CPU cache are all populated exactly as live. The
+   * caller sets the epoch params on the store, frames a region with
+   * {@link setViewForTest}, and lets the real per-frame viewport normalization run.
+   */
+  preloadNormalizeScenario(): {
+    rows: number;
+    epoch: number;
+    params: { epoch: number; tick: number; tick_multiple: number; dt_ns: number; p0: number; rows: number };
+    dim: { colLo: number; colHi: number };
+    bright: { colLo: number; colHi: number };
+    /** Col windows strictly INSIDE each regime (inset from the mid-tile seam). */
+    dimWindow: { colLo: number; colHi: number };
+    brightWindow: { colLo: number; colHi: number };
+    centerRow: number;
+    band: { lo: number; hi: number };
+    wall: { col: number; row: number; bid: number; price: number };
+    capacityCols: number;
+  } {
+    const rows = 512;
+    // Tile-aligned regions (colsPerTile = 256): dim = tiles 0-1, bright = tiles
+    // 2-3. A regime boundary mid-tile would leak the brighter columns into the
+    // dimmer viewport's merge (histograms are tile-granular by design, the §10
+    // O(tiles) budget) — so the two regimes sit on whole-tile boundaries and the
+    // measured windows are inset from the seam.
+    const region = 512;
+    const centerRow = 256;
+    const tick = 0.5;
+    const tickMultiple = 1;
+    const dtNs = 25_000_000;
+    const p0 = 100;
+    const brightScale = 50;
+    const wallCol = region + region / 2; // 768, mid of the bright region
+    const wallRow = centerRow;
+    const wallBid = 277; // distinctive exact value the crosshair must report
+
+    this.mips?.dispose();
+    this.heatmap?.dispose();
+    this.ring?.dispose();
+    this.mips = null;
+    this.heatmap = null;
+    this.ring = null;
+    this.history = null;
+    this.normalizer.reset();
+    this.columnCache.reset();
+    this.normSeeded = false;
+
+    const total = 2 * region;
+    const wantLayers = Math.ceil(total / COLS_PER_TILE);
+    const layers = clamp(wantLayers, 2, this.ctx.caps.maxArrayTextureLayers);
+    const ring = new TileRing(this.ctx.gl, rows, layers);
+    this.ring = ring;
+    this.heatmap = new Heatmap(this.ctx, ring, this.lut);
+    this.mips = this.createMips(rows, layers);
+    this.heatmap.mips = this.mips;
+    const cap = ring.capacityCols;
+    this.extentLo = new Int32Array(cap).fill(-1);
+    this.extentHi = new Int32Array(cap).fill(-1);
+    this.decodeScale = 1;
+    this.ramp = RAMP_THERMAL;
+    this.camera.setLimits(limitsFor(rows, cap));
+
+    for (let s = 0; s < total; s++) {
+      const scale = s < region ? 1 : brightScale;
+      // Fresh arrays per column — the cache holds references (never scratch).
+      const bid = new Float32Array(rows);
+      const ask = new Float32Array(rows);
+      for (let r = 0; r < rows; r++) {
+        const d = Math.abs(r - centerRow);
+        let v = 0;
+        if (d <= 2) v = 5 * scale; // the persistent wall band
+        else if (d <= 20) v = 0.6 * scale * (1 - d / 20); // ladder falloff
+        if (v > 0) {
+          if (r <= centerRow) bid[r] = v;
+          else ask[r] = v;
+        }
+      }
+      if (s === wallCol) bid[wallRow] = wallBid; // the known crosshair cell
+      const col: DepthColumn = {
+        type: MsgType.DEPTH_COL,
+        epoch: 0,
+        col_seq: s,
+        t0_ns: BigInt(s) * BigInt(dtNs),
+        mode: MODE_L2,
+        final: true,
+        bid,
+        ask,
+      };
+      this.writeColumn(col, rows);
+    }
+    this.newestSeq = total - 1;
+
+    // Frame the bright region initially; the spec reframes to compare regions.
+    this.setViewForTest(region, region, centerRow - 40, 80);
+
+    return {
+      rows,
+      epoch: 0,
+      params: { epoch: 0, tick, tick_multiple: tickMultiple, dt_ns: dtNs, p0, rows },
+      dim: { colLo: 0, colHi: region - 1 },
+      bright: { colLo: region, colHi: total - 1 },
+      // Inset 20 cols so the framed window's tiles are pure (no seam leak).
+      dimWindow: { colLo: 20, colHi: region - 21 },
+      brightWindow: { colLo: region + 20, colHi: total - 21 },
+      centerRow,
+      band: { lo: centerRow - 40, hi: centerRow + 40 },
+      wall: { col: wallCol, row: wallRow, bid: wallBid, price: p0 + wallRow * tick * tickMultiple },
+      capacityCols: cap,
+    };
+  }
+
+  /** Set the view directly from edge/scale form (e2e framing). Follow off. */
+  setViewForTest(colOffset: number, colScale: number, rowOffset: number, rowScale: number): void {
+    this.camera.state = {
+      colCenter: colOffset + colScale / 2,
+      colSpan: colScale,
+      rowCenter: rowOffset + rowScale / 2,
+      rowSpan: rowScale,
+      follow: false,
+    };
+    this.view = this.camera.toView();
+    this.dirty = true;
+    this.viewMoved = true;
+  }
+
+  /** Forward map a grid cell CENTER to canvas CSS pixels (e2e crosshair hover). */
+  cellToCanvasCss(colSeq: number, row: number): { x: number; y: number } {
+    const cssW = Math.max(1, this.canvas.clientWidth);
+    const cssH = Math.max(1, this.canvas.clientHeight);
+    const uvX = (colSeq + 0.5 - this.view.colOffset) / this.view.colScale;
+    const uvY = (row + 0.5 - this.view.rowOffset) / this.view.rowScale;
+    return { x: uvX * cssW, y: (1 - uvY) * cssH };
+  }
+
+  /** The EMA-smoothed norm currently fed to u_norm (e2e diagnostics). */
+  get currentNorm(): number {
+    return this.normalizer.current;
   }
 
   /** Run a scripted continuous PAN for `durationMs`; resolves with frame timing. */
