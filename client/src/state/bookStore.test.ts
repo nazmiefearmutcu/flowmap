@@ -20,6 +20,7 @@ import {
   THROTTLE_MS,
   getSnapshot,
   ingestForTest,
+  resetForSession,
   resetForTest,
   subscribe,
 } from './bookStore';
@@ -175,6 +176,51 @@ describe('bookStore throttling', () => {
     ingestForTest(trade(1, 100, 1, SIDE_BUY));
     vi.advanceTimersByTime(THROTTLE_MS * 3);
     expect(cb).not.toHaveBeenCalled();
+  });
+});
+
+describe('bookStore resetForSession (symbol switch)', () => {
+  it('clears book, BBO and tape so the new symbol does not show stale data', () => {
+    ingestForTest(depthCol(1, 10, [1, 2, 3], [0, 0, 4]));
+    ingestForTest(bbo(99.5, 12, 100.5, 7));
+    ingestForTest(trade(1, 100, 1, SIDE_BUY));
+    ingestForTest(trade(2, 101, 1, SIDE_SELL));
+    const before = getSnapshot();
+    expect(before.book).not.toBeNull();
+    expect(before.bbo).not.toBeNull();
+    expect(before.trades.length).toBe(2);
+
+    resetForSession();
+
+    const after = getSnapshot();
+    expect(after.book).toBeNull();
+    expect(after.bbo).toBeNull();
+    expect(after.trades.length).toBe(0);
+    // The version advances (cache invalidated) so subscribed panels repaint.
+    expect(after.version).toBeGreaterThan(before.version);
+  });
+
+  it('keeps panel subscriptions alive and notifies them of the cleared state', () => {
+    vi.useFakeTimers();
+    const cb = vi.fn();
+    const unsub = subscribe(cb);
+    ingestForTest(depthCol(1, 5, [7, 8], [0, 9]));
+    vi.advanceTimersByTime(THROTTLE_MS);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    resetForSession();
+    vi.advanceTimersByTime(THROTTLE_MS);
+    // The same listener is still registered and sees the empty book.
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(cb.mock.calls[1][0].book).toBeNull();
+
+    // Still live: the new session's first column flows to the same listener.
+    ingestForTest(depthCol(2, 0, [1, 1], [0, 2]));
+    vi.advanceTimersByTime(THROTTLE_MS);
+    expect(cb).toHaveBeenCalledTimes(3);
+    expect(cb.mock.calls[2][0].book?.epoch).toBe(2);
+
+    unsub();
   });
 });
 

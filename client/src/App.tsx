@@ -185,6 +185,29 @@ export function App() {
     prevSettingsRef.current = settings;
   }, [settings]);
 
+  // --- reset the heatmap on an actual symbol / market switch -------------------
+  // The DOM ladder + tape read the live book and switch on their own, but the GL
+  // heatmap holds the old symbol's ring + a camera fit to the old price frame, so
+  // on a real switch we tear the renderer's GL state back down to empty (the next
+  // column of the new session rebuilds it, fit to the new price range) and clear
+  // the shared book buffer (so the ladder/tape don't flash the old symbol). Keyed
+  // on market:symbol — NOT sessionId — so a bare reconnect of the SAME symbol
+  // (e.g. a mode toggle or a transport reconnect) keeps any scrolled-back
+  // history. The FIRST subscription (the initial mount connect) is skipped: the
+  // renderer already starts empty.
+  const subscription = useFlowMapStore((s) => s.subscription);
+  const subKey = subscription ? `${subscription.market}:${subscription.symbol}` : null;
+  const prevSubKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (subKey === null) return;
+    const prev = prevSubKeyRef.current;
+    prevSubKeyRef.current = subKey;
+    // Skip the first subscription (nothing to reset) and any no-op re-run.
+    if (prev === null || prev === subKey) return;
+    rendererRef.current?.resetForSession();
+    bookStore.resetForSession();
+  }, [subKey]);
+
   // --- stream clock (≤1 Hz) -----------------------------------------------------
   useEffect(() => {
     const tick = (): void => {

@@ -201,6 +201,24 @@ export function subscribe(cb: (s: BookSnapshot) => void): () => void {
   };
 }
 
+/**
+ * Clear the current book / BBO / tape for a NEW subscription (symbol switch),
+ * WITHOUT tearing down the stream subscription or panel listeners (unlike
+ * {@link resetForTest}). Otherwise the DOM ladder keeps the OLD symbol's settled
+ * book until the new session's first FINALIZED column arrives (a full interval
+ * later, since partials are ignored), and the tape ring keeps showing the old
+ * symbol's trades until {@link TRADE_RING} new ones push them out. Bumps the
+ * version + schedules a throttled flush so subscribed panels repaint empty.
+ * Called from App.tsx alongside the renderer reset on an actual symbol/market
+ * switch (see Renderer.resetForSession).
+ */
+export function resetForSession(): void {
+  book = null;
+  bbo = null;
+  trades = [];
+  bump();
+}
+
 // --- test seams (not for production use) ----------------------------------------
 
 /** Inject a stream message directly (bypasses the socket). Unit/e2e only. */
@@ -239,6 +257,7 @@ export function resetForTest(): void {
 export const bookStore = {
   getSnapshot,
   subscribe,
+  resetForSession,
   ingestForTest,
   flushForTest,
   resetForTest,

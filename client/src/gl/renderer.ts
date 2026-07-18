@@ -418,6 +418,84 @@ export class Renderer {
     this.controller.goLive();
   }
 
+  /**
+   * Reset the heatmap renderer to a clean, empty slate for a NEW subscription
+   * (a symbol / market switch). The DOM ladder + tape read the live book directly
+   * and switch on their own; the GL heatmap, by contrast, holds a {@link TileRing}
+   * of the OLD symbol's columns and a camera fit to the OLD price frame — so
+   * WITHOUT this the new session's columns (a fresh epoch with a wildly different
+   * `p0`) append onto the stale ring while the camera stays framed on the old
+   * price range, and the old tiles keep showing. This is the M2 integration-gate
+   * bug: switch sim→binance and the heatmap keeps painting sim's 88–128 band.
+   *
+   * The teardown mirrors the pre-first-column state (`ring === null`): the NEXT
+   * {@link onDepthColumn} of the new session lazily rebuilds the ring at the new
+   * symbol's row count via {@link createRing} — the LIVE path, so the ring/mips
+   * sizing is correct even when the grid height changes — re-fits the camera, and
+   * rebuilds the {@link HistoryLoader}. The CPU-side normalizer / column cache /
+   * overlays are cleared, the (epoch, col_seq) auto-follow + overlay-anchor
+   * cursors are rewound (so the new session's first, lower col_seq is accepted as
+   * the newest), and the norm re-seeds from the new session's `norm_seed` on its
+   * first column ({@link normSeeded} back to false).
+   *
+   * Distinct from the context-loss {@link recreateGL} (same symbol → same
+   * geometry, GL objects revived in place, camera view preserved) and from the
+   * perf / normalize / overlay preloads (which install a FIXED test geometry). A
+   * bare reconnect that keeps the symbol must NOT call this — it would wipe
+   * scrolled-back history — so App.tsx keys the trigger on market:symbol, not
+   * sessionId. Safe to call before the first column too (a no-op teardown).
+   */
+  resetForSession(): void {
+    // A lost context is mid-rebuild; its own `restored` path re-empties the ring.
+    if (this.glLost()) return;
+
+    // Tear down the GL heatmap objects; the next new-session column recreates
+    // them at the new row count via createRing (matching the live-path sizing).
+    this.mips?.dispose();
+    this.heatmap?.dispose();
+    this.ring?.dispose();
+    this.mips = null;
+    this.heatmap = null;
+    this.ring = null;
+    this.history = null;
+    this.extentLo = null;
+    this.extentHi = null;
+    this.ringRows = 0;
+    this.ringLayers = 0;
+
+    // CPU-side state survives a context loss, but a NEW symbol invalidates it.
+    this.normalizer.reset();
+    this.columnCache.reset();
+    this.overlays.reset();
+    this.normSeeded = false;
+    this.decodeScale = 1;
+    this.ramp = RAMP_THERMAL;
+    this.overlayIngestWarned = false;
+
+    // Rewind the per-session cursors used for auto-follow + overlay anchoring so
+    // the new session's first (typically lower) col_seq becomes the newest again.
+    this.newestSeq = -1;
+    this.overlayAnchorSeq = -1;
+    this.overlayAnchorT0Ns = 0n;
+    this.overlayAnchorEpoch = 0;
+
+    // Camera back to the provisional live default (follow ON, like the ctor);
+    // createRing re-fits to the new grid on the first column, then the per-column
+    // follow frame fits the price axis to the new book.
+    this.camera.setLimits(limitsFor(1, this.opts.capacityColsTarget));
+    this.camera.reset(null);
+    this.view = this.camera.toView();
+
+    // Wipe the old image now — preserveDrawingBuffer would otherwise keep the
+    // stale frame on screen until the first new-session column draws.
+    const gl = this.ctx.gl;
+    gl.clearColor(BG[0], BG[1], BG[2], BG[3]);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    this.dirty = true;
+    this.viewMoved = true;
+  }
+
   // --- gesture control (input/gestures → Camera) --------------------------------
 
   private makeController(): CameraController {
