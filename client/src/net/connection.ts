@@ -23,6 +23,7 @@
  */
 
 import { decodeFrame } from '../proto/decode';
+import { wsUrl } from './serverBase';
 import {
   encodeHistoryRequest,
   encodePause,
@@ -111,12 +112,9 @@ interface HistoryWaiter {
 }
 
 function defaultUrl(): string {
-  if (typeof window !== 'undefined' && window.location) {
-    const { protocol, host } = window.location;
-    const scheme = protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${scheme}//${host}/ws`;
-  }
-  return 'ws://localhost/ws';
+  // Absolute `http(s)://…/ws` from the Tauri-injected server origin in the
+  // packaged app; same-origin (`window.location`, vite-proxied) in dev.
+  return wsUrl();
 }
 
 const defaultWsFactory = (url: string): SocketLike => new WebSocket(url) as unknown as SocketLike;

@@ -85,7 +85,13 @@ async def test_symbols_filter_case_insensitive_substring(client):
 
 
 async def test_cors_allowed_origins(client):
-    for origin in ("http://127.0.0.1:5173", "http://localhost:5173"):
+    # Vite dev origins + the packaged desktop webview origin (Tauri serves the
+    # SPA from tauri://localhost and fetches /api/symbols cross-origin).
+    for origin in (
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "tauri://localhost",
+    ):
         r = await client.get("/api/health", headers={"origin": origin})
         assert r.headers.get("access-control-allow-origin") == origin
 

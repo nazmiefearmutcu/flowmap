@@ -22,6 +22,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 
+import { apiBase } from '../net/serverBase';
 import {
   capabilityChips,
   filterSymbols,
@@ -66,7 +67,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       if (!open) return;
       const ctrl = new AbortController();
       const timer = window.setTimeout(() => {
-        fetch(`/api/symbols?q=${encodeURIComponent(query.trim())}`, { signal: ctrl.signal })
+        fetch(`${apiBase()}/api/symbols?q=${encodeURIComponent(query.trim())}`, { signal: ctrl.signal })
           .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`symbols ${r.status}`))))
           .then((body: { symbols?: SymbolEntry[] }) => setEntries(body.symbols ?? []))
           .catch((err) => {

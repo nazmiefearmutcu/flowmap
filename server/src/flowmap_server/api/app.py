@@ -31,8 +31,17 @@ from flowmap_server.proto import events
 
 __all__ = ["create_app"]
 
-# Vite dev-server origins only (spec §11: CORS restricted to the client).
-_ALLOWED_ORIGINS = ("http://127.0.0.1:5173", "http://localhost:5173")
+# CORS restricted to the FlowMap client (spec §11): the vite dev-server origins,
+# plus the packaged desktop webview. In the Tauri app the SPA is served from
+# `tauri://localhost` and the REST directory (`/api/symbols`) is fetched
+# cross-origin from the loopback sidecar, so that origin must be allowed too.
+# (The `/ws` stream is not CORS-gated — the WS endpoint accepts unconditionally.)
+_ALLOWED_ORIGINS = (
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "tauri://localhost",
+    "http://tauri.localhost",
+)
 
 
 def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:

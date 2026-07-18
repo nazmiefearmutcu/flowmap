@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the FlowMap window. The client uses only plain fetch + WebSocket to the loopback sidecar, so no extra Tauri APIs are granted.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

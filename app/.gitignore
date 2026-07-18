@@ -1,0 +1,19 @@
+# Rust / Tauri build outputs
+src-tauri/target/
+src-tauri/gen/
+
+# Bundled Python runtime + download cache (large binaries; rebuilt by
+# scripts/bundle-python.sh, shipped in the DMG via the GitHub Release — not git)
+src-tauri/resources/pyruntime/
+src-tauri/resources/.cache/
+
+# Tauri-generated icon set (regenerated from ../icons/icon-1024.png by
+# `cargo tauri icon` in scripts/build-dmg.sh)
+src-tauri/icons/
+
+# Built artifacts
+*.dmg
+*.app
+
+# Node (if a package.json is ever added here)
+node_modules/
