@@ -1,42 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   FlowMap app icon — hand-authored.
-  Mark: a slice of an order-flow / liquidity heatmap. Seven horizontal rows (price
-  levels) span the tile as a coherent panel, flush left against an implied price
-  axis and near-flush right, varying in thickness and opacity to read as banded
-  liquidity density. Two crisp thin teal->cyan "liquidity walls" carry the focus,
-  the brightest sitting dead-centre; one amber accent row = the caution/replay
-  channel; a single short red tick to the upper-right marks the sell/ask side
-  against the teal bid stack. Palette from the product theme (theme.css):
-  bg #050709, teal #1fb6a6, cyan #37d0c0, amber #d6a13a, red #d3524f. macOS
-  squircle tile (circular-corner approximation of the Apple superellipse,
-  r = 18% of side). No glows, no orbs, no clip-art — geometry only.
+  Mark: a VOLUME PROFILE / order-flow liquidity histogram. Fifteen price rows share
+  a common price-axis baseline at the left; each bar's LENGTH is proportional to
+  resting liquidity at that price, so the bars form the characteristic profile
+  silhouette — longest at the Point of Control (the bright teal->cyan focal
+  "liquidity wall" dead-centre) and tapering, irregularly, above and below. Two
+  secondary bright cyan walls mark other high-volume nodes; one amber row is the
+  caution/replay channel; a single short red tick near the top marks the sell/ask
+  side; a faint vertical hairline is the current-price cursor crossing the profile.
+  Palette from the product theme (theme.css): bg #050709, teal #1fb6a6,
+  cyan #37d0c0, amber #d6a13a, red #d3524f. macOS squircle tile (circular-corner
+  approximation of the Apple superellipse, r = 18% of side). Geometry only — no
+  glows, no orbs, no clip-art.
 -->
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <!-- top-lit near-black tile -->
     <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#0b0f16"/>
       <stop offset="0.55" stop-color="#070a10"/>
       <stop offset="1" stop-color="#050709"/>
     </linearGradient>
-
-    <!-- focal liquidity wall: teal -> cyan across the tile -->
-    <linearGradient id="focalWall" x1="152" y1="0" x2="872" y2="0" gradientUnits="userSpaceOnUse">
+    <!-- focal POC wall: teal -> cyan along its length -->
+    <linearGradient id="focalWall" x1="184" y1="0" x2="856" y2="0" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#1fb6a6"/>
       <stop offset="1" stop-color="#37d0c0"/>
     </linearGradient>
-
-    <!-- diffuse liquidity: density builds left -> right (scroll cue) -->
-    <linearGradient id="fadeA" x1="152" y1="0" x2="864" y2="0" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1fb6a6" stop-opacity="0.15"/>
-      <stop offset="1" stop-color="#1fb6a6" stop-opacity="0.52"/>
-    </linearGradient>
-    <linearGradient id="fadeB" x1="152" y1="0" x2="870" y2="0" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1fb6a6" stop-opacity="0.17"/>
-      <stop offset="1" stop-color="#25c2b0" stop-opacity="0.54"/>
-    </linearGradient>
-
     <clipPath id="tileClip">
       <rect x="0" y="0" width="1024" height="1024" rx="185" ry="185"/>
     </clipPath>
@@ -45,25 +34,28 @@
   <!-- tile -->
   <rect x="0" y="0" width="1024" height="1024" rx="185" ry="185" fill="url(#bgGrad)"/>
 
-  <!-- order-flow liquidity motif (panel centred on y=512) -->
+  <!-- volume-profile motif: baseline x=184, bar length = liquidity at that price -->
   <g clip-path="url(#tileClip)">
-    <!-- 1. quiet upper band -->
-    <rect x="152" y="347" width="716" height="18" rx="4" fill="#1fb6a6" opacity="0.32"/>
-    <!-- 2. upper liquidity wall (crisp, thin) -->
-    <rect x="152" y="402" width="720" height="12" rx="3" fill="#37d0c0" opacity="0.90"/>
-    <!-- red sell tick (short) — the ask, above the focal bid wall -->
-    <rect x="792" y="426" width="80" height="12" rx="3" fill="#d3524f" opacity="0.92"/>
-    <!-- 3. diffuse liquidity pool -->
-    <rect x="152" y="447" width="712" height="26" rx="5" fill="url(#fadeA)"/>
-    <!-- 4. FOCAL liquidity wall — brightest, dead-centre -->
-    <rect x="152" y="504" width="720" height="16" rx="3" fill="url(#focalWall)"/>
-    <rect x="152" y="510" width="720" height="4" rx="2" fill="#8ceede" opacity="0.85"/>
-    <!-- 5. amber accent band (caution/replay channel) -->
-    <rect x="152" y="553" width="716" height="22" rx="4" fill="#d6a13a" opacity="0.58"/>
-    <!-- 6. diffuse liquidity pool (lower) -->
-    <rect x="152" y="602" width="718" height="28" rx="5" fill="url(#fadeB)"/>
-    <!-- 7. quiet lower band -->
-    <rect x="152" y="659" width="708" height="18" rx="4" fill="#1fb6a6" opacity="0.30"/>
+    <!-- current-price cursor, faint, crosses the profile -->
+    <rect x="595" y="150" width="2.5" height="724" fill="#37d0c0" opacity="0.13"/>
+
+    <!-- rows top -> bottom; POC (row 8) is longest & dead-centre -->
+    <rect x="184" y="155" width="148" height="26" rx="4" fill="#1fb6a6" opacity="0.40"/>
+    <rect x="184" y="207" width="108" height="20" rx="3" fill="#d3524f" opacity="0.92"/><!-- red ask tick (short) -->
+    <rect x="184" y="253" width="282" height="26" rx="4" fill="#1fb6a6" opacity="0.52"/>
+    <rect x="184" y="302" width="242" height="26" rx="4" fill="#1fb6a6" opacity="0.48"/>
+    <rect x="184" y="352" width="376" height="26" rx="4" fill="#d6a13a" opacity="0.66"/><!-- amber channel -->
+    <rect x="184" y="402" width="497" height="24" rx="3" fill="#37d0c0" opacity="0.90"/><!-- bright node -->
+    <rect x="184" y="450" width="430" height="26" rx="4" fill="#1fb6a6" opacity="0.62"/>
+    <rect x="184" y="498" width="672" height="28" rx="4" fill="url(#focalWall)"/><!-- POC (focal) -->
+    <rect x="184" y="509" width="672" height="6" rx="3" fill="#8ceede" opacity="0.85"/><!-- POC bright core -->
+    <rect x="184" y="548" width="564" height="26" rx="4" fill="#1fb6a6" opacity="0.74"/>
+    <rect x="184" y="597" width="390" height="26" rx="4" fill="#1fb6a6" opacity="0.58"/>
+    <rect x="184" y="647" width="484" height="24" rx="3" fill="#37d0c0" opacity="0.82"/><!-- bright node -->
+    <rect x="184" y="696" width="322" height="26" rx="4" fill="#1fb6a6" opacity="0.54"/>
+    <rect x="184" y="745" width="242" height="26" rx="4" fill="#1fb6a6" opacity="0.48"/>
+    <rect x="184" y="794" width="296" height="26" rx="4" fill="#1fb6a6" opacity="0.52"/>
+    <rect x="184" y="843" width="175" height="26" rx="4" fill="#1fb6a6" opacity="0.42"/>
   </g>
 
   <!-- faint inner border for definition on light desktops -->
