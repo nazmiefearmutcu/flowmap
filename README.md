@@ -1,157 +1,81 @@
-# FlowMap 📊
+# FlowMap v2
 
-**Open-source real-time order flow and market depth visualization platform.**
+**A Bookmap-standard, dual-market order-flow visualizer — real-time liquidity heatmap, DOM
+ladder, time & sales, and order-flow overlays for crypto and US equities, in one renderer.**
 
-FlowMap brings institutional-grade order book heatmap visualization to your desktop. Built with Python, PyQt6, and vectorized NumPy array projections, it renders real-time liquidity heatmaps, trade execution bubbles, DOM depth, and volume analytics.
+FlowMap v2 is a ground-up rebuild. The old PyQt6 desktop app (v1) re-rasterized the entire visible
+history on the CPU every pan/zoom frame, so scrolling back through history collapsed to ~1 fps.
+v2 puts history in a WebGL2 texture and makes pan/zoom a pure view transform — **interaction cost
+is independent of history depth**. It unifies two market-data engines
+([Crypcodile](https://github.com/nazmiefearmutcu/Crypcodile) for crypto,
+stockodile for US equities) behind one market-agnostic renderer.
 
----
+## Highlights
 
-## 🏷️ Tags & Badges
+- **60 fps pan/zoom at any history depth.** A column, once uploaded to the GPU, is never
+  re-rasterized; pan and both zoom axes only change a uniform. Measured: draw cost is ~0.2 ms
+  whether 200 or 10 000 columns are resident (history-independent — the v1 1-fps bug is
+  structurally gone).
+- **Bookmap-standard order flow:** liquidity heatmap (thermal, with correct SUM-mip zoom-out so
+  walls don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
+  event markers, crosshair with exact liquidity readout, deep scroll-back, replay transport.
+- **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities
+  show what their free data actually supports — a keyless volume-at-price SYNTH profile (Yahoo 1 m
+  bars) that upgrades to Alpaca IEX L1 with zero code change when `ALPACA_API_KEY`/`SECRET` are
+  set. Capability badges (`L2` / `L1` / `SYNTH`, `TAPE TICK` / `TAPE POLL`, `SIDE EXCHANGE` /
+  `SIDE NA`) are always honest — no fabricated depth.
 
-![Status](https://img.shields.io/badge/status-active--development-emerald)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![PyQt6](https://img.shields.io/badge/PyQt-6-darkblue)
-![Engine](https://img.shields.io/badge/engine-NumPy%20Vectorized-orange)
-![Replay](https://img.shields.io/badge/replay-Crypcodile%20DuckDB-purple)
-
----
-
-## ✨ Features
-
-### 🔥 Real-Time Liquidity Stratigraphy Heatmap
-- **Unified Color Scale**: Transitions smoothly based on volume density (transparent $\rightarrow$ white $\rightarrow$ orange/red) on both bid and ask sides.
-- **Flicker-Free Stratigraphy**: Iterates the union of all active price levels in memory, allowing historical lines to smoothly decay and fade out rather than instantly vanish.
-- **Zero Vertical Jitter**: Uses a running minimum of observed tick intervals to freeze the vertical price tick scale.
-
-### 🫧 Trade Execution Bubbles & Overlays
-- **Interactive Trade Circles**: Every trade is plotted at its exact price row, with size scaling by volume and color mapped to aggressor side (green = buy, red = sell).
-- **Volume Profile Overlay**: Matches the exact float-based boundaries of heatmap rows to prevent vertical layout drift.
-- **VWAP & CVD (Market Pulse)**: Continuous float-based sub-pixel line rendering for technical analysis.
-- **High-Readability BBO Current Price Tags**: Snapped bid/ask tags highlighted inside dark, side-colored rounded capsules.
-
-### 🗄️ Crypcodile Live & Replay Feed Integration
-- **DuckDB Querying (Replay)**: Connects locally to parquet-structured Crypcodile historical data folders (e.g., `exchange=binance-spot`, `channel=book_delta`).
-- **Real-Time WebSocket Feed (Live)**: Connects to live data pipelines for instant order flow charting on live tickers.
-- **Zero-Lag Queue Optimization**: Direct queue processing of BBO (Best Bid & Offer) quotes, trade executions, and L2 snapshots/updates to update the heatmap on every packet.
-
-### 🖥️ Platform & Rendering
-- **GPU Acceleration**: Supports both CPU (`QWidget`) and GPU (`QOpenGLWidget`) backends.
-- **Performance Optimized**: Vectorized price projections (`np.fromiter` and `np.maximum.at`) and pre-allocated/cached `QPen`/`QBrush` styling objects allow uncapped rendering speeds of **135+ FPS** at 1080p.
-
----
-
-## 🏗️ Architecture
+## Architecture
 
 ```
-flowmap/
-├── flowmap/
-│   ├── core/           # Data models & order book
-│   │   ├── types.py    # Market data primitives
-│   │   └── order_book.py  # L2 limit order book
-│   ├── data/           # Data sources
-│   │   ├── simulator.py   # Synthetic market data
-│   │   ├── crypcodile_replay.py # Historical DuckDB/Parquet player
-│   │   ├── crypcodile_live.py   # Real-time WebSocket feed provider
-│   │   └── crypto.py      # Live crypto feeds (CCXT)
-│   ├── ui/             # PyQt6 GUI
-│   │   ├── bubbles.py     # Trade circles canvas
-│   │   ├── price_chart.py # Sits above heatmap, sharing time axis
-│   │   ├── pulse.py       # Cumulative Volume Delta (CVD)
-│   │   ├── overlays/      # VWAP, CVD, Volume Profile
-│   │   ├── dom/           # DOM ladder
-│   │   ├── theme.py       # Styling and CSS
-│   │   └── main_window.py # App orchestration
-│   ├── engine/         # Quant/Visual computation
-│   │   ├── density_engine.py  # Vectorized row projections
-│   │   └── color_system.py    # Look-up tables (LUTs)
-│   └── main.py         # Entry point
+client/   TypeScript + React + WebGL2 renderer (Vite)
+          heatmap tile-array + SUM-mips + camera + overlays + DOM/tape + UI shell
+server/   Python 3.13 asyncio gateway (FastAPI, binary WebSocket, loopback-only)
+          time-weighted density grid + sessions + parquet recording/replay
+          feeds/  crypto (Crypcodile) · equity (stockodile) · deterministic sim
 ```
 
----
+The client is a pure renderer of a canonical binary stream (`docs/superpowers/specs/`); the server
+normalizes every market into that stream + a capability descriptor. See
+`docs/superpowers/plans/m1-verification.md`, `m2-verification.md`, `m3-verification.md` for the
+verification record (live Binance + live equity evidence, perf gates, parity matrix).
 
-## 🚀 Quick Start
+## Run it
 
-### 📦 Installation
+Prereqs: Python 3.13 + [uv](https://docs.astral.sh/uv/), Node 22 + npm.
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/nazmiefearmutcu/flowmap.git
-   cd flowmap
-   ```
-
-2. **Create a virtual environment & install dependencies:**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-### 🎮 Running the Platform
-
-To launch the dashboard:
 ```bash
-python run_flowmap.py
+./scripts/dev.sh          # boots the server (:8720) + the client dev server (:5173)
+# then open http://localhost:5173
 ```
 
-- **Data Source Selection**: Choose **Simulator** or **Crypcodile Replay** from the toolbar source dropdown.
-- **Controls**:
-  - **Start / Stop**: toolbar **Start** button or **Space**
-  - **Auto-follow BBO**: **F** (toggle)
-  - **Zoom**: mouse **wheel** (time zoom on chart; price zoom on price axis) or `+`/`-`
-  - **Pan / scroll**: **Ctrl + wheel** (time pan on chart; price scroll on price axis); arrow keys also pan time
-  - **Reset view**: **R**
+Or manually:
 
----
+```bash
+# terminal 1 — server
+cd server && uv sync && FLOWMAP_PORT=8720 uv run python -m flowmap_server
+# terminal 2 — client
+cd client && npm install && npm run dev
+```
 
-## 📊 Benchmarks & Performance Metrics
+In the top-bar symbol search: pick `SIM-DEMO` (deterministic demo feed), a crypto pair
+(`BTCUSDT` → live Binance), or a US ticker (`AAPL` → keyless SYNTH profile; live tick during
+market hours with Alpaca keys).
 
-To ensure institutional-grade reliability and low latency, FlowMap is continuously benchmarked using headless offscreen rendering driven by [benchmark_rendering.py](file:///Users/nazmi/flowmap/benchmark_rendering.py).
+**Optional live tiers** (auto-detected from the environment):
+`ALPACA_API_KEY` + `ALPACA_API_SECRET` → equity L1 tick tape + quotes; `FINNHUB_API_KEY` → equity
+tick tape. Without keys, equities run the honest keyless SYNTH tier.
 
-Under maximum throughput stress tests (rendering L2 book updates, CVD delta ticks, and trade events as fast as the queue drains), the platform achieves the following metrics:
+## Tests
 
-| Resolution | Target Component | Mode | Throughput / FPS | Avg CPU Usage | Avg Paint Time | Max Paint Time |
-|:---|:---|:---|:---|:---|:---|:---|
-| **800x600** | HeatmapWidget | Uncapped | 56.3 FPS | 63.3% | 8.46 ms | 268.69 ms |
-| **800x600** | MainWindow (Heatmap) | Uncapped | **147.9 FPS** | 90.0% | **2.73 ms** | 94.89 ms |
-| **800x600** | MainWindow (Heatmap) | Capped (60 FPS) | 53.9 FPS | 62.4% | 4.64 ms | 50.42 ms |
-| **1920x1080** | HeatmapWidget | Uncapped | 67.4 FPS | 88.8% | 6.06 ms | 180.31 ms |
-| **1920x1080** | MainWindow (Heatmap) | Uncapped | **104.0 FPS** | 89.0% | **3.34 ms** | 134.66 ms |
-| **1920x1080** | MainWindow (Heatmap) | Capped (60 FPS) | 39.2 FPS | 58.3% | 6.23 ms | 155.69 ms |
+```bash
+cd server && uv run pytest -q          # gateway: grid, protocol, sessions, feeds, recording
+cd client && npm test && npm run e2e   # renderer units + Playwright (heatmap, perf gate, parity)
+```
 
-### Key Reliability Features
-- **Zero-Lag Event Pipeline**: Rather than choking the UI event thread on high-frequency feeds, incoming messages are batched using thread-safe queues.
-- **Microsecond Desync Protection**: BBO updates are applied directly to the order book's BBO tracking state, automatically cleaning crossed levels and triggering a repaint only when new data changes.
-- **Offscreen Benchmarking**: Benchmarked headlessly via Qt's `offscreen` QPA platform to measure true internal computation limits independent of display server v-sync capping.
+The Playwright suite includes the §10 performance gate (history-independent frame cost) and the
+two-market parity matrix.
 
----
+## License
 
-## 🛣️ Roadmap
-
-### Phase 1 — Core Engine & UI ✅
-- [x] Vectorized order book density engine
-- [x] Zero-flicker double-buffered layout scaling
-- [x] Professional bi-color density colormap implementation
-- [x] Interactive mouse zooming, scrolling, and dragging
-
-### Phase 2 — Indicators & Overlays ✅
-- [x] VWAP overlays and snap price lines
-- [x] Volume Profile (perfectly aligned POC)
-- [x] CVD (Market Pulse) with Color Vision Deficiency (CVD) support
-- [x] DOM Ladder panel
-
-### Phase 3 — Live & Replay Feeds ✅
-- [x] Crypcodile Replay parquet DuckDB connector
-- [x] CCXT Live exchanges WebSocket provider
-- [x] Record & Replay session manager
-
-### Phase 4 — Algorithmic Detection 🔨
-- [ ] Liquidity Wall & Iceberg order detection
-- [ ] Order book order-flow imbalance indicators
-- [ ] Footprint chart widgets
-
----
-
-## 📄 License
-
-Distributed under the MIT License. See `LICENSE` for more information.
+Apache-2.0 — see [LICENSE](LICENSE).

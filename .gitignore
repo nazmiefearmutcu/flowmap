@@ -1,42 +1,22 @@
+# Python (server)
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
-flowmap.egg-info/
-build/
+.ruff_cache/
+.mypy_cache/
+
+# Node (client)
+node_modules/
 dist/
+.vite/
+*.tsbuildinfo
+playwright-report/
+test-results/
+client/tests/e2e/__artifacts__/
+
+# OS / editor
 .DS_Store
-
-# Temporary visual renders & benchmarks
-heatmap_final.png
-flowmap_final*.png
-flowmap_live.png
-flowmap_headless_render.png
-heatmap_test.png
-benchmark_report.json
-
-.worktrees/
-
-# Debug / GUI-capture scratch artifacts (bug-hunt tooling)
-scratch/
-debug_data.py
-flowmap_*.png
-test_*.png
-test_screen.png
-gui_diag.log
-my_windows.txt
-*_state.json
-gui_state*.json
-new_state*.json
-dropdown_state.json
-get_state.json
-menu_state.json
-
-# Bug-hunt working dir: keep markdown audit trail, drop captures/scratch
-bug_hunt/**/*.png
-bug_hunt/**/*.log
-bug_hunt/**/*.json
-bug_hunt/**/*.jsonl
-bug_hunt/**/*.py
+*.local
