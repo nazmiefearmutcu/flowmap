@@ -40,6 +40,20 @@ normalizes every market into that stream + a capability descriptor. See
 `docs/superpowers/plans/m1-verification.md`, `m2-verification.md`, `m3-verification.md` for the
 verification record (live Binance + live equity evidence, perf gates, parity matrix).
 
+## Install (macOS)
+
+Download **`FlowMap_1.0.0_aarch64.dmg`** from the
+[latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest), open it, and drag
+**FlowMap.app** to Applications. The app is fully self-contained — it bundles the client and the
+Python server, so there is nothing else to install (no Python, no Node).
+
+> **First launch — Gatekeeper.** The app is ad-hoc signed but **not notarized** (that needs a paid
+> Apple Developer ID, which this project doesn't have), so macOS will warn on first open. Either
+> **right-click → Open** (then confirm once), or run once in Terminal:
+> `xattr -cr /Applications/FlowMap.app`. After that it launches normally.
+
+Apple Silicon only. Intel Macs and other platforms: run from source (below).
+
 ## Run it
 
 Prereqs: Python 3.13 + [uv](https://docs.astral.sh/uv/), Node 22 + npm.
