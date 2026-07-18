@@ -9,10 +9,14 @@ Plus one bonus: feed crash -> degraded Status -> recovery.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 
 import numpy as np
 import pytest
+
+from stockodile.scheduler.calendar import MARKET_TZ
+from stockodile.schema.records import Bar as StkBar
 
 from flowmap_server.config import Config
 from flowmap_server.core.grid import Grid, GridCfg
@@ -24,11 +28,14 @@ from flowmap_server.core.session import (
     SessionManager,
 )
 from flowmap_server.feeds.base import BookState
+from flowmap_server.feeds.equity import EQUITY_MARKET, EquityFeed
 from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import wire
 from flowmap_server.proto.events import (
     BBO,
+    MODE_L1_BAND,
     MODE_L2,
+    MODE_SYNTH_PROFILE,
     BarColumn,
     DepthColumn,
     EpochStart,
@@ -817,3 +824,164 @@ async def test_unknown_feed_event_warns_and_continues(caplog):
     assert any(
         "unknown feed event type str" in r.getMessage() for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# equity sessions: SYNTH grid routing + closed-market Status (M3 T2)
+#
+# Fixture-driven, NO live network: bars/clock are injected so the EquityFeed
+# runs its keyless SYNTH path against a pinned closed market (Saturday) with a
+# hand-built last session's 1 m bars (reuses T1's fixture approach).
+
+
+def _eq_et_ns(y: int, mo: int, d: int, h: int, mi: int = 0) -> int:
+    return int(datetime.datetime(y, mo, d, h, mi, tzinfo=MARKET_TZ).timestamp() * 1e9)
+
+
+def _eq_bar(ts_ns: int, price: float, vol: float) -> StkBar:
+    """A 1 m bar whose whole OHLC sits at ``price`` (typical price == price)."""
+    return StkBar(
+        provider="yahoo",
+        symbol="AAPL",
+        symbol_raw="AAPL",
+        local_ts=ts_ns,
+        source_ts=ts_ns,
+        interval="1m",
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=vol,
+    )
+
+
+def _eq_session_bars(price: float) -> list[StkBar]:
+    base = _eq_et_ns(2026, 7, 17, 10, 0)  # Friday RTH
+    m = 60 * 10**9
+    return [_eq_bar(base + i * m, price, 1000.0) for i in range(5)]
+
+
+async def _eq_nosleep(_s: float) -> None:
+    return None
+
+
+def _closed_equity_feed(price: float) -> EquityFeed:
+    """Keyless EquityFeed pinned to a Saturday: warms up the last session's
+    SYNTH profile at ``price``, then reports the market closed. No price_fn ->
+    the closed path never polls, so pytest never touches the network."""
+    sat = _eq_et_ns(2026, 7, 18, 12, 0)
+
+    async def bars_fn() -> list[StkBar]:
+        return _eq_session_bars(price)
+
+    return EquityFeed(
+        "AAPL",
+        Config(),
+        now_ns_fn=lambda: sat,
+        bars_fn=bars_fn,
+        sleep_fn=_eq_nosleep,
+    )
+
+
+async def test_equity_subscribe_synth_grid_and_closed_status():
+    cfg = Config(max_sessions=4, ring_columns=4096, max_rows=4096)
+    feed = _closed_equity_feed(100.0)
+    mgr = SessionManager(cfg, timer=FakeTimer(), feed_factory=lambda sub: feed)
+    sub = Subscribe(market=EQUITY_MARKET, symbol="AAPL", mode="live", source=None, start_t=None)
+    client = ClientTx()
+    sess = await mgr.subscribe(sub, client)
+
+    # (c) grid is equity-appropriate: SYNTH_PROFILE mode, cent tick, keyless dt.
+    assert sess._grid.cfg.mode == MODE_SYNTH_PROFILE
+    assert sess._grid.cfg.tick == 0.01
+    assert sess._grid.cfg.dt_ns == cfg.dt_equity_keyless_ns
+    assert 0 < sess._grid.cfg.rows <= cfg.max_rows
+
+    await asyncio.wait_for(sess.run_task, timeout=5)  # warms up, then closes
+    msgs = _drain_all(client)
+
+    # (a) Hello capability is the keyless SYNTH descriptor.
+    hello = msgs[0]
+    assert isinstance(hello, Hello)
+    assert hello.capability["depth"] == "SYNTH_PROFILE"
+    assert hello.capability["tape"] == "poll"
+
+    # (a) depth columns render in SYNTH_PROFILE mode with the ask channel dropped.
+    depths = [m for m in msgs if isinstance(m, DepthColumn)]
+    assert depths, "warmup SYNTH profile produced no depth columns"
+    assert all(d.mode == MODE_SYNTH_PROFILE and d.ask is None for d in depths)
+
+    # (b) a terminal closed Status surfaces the next RTH open (Mon 2026-07-20).
+    closed = [m for m in msgs if isinstance(m, Status) and m.feed_state == "closed"]
+    assert len(closed) == 1
+    assert closed[0].capability["depth"] == "SYNTH_PROFILE"
+    assert closed[0].next_open_ts == _eq_et_ns(2026, 7, 20, 9, 30)
+
+    # session_break marker (Bookmap-style compressed gap) from the last session.
+    breaks = [m for m in msgs if isinstance(m, Marker) and m.kind == "session_break"]
+    assert len(breaks) == 1
+
+    # normal 'closed' end must NOT hot-loop restart: the run task stays done.
+    assert sess.run_task.done() and not sess.run_task.cancelled()
+
+
+async def test_equity_grid_reanchors_to_symbol_price():
+    cfg = Config(max_sessions=4, ring_columns=4096, max_rows=4096)
+    feed = _closed_equity_feed(180.0)  # far above the nominal $100 p0
+    mgr = SessionManager(cfg, timer=FakeTimer(), feed_factory=lambda sub: feed)
+    sub = Subscribe(market=EQUITY_MARKET, symbol="AAPL", mode="live", source=None, start_t=None)
+    client = ClientTx()
+    sess = await mgr.subscribe(sub, client)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    # the bid-only SYNTH profile re-anchored the grid onto ~$180.
+    ep = sess._grid.current_epoch_params()
+    assert ep.epoch >= 1, "grid never re-anchored to the symbol price"
+    assert 155.0 <= ep.p0 <= 165.0  # p0 = 180 - span/2 ~ 159.5
+
+    msgs = _drain_all(client)
+    # re-anchor announced to the client as an EpochStart before its columns.
+    assert any(isinstance(m, EpochStart) and m.epoch >= 1 for m in msgs)
+    reanchored = [m for m in msgs if isinstance(m, DepthColumn) and m.epoch >= 1]
+    assert reanchored and all(d.ask is None for d in reanchored)
+
+
+async def test_equity_grid_uses_keyed_cadence_when_keyed():
+    """A keyed (L1_BAND) capability drives the 1 s equity cadence + band mode.
+
+    The grid cadence/mode are derived from the feed's own capability, so a
+    fixture feed advertising the keyed descriptor is enough — no real keys or
+    provider needed (the feed never runs here)."""
+
+    class _KeyedEquityFeed:
+        market = EQUITY_MARKET
+        symbol = "AAPL"
+        capability = {"depth": "L1_BAND", "tape": "tick", "trade_side": "inferred"}
+
+        async def events(self):  # pragma: no cover - never driven
+            if False:
+                yield None
+
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=4096)
+    mgr = SessionManager(
+        cfg, timer=FakeTimer(), feed_factory=lambda sub: _KeyedEquityFeed()
+    )
+    sub = Subscribe(market=EQUITY_MARKET, symbol="AAPL", mode="live", source=None, start_t=None)
+    sess = await mgr.subscribe(sub, ClientTx())
+    assert sess._grid.cfg.dt_ns == cfg.dt_equity_keyed_ns
+    assert sess._grid.cfg.mode == MODE_L1_BAND
+    assert sess._grid.cfg.tick == 0.01
+
+    sess.run_task.cancel()
+    await asyncio.gather(sess.run_task, return_exceptions=True)
+
+
+async def test_equity_routed_by_default_feed_factory():
+    """The default (no-injection) factory maps market 'equity' -> EquityFeed."""
+    cfg = Config(max_sessions=4, ring_columns=256, max_rows=4096)
+    mgr = SessionManager(cfg, timer=FakeTimer())
+    feed = mgr._default_feed_factory(
+        Subscribe(market=EQUITY_MARKET, symbol="msft", mode="live", source=None, start_t=None)
+    )
+    assert isinstance(feed, EquityFeed)
+    assert feed.market == EQUITY_MARKET and feed.symbol == "MSFT"

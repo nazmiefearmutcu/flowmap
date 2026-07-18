@@ -25,6 +25,7 @@ from flowmap_server.core.record import Recorder
 from flowmap_server.core.session import SessionManager
 from flowmap_server.feeds.base import Feed
 from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
+from flowmap_server.feeds.equity import EQUITY_MARKETS, EquityFeed
 from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import events
 
@@ -49,8 +50,12 @@ def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
             # "<exchange>-<market>" ("binance-usdm") or bare "<exchange>".
             exchange, _, market = sub.market.partition("-")
             return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=market, cfg=cfg)
+        if sub.market in EQUITY_MARKETS:
+            # Tier (keyless SYNTH / Alpaca / Finnhub) auto-selected from cfg keys.
+            return EquityFeed(sub.symbol, cfg)
         raise NotImplementedError(
-            f"market {sub.market!r} has no feed (M1: 'sim' + crypto {sorted(CRYPTO_MARKETS)})"
+            f"market {sub.market!r} has no feed "
+            f"(sim + crypto {sorted(CRYPTO_MARKETS)} + equity {sorted(EQUITY_MARKETS)})"
         )
 
     return factory

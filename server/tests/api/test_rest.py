@@ -1,9 +1,11 @@
-"""REST surface tests (M1 plan Task 8): /api/health, /api/symbols, CORS.
+"""REST surface tests (M1 plan Task 8; equity capability M3 T2): /api/health,
+/api/symbols, CORS.
 
 Runs against ``create_app`` through httpx's ASGITransport — no real server,
-no network. The symbol directory at M1 is: the sim symbol (capability taken
-from SimFeed) + static crypto/equity shortlists with "live in T9"/"live in
-M4" notes; handlers must never do network I/O.
+no network. The symbol directory is: the sim symbol (capability taken from
+SimFeed) + a static crypto shortlist (noted "live in T9") + a static equity
+shortlist whose capability is read off EquityFeed (live keyless SYNTH tier,
+no note); handlers must never do network I/O.
 """
 
 from __future__ import annotations
@@ -55,8 +57,11 @@ async def test_symbols_equity_shortlist(client):
     r = await client.get("/api/symbols", params={"q": "aapl"})
     entry = next(s for s in r.json()["symbols"] if s["symbol"] == "AAPL")
     assert entry["market"] == "equity"
-    assert entry["capability"]["depth"] == "SYNTH"
-    assert entry["note"] == "live in M4"
+    # Honest capability mirrored from EquityFeed's keyless tier (M3 T2).
+    assert entry["capability"]["depth"] == "SYNTH_PROFILE"
+    assert entry["capability"]["tape"] == "poll"
+    assert entry["capability"]["trade_side"] == "na"
+    assert "note" not in entry  # equity is live (keyless SYNTH), like sim
 
 
 async def test_symbols_empty_q_returns_all(client):

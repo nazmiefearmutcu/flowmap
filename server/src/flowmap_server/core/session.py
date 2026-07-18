@@ -67,6 +67,7 @@ from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.feeds.base import BookState, Feed
 from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
+from flowmap_server.feeds.equity import EQUITY_MARKETS, EquityFeed
 from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import events, wire
 
@@ -566,6 +567,7 @@ class Session:
             while True:
                 try:
                     await self._consume()
+                    self._emit_closed_if_needed()
                     return
                 except asyncio.CancelledError:
                     raise
@@ -624,15 +626,31 @@ class Session:
     def _on_book(self, ev: BookState) -> None:
         cols = self._grid.on_book(ev.ts_ns, ev.bid_px, ev.bid_sz, ev.ask_px, ev.ask_sz)
         self._emit_finalized(cols)
-        if len(ev.bid_px) and len(ev.ask_px):
-            mid = (float(np.max(ev.bid_px)) + float(np.min(ev.ask_px))) / 2.0
-            params = self._grid.maybe_reanchor(mid)
+        anchor = self._reanchor_ref(ev)
+        if anchor is not None:
+            params = self._grid.maybe_reanchor(anchor)
             if params is not None:
                 # EpochStart FIRST: broadcast before any new-epoch column
                 # message (the columns emitted above carry the old epoch).
                 self._record(lambda r, p=params: r.record_epoch(p))
                 start = events.EpochStart(epoch=params.epoch, epoch_params=params)
                 self._broadcast(wire.encode(start), col=False)
+
+    @staticmethod
+    def _reanchor_ref(ev: BookState) -> float | None:
+        """Price the grid re-anchors around for this book (None to skip).
+
+        Two-sided books (L2 crypto/sim, and keyed L1_BAND equity) use the BBO
+        mid — the exact expression the L2 path has always used, so crypto/sim
+        stay byte-identical. A one-sided SYNTH_PROFILE density (bid-only, ask
+        empty) has no BBO, so it re-anchors around its price-span center
+        instead: that is what lets an equity grid started at a nominal $100 p0
+        recentre on the symbol's real price (e.g. an AAPL profile near $180)."""
+        if len(ev.bid_px) and len(ev.ask_px):
+            return (float(np.max(ev.bid_px)) + float(np.min(ev.ask_px))) / 2.0
+        if len(ev.bid_px):
+            return (float(np.min(ev.bid_px)) + float(np.max(ev.bid_px))) / 2.0
+        return None
 
     def _emit_finalized(self, cols: list[FinalizedColumn]) -> None:
         emitted = False
@@ -669,6 +687,37 @@ class Session:
             t0_ns=partial.t0_ns,
             is_partial=True,
         )
+
+    def _emit_closed_if_needed(self) -> None:
+        """After a feed loop ends *normally*, an equity feed may report a
+        closed RTH window (``feed.feed_state == 'closed'``; spec §7.1). When it
+        does, broadcast a terminal ``Status{feed_state='closed', next_open_ts}``
+        so the client shows the closed banner + countdown, then leave the run
+        task ended. This is distinct from the crash path in :meth:`run`, which
+        restarts with backoff on EXCEPTIONS — a normal 'closed' end must NOT
+        hot-loop restart. Feeds with no ``feed_state`` attribute (sim/crypto)
+        end normally and emit nothing here.
+
+        The session stays registered (refcounted) while a client is attached;
+        a later re-subscribe restarts the feed (``start()`` is idempotent), so
+        the client wakes the stream after the next open. M3 limitation
+        (documented for T4 live verification): the wake at ``next_open_ts`` is
+        client-driven, not a server-scheduled timer. The weekend demo is a
+        closed banner + last-session SYNTH warmup that resumes on re-subscribe.
+        """
+        if getattr(self._feed, "feed_state", None) != "closed":
+            return
+        # Direct broadcast (not _set_feed_state) so next_open_ts rides along; a
+        # later restart's first event flips _feed_state back to live.
+        self._feed_state = "closed"
+        status = events.Status(
+            feed_state="closed",
+            capability=self._feed.capability,
+            latency_ms=0.0,
+            clock_skew_ms=0.0,
+            next_open_ts=getattr(self._feed, "next_open_ts", None),
+        )
+        self._broadcast(wire.encode(status), col=False)
 
     def _set_feed_state(self, state: str) -> None:
         if state == self._feed_state:
@@ -794,6 +843,19 @@ _SIM_MID0 = 100.0
 _SIM_TICK = 0.5
 _SIM_ROWS = 2048
 
+# Equity grid shape (spec §7/§7.1): a cent tick (SEC Rule 612, >=$1 stocks),
+# a ~$41 vertical span at 4096 rows, and a nominal $100 p0 that the grid
+# re-anchors to the symbol's real price on the first book. mode + cadence are
+# derived from the feed's honest capability so the grid can never claim more
+# than the feed delivers (SYNTH_PROFILE keyless / L1_BAND keyed).
+_EQUITY_TICK = 0.01
+_EQUITY_ROWS = 4096
+_EQUITY_P0_NOMINAL = 100.0
+_EQUITY_DEPTH_MODE: dict[object, int] = {
+    "SYNTH_PROFILE": events.MODE_SYNTH_PROFILE,
+    "L1_BAND": events.MODE_L1_BAND,
+}
+
 
 class SessionManager:
     """Owns sessions keyed by (market, symbol, mode, source); refcounted."""
@@ -826,11 +888,17 @@ class SessionManager:
             # "<exchange>-<market>" ("binance-usdm") or bare "<exchange>" ("okx").
             exchange, _, market = sub.market.partition("-")
             return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=market, cfg=self._cfg)
+        if sub.market in EQUITY_MARKETS:
+            # Tier (keyless SYNTH / Alpaca / Finnhub) auto-selected from cfg keys.
+            return EquityFeed(sub.symbol, self._cfg)
         raise NotImplementedError(
-            f"market {sub.market!r} has no feed (M1: 'sim' + crypto {sorted(CRYPTO_MARKETS)})"
+            f"market {sub.market!r} has no feed "
+            f"(sim + crypto {sorted(CRYPTO_MARKETS)} + equity {sorted(EQUITY_MARKETS)})"
         )
 
     def _grid_for(self, feed: Feed) -> Grid:
+        if feed.market in EQUITY_MARKETS:
+            return self._equity_grid_for(feed)
         rows = min(_SIM_ROWS, self._cfg.max_rows)
         step = _SIM_TICK  # tick_multiple 1
         p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
@@ -843,6 +911,35 @@ class SessionManager:
                 rows=rows,
                 ring_columns=self._cfg.ring_columns,
                 mode=events.MODE_L2,
+            )
+        )
+
+    def _equity_grid_for(self, feed: Feed) -> Grid:
+        """Equity-appropriate grid (spec §7): mode and column cadence honestly
+        derived from the feed's capability. Keyless SYNTH_PROFILE runs a
+        single-channel (bid-only) density at the 10 s keyless cadence; keyed
+        tiers (L1_BAND) run at the 1 s equity cadence. Cent tick; a nominal
+        $100 p0 that the grid re-anchors to the symbol's real price on the
+        first book (a >=$1 stock's profile near $180 pulls p0 up)."""
+        depth = feed.capability.get("depth")
+        mode = _EQUITY_DEPTH_MODE.get(depth, events.MODE_L1_BAND)
+        dt = (
+            self._cfg.dt_equity_keyless_ns
+            if depth == "SYNTH_PROFILE"
+            else self._cfg.dt_equity_keyed_ns
+        )
+        rows = min(_EQUITY_ROWS, self._cfg.max_rows)
+        tick = _EQUITY_TICK
+        p0 = round((_EQUITY_P0_NOMINAL - rows * tick / 2.0) / tick) * tick
+        return Grid(
+            GridCfg(
+                tick=tick,
+                tick_multiple=1,
+                dt_ns=dt,
+                p0=p0,
+                rows=rows,
+                ring_columns=self._cfg.ring_columns,
+                mode=mode,
             )
         )
 
