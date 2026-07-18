@@ -32,6 +32,7 @@ from flowmap_server.feeds.base import BookState, Feed, FeedEvent
 from flowmap_server.feeds.equity import (
     DEFAULT_PROFILE_TICK,
     EQUITY_MARKET,
+    PROFILE_PEAK_TARGET,
     EquityFeed,
     _EquitySink,
 )
@@ -121,7 +122,7 @@ async def _collect(feed: EquityFeed, n: int, cap: int = 10_000) -> list[FeedEven
 # --- 1. SYNTH profile builder --------------------------------------------------
 
 
-def test_synth_profile_peaks_at_high_volume_price_bid_only_conserves_volume():
+def test_synth_profile_peaks_at_high_volume_price_bid_only_bounded():
     bars = _concentrated_session()
     bs = EquityFeed.synth_profile(bars)
 
@@ -130,14 +131,43 @@ def test_synth_profile_peaks_at_high_volume_price_bid_only_conserves_volume():
     assert bs.ask_px.size == 0 and bs.ask_sz.size == 0
     # every emitted value finite.
     assert np.isfinite(bs.bid_px).all() and np.isfinite(bs.bid_sz).all()
-    # volume conserved: 3*1000 + 50 + 50.
-    assert bs.bid_sz.sum() == 3100.0
-    # peak bucket is the 100.00 price, holding the stacked 3000.
+    # normalized to a fixed peak, bounded far below the grid's f16 ceiling.
+    assert bs.bid_sz.max() == PROFILE_PEAK_TARGET
+    assert bs.bid_sz.max() < float(np.finfo(np.float16).max)
+    # peak bucket is the 100.00 price, holding the stacked 3000 (relative).
     peak_price = float(bs.bid_px[int(np.argmax(bs.bid_sz))])
     assert abs(peak_price - 100.00) < DEFAULT_PROFILE_TICK
-    assert bs.bid_sz.max() == 3000.0
+    # SHAPE preserved exactly: raw 3000 vs 50 (ratio 60) survives normalization.
+    sz = bs.bid_sz[np.argsort(bs.bid_px)]  # ascending price: 95.00, 100.00, 105.00
+    assert sz[1] == PROFILE_PEAK_TARGET  # the 100.00 peak
+    assert abs(sz[1] / sz[0] - 60.0) < 1e-9  # 3000 / 50
+    assert abs(sz[1] / sz[2] - 60.0) < 1e-9
     # buckets are ascending, one per occupied price.
     assert np.all(np.diff(bs.bid_px) > 0)
+
+
+def test_synth_profile_bounded_under_liquid_cumulative_volume():
+    # A liquid name over a full RTH session: raw cumulative shares reach the
+    # hundreds of millions and would overflow the grid's float16 ring (max
+    # 65 504) to inf. The normalized profile must stay finite, bounded, and
+    # peaked at the high-volume price no matter how large the cumulative grows.
+    base = _et_ns(2026, 7, 17, 10, 0)
+    m = 60 * 10**9
+    bars = []
+    for i in range(390):  # 390 one-minute RTH bars
+        if i % 3:
+            bars.append(_flat_bar(base + i * m, 200.00, 3_000_000.0))
+        else:
+            bars.append(_flat_bar(base + i * m, 199.99, 20_000.0))
+    bs = EquityFeed.synth_profile(bars)
+    f16_max = float(np.finfo(np.float16).max)
+    # raw cumulative peak ~= 260 * 3e6 = 7.8e8 >> f16 max; normalized fits with
+    # room to spare and survives the grid's f16 cast.
+    assert np.isfinite(bs.bid_sz).all()
+    assert bs.bid_sz.max() == PROFILE_PEAK_TARGET
+    assert float(bs.bid_sz.astype(np.float16).max()) < f16_max
+    peak_price = float(bs.bid_px[int(np.argmax(bs.bid_sz))])
+    assert abs(peak_price - 200.00) < DEFAULT_PROFILE_TICK
 
 
 def test_synth_profile_empty_bars_is_empty_book():
@@ -219,6 +249,66 @@ async def test_warmup_profile_drives_synth_grid_bid_only_density():
     # SYNTH: ask channel carries nothing, and the wire column drops it.
     assert np.all(last.ask.astype(np.float64) == 0.0)
     assert grid.to_depth(last).ask is None
+
+
+async def test_liquid_name_synth_grid_density_stays_finite_f16():
+    # M3 regression: a liquid name's raw cumulative shares (hundreds of millions)
+    # cast to the grid's float16 ring overflow to inf — the heatmap blows out to
+    # a saturated white band and the ladder shows ∞. With the normalized profile,
+    # every finalized f16 density must stay finite and bounded, peaked at price.
+    base = _et_ns(2026, 7, 17, 10, 0)
+    m = 60 * 10**9
+    bars = []
+    for i in range(60):  # revisit 200.00 (heavy) so its cumulative >> f16 max
+        if i % 3:
+            bars.append(_flat_bar(base + i * m, 200.00, 3_000_000.0))
+        else:
+            bars.append(_flat_bar(base + i * m, 200.01, 20_000.0))
+    feed = EquityFeed(
+        "AAPL",
+        Config(),
+        now_ns_fn=lambda: _et_ns(2026, 7, 18, 12, 0),  # Saturday -> closed after warmup
+        bars_fn=_make_bars_fn(bars),
+    )
+    events = await _collect(feed, 10_000)
+    books = [e for e in events if isinstance(e, BookState)]
+    assert books, "no warmup BookState emitted"
+
+    rows = 512
+    tick = 0.01
+    p0 = round((200.00 - rows * tick / 2.0) / tick) * tick
+    grid = Grid(
+        GridCfg(
+            tick=tick,
+            tick_multiple=1,
+            dt_ns=DT_KEYLESS_NS,
+            p0=p0,
+            rows=rows,
+            ring_columns=4096,
+            mode=MODE_SYNTH_PROFILE,
+        )
+    )
+    cols = []
+    for b in books:
+        cols.extend(grid.on_book(b.ts_ns, b.bid_px, b.bid_sz, b.ask_px, b.ask_sz))
+    cols.extend(
+        grid.on_book(
+            books[-1].ts_ns + DT_KEYLESS_NS,
+            books[-1].bid_px,
+            books[-1].bid_sz,
+            books[-1].ask_px,
+            books[-1].ask_sz,
+        )
+    )
+    assert cols
+    f16_max = float(np.finfo(np.float16).max)
+    for c in cols:
+        bid = c.bid.astype(np.float64)
+        assert np.isfinite(bid).all(), "SYNTH f16 density overflowed to inf"
+        assert float(bid.max()) < f16_max
+    # peak density lands on the high-volume price (200.00) after normalization.
+    last = cols[-1]
+    assert int(np.argmax(last.bid.astype(np.float64))) == round((200.00 - p0) / tick)
 
 
 # --- 3. keyless live poll emits display-only trades ----------------------------

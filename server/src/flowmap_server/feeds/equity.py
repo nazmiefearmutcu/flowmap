@@ -22,14 +22,18 @@ finnhub (keyed) tick tape with side **inferred** (tick rule); no depth / no
 **SYNTH volume-at-price** (keyless): each 1 m bar's whole volume is placed at
 its typical price ``(H+L+C)/3`` snapped to a cent bucket, accumulated into a
 *cumulative* profile. One :class:`BookState` is emitted per bar (bid_px = the
-occupied price buckets, bid_sz = cumulative volume there, ask arrays EMPTY) so
-the grid — which time-weights the previous book over each interval — renders a
-horizontal volume-profile-over-time. The grid carries ``mode=SYNTH_PROFILE``
-and drops the (empty) ask channel on the wire; total ``bid_sz`` equals the
-summed bar volume (volume-conserving). Warmup uses **the most recent session's
-bars only**, so bar timestamps stay ~1 m apart and the grid never bridges an
-overnight gap into thousands of empty columns (spec §7.1 "no empty-column
-accumulation").
+occupied price buckets, bid_sz = that profile's SHAPE rescaled to a fixed peak,
+ask arrays EMPTY) so the grid — which time-weights the previous book over each
+interval — renders a horizontal volume-profile-over-time. The grid carries
+``mode=SYNTH_PROFILE`` and drops the (empty) ask channel on the wire. The
+emitted ``bid_sz`` is a bounded *relative* intensity (peak ==
+``PROFILE_PEAK_TARGET``), not a share count: a liquid name's cumulative shares
+(tens of millions) cast to the grid's float16 ring would overflow to ``inf``
+(spec §8.1), so the profile is normalized per column — bounded by construction
+across a full session, with between-bucket ratios (and thus the point-of-control)
+preserved exactly. Warmup uses **the most recent session's bars only**, so bar
+timestamps stay ~1 m apart and the grid never bridges an overnight gap into
+thousands of empty columns (spec §7.1 "no empty-column accumulation").
 
 **Market-closed** — the :class:`~flowmap_server.feeds.base.Feed` protocol's
 ``FeedEvent`` union has no ``Status`` (that is a session/protocol message), so
@@ -94,6 +98,15 @@ EQUITY_MARKETS = frozenset({EQUITY_MARKET})
 # SYNTH profile price granularity: US equities quote in cents. Bar volume is
 # bucketed to this tick before the grid re-buckets to its own rows.
 DEFAULT_PROFILE_TICK = 0.01
+# SYNTH profile normalized peak. Each emitted volume-at-price column is rescaled
+# so its densest bucket equals this — a bounded *relative* intensity, NOT a share
+# count. A liquid name's raw cumulative shares (tens of millions) would overflow
+# the grid's float16 ring/wire (max 65 504) to ``inf`` (spec §8.1); normalizing
+# per column keeps every texel ~1e3 (≈65× headroom) no matter how large the
+# session's cumulative volume grows, and — unlike a fixed divisor on an unbounded
+# cumulative sum — can never creep back into overflow (spec §8.3 fixed-scale
+# intent). Between-bucket ratios (hence the point-of-control) are preserved.
+PROFILE_PEAK_TARGET = 1000.0
 # Keyless last-price display venue tag (spec §7: not an exchange print/NBBO).
 SYNTH_VENUE = "synthetic"
 # Live keyless bar refresh cadence (spec §7: Yahoo >=60 s/symbol).
@@ -134,10 +147,14 @@ def _typical_price(bar: StkBar) -> float:
 class _ProfileBuilder:
     """Accumulates 1 m bars into a cumulative volume-at-price density.
 
-    Volume is conserved: each bar contributes its whole volume to exactly one
-    cent bucket (its typical price), so the emitted ``bid_sz`` always sums to
-    the summed volume of the added bars. Bucketing by integer index avoids
-    float-key drift."""
+    Each bar contributes its whole volume to exactly one cent bucket (its
+    typical price), so the internal accumulation conserves volume
+    (:meth:`total_volume` is the true summed share volume). Bucketing by integer
+    index avoids float-key drift. :meth:`book_state` emits a *normalized* view of
+    that profile — rescaled so the peak bucket == ``PROFILE_PEAK_TARGET`` — which
+    keeps the wire/grid density bounded far below float16's ceiling for any
+    cumulative total (the raw shares would overflow the grid's f16 ring to
+    ``inf``)."""
 
     def __init__(self, tick: float = DEFAULT_PROFILE_TICK) -> None:
         if not (tick > 0.0):
@@ -161,15 +178,25 @@ class _ProfileBuilder:
         return float(sum(self._buckets.values()))
 
     def book_state(self, ts_ns: int) -> BookState:
-        """The cumulative profile as a bid-only :class:`BookState`.
+        """The cumulative profile as a bid-only :class:`BookState`, normalized so
+        its peak bucket == ``PROFILE_PEAK_TARGET``.
 
-        bid_px/bid_sz are the occupied buckets (ascending price); the ask
-        arrays are EMPTY — the grid runs in SYNTH_PROFILE mode and only the bid
-        channel is a real density."""
+        bid_px/bid_sz are the occupied buckets (ascending price); the ask arrays
+        are EMPTY — the grid runs in SYNTH_PROFILE mode and only the bid channel
+        is a density. ``bid_sz`` is the profile's SHAPE rescaled to a fixed peak
+        (a bounded *relative* intensity, not a share count): a liquid name's raw
+        cumulative shares would overflow the grid's float16 ring to ``inf`` (spec
+        §8.1), so it is normalized per column — bounded across a full session,
+        with between-bucket ratios (hence the point-of-control) preserved."""
         if self._buckets:
             idxs = np.fromiter(sorted(self._buckets), dtype=np.int64)
             bid_px = idxs.astype(np.float64) * self._tick
-            bid_sz = np.array([self._buckets[int(i)] for i in idxs], dtype=np.float64)
+            raw = np.array([self._buckets[int(i)] for i in idxs], dtype=np.float64)
+            peak = float(raw.max())
+            # Rescale the profile's SHAPE to a fixed peak (relative intensity):
+            # bounded by construction, so a growing cumulative sum can never
+            # creep back into f16 overflow.
+            bid_sz = raw * (PROFILE_PEAK_TARGET / peak) if peak > 0.0 else raw
         else:
             bid_px = np.empty(0, dtype=np.float64)
             bid_sz = np.empty(0, dtype=np.float64)
@@ -385,11 +412,13 @@ class EquityFeed:
     def synth_profile(
         bars: Sequence[StkBar], *, tick: float = DEFAULT_PROFILE_TICK
     ) -> BookState:
-        """Aggregate ``bars`` into one cumulative volume-at-price BookState.
+        """Aggregate ``bars`` into one volume-at-price BookState.
 
-        Bid-only density (ask arrays empty); ``bid_sz`` sums to the summed
-        volume of the finite bars; the peak bucket is where the most volume
-        concentrated. ``ts_ns`` is the newest bar's timestamp (0 if none)."""
+        Bid-only density (ask arrays empty); the profile's SHAPE is rescaled so
+        its peak bucket == ``PROFILE_PEAK_TARGET`` (a bounded relative intensity,
+        not a share count — see :meth:`_ProfileBuilder.book_state`); the peak
+        bucket is where the most volume concentrated. ``ts_ns`` is the newest
+        bar's timestamp (0 if none)."""
         builder = _ProfileBuilder(tick)
         last_ts = 0
         for bar in bars:
