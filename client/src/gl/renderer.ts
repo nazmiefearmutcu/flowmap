@@ -30,6 +30,7 @@
 import { COLS_PER_TILE, TileRing } from './tileRing';
 import { Heatmap, type HeatmapView } from './heatmap';
 import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
+import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import { Camera, limitsFor } from './camera';
 import { attachGestures, type CameraController } from '../input/gestures';
@@ -111,6 +112,8 @@ export class Renderer {
   // Created lazily on the first column, once the row count is known.
   private ring: TileRing | null = null;
   private heatmap: Heatmap | null = null;
+  /** SUM-mip chain for correct zoom-out (T7). null when float FBOs are absent. */
+  private mips: MipChain | null = null;
   /** Per-slot non-zero row extent (lo/hi), -1 = empty. Sized to ring capacity. */
   private extentLo: Int32Array | null = null;
   private extentHi: Int32Array | null = null;
@@ -195,6 +198,7 @@ export class Renderer {
     this.resizeObserver.disconnect();
     this.gesturesDispose();
     this.unsubscribeStream();
+    this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
     this.ctx.gl.deleteTexture(this.lut);
@@ -286,6 +290,9 @@ export class Renderer {
     }
 
     ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows);
+    // Incremental SUM-mip regen for the affected 4/16-column group (T7). This is
+    // append-time work, not per-frame — the draw stays O(1) in history.
+    this.mips?.updateFrom(ring, col.col_seq);
 
     const cap = ring.capacityCols;
     const slot = ((col.col_seq % cap) + cap) % cap;
@@ -321,6 +328,9 @@ export class Renderer {
 
     this.ring = new TileRing(this.ctx.gl, rows, layers);
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+    this.mips?.dispose();
+    this.mips = this.createMips(rows, layers);
+    this.heatmap.mips = this.mips;
     const cap = this.ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
@@ -328,6 +338,16 @@ export class Renderer {
     // Real geometry known: update the camera's clamps and (re)frame live.
     this.camera.setLimits(limitsFor(rows, cap));
     this.camera.reset(this.ring.residentRange(), rows);
+  }
+
+  /**
+   * Build the SUM-mip chain when float FBOs are available and the row count
+   * supports a 4× downsample. Returns null (single-level, level-0 draw path)
+   * otherwise — the heatmap then renders exactly as it did pre-T7.
+   */
+  private createMips(rows: number, layers: number): MipChain | null {
+    if (!this.ctx.caps.colorBufferFloat || rows % 4 !== 0) return null;
+    return new MipChain(this.ctx, COLS_PER_TILE, rows, layers);
   }
 
   // --- view + draw --------------------------------------------------------------
@@ -480,8 +500,10 @@ export class Renderer {
     if (rows > this.ctx.caps.maxTextureSize) {
       throw new Error(`preloadSynthetic: rows ${rows} > MAX_TEXTURE_SIZE ${this.ctx.caps.maxTextureSize}`);
     }
+    this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
+    this.mips = null;
     this.heatmap = null;
     this.ring = null;
 

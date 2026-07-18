@@ -10,19 +10,27 @@
 
 import type { GLContext } from './context';
 import { initGL } from './context';
-import { Heatmap, type HeatmapView } from './heatmap';
+import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
 import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
-import { TileRing, type ResidentRange } from './tileRing';
+import { MipChain } from './mips';
+import { COLS_PER_TILE, TileRing, type ResidentRange } from './tileRing';
 
 export interface FlowmapTestApi {
-  /** Create context+ring+lut+heatmap on the canvas at a fixed pixel size. */
-  init(rows: number, layers: number, width?: number, height?: number): {
+  /**
+   * Create context+ring+lut+heatmap on the canvas at a fixed pixel size. Pass
+   * `mips=true` (T7) to build + attach the SUM-mip chain so zoom-out sampling
+   * exercises the coarse levels (requires EXT_color_buffer_float; the returned
+   * `mipsEnabled` reports whether it was actually created).
+   */
+  init(rows: number, layers: number, width?: number, height?: number, mips?: boolean): {
     maxTextureImageUnits: number;
     maxArrayTextureLayers: number;
     maxTextureSize: number;
     colorBufferFloat: boolean;
     canvasWidth: number;
     canvasHeight: number;
+    mipsEnabled: boolean;
+    maxMipLevel: number;
   };
   /** Append one synthetic column. `ask` null → SYNTH_PROFILE (amber ramp path). */
   appendColumn(colSeq: number, bid: number[], ask: number[] | null): void;
@@ -34,6 +42,8 @@ export interface FlowmapTestApi {
   /** Draw fresh, then read back RGBA bytes (origin bottom-left). */
   readPixels(x: number, y: number, w: number, h: number): number[];
   residentRange(): ResidentRange | null;
+  /** The SUM-mip level the current view+canvas would sample (T7 diagnostics). */
+  levelInfo(): { rowsPerPixel: number; level: number; blk: number; nRowTaps: number };
   dispose(): void;
 }
 
@@ -41,6 +51,7 @@ interface HookState {
   ctx: GLContext;
   ring: TileRing;
   heatmap: Heatmap;
+  mips: MipChain | null;
   view: HeatmapView;
 }
 
@@ -48,7 +59,7 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
   let state: HookState | null = null;
 
   const api: FlowmapTestApi = {
-    init(rows, layers, width = 512, height = 512) {
+    init(rows, layers, width = 512, height = 512, mips = false) {
       canvas.width = width;
       canvas.height = height;
       // EXT_color_buffer_float may be absent on some CI GL backends; the
@@ -58,7 +69,13 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
       const ring = new TileRing(ctx.gl, rows, layers);
       const lut = createLUTTexture(ctx.gl);
       const heatmap = new Heatmap(ctx, ring, lut);
-      state = { ctx, ring, heatmap, view: heatmap.fitView() };
+      // SUM-mip chain (T7): only when requested AND float FBOs are available.
+      let mipChain: MipChain | null = null;
+      if (mips && ctx.caps.colorBufferFloat) {
+        mipChain = new MipChain(ctx, COLS_PER_TILE, rows, layers);
+        heatmap.mips = mipChain;
+      }
+      state = { ctx, ring, heatmap, mips: mipChain, view: heatmap.fitView() };
       return {
         maxTextureImageUnits: ctx.caps.maxTextureImageUnits,
         maxArrayTextureLayers: ctx.caps.maxArrayTextureLayers,
@@ -66,6 +83,8 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
         colorBufferFloat: ctx.caps.colorBufferFloat,
         canvasWidth: canvas.width,
         canvasHeight: canvas.height,
+        mipsEnabled: mipChain !== null,
+        maxMipLevel: mipChain ? mipChain.maxLevel : 0,
       };
     },
 
@@ -78,6 +97,8 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
         ask === null ? null : Float32Array.from(ask),
         state.ring.rows,
       );
+      // Incremental SUM-mip regen for the affected 4/16-column group (T7).
+      state.mips?.updateFrom(state.ring, colSeq);
     },
 
     setEncoding(decodeScale, norm, synth = false) {
@@ -121,8 +142,16 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
       return state.ring.residentRange();
     },
 
+    levelInfo() {
+      if (!state) throw new Error('__flowmapTest: init() first');
+      const maxLevel = state.mips ? state.mips.maxLevel : 0;
+      const rowsPerPixel = state.view.rowScale / Math.max(1, state.ctx.gl.drawingBufferHeight);
+      return { rowsPerPixel, ...selectLevel(rowsPerPixel, maxLevel) };
+    },
+
     dispose() {
       if (!state) return;
+      state.mips?.dispose();
       state.heatmap.dispose();
       state.ring.dispose();
       state = null;

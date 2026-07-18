@@ -11,6 +11,7 @@
 
 import { checkGLError, type GLContext } from './context';
 import { RAMP_THERMAL } from './lut';
+import type { MipChain } from './mips';
 import { HEATMAP_FRAG, HEATMAP_VERT } from './shaders/heatmap';
 import { TileRing } from './tileRing';
 
@@ -34,6 +35,30 @@ export interface HeatmapEncoding {
 
 const TILE_UNIT = 0;
 const LUT_UNIT = 1;
+const MIP1_UNIT = 2;
+const MIP2_UNIT = 3;
+
+/** The mip level + tap geometry to sample this frame (see {@link selectLevel}). */
+interface LevelSel {
+  level: number;
+  blk: number;
+  nRowTaps: number;
+}
+
+/**
+ * Choose the SUM-mip level from how many price rows collapse into one device
+ * pixel (`rowsPerPixel`). Level L's texels sum a 4^L×4^L block, so the coarsest
+ * level whose block is ≤ the pixel footprint is picked; the leftover is covered
+ * by 1..4 finer-level taps summed in the shader (the "in-between zoom" case).
+ * With no mips (`maxLevel === 0`) this is the identity: level 0, one tap.
+ */
+export function selectLevel(rowsPerPixel: number, maxLevel: number): LevelSel {
+  if (maxLevel <= 0 || rowsPerPixel <= 1) return { level: 0, blk: 1, nRowTaps: 1 };
+  const level = Math.max(0, Math.min(maxLevel, Math.floor(Math.log(rowsPerPixel) / Math.log(4))));
+  const blk = 4 ** level;
+  const nRowTaps = Math.max(1, Math.min(4, Math.round(rowsPerPixel / blk)));
+  return { level, blk, nRowTaps };
+}
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
   const sh = gl.createShader(type);
@@ -70,6 +95,8 @@ function linkProgram(gl: WebGL2RenderingContext, vert: string, frag: string): We
 
 type UniformName =
   | 'u_tiles'
+  | 'u_mip1'
+  | 'u_mip2'
   | 'u_lut'
   | 'u_colOffset'
   | 'u_colScale'
@@ -82,7 +109,10 @@ type UniformName =
   | 'u_residentNewest'
   | 'u_decodeScale'
   | 'u_norm'
-  | 'u_ramp';
+  | 'u_ramp'
+  | 'u_level'
+  | 'u_blk'
+  | 'u_nRowTaps';
 
 export class Heatmap {
   readonly gl: WebGL2RenderingContext;
@@ -92,6 +122,9 @@ export class Heatmap {
   private readonly vao: WebGLVertexArrayObject;
   private readonly quad: WebGLBuffer;
   private readonly u: Record<UniformName, WebGLUniformLocation | null>;
+
+  /** SUM-mip chain (T7). null → the shader stays on the level-0 single-tap path. */
+  mips: MipChain | null = null;
 
   encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_THERMAL };
 
@@ -132,6 +165,8 @@ export class Heatmap {
     const loc = (n: UniformName) => gl.getUniformLocation(this.program, n);
     this.u = {
       u_tiles: loc('u_tiles'),
+      u_mip1: loc('u_mip1'),
+      u_mip2: loc('u_mip2'),
       u_lut: loc('u_lut'),
       u_colOffset: loc('u_colOffset'),
       u_colScale: loc('u_colScale'),
@@ -145,6 +180,9 @@ export class Heatmap {
       u_decodeScale: loc('u_decodeScale'),
       u_norm: loc('u_norm'),
       u_ramp: loc('u_ramp'),
+      u_level: loc('u_level'),
+      u_blk: loc('u_blk'),
+      u_nRowTaps: loc('u_nRowTaps'),
     };
     checkGLError(gl, 'Heatmap.ctor');
   }
@@ -179,6 +217,19 @@ export class Heatmap {
     gl.bindTexture(gl.TEXTURE_2D, this.lut);
     gl.uniform1i(this.u.u_lut, LUT_UNIT);
 
+    // Bind the SUM-mip levels (T7). With no mip chain the ring texture is bound
+    // here as a valid, complete stand-in — the shader never samples it because
+    // level selection is forced to 0 below (u_level == 0 → u_tiles only).
+    const mips = this.mips;
+    const mip1 = mips ? mips.tex1 : this.tileRing.texture;
+    const mip2 = mips && mips.tex2 ? mips.tex2 : this.tileRing.texture;
+    gl.activeTexture(gl.TEXTURE0 + MIP1_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, mip1);
+    gl.uniform1i(this.u.u_mip1, MIP1_UNIT);
+    gl.activeTexture(gl.TEXTURE0 + MIP2_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, mip2);
+    gl.uniform1i(this.u.u_mip2, MIP2_UNIT);
+
     gl.uniform1f(this.u.u_colOffset, view.colOffset);
     gl.uniform1f(this.u.u_colScale, view.colScale);
     gl.uniform1f(this.u.u_rowOffset, view.rowOffset);
@@ -194,6 +245,18 @@ export class Heatmap {
     gl.uniform1f(this.u.u_decodeScale, this.encoding.decodeScale);
     gl.uniform1f(this.u.u_norm, this.encoding.norm);
     gl.uniform1i(this.u.u_ramp, this.encoding.ramp);
+
+    // Rows collapsing into one device pixel drive the mip level (§8.3): coarser
+    // level as price zooms out. rowScale is a uniform and the buffer height is
+    // fixed, so this is one selection for the whole frame — a constant the shader
+    // branches on coherently. mip *generation* is incremental (append time); mip
+    // *sampling* is ≤4 texelFetch per pixel, keeping the draw O(1) in history.
+    const maxLevel = this.mips ? this.mips.maxLevel : 0;
+    const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
+    const sel = selectLevel(rowsPerPixel, maxLevel);
+    gl.uniform1i(this.u.u_level, sel.level);
+    gl.uniform1i(this.u.u_blk, sel.blk);
+    gl.uniform1i(this.u.u_nRowTaps, sel.nRowTaps);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);

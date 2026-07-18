@@ -33,7 +33,12 @@ in vec2 v_uv;
 out vec4 fragColor;
 
 // Density tiles: RG16F, R = bid, G = ask. texelFetch only — no filtering.
-uniform sampler2DArray u_tiles;
+uniform highp sampler2DArray u_tiles;
+// SUM-mip levels (§8.3 / T7). Each texel of level L is the SUM of a 4^L x 4^L
+// block of level 0 — walls stay walls when zoomed out. When mips are absent the
+// caller binds u_tiles here too (they are never sampled while u_level == 0).
+uniform highp sampler2DArray u_mip1; // level 1: colsPerTile/4 x rows/4
+uniform highp sampler2DArray u_mip2; // level 2: colsPerTile/16 x rows/16
 // Colormap atlas: 256x2 RGBA8, row 0 thermal, row 1 synth.
 uniform sampler2D u_lut;
 
@@ -59,10 +64,28 @@ uniform float u_norm;
 // Colormap row: 0 = thermal, 1 = synth (amber).
 uniform int u_ramp;
 
+// Mip level selection (§8.3 / T7). All three are per-draw CONSTANTS (the CPU
+// derives them from rows-per-pixel, which is a uniform), so every branch below
+// is coherent across the frame — no divergence, ~as cheap as a direct fetch.
+//   u_level    : 0/1/2 — which level to sample (coarser as more rows collapse).
+//   u_blk      : 4^u_level — the linear downsample factor at that level.
+//   u_nRowTaps : 1..4 — finer-level taps summed to cover the pixel's row footprint
+//                (the "in-between zoom" manual SUM).
+uniform int u_level;
+uniform int u_blk;
+uniform int u_nRowTaps;
+
 vec4 background() {
   // LUT entry 0 is the near-black floor — reuse it so out-of-range and
   // zero-density read identically.
   return texelFetch(u_lut, ivec2(0, u_ramp), 0);
+}
+
+// One texel at the active mip level. u_level is uniform, so the branch is coherent.
+vec2 fetchLevel(int x, int y, int layer) {
+  if (u_level == 0) return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
+  if (u_level == 1) return texelFetch(u_mip1, ivec3(x, y, layer), 0).rg;
+  return texelFetch(u_mip2, ivec3(x, y, layer), 0).rg;
 }
 
 void main() {
@@ -78,10 +101,30 @@ void main() {
 
   int slot = col % u_capacityCols;
   int layer = slot / u_colsPerTile;
-  int x = slot % u_colsPerTile;
+  int x0 = slot % u_colsPerTile;
 
-  vec2 d = texelFetch(u_tiles, ivec3(x, row, layer), 0).rg;
-  float intensity = (d.r + d.g) * u_decodeScale;
+  int blk = u_blk;
+  int xL = x0 / blk;
+  int rowsL = u_rows / blk;
+  // Center the finer-level taps on the pixel's row footprint.
+  int y0 = (row / blk) - (u_nRowTaps / 2);
+
+  vec2 acc = vec2(0.0);
+  for (int t = 0; t < 4; t++) {
+    if (t >= u_nRowTaps) break;
+    int y = y0 + t;
+    if (y < 0 || y >= rowsL) continue;
+    acc += fetchLevel(xL, y, layer);
+  }
+
+  // Price rows are SUMMED across the block + taps (a 500-lot wall stays ~500 when
+  // tick-grouped). The block's COLUMN dimension is the only thing averaged out
+  // (/blk), so a persistent wall reads at its true size, not blk x brighter — and
+  // NOT diluted the way an average mip (which divides by blk*blk = the full 16^L)
+  // would. That /blk is the "1/16^L rescale folded into normalization" from §8.3,
+  // reduced to the wall-preserving 1/4^L (T9 replaces this with a per-level
+  // histogram percentile).
+  float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
 
   int li = int(t * 255.0 + 0.5);
