@@ -642,14 +642,19 @@ class Session:
 
         Two-sided books (L2 crypto/sim, and keyed L1_BAND equity) use the BBO
         mid — the exact expression the L2 path has always used, so crypto/sim
-        stay byte-identical. A one-sided SYNTH_PROFILE density (bid-only, ask
-        empty) has no BBO, so it re-anchors around its price-span center
-        instead: that is what lets an equity grid started at a nominal $100 p0
-        recentre on the symbol's real price (e.g. an AAPL profile near $180)."""
+        stay byte-identical. A one-sided density (only bid, or — for a two-sided
+        synthetic split whose reference price sits at/below every occupied bucket
+        during a sustained decline — only ask) has no BBO, so it re-anchors around
+        that side's price-span center instead: this is what lets an equity grid
+        started at a nominal $100 p0 recentre on the symbol's real price (e.g. an
+        AAPL profile near $180) regardless of which side the split leaves
+        populated."""
         if len(ev.bid_px) and len(ev.ask_px):
             return (float(np.max(ev.bid_px)) + float(np.min(ev.ask_px))) / 2.0
         if len(ev.bid_px):
             return (float(np.min(ev.bid_px)) + float(np.max(ev.bid_px))) / 2.0
+        if len(ev.ask_px):
+            return (float(np.min(ev.ask_px)) + float(np.max(ev.ask_px))) / 2.0
         return None
 
     def _emit_finalized(self, cols: list[FinalizedColumn]) -> None:
@@ -851,10 +856,19 @@ _SIM_ROWS = 2048
 _EQUITY_TICK = 0.01
 _EQUITY_ROWS = 4096
 _EQUITY_P0_NOMINAL = 100.0
+# Depth-capability string -> grid render mode. Two-sided equity depth (synthetic
+# volume-at-price split at the reference price, or real Alpaca L1 top-of-book)
+# renders two-channel via MODE_L1_BAND; the honest tier lives in the capability
+# badge (SYNTH vs L1), decoupled from the render shape. Legacy one-sided
+# SYNTH_PROFILE kept for compatibility.
 _EQUITY_DEPTH_MODE: dict[object, int] = {
+    "SYNTH": events.MODE_L1_BAND,
+    "L1": events.MODE_L1_BAND,
     "SYNTH_PROFILE": events.MODE_SYNTH_PROFILE,
     "L1_BAND": events.MODE_L1_BAND,
 }
+# Synthetic (keyless) depth tiers run the slower Yahoo-friendly cadence.
+_EQUITY_SYNTH_DEPTHS = frozenset({"SYNTH", "SYNTH_PROFILE"})
 
 
 class SessionManager:
@@ -925,7 +939,7 @@ class SessionManager:
         mode = _EQUITY_DEPTH_MODE.get(depth, events.MODE_L1_BAND)
         dt = (
             self._cfg.dt_equity_keyless_ns
-            if depth == "SYNTH_PROFILE"
+            if depth in _EQUITY_SYNTH_DEPTHS
             else self._cfg.dt_equity_keyed_ns
         )
         rows = min(_EQUITY_ROWS, self._cfg.max_rows)

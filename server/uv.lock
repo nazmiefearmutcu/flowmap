@@ -434,7 +434,7 @@ requires-dist = [
     { name = "msgspec", specifier = ">=0.18" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "polars", specifier = ">=1.0" },
-    { name = "stockodile", git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=476caeda94e3a1874ecb40166be08b970ffef010" },
+    { name = "stockodile", git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=8ea71db58bad58d68abbfdbd798b38b18eb7afef" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 
@@ -1284,8 +1284,8 @@ wheels = [
 
 [[package]]
 name = "stockodile"
-version = "0.1.2"
-source = { git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=476caeda94e3a1874ecb40166be08b970ffef010#476caeda94e3a1874ecb40166be08b970ffef010" }
+version = "0.2.0"
+source = { git = "https://github.com/nazmiefearmutcu/stockodile.git?rev=8ea71db58bad58d68abbfdbd798b38b18eb7afef#8ea71db58bad58d68abbfdbd798b38b18eb7afef" }
 dependencies = [
     { name = "aiohttp" },
     { name = "beautifulsoup4" },

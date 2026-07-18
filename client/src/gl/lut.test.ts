@@ -92,8 +92,20 @@ describe('rampForMode (§7 mode → colormap)', () => {
     expect(rampForMode(MODE_L1_BAND)).toBe(RAMP_THERMAL);
   });
 
+  it('colours SYNTHETIC depth amber by its capability tier, not the render mode', () => {
+    // Two-sided synthetic equity depth ships as MODE_L1_BAND (so it renders
+    // bid+ask) but is still fabricated volume-at-price — it must NOT wear the
+    // real-order-flow thermal ramp. The honesty signal is capability.depth.
+    expect(rampForMode(MODE_L1_BAND, 'SYNTH')).toBe(RAMP_SYNTH);
+    expect(rampForMode(MODE_L1_BAND, 'SYNTH_PROFILE')).toBe(RAMP_SYNTH);
+    // Real depth keeps the thermal ramp.
+    expect(rampForMode(MODE_L1_BAND, 'L1')).toBe(RAMP_THERMAL);
+    expect(rampForMode(MODE_L2, 'L2')).toBe(RAMP_THERMAL);
+  });
+
   it('defaults an unknown mode to thermal (never fabricates the synth look)', () => {
     expect(rampForMode(99)).toBe(RAMP_THERMAL);
+    expect(rampForMode(99, 'L2')).toBe(RAMP_THERMAL);
   });
 });
 

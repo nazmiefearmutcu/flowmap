@@ -1,6 +1,6 @@
 [package]
 name = "flowmap"
-version = "1.0.0"
+version = "1.1.0"
 description = "FlowMap — dual-market order-flow terminal"
 authors = ["nazmiefearmutcu"]
 edition = "2021"

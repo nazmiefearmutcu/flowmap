@@ -13,8 +13,8 @@ is:
   symbols would require network — hence the static list, noted "live in T9";
 - a static equity top-tickers shortlist whose capability is read off
   :class:`EquityFeed` (M3 T2). Equity is live: the keyless tier serves a
-  genuine SYNTH_PROFILE (Yahoo 1 m warmup + slow last-price poll), and the
-  descriptor mirrors the feed's env-selected tier so it can never lie about
+  genuine two-sided SYNTH depth (Yahoo 1 m warmup + slow last-price poll), and
+  the descriptor mirrors the feed's env-selected tier so it can never lie about
   what an equity subscribe delivers.
 """
 
@@ -40,9 +40,9 @@ _SIM_CAPABILITY = SimFeed(seed=0).capability
 def _equity_capability() -> dict[str, object]:
     """Equity capability mirrored from :class:`EquityFeed`'s own tier
     selection so the directory never lies about an equity subscribe. Keys are
-    auto-detected from env (spec §7): keyless -> SYNTH_PROFILE on this machine;
-    the Alpaca/Finnhub keyed tiers activate with no code change. Construction
-    is pure (no I/O)."""
+    auto-detected from env (spec §7): keyless -> SYNTH (two-sided) on this
+    machine; the Alpaca/Finnhub keyed tiers activate with no code change.
+    Construction is pure (no I/O)."""
     try:
         cfg = Config.from_env(os.environ)
     except Exception:  # noqa: BLE001 — a bad env falls back to keyless defaults

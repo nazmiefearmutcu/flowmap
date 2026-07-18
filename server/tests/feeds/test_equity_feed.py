@@ -4,15 +4,18 @@ All bars/prices/clocks are hand-built and injected (``bars_fn`` / ``price_fn``
 / ``now_ns_fn`` / ``sleep_fn``), so pytest never touches Yahoo or
 google_finance. The frozen contract:
 
-1. SYNTH volume-at-price builder: bars -> bid-only BookState, peak at the
-   high-volume price, ask arrays empty, volume conserved.
-2. That profile lands as bid-only density in a real SYNTH_PROFILE Grid.
+1. SYNTH volume-at-price builder: bars -> **two-sided** BookState split at a
+   reference price (bid ``price <= ref`` / ask ``price > ref``, stockodile
+   ``split_ladder`` semantics), the profile SHAPE rescaled to a combined peak,
+   the point-of-control preserved.
+2. That profile lands as two-sided density in a real L1_BAND Grid.
 3. Keyless live poll emits display-only Trades (side_src=na, venue synthetic).
 4. Market-closed (pinned Saturday): warmup profile still renders, one
    session_break marker, NO live trades, closed state exposed.
 5. Market-open (pinned weekday RTH): live polling emits trades.
-6. Tier auto-select + capability shapes; keyed sink side inference;
-   re-callable events(); NaN/finite safety; Feed protocol conformance.
+6. Tier auto-select + capability shapes (keyless SYNTH / alpaca L1); keyed sink
+   side inference + real L1 depth column; re-callable events(); NaN/finite
+   safety; Feed protocol conformance.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from flowmap_server.feeds.equity import (
 )
 from flowmap_server.proto.events import (
     BBO,
+    MODE_L1_BAND,
     MODE_SYNTH_PROFILE,
     SIDE_BUY,
     SIDE_SELL,
@@ -122,28 +126,32 @@ async def _collect(feed: EquityFeed, n: int, cap: int = 10_000) -> list[FeedEven
 # --- 1. SYNTH profile builder --------------------------------------------------
 
 
-def test_synth_profile_peaks_at_high_volume_price_bid_only_bounded():
-    bars = _concentrated_session()
+def test_synth_profile_two_sided_split_peaks_and_bounded():
+    bars = _concentrated_session()  # last close 100.00 -> ref = 100.00
     bs = EquityFeed.synth_profile(bars)
 
     assert isinstance(bs, BookState)
-    # bid-only density: ask arrays empty (grid runs SYNTH_PROFILE, drops ask).
-    assert bs.ask_px.size == 0 and bs.ask_sz.size == 0
+    # Two-sided now: ref 100.00 puts {95.00, 100.00} on bid, {105.00} on ask.
+    assert set(np.round(bs.bid_px, 2)) == {95.00, 100.00}
+    assert set(np.round(bs.ask_px, 2)) == {105.00}
     # every emitted value finite.
-    assert np.isfinite(bs.bid_px).all() and np.isfinite(bs.bid_sz).all()
-    # normalized to a fixed peak, bounded far below the grid's f16 ceiling.
-    assert bs.bid_sz.max() == PROFILE_PEAK_TARGET
-    assert bs.bid_sz.max() < float(np.finfo(np.float16).max)
-    # peak bucket is the 100.00 price, holding the stacked 3000 (relative).
-    peak_price = float(bs.bid_px[int(np.argmax(bs.bid_sz))])
-    assert abs(peak_price - 100.00) < DEFAULT_PROFILE_TICK
-    # SHAPE preserved exactly: raw 3000 vs 50 (ratio 60) survives normalization.
-    sz = bs.bid_sz[np.argsort(bs.bid_px)]  # ascending price: 95.00, 100.00, 105.00
-    assert sz[1] == PROFILE_PEAK_TARGET  # the 100.00 peak
-    assert abs(sz[1] / sz[0] - 60.0) < 1e-9  # 3000 / 50
-    assert abs(sz[1] / sz[2] - 60.0) < 1e-9
-    # buckets are ascending, one per occupied price.
-    assert np.all(np.diff(bs.bid_px) > 0)
+    for arr in (bs.bid_px, bs.bid_sz, bs.ask_px, bs.ask_sz):
+        assert np.isfinite(arr).all()
+    # combined-peak normalization: the global peak (both sides) == the target,
+    # bounded far below the grid's f16 ceiling.
+    combined_peak = max(float(bs.bid_sz.max()), float(bs.ask_sz.max()))
+    assert combined_peak == PROFILE_PEAK_TARGET
+    assert combined_peak < float(np.finfo(np.float16).max)
+    # the point-of-control (100.00, stacked 3000) is the peak, on the bid side.
+    poc_price = float(bs.bid_px[int(np.argmax(bs.bid_sz))])
+    assert abs(poc_price - 100.00) < DEFAULT_PROFILE_TICK
+    assert float(bs.bid_sz.max()) == PROFILE_PEAK_TARGET
+    # SHAPE preserved exactly through a single combined scale: raw 3000 vs 50
+    # (ratio 60) survives, and holds ACROSS the bid/ask split (100.00 bid vs
+    # 105.00 ask) — the cross-side comparison is honest.
+    bid_sz = bs.bid_sz[np.argsort(bs.bid_px)]  # ascending: 95.00, 100.00
+    assert abs(bid_sz[1] / bid_sz[0] - 60.0) < 1e-9  # 3000 / 50 (both bid)
+    assert abs(float(bs.bid_sz.max()) / float(bs.ask_sz.max()) - 60.0) < 1e-9  # 3000 / 50 cross-side
 
 
 def test_synth_profile_bounded_under_liquid_cumulative_volume():
@@ -191,10 +199,10 @@ def test_synth_profile_skips_nonfinite_and_negative_volume():
     assert np.isfinite(bs.bid_px).all() and np.isfinite(bs.bid_sz).all()
 
 
-# --- 2. profile lands as bid-only density in a SYNTH_PROFILE Grid ---------------
+# --- 2. profile lands as two-sided density in an L1_BAND Grid ------------------
 
 
-async def test_warmup_profile_drives_synth_grid_bid_only_density():
+async def test_warmup_profile_drives_two_sided_l1band_density():
     # bars within the grid span so nothing is clipped by the grid.
     base = _et_ns(2026, 7, 17, 10, 0)
     m = 60 * 10**9
@@ -202,7 +210,7 @@ async def test_warmup_profile_drives_synth_grid_bid_only_density():
         _flat_bar(base + 0 * m, 100.00, 1000.0),
         _flat_bar(base + 1 * m, 100.50, 40.0),
         _flat_bar(base + 2 * m, 100.00, 1000.0),
-        _flat_bar(base + 3 * m, 99.50, 40.0),
+        _flat_bar(base + 3 * m, 99.50, 40.0),  # last close 99.50 -> ref splits here
     ]
     cfg = Config()
     feed = EquityFeed(
@@ -214,6 +222,9 @@ async def test_warmup_profile_drives_synth_grid_bid_only_density():
     events = await _collect(feed, 100)
     books = [e for e in events if isinstance(e, BookState)]
     assert books, "no warmup BookState emitted"
+    # two-sided: by the last book the ref (99.50) leaves the 100.00/100.50 mass
+    # on the ask side, so the ask channel is genuinely populated.
+    assert any(b.ask_px.size > 0 for b in books), "no ask channel — depth is still one-sided"
 
     rows = 512
     tick = 0.01
@@ -226,7 +237,7 @@ async def test_warmup_profile_drives_synth_grid_bid_only_density():
             p0=p0,
             rows=rows,
             ring_columns=4096,
-            mode=MODE_SYNTH_PROFILE,
+            mode=MODE_L1_BAND,
         )
     )
     cols = []
@@ -244,11 +255,19 @@ async def test_warmup_profile_drives_synth_grid_bid_only_density():
     )
     assert cols
     last = cols[-1]
-    peak_row = int(np.argmax(last.bid.astype(np.float64)))
-    assert peak_row == round((100.00 - p0) / tick), "bid density peak not at 100.00 row"
-    # SYNTH: ask channel carries nothing, and the wire column drops it.
-    assert np.all(last.ask.astype(np.float64) == 0.0)
-    assert grid.to_depth(last).ask is None
+    bid = last.bid.astype(np.float64)
+    ask = last.ask.astype(np.float64)
+    # combined point-of-control (100.00, stacked 2000) is the peak across BOTH
+    # channels; with ref 99.50 it lands on the ask side.
+    peak_row = int(np.argmax(np.maximum(bid, ask)))
+    assert peak_row == round((100.00 - p0) / tick), "combined density peak not at 100.00 row"
+    # L1_BAND keeps both channels on the wire; the ask density is real.
+    assert grid.to_depth(last).ask is not None
+    assert float(ask.max()) > 0.0
+    # finite + bounded (no f16 overflow on either channel).
+    f16_max = float(np.finfo(np.float16).max)
+    assert np.isfinite(bid).all() and np.isfinite(ask).all()
+    assert float(bid.max()) < f16_max and float(ask.max()) < f16_max
 
 
 async def test_liquid_name_synth_grid_density_stays_finite_f16():
@@ -371,7 +390,9 @@ async def test_market_closed_renders_warmup_no_trades_and_exposes_state():
     trades = [e for e in events if isinstance(e, Trade)]
 
     assert books, "warmup SYNTH profile must still render when closed"
-    assert all(b.ask_px.size == 0 for b in books)
+    # two-sided depth: some warmup books carry an ask channel (mass above the
+    # then-current price); all books are finite.
+    assert all(np.isfinite(b.bid_sz).all() and np.isfinite(b.ask_sz).all() for b in books)
     assert not trades, "closed market must emit no stale live trades"
     assert trade_calls["n"] == 0, "must not poll last price when closed"
     assert len(markers) == 1 and markers[0].kind == "session_break"
@@ -424,7 +445,7 @@ def test_tier_keyless_when_no_keys():
     feed = EquityFeed("AAPL", Config())
     assert feed.tier == "keyless"
     assert feed.capability == {
-        "depth": "SYNTH_PROFILE",
+        "depth": "SYNTH",
         "tape": "poll",
         "trade_side": "na",
         "vwap": "approx",
@@ -437,7 +458,7 @@ def test_tier_keyless_when_no_keys():
 def test_tier_alpaca_when_both_keys():
     feed = EquityFeed("AAPL", Config(alpaca_key="k", alpaca_secret="s"))
     assert feed.tier == "alpaca"
-    assert feed.capability["depth"] == "L1_BAND"
+    assert feed.capability["depth"] == "L1"
     assert feed.capability["trade_side"] == "inferred"
     assert feed.capability["tape"] == "tick"
 
@@ -506,6 +527,44 @@ async def test_keyed_sink_quote_rule_alpaca_emits_bbo_and_infers_side():
     assert len(bbos) == 1 and bbos[0].bid_px == 100.0 and bbos[0].ask_px == 101.0
     assert [t.side for t in trades] == [SIDE_BUY, SIDE_SELL]
     assert all(t.side_src == SIDE_SRC_INFERRED for t in trades)
+    # the streamed L1 quote also lands as a real two-sided depth column (fills
+    # the keyed depth channel; sizes emitted raw so the imbalance survives).
+    books = [e for e in out if isinstance(e, BookState)]
+    assert len(books) == 1
+    b = books[0]
+    assert b.bid_px.tolist() == [100.0] and b.bid_sz.tolist() == [5.0]
+    assert b.ask_px.tolist() == [101.0] and b.ask_sz.tolist() == [7.0]
+
+
+async def test_keyed_sink_alpaca_skips_zero_price_quote_for_depth():
+    """Alpaca sends a 0 price to mean "no quote on this side" (at the open, on
+    illiquid names, during a halt). Such a quote must NOT become a depth level:
+    a 0-priced bid/ask would snap the grid's reanchor midpoint to ~half the real
+    price. The BBO still surfaces (that path already existed), but no BookState."""
+    out: list[FeedEvent] = []
+    sink = _EquitySink(out.append, use_quote_rule=True)
+    await sink.put(
+        StkQuote(
+            provider="alpaca",
+            symbol="AAPL",
+            symbol_raw="AAPL",
+            local_ts=1,
+            source_ts=1,
+            bid_px=0.0,  # "no bid" sentinel
+            bid_sz=0.0,
+            ask_px=101.0,
+            ask_sz=7.0,
+        )
+    )
+    assert not [e for e in out if isinstance(e, BookState)], "0-priced quote must not become depth"
+    # a healthy two-sided quote afterwards DOES produce a depth column.
+    await sink.put(
+        StkQuote(
+            provider="alpaca", symbol="AAPL", symbol_raw="AAPL", local_ts=2, source_ts=2,
+            bid_px=100.0, bid_sz=5.0, ask_px=101.0, ask_sz=7.0,
+        )
+    )
+    assert len([e for e in out if isinstance(e, BookState)]) == 1
 
 
 # --- 6c. re-callable events() + protocol ---------------------------------------

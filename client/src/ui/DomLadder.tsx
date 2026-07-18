@@ -6,16 +6,22 @@
  * data source is capability-driven and HONEST (§7) — the badge shows the real tier
  * and the panel never fabricates bid/ask it does not have:
  *
- *   - depth L2   → the real multi-level book: the newest DepthColumn's bid/ask
- *                  density arrays, rows→prices via the epoch geometry, the N rungs
- *                  around the mid. Best bid/ask rows highlighted. Badge `L2`.
- *   - depth L1   → only the BBO as a one-level ladder; other rungs blank. Badge `L1`.
- *   - depth SYNTH→ a single-channel volume-at-price profile ladder (no bid/ask
- *                  split, bar centered). Badge `SYNTH`.
+ * The badge (honesty tier) and the layout SHAPE are decoupled ({@link depthTier}
+ * vs {@link ladderShape}): the badge names provenance, the shape follows the book
+ * the feed sends.
  *
- * For M2 (sim + crypto) it is always L2; the switch + badge exist so M3/M4 (equity
- * L1/SYNTH) slot in without fabricating data. The sim feed emits NO BBO, so the mid
- * and best bid/ask are DERIVED from the book's density arrays; when a BBO is present
+ *   - depth L2    → the real multi-level book: the newest DepthColumn's bid/ask
+ *                   density arrays, rows→prices via the epoch geometry, the N rungs
+ *                   around the mid. Best bid/ask rows highlighted. Badge `L2`.
+ *   - depth L1    → keyed Alpaca top-of-book: a two-sided book (or the BBO as a
+ *                   one-level ladder before the first book). Badge `L1`.
+ *   - depth SYNTH → the two-sided synthetic volume-at-price depth (bid below / ask
+ *                   above the reference price) renders as a real bid/ask book;
+ *                   a legacy one-sided SYNTH_PROFILE mode still renders a centered
+ *                   profile. Either way, badge `SYNTH` — honest provenance.
+ *
+ * For M2 (sim + crypto) it is always L2. The sim feed emits NO BBO, so the mid and
+ * best bid/ask are DERIVED from the book's density arrays; when a BBO is present
  * (crypto) it is preferred. Auto-scroll keeps the mid centered; a lock toggle
  * freezes the center so the user can read a level while the market moves.
  *
@@ -80,6 +86,26 @@ export function depthTier(
   return null;
 }
 
+/**
+ * How to LAY OUT the rungs — decoupled from the honesty {@link DepthTier} badge.
+ * The badge names the data's provenance (`SYNTH` stays `SYNTH`); the shape is
+ * driven by the book the feed actually sends:
+ *   - `profile` — a one-sided density (legacy bid-only SYNTH_PROFILE mode):
+ *     centered volume-at-price bars, no bid/ask split.
+ *   - `l1`      — an L1 tier with a BBO: the two BBO rungs, others blank.
+ *   - `book`    — any two-sided density (real L2, keyed L1 band, OR the new
+ *     two-sided synthetic depth): per-row bid/ask from the density arrays.
+ * So a two-sided synthetic book renders like a real book while still badged
+ * `SYNTH` — honest provenance, honest shape, no fabricated levels.
+ */
+export type LadderShape = 'profile' | 'l1' | 'book';
+
+export function ladderShape(tier: DepthTier | null, bookMode: number | null): LadderShape {
+  if (bookMode === MODE_SYNTH_PROFILE) return 'profile';
+  if (tier === 'L1' && bookMode === null) return 'l1';
+  return 'book';
+}
+
 /** Decimal places implied by the price step (tick·multiple). */
 export function priceDecimals(step: number): number {
   if (!(step > 0)) return 2;
@@ -101,12 +127,12 @@ function clampRow(r: number, rows: number): number {
 function deriveQuotes(
   snap: BookSnapshot,
   params: EpochParams,
-  tier: DepthTier | null,
+  shape: LadderShape,
 ): { bestBidRow: number; bestAskRow: number; midRow: number | null } {
   const step = params.tick * params.tick_multiple;
   const rows = params.rows;
   const bbo = snap.bbo;
-  if (bbo && tier !== 'SYNTH') {
+  if (bbo && shape !== 'profile') {
     const bestBidRow = clampRow(Math.round((bbo.bidPx - params.p0) / step), rows);
     const bestAskRow = clampRow(Math.round((bbo.askPx - params.p0) / step), rows);
     const midRow = ((bbo.bidPx + bbo.askPx) / 2 - params.p0) / step;
@@ -115,7 +141,7 @@ function deriveQuotes(
   const book = snap.book;
   if (book === null) return { bestBidRow: -1, bestAskRow: -1, midRow: null };
 
-  if (tier === 'SYNTH') {
+  if (shape === 'profile') {
     // Point-of-control: the densest row of the volume-at-price profile.
     let pocRow = -1;
     let pocVal = DENSITY_EPS;
@@ -160,7 +186,7 @@ function deriveQuotes(
 export function buildLadder(
   snap: BookSnapshot,
   params: EpochParams | undefined,
-  tier: DepthTier | null,
+  shape: LadderShape,
   visRows: number,
   centerOverride: number | null,
 ): LadderModel {
@@ -170,7 +196,7 @@ export function buildLadder(
   const step = params.tick * params.tick_multiple;
   const nrows = params.rows;
   const decimals = priceDecimals(step);
-  const { bestBidRow, bestAskRow, midRow } = deriveQuotes(snap, params, tier);
+  const { bestBidRow, bestAskRow, midRow } = deriveQuotes(snap, params, shape);
 
   const center = centerOverride ?? midRow ?? (nrows - 1) / 2;
   const centerInt = Math.round(center);
@@ -184,13 +210,13 @@ export function buildLadder(
     let bidSz = 0;
     let askSz = 0;
     let profileSz = 0;
-    if (tier === 'SYNTH') {
+    if (shape === 'profile') {
       profileSz = inRange ? book.bid[r] : 0;
-    } else if (tier === 'L1') {
+    } else if (shape === 'l1') {
       if (snap.bbo && r === bestBidRow) bidSz = snap.bbo.bidSz;
       if (snap.bbo && r === bestAskRow) askSz = snap.bbo.askSz;
     } else {
-      // L2 (or unknown-but-have-book): the real per-row density.
+      // book: real per-row density (L2, keyed L1 band, or two-sided synthetic).
       bidSz = inRange ? book.bid[r] : 0;
       askSz = inRange && book.ask ? book.ask[r] : 0;
     }
@@ -204,8 +230,8 @@ export function buildLadder(
       bidPct: 0,
       askPct: 0,
       profilePct: 0,
-      isBestBid: tier !== 'SYNTH' && r === bestBidRow,
-      isBestAsk: tier !== 'SYNTH' && r === bestAskRow,
+      isBestBid: shape !== 'profile' && r === bestBidRow,
+      isBestAsk: shape !== 'profile' && r === bestAskRow,
     });
   }
   for (const row of out) {
@@ -253,9 +279,11 @@ export function DomLadder(): JSX.Element {
   }, []);
 
   const params = snap.book ? epochs.get(snap.book.epoch) : undefined;
-  const tier = depthTier(capability, snap.book ? snap.book.mode : null);
+  const bookMode = snap.book ? snap.book.mode : null;
+  const tier = depthTier(capability, bookMode);
+  const shape = ladderShape(tier, bookMode);
   const center = locked ? frozenCenterRef.current : null;
-  const model = buildLadder(snap, params, tier, visRows, center);
+  const model = buildLadder(snap, params, shape, visRows, center);
 
   // Track the live mid so locking freezes at the current center.
   useEffect(() => {
@@ -311,7 +339,7 @@ export function DomLadder(): JSX.Element {
                 data-bid={r.bidSz.toFixed(4)}
                 data-ask={r.askSz.toFixed(4)}
               >
-                {tier === 'SYNTH' ? (
+                {shape === 'profile' ? (
                   <div className="ladder__profile">
                     <div className="ladder__bar ladder__bar--profile" style={{ width: `${r.profilePct}%` }} />
                     <span className="ladder__sz">{fmtSz(r.profileSz)}</span>
@@ -329,7 +357,7 @@ export function DomLadder(): JSX.Element {
                     </div>
                   </>
                 )}
-                {tier === 'SYNTH' && <div className="ladder__px ladder__px--synth">{r.price.toFixed(model.priceDecimals)}</div>}
+                {shape === 'profile' && <div className="ladder__px ladder__px--synth">{r.price.toFixed(model.priceDecimals)}</div>}
               </div>
             ))
           )}

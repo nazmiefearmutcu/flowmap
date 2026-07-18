@@ -21,14 +21,19 @@ export const RAMP_THERMAL = 0;
 export const RAMP_SYNTH = 1;
 
 /**
- * Colormap row for a DepthColumn's density mode (§7 / §8.3): a SYNTH_PROFILE
- * (keyless equity volume-at-price, bid-only) renders in the single-hue amber
- * ramp so synthetic density reads as visually distinct from real L2/L1 depth;
- * everything else uses the thermal ramp. Pure so the mode→ramp selection is
- * unit-testable without a GL context.
+ * Colormap row for a density column (§7 / §8.3): SYNTHETIC equity depth renders
+ * in the single-hue amber ramp so it reads as visually distinct from real L2/L1
+ * depth; everything else uses the thermal ramp. The honesty signal is the
+ * capability `depth` tier (``"SYNTH"`` / legacy ``"SYNTH_PROFILE"``), NOT the
+ * wire render mode — two-sided synthetic depth ships as ``MODE_L1_BAND`` (so it
+ * renders bid+ask) yet must still colour as synthetic; keying off the tier keeps
+ * that honest. ``mode === MODE_SYNTH_PROFILE`` is a fallback for when no
+ * capability is known. Pure so the selection is unit-testable without a GL
+ * context.
  */
-export function rampForMode(mode: number): number {
-  return mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL;
+export function rampForMode(mode: number, depth?: unknown): number {
+  const synthetic = depth === 'SYNTH' || depth === 'SYNTH_PROFILE';
+  return synthetic || mode === MODE_SYNTH_PROFILE ? RAMP_SYNTH : RAMP_THERMAL;
 }
 
 interface Stop {

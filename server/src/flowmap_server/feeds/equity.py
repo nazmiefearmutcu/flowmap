@@ -7,31 +7,34 @@ each tier's real capability honestly (spec §7):
 ============  ================================================================
 Tier          What ``events()`` emits
 ============  ================================================================
-keyless       SYNTH_PROFILE depth (volume-at-price from Yahoo 1 m bars,
-              bid-only density), a display-only last-price tape
-              (``side_src=na``, ``venue='synthetic'``) polled every
-              ``dt_equity_keyless_ns``, gaps + session_break markers. **No
+keyless       SYNTH depth — a **two-sided** volume-at-price ladder from Yahoo 1 m
+              bars (bid below / ask above the reference price) — a display-only
+              last-price tape (``side_src=na``, ``venue='synthetic'``) polled
+              every ``dt_equity_keyless_ns``, gaps + session_break markers. **No
               tick tape, no CVD** — the machine has no equity keys, so this is
               the only genuinely-available tier and it must be honest.
-alpaca (keyed) L1_BAND depth + tick tape with side **inferred** (quote rule
-              vs the streamed L1 BBO), quotes as ``BBO``.
+alpaca (keyed) real **L1** two-sided top-of-book depth (from the streamed BBO) +
+              tick tape with side **inferred** (quote rule vs the streamed L1
+              BBO), quotes as ``BBO``.
 finnhub (keyed) tick tape with side **inferred** (tick rule); no depth / no
               quotes.
 ============  ================================================================
 
 **SYNTH volume-at-price** (keyless): each 1 m bar's whole volume is placed at
 its typical price ``(H+L+C)/3`` snapped to a cent bucket, accumulated into a
-*cumulative* profile. One :class:`BookState` is emitted per bar (bid_px = the
-occupied price buckets, bid_sz = that profile's SHAPE rescaled to a fixed peak,
-ask arrays EMPTY) so the grid — which time-weights the previous book over each
-interval — renders a horizontal volume-profile-over-time. The grid carries
-``mode=SYNTH_PROFILE`` and drops the (empty) ask channel on the wire. The
-emitted ``bid_sz`` is a bounded *relative* intensity (peak ==
-``PROFILE_PEAK_TARGET``), not a share count: a liquid name's cumulative shares
-(tens of millions) cast to the grid's float16 ring would overflow to ``inf``
-(spec §8.1), so the profile is normalized per column — bounded by construction
-across a full session, with between-bucket ratios (and thus the point-of-control)
-preserved exactly. Warmup uses **the most recent session's bars only**, so bar
+*cumulative* profile. One :class:`BookState` is emitted per bar, its SHAPE
+rescaled so the **combined** peak == ``PROFILE_PEAK_TARGET`` and then split at a
+**reference price** (that bar's close during warmup, the live last price when
+running) into a bid channel (``price <= ref``) and an ask channel (``price >
+ref``) — stockodile ``split_ladder`` semantics. The grid, which time-weights the
+previous book over each interval, thus renders a **two-sided** depth-over-time
+whose bid/ask boundary walks with price (grid ``mode=L1_BAND``, two channels on
+the wire; the badge stays honestly ``SYNTH``). The emitted sizes are a bounded
+*relative* intensity, not a share count: a liquid name's cumulative shares (tens
+of millions) cast to the grid's float16 ring would overflow to ``inf`` (spec
+§8.1), so the single combined-peak scale bounds every texel while preserving
+between-bucket ratios (the point-of-control) and the cross-side bid/ask
+comparison exactly. Warmup uses **the most recent session's bars only**, so bar
 timestamps stay ~1 m apart and the grid never bridges an overnight gap into
 thousands of empty columns (spec §7.1 "no empty-column accumulation").
 
@@ -69,6 +72,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 import numpy as np
 
+from stockodile.depth.vap import reference_price as stk_reference_price
 from stockodile.scheduler.calendar import MARKET_TZ, USMarketCalendar
 from stockodile.schema.records import Bar as StkBar
 from stockodile.schema.records import Quote as StkQuote
@@ -177,32 +181,49 @@ class _ProfileBuilder:
     def total_volume(self) -> float:
         return float(sum(self._buckets.values()))
 
-    def book_state(self, ts_ns: int) -> BookState:
-        """The cumulative profile as a bid-only :class:`BookState`, normalized so
-        its peak bucket == ``PROFILE_PEAK_TARGET``.
+    def book_state(self, ts_ns: int, ref: float | None = None) -> BookState:
+        """The cumulative volume-at-price profile as a **two-sided** normalized
+        :class:`BookState`, split at ``ref`` (stockodile ``split_ladder``
+        semantics): buckets with ``price <= ref`` are the bid channel, ``price >
+        ref`` the ask channel. The occupied buckets carry the profile's SHAPE
+        rescaled so its **combined** (bid+ask) peak == ``PROFILE_PEAK_TARGET``.
 
-        bid_px/bid_sz are the occupied buckets (ascending price); the ask arrays
-        are EMPTY — the grid runs in SYNTH_PROFILE mode and only the bid channel
-        is a density. ``bid_sz`` is the profile's SHAPE rescaled to a fixed peak
-        (a bounded *relative* intensity, not a share count): a liquid name's raw
-        cumulative shares would overflow the grid's float16 ring to ``inf`` (spec
-        §8.1), so it is normalized per column — bounded across a full session,
-        with between-bucket ratios (hence the point-of-control) preserved."""
-        if self._buckets:
-            idxs = np.fromiter(sorted(self._buckets), dtype=np.int64)
-            bid_px = idxs.astype(np.float64) * self._tick
-            raw = np.array([self._buckets[int(i)] for i in idxs], dtype=np.float64)
-            peak = float(raw.max())
-            # Rescale the profile's SHAPE to a fixed peak (relative intensity):
-            # bounded by construction, so a growing cumulative sum can never
-            # creep back into f16 overflow.
-            bid_sz = raw * (PROFILE_PEAK_TARGET / peak) if peak > 0.0 else raw
-        else:
-            bid_px = np.empty(0, dtype=np.float64)
-            bid_sz = np.empty(0, dtype=np.float64)
+        The single combined scale factor keeps between-bucket ratios — hence the
+        point-of-control and the *cross-side* bid/ask intensity comparison —
+        exact, while bounding every texel far below float16's ceiling for any
+        cumulative total (a liquid name's raw cumulative shares, tens of millions,
+        would overflow the grid's float16 ring to ``inf``; spec §8.1). The ask
+        side legitimately shrinks/vanishes when ``ref`` sits near the profile's
+        top (little volume traded above the current price — an honest asymmetry).
+
+        ``ref is None`` keeps the legacy one-sided shape (everything on bid, ask
+        empty) for callers that have no reference price."""
+        if not self._buckets:
+            empty = np.empty(0, dtype=np.float64)
+            return BookState(
+                ts_ns=int(ts_ns), bid_px=empty, bid_sz=empty, ask_px=empty, ask_sz=empty
+            )
+        idxs = np.fromiter(sorted(self._buckets), dtype=np.int64)
+        px = idxs.astype(np.float64) * self._tick
+        raw = np.array([self._buckets[int(i)] for i in idxs], dtype=np.float64)
+        peak = float(raw.max())
+        # Combined-peak normalization BEFORE the split: bounded by construction,
+        # so a growing cumulative sum can never creep back into f16 overflow and
+        # the bid/ask magnitudes stay directly comparable.
+        sz = raw * (PROFILE_PEAK_TARGET / peak) if peak > 0.0 else raw
         empty = np.empty(0, dtype=np.float64)
+        if ref is None:
+            return BookState(
+                ts_ns=int(ts_ns), bid_px=px, bid_sz=sz, ask_px=empty, ask_sz=empty
+            )
+        bid_mask = px <= float(ref)
+        ask_mask = ~bid_mask
         return BookState(
-            ts_ns=int(ts_ns), bid_px=bid_px, bid_sz=bid_sz, ask_px=empty, ask_sz=empty
+            ts_ns=int(ts_ns),
+            bid_px=px[bid_mask],
+            bid_sz=sz[bid_mask],
+            ask_px=px[ask_mask],
+            ask_sz=sz[ask_mask],
         )
 
 
@@ -254,16 +275,32 @@ class _EquitySink:
                 )
             )
         elif isinstance(record, StkQuote) and self._use_quote_rule:
-            self._bbo = (float(record.bid_px), float(record.ask_px))
+            bid_px, ask_px = float(record.bid_px), float(record.ask_px)
+            bid_sz, ask_sz = float(record.bid_sz), float(record.ask_sz)
+            self._bbo = (bid_px, ask_px)
+            ts = _rec_ts(record)
             self._emit(
-                BBO(
-                    ts_ns=_rec_ts(record),
-                    bid_px=float(record.bid_px),
-                    bid_sz=float(record.bid_sz),
-                    ask_px=float(record.ask_px),
-                    ask_sz=float(record.ask_sz),
-                )
+                BBO(ts_ns=ts, bid_px=bid_px, bid_sz=bid_sz, ask_px=ask_px, ask_sz=ask_sz)
             )
+            # Real L1 top-of-book as a two-sided depth column (fills the keyed
+            # depth channel; badge stays honest `L1`). Displayed sizes are round
+            # lots, far under the grid's float16 ceiling — emitted raw so the
+            # true bid/ask size imbalance survives. Prices must be strictly
+            # positive: Alpaca sends a 0 price to mean "no quote on this side"
+            # (at the open, on illiquid names, or during a halt); admitting it
+            # would snap the reanchor midpoint to ~half the real price.
+            prices_ok = math.isfinite(bid_px) and bid_px > 0.0 and math.isfinite(ask_px) and ask_px > 0.0
+            sizes_ok = math.isfinite(bid_sz) and bid_sz >= 0.0 and math.isfinite(ask_sz) and ask_sz >= 0.0
+            if prices_ok and sizes_ok:
+                self._emit(
+                    BookState(
+                        ts_ns=ts,
+                        bid_px=np.array([bid_px], dtype=np.float64),
+                        bid_sz=np.array([bid_sz], dtype=np.float64),
+                        ask_px=np.array([ask_px], dtype=np.float64),
+                        ask_sz=np.array([ask_sz], dtype=np.float64),
+                    )
+                )
         # Bars/fundamentals/status/etc.: not part of the canonical tape dialect.
 
     async def flush(self) -> None:
@@ -410,21 +447,30 @@ class EquityFeed:
 
     @staticmethod
     def synth_profile(
-        bars: Sequence[StkBar], *, tick: float = DEFAULT_PROFILE_TICK
+        bars: Sequence[StkBar],
+        *,
+        tick: float = DEFAULT_PROFILE_TICK,
+        ref: float | None = None,
     ) -> BookState:
-        """Aggregate ``bars`` into one volume-at-price BookState.
+        """Aggregate ``bars`` into one **two-sided** volume-at-price BookState.
 
-        Bid-only density (ask arrays empty); the profile's SHAPE is rescaled so
-        its peak bucket == ``PROFILE_PEAK_TARGET`` (a bounded relative intensity,
-        not a share count — see :meth:`_ProfileBuilder.book_state`); the peak
-        bucket is where the most volume concentrated. ``ts_ns`` is the newest
-        bar's timestamp (0 if none)."""
+        The profile's SHAPE is rescaled so its combined peak bucket ==
+        ``PROFILE_PEAK_TARGET`` (a bounded relative intensity, not a share count —
+        see :meth:`_ProfileBuilder.book_state`) then split at ``ref`` into bid
+        (``price <= ref``) and ask (``price > ref``) channels. ``ref`` defaults to
+        the last finite bar's close (``stockodile.depth.vap.reference_price``); a
+        ``None`` result of that (no finite bars) yields an empty book. ``ts_ns``
+        is the newest bar's timestamp (0 if none)."""
         builder = _ProfileBuilder(tick)
         last_ts = 0
+        finite: list[StkBar] = []
         for bar in bars:
             if builder.add_bar(bar):
                 last_ts = max(last_ts, _bar_ts(bar))
-        return builder.book_state(last_ts)
+                finite.append(bar)
+        if ref is None and finite:
+            ref = stk_reference_price(finite)
+        return builder.book_state(last_ts, ref)
 
     def _select_warmup_bars(self, bars: Sequence[StkBar]) -> list[StkBar]:
         """The most recent session's finite bars (grouped by ET date), sorted
@@ -487,13 +533,16 @@ class EquityFeed:
         warmup = self._select_warmup_bars(bars)
         builder = _ProfileBuilder(self._profile_tick)
         last_bar_ts = 0
+        ref: float | None = None
         for bar in warmup:
             builder.add_bar(bar)
             ts = _bar_ts(bar)
             last_bar_ts = max(last_bar_ts, ts)
-            # Cumulative bid-only density at the bar time: the heatmap grows a
-            # horizontal volume-profile-over-time as levels are revisited.
-            yield builder.book_state(ts)
+            # Reference = this bar's close, so the two-sided split boundary walks
+            # with historical price: a genuine bid-below / ask-above depth-over-
+            # time as the cumulative volume-profile fills in (spec §7).
+            ref = float(bar.close)
+            yield builder.book_state(ts, ref)
 
         now = self._now_ns()
         state, next_open = self._session_state(now)
@@ -511,18 +560,20 @@ class EquityFeed:
             return
 
         try:
-            async for ev in self._keyless_live(builder, last_bar_ts):
+            async for ev in self._keyless_live(builder, last_bar_ts, ref):
                 yield ev
         finally:
             await self._close_poller()
 
     async def _keyless_live(
-        self, builder: _ProfileBuilder, last_bar_ts: int
+        self, builder: _ProfileBuilder, last_bar_ts: int, ref: float | None
     ) -> AsyncIterator[FeedEvent]:
         """Live keyless loop: per ``dt_equity_keyless_ns`` poll the last price
-        (display-only Trade) and re-assert the resting SYNTH profile (advances
-        the grid one column); refresh bars every ``bar_refresh_ns``. Stops with
-        a session_break when the RTH window closes."""
+        (display-only Trade + the two-sided split reference) and re-assert the
+        resting SYNTH profile split at that price (advances the grid one column);
+        refresh bars every ``bar_refresh_ns``. Stops with a session_break when the
+        RTH window closes. ``ref`` seeds from the last warmup bar's close and then
+        tracks each valid live price so the bid/ask boundary follows the market."""
         poll_s = self._cfg.dt_equity_keyless_ns / 1e9
         next_refresh = self._now_ns() + self._bar_refresh_ns
         while True:
@@ -552,7 +603,10 @@ class EquityFeed:
 
             price = await self._poll_price_safe()
             if price is not None and math.isfinite(price) and price > 0.0:
-                # Display-only tape: google last-price is not a print/NBBO.
+                # Display-only tape: google last-price is not a print/NBBO. The
+                # same price is the two-sided split reference so the bid/ask
+                # boundary follows the live market.
+                ref = float(price)
                 yield Trade(
                     ts_ns=now,
                     price=float(price),
@@ -562,8 +616,9 @@ class EquityFeed:
                     venue=SYNTH_VENUE,
                 )
             # Re-assert the resting profile so the grid advances a column and
-            # the current column rolls with the (bar-refreshed) profile.
-            yield builder.book_state(now)
+            # the current column rolls with the (bar-refreshed) profile, split
+            # two-sided at the latest reference price.
+            yield builder.book_state(now, ref)
             await self._sleep(poll_s)
 
     async def _fetch_bars(self) -> Sequence[StkBar]:
@@ -660,14 +715,14 @@ class EquityFeed:
 # Per-tier capability descriptors (spec §7 dual-market parity table).
 _CAPABILITY: dict[str, dict[str, object]] = {
     "keyless": {
-        "depth": "SYNTH_PROFILE",
+        "depth": "SYNTH",
         "tape": "poll",
         "trade_side": "na",
         "vwap": "approx",
         "markers": ["gap", "session_break"],
     },
     "alpaca": {
-        "depth": "L1_BAND",
+        "depth": "L1",
         "tape": "tick",
         "trade_side": "inferred",
         "vwap": "from_tape",

@@ -891,8 +891,8 @@ async def test_equity_subscribe_synth_grid_and_closed_status():
     client = ClientTx()
     sess = await mgr.subscribe(sub, client)
 
-    # (c) grid is equity-appropriate: SYNTH_PROFILE mode, cent tick, keyless dt.
-    assert sess._grid.cfg.mode == MODE_SYNTH_PROFILE
+    # (c) grid is equity-appropriate: two-sided L1_BAND mode, cent tick, keyless dt.
+    assert sess._grid.cfg.mode == MODE_L1_BAND
     assert sess._grid.cfg.tick == 0.01
     assert sess._grid.cfg.dt_ns == cfg.dt_equity_keyless_ns
     assert 0 < sess._grid.cfg.rows <= cfg.max_rows
@@ -903,18 +903,20 @@ async def test_equity_subscribe_synth_grid_and_closed_status():
     # (a) Hello capability is the keyless SYNTH descriptor.
     hello = msgs[0]
     assert isinstance(hello, Hello)
-    assert hello.capability["depth"] == "SYNTH_PROFILE"
+    assert hello.capability["depth"] == "SYNTH"
     assert hello.capability["tape"] == "poll"
 
-    # (a) depth columns render in SYNTH_PROFILE mode with the ask channel dropped.
+    # (a) depth columns render two-sided (L1_BAND keeps the ask channel on the
+    # wire; here every bar sits at one price <= ref so the ask side is empty but
+    # present — an honest "no volume above the price" rather than a dropped axis).
     depths = [m for m in msgs if isinstance(m, DepthColumn)]
     assert depths, "warmup SYNTH profile produced no depth columns"
-    assert all(d.mode == MODE_SYNTH_PROFILE and d.ask is None for d in depths)
+    assert all(d.mode == MODE_L1_BAND and d.ask is not None for d in depths)
 
     # (b) a terminal closed Status surfaces the next RTH open (Mon 2026-07-20).
     closed = [m for m in msgs if isinstance(m, Status) and m.feed_state == "closed"]
     assert len(closed) == 1
-    assert closed[0].capability["depth"] == "SYNTH_PROFILE"
+    assert closed[0].capability["depth"] == "SYNTH"
     assert closed[0].next_open_ts == _eq_et_ns(2026, 7, 20, 9, 30)
 
     # session_break marker (order-flow-style compressed gap) from the last session.
@@ -934,7 +936,7 @@ async def test_equity_grid_reanchors_to_symbol_price():
     sess = await mgr.subscribe(sub, client)
     await asyncio.wait_for(sess.run_task, timeout=5)
 
-    # the bid-only SYNTH profile re-anchored the grid onto ~$180.
+    # the two-sided SYNTH profile re-anchored the grid onto ~$180.
     ep = sess._grid.current_epoch_params()
     assert ep.epoch >= 1, "grid never re-anchored to the symbol price"
     assert 155.0 <= ep.p0 <= 165.0  # p0 = 180 - span/2 ~ 159.5
@@ -943,7 +945,36 @@ async def test_equity_grid_reanchors_to_symbol_price():
     # re-anchor announced to the client as an EpochStart before its columns.
     assert any(isinstance(m, EpochStart) and m.epoch >= 1 for m in msgs)
     reanchored = [m for m in msgs if isinstance(m, DepthColumn) and m.epoch >= 1]
-    assert reanchored and all(d.ask is None for d in reanchored)
+    # two-sided L1_BAND keeps the ask channel on the wire (empty here — all mass
+    # at the single price <= ref — but present, not a dropped axis).
+    assert reanchored and all(d.ask is not None for d in reanchored)
+
+
+def test_reanchor_ref_handles_all_bid_ask_populations():
+    """The two-sided synthetic split can leave a book bid-only, ask-only, or
+    two-sided; _reanchor_ref must recentre in every case. A sustained intraday
+    decline pushes the reference below every occupied bucket, yielding an
+    ask-only book — that MUST still re-anchor, not freeze the grid at nominal p0
+    (which would drop every real level as out-of-range and render nothing)."""
+
+    def bs(bids, asks):
+        return BookState(
+            ts_ns=1,
+            bid_px=np.array(bids, dtype=np.float64),
+            bid_sz=np.ones(len(bids), dtype=np.float64),
+            ask_px=np.array(asks, dtype=np.float64),
+            ask_sz=np.ones(len(asks), dtype=np.float64),
+        )
+
+    r = Session._reanchor_ref
+    # two-sided -> BBO mid (max bid, min ask)
+    assert r(bs([99.0, 100.0], [101.0, 102.0])) == pytest.approx(100.5)
+    # bid-only -> bid span center
+    assert r(bs([98.0, 100.0], [])) == pytest.approx(99.0)
+    # ask-only (sustained decline) -> ask span center; MUST NOT be None
+    assert r(bs([], [180.0, 184.0])) == pytest.approx(182.0)
+    # empty -> None (skip reanchor)
+    assert r(bs([], [])) is None
 
 
 async def test_equity_grid_uses_keyed_cadence_when_keyed():

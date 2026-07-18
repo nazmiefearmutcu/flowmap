@@ -3,14 +3,14 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { MODE_L2, MODE_SYNTH_PROFILE, type EpochParams } from '../proto/types';
+import { MODE_L1_BAND, MODE_L2, MODE_SYNTH_PROFILE, type EpochParams } from '../proto/types';
 import {
   ingestForTest,
   resetForTest,
   type BookSnapshot,
 } from '../state/bookStore';
 import { useFlowMapStore } from '../state/store';
-import { DomLadder, buildLadder, depthTier, fmtSz, priceDecimals } from './DomLadder';
+import { DomLadder, buildLadder, depthTier, ladderShape, fmtSz, priceDecimals } from './DomLadder';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -96,6 +96,20 @@ describe('depthTier', () => {
   });
 });
 
+describe('ladderShape', () => {
+  it('decouples layout shape from the honesty badge', () => {
+    // Legacy one-sided density → centered profile, regardless of tier.
+    expect(ladderShape('SYNTH', MODE_SYNTH_PROFILE)).toBe('profile');
+    // Two-sided synthetic depth renders like a real book (badge stays SYNTH).
+    expect(ladderShape('SYNTH', MODE_L1_BAND)).toBe('book');
+    // Real two-sided books render as books.
+    expect(ladderShape('L2', MODE_L2)).toBe('book');
+    expect(ladderShape('L1', MODE_L1_BAND)).toBe('book');
+    // An L1 tier with only a BBO (no book yet) → the one-level L1 layout.
+    expect(ladderShape('L1', null)).toBe('l1');
+  });
+});
+
 describe('fmtSz', () => {
   it('formats finite sizes compactly and blanks non-positive', () => {
     expect(fmtSz(0)).toBe('');
@@ -123,7 +137,7 @@ describe('priceDecimals', () => {
 
 describe('buildLadder', () => {
   it('centers on the derived mid and flags best bid/ask (L2, no BBO)', () => {
-    const model = buildLadder(snapWithBook(), PARAMS, 'L2', 5, null);
+    const model = buildLadder(snapWithBook(), PARAMS, 'book', 5, null);
     expect(model.priceDecimals).toBe(1);
     expect(model.midRow).toBeCloseTo(100.5);
 
@@ -146,21 +160,21 @@ describe('buildLadder', () => {
   it('prefers the BBO for best bid/ask when present', () => {
     const snap = snapWithBook();
     snap.bbo = { tsNs: 1n, bidPx: 100.0, bidSz: 12, askPx: 100.5, askSz: 9 };
-    const model = buildLadder(snap, PARAMS, 'L2', 7, null);
+    const model = buildLadder(snap, PARAMS, 'book', 7, null);
     const byRow = new Map(model.rows.map((r) => [r.row, r]));
     expect(byRow.get(100)?.isBestBid).toBe(true);
     expect(byRow.get(101)?.isBestAsk).toBe(true);
   });
 
   it('honors a locked center override instead of following the mid', () => {
-    const model = buildLadder(snapWithBook(), PARAMS, 'L2', 5, 40);
+    const model = buildLadder(snapWithBook(), PARAMS, 'book', 5, 40);
     // Window centered on row 40 → rows 38..42, none near the live mid (100).
     expect(model.rows.map((r) => r.row)).toEqual([42, 41, 40, 39, 38]);
   });
 
   it('returns an empty model with no book', () => {
     const empty: BookSnapshot = { version: 0, book: null, bbo: null, trades: [] };
-    expect(buildLadder(empty, PARAMS, 'L2', 5, null).rows).toEqual([]);
+    expect(buildLadder(empty, PARAMS, 'book', 5, null).rows).toEqual([]);
   });
 });
 
@@ -198,6 +212,41 @@ describe('DomLadder render', () => {
 
     // The price cell shows the epoch-derived precision.
     expect(bidRow?.querySelector('.ladder__px')?.textContent).toBe('100.0');
+  });
+
+  it('renders two-sided bid/ask rungs for synthetic depth while badging SYNTH', () => {
+    // The new keyless equity depth: a two-sided synthetic book (mode L1_BAND)
+    // with capability depth SYNTH. Honest provenance badge (SYNTH), real book
+    // layout (bid AND ask rungs) — not the old bid-only centered profile.
+    useFlowMapStore.setState({
+      capability: { depth: 'SYNTH', tape: 'poll' },
+      epochs: new Map([[1, PARAMS]]),
+      gridEpoch: 1,
+    });
+    const { bid, ask } = makeBook();
+    ingestForTest({
+      type: 3,
+      epoch: 1,
+      col_seq: 1,
+      t0_ns: 1_000_000n,
+      mode: MODE_L1_BAND,
+      final: true,
+      bid,
+      ask,
+    } as never);
+
+    const { container } = render(<DomLadder />);
+
+    // Honest badge: synthetic provenance.
+    expect(container.querySelector('[data-testid="ladder-badge"]')?.textContent).toBe('SYNTH');
+    // Real two-sided layout: both a populated bid rung and ask rung.
+    const bidRow = container.querySelector('[data-row="100"]');
+    expect(bidRow?.getAttribute('data-bid')).toBe('8.0000');
+    const askRow = container.querySelector('[data-row="101"]');
+    expect(askRow?.getAttribute('data-ask')).toBe('7.0000');
+    // The two-sided book uses bid/ask cells, not the single-channel profile bar.
+    expect(container.querySelector('.ladder__bar--profile')).toBeNull();
+    expect(container.querySelector('.ladder__bar--ask')).not.toBeNull();
   });
 
   it('collapses the body via the header chevron', () => {

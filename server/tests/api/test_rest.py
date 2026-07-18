@@ -58,7 +58,7 @@ async def test_symbols_equity_shortlist(client):
     entry = next(s for s in r.json()["symbols"] if s["symbol"] == "AAPL")
     assert entry["market"] == "equity"
     # Honest capability mirrored from EquityFeed's keyless tier (M3 T2).
-    assert entry["capability"]["depth"] == "SYNTH_PROFILE"
+    assert entry["capability"]["depth"] == "SYNTH"
     assert entry["capability"]["tape"] == "poll"
     assert entry["capability"]["trade_side"] == "na"
     assert "note" not in entry  # equity is live (keyless SYNTH), like sim

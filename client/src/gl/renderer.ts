@@ -652,11 +652,13 @@ export class Renderer {
         this.normSeeded = true;
       }
     }
-    // Colormap follows the column's density mode (synth profile → amber ramp).
+    // Colormap follows the HONESTY tier, not the render mode: synthetic equity
+    // depth → amber ramp even though it ships two-sided as MODE_L1_BAND (§8.3).
     // Apply it to the heatmap encoding right away so the ramp is correct even on
     // a frame where the viewport normalizer has no data yet (updateNormalization
     // early-returns then); it re-affirms the same ramp once histograms exist.
-    this.ramp = rampForMode(col.mode);
+    const depthTier = (this.store.getState().capability as { depth?: unknown } | null)?.depth;
+    this.ramp = rampForMode(col.mode, depthTier);
     if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
       this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
     }
