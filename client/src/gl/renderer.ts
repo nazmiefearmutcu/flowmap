@@ -48,6 +48,9 @@ import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
 import { MODE_L2, MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
+import { OverlayManager } from './overlays/manager';
+import type { OverlayVisibility } from './overlays/frame';
+import type { PriceMap, TimeMap } from './overlays/coords';
 
 /** The renderer only needs the store's imperative surface, not the React hook. */
 interface RendererStore {
@@ -173,6 +176,14 @@ export class Renderer {
   private readonly normalizer: ViewportNormalizer;
   /** Exact CPU column cache (T9): the crosshair readout + instant-recovery data. */
   private readonly columnCache: ColumnCache;
+  /** Overlays (T10): trades/BBO/VWAP/profile/markers + axes + text layer. */
+  private overlays: OverlayManager;
+  /** Column⇄time anchor for overlays: newest written column (any is valid). */
+  private overlayAnchorSeq = -1;
+  private overlayAnchorT0Ns = 0n;
+  private overlayAnchorEpoch = 0;
+  /** One-shot guard so a suppressed overlay-ingest error warns at most once. */
+  private overlayIngestWarned = false;
   /** norm_seed applied once, the first time the server sends it. */
   private normSeeded = false;
   /** Fixed per-instrument decode scale (capability-driven; 1 for the sim). */
@@ -230,6 +241,9 @@ export class Renderer {
     // loss, so they're built once here and kept across ring rebuilds.
     this.normalizer = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
     this.columnCache = new ColumnCache();
+
+    // Overlays (T10): own GL batches + a 2D text layer sibling over the canvas.
+    this.overlays = new OverlayManager(this.ctx.gl, canvas);
 
     // Match the backing store to the CSS box, then paint the background once so
     // the pre-data canvas is the terminal near-black, not transparent garbage.
@@ -332,10 +346,39 @@ export class Renderer {
     );
     this.gesturesDispose();
     this.unsubscribeStream();
+    this.overlays.dispose();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
     this.ctx.gl.deleteTexture(this.lut);
+  }
+
+  // --- overlays (T10) -----------------------------------------------------------
+
+  /** Attach the App-owned price/time gutter canvases for axis drawing. */
+  attachOverlaySurfaces(
+    priceAxisCanvas: HTMLCanvasElement | null,
+    timeAxisCanvas: HTMLCanvasElement | null,
+  ): void {
+    this.overlays.attachAxes(priceAxisCanvas, timeAxisCanvas);
+    this.dirty = true;
+  }
+
+  /** Toggle which overlays render (App visibility state). */
+  setOverlayVisibility(v: Partial<OverlayVisibility>): void {
+    this.overlays.setVisibility(v);
+    this.dirty = true;
+  }
+
+  /** Which overlays are currently on (App reads this to seed its toggles). */
+  overlayVisibility(): OverlayVisibility {
+    return this.overlays.getVisibility();
+  }
+
+  /** Bubble draw threshold (min trade size), §9 settings. */
+  setBubbleMinSize(minSize: number): void {
+    this.overlays.setBubbleMinSize(minSize);
+    this.dirty = true;
   }
 
   // --- gesture control (input/gestures → Camera) --------------------------------
@@ -407,9 +450,39 @@ export class Renderer {
   // --- stream handling ----------------------------------------------------------
 
   private onMessage = (msg: StreamMsg): void => {
-    // Overlays (BarColumn / Trade / BBO / Marker) are T10 — ignore, never crash.
-    if (msg.type !== MsgType.DEPTH_COL) return;
-    this.onDepthColumn(msg);
+    if (msg.type === MsgType.DEPTH_COL) {
+      this.onDepthColumn(msg);
+      return;
+    }
+    // Overlays (T10): feed the overlay manager; a redraw is scheduled so the
+    // sprites/lines/glyphs update in lock-step with the heatmap. Cheap — the
+    // manager only stores into bounded rings/maps here (O(1)); drawing is
+    // O(visible) on the next dirty frame. Guarded so a single malformed overlay
+    // event can NEVER break the column stream / renderer (§8.3 lifecycle).
+    try {
+      switch (msg.type) {
+        case MsgType.TRADE:
+          this.overlays.onTrade(msg);
+          break;
+        case MsgType.BBO:
+          this.overlays.onBbo(msg);
+          break;
+        case MsgType.BAR_COL:
+          this.overlays.onBar(msg);
+          break;
+        case MsgType.MARKER:
+          this.overlays.onMarker(msg);
+          break;
+        default:
+          return;
+      }
+      this.dirty = true;
+    } catch (err) {
+      if (!this.overlayIngestWarned) {
+        this.overlayIngestWarned = true;
+        console.warn('[flowmap] overlay ingest error (suppressed; stream continues):', err);
+      }
+    }
   };
 
   private onDepthColumn(col: DepthColumn): void {
@@ -504,6 +577,15 @@ export class Renderer {
     this.normalizer.addColumn(col.col_seq, col.bid, col.ask);
 
     this.history?.noteColumn(col.col_seq, col.t0_ns);
+
+    // Overlays (T10): remember an absolute (col_seq → t0_ns) anchor for the
+    // ts_ns→column mapping (any resident column is a valid anchor within an
+    // epoch), and keep the per-window VWAP map bounded to the resident range.
+    this.overlayAnchorSeq = col.col_seq;
+    this.overlayAnchorT0Ns = col.t0_ns;
+    this.overlayAnchorEpoch = col.epoch;
+    const r = ring.residentRange();
+    if (r !== null) this.overlays.prune(r.oldest, r.newest);
   }
 
   private createRing(rows: number): void {
@@ -745,6 +827,60 @@ export class Renderer {
     };
   }
 
+  // --- overlay draw (T10) -------------------------------------------------------
+
+  /**
+   * Draw the overlays over the heatmap for the current view. All O(visible): each
+   * overlay emits geometry only for the columns/rows in the viewport. Returns
+   * early (no cost) when nothing can be placed — no epoch geometry yet, or every
+   * overlay is toggled off.
+   */
+  private drawOverlays(): void {
+    if (this.glLost()) return;
+    const overlays = this.overlays;
+    if (!overlays.anyVisible) return;
+    const price = this.overlayPriceMap();
+    const time = this.overlayTimeMap();
+    // Need at least a price affine (axes/BBO/profile) or a time affine (events);
+    // with neither there is nothing to map onto the camera.
+    if (price === null && time === null) return;
+
+    const gl = this.ctx.gl;
+    const range = this.ring?.residentRange() ?? null;
+    overlays.draw({
+      view: this.view,
+      dims: {
+        drawW: gl.drawingBufferWidth,
+        drawH: gl.drawingBufferHeight,
+        cssW: Math.max(1, this.canvas.clientWidth),
+        cssH: Math.max(1, this.canvas.clientHeight),
+      },
+      dpr: window.devicePixelRatio || 1,
+      resident: range ? { oldest: range.oldest, newest: range.newest } : null,
+      capability: this.store.getState().capability,
+      time,
+      price,
+      columnArrays: (col) => this.columnCache.arrays(col),
+      newestArrays: this.newestSeq >= 0 ? this.columnCache.arrays(this.newestSeq) : null,
+    });
+  }
+
+  /** Row→price affine for the current grid epoch, or null before any epoch. */
+  private overlayPriceMap(): PriceMap | null {
+    const st = this.store.getState();
+    const ep = st.gridEpoch !== null ? st.epochs.get(st.gridEpoch) : undefined;
+    if (ep === undefined) return null;
+    return { p0: ep.p0, step: ep.tick * ep.tick_multiple };
+  }
+
+  /** Column⇄time affine anchored on the newest written column, or null. */
+  private overlayTimeMap(): TimeMap | null {
+    if (this.overlayAnchorSeq < 0) return null;
+    const ep = this.store.getState().epochs.get(this.overlayAnchorEpoch);
+    const dtNs = ep?.dt_ns ?? this.currentDtNs();
+    return { anchorSeq: this.overlayAnchorSeq, anchorT0Ns: this.overlayAnchorT0Ns, dtNs };
+  }
+
   // --- context-loss lifecycle (§8.3) --------------------------------------------
 
   /** GL context lost: preventDefault so the browser will restore it, then stop
@@ -776,6 +912,9 @@ export class Renderer {
       preserveDrawingBuffer: true,
     });
     this.lut = createLUTTexture(this.ctx.gl);
+    // Overlay GL batches were invalidated by the loss — rebuild them (the 2D
+    // text layer + overlay data survive).
+    this.overlays.recreateGL(this.ctx.gl);
 
     const gl = this.ctx.gl;
     this.resize();
@@ -852,6 +991,22 @@ export class Renderer {
       this.dirty = false;
       this.drawCountN++;
       this.lastDrawEndTsN = performance.now();
+
+      // Overlays (T10) draw OVER the heatmap, O(visible). Skipped during a perf
+      // run (the measured drawMs is heatmap-only) and when there is no epoch to
+      // map events/prices onto (perf preload) — so the §10 gate is untouched. A
+      // throw here must never freeze the render loop (bookkeeping is already done
+      // above), but IS surfaced asynchronously so a real GL error still fails the
+      // §12 "no GL errors" gate.
+      if (perf === null) {
+        try {
+          this.drawOverlays();
+        } catch (err) {
+          setTimeout(() => {
+            throw err;
+          }, 0);
+        }
+      }
 
       // Keep redrawing until the viewport norm reaches its target so the contrast
       // glides into a new regime (~0.3 s) instead of snapping. O(tiles)/frame for
@@ -1120,6 +1275,156 @@ export class Renderer {
   /** The EMA-smoothed norm currently fed to u_norm (e2e diagnostics). */
   get currentNorm(): number {
     return this.normalizer.current;
+  }
+
+  // --- overlay e2e hooks (driven by tests/e2e/overlays.spec) ---------------------
+
+  /**
+   * Ingest a synthetic overlay stream message (Trade/BBO/BarColumn/Marker) through
+   * the real live path so the overlays populate exactly as from the socket. e2e
+   * only — the spec builds the messages (with BigInt fields) in-page.
+   */
+  ingestForTest(msg: StreamMsg): void {
+    this.onMessage(msg);
+  }
+
+  /**
+   * Forward-map an overlay event `(ts_ns, price)` to canvas CSS px through the
+   * SAME transform the overlays use (bubble/marker center), so the spec can
+   * pixel-sample where a glyph must land. Null before any epoch/column.
+   */
+  overlayPointCss(tsNs: bigint, price: number): { x: number; y: number } | null {
+    const priceMap = this.overlayPriceMap();
+    const time = this.overlayTimeMap();
+    if (priceMap === null || time === null) return null;
+    const cssW = Math.max(1, this.canvas.clientWidth);
+    const cssH = Math.max(1, this.canvas.clientHeight);
+    const colf = time.anchorSeq + Number(tsNs - time.anchorT0Ns) / time.dtNs + 0.5;
+    const rowf = (price - priceMap.p0) / priceMap.step + 0.5;
+    const uvX = (colf - this.view.colOffset) / this.view.colScale;
+    const uvY = (rowf - this.view.rowOffset) / this.view.rowScale;
+    return { x: uvX * cssW, y: (1 - uvY) * cssH };
+  }
+
+  /** Overlay data counts + last profile result. e2e diagnostics. */
+  overlayDebugForTest(): ReturnType<OverlayManager['debug']> {
+    return this.overlays.debug();
+  }
+
+  /** Canvas CSS px y of a price row edge (for BBO / axis line sampling). e2e. */
+  overlayRowCss(rowf: number): number {
+    const cssH = Math.max(1, this.canvas.clientHeight);
+    const uvY = (rowf - this.view.rowOffset) / this.view.rowScale;
+    return (1 - uvY) * cssH;
+  }
+
+  /**
+   * Preload a deterministic overlay scenario (network bypassed): a fresh ring of
+   * depth columns with a persistent wall band + ladder (through the REAL
+   * writeColumn path, so the column cache + time anchor populate as live), framed
+   * to a recent window. The spec then publishes the epoch + capability to the
+   * store and injects known Trade/BBO/BarColumn/Marker events via ingestForTest.
+   * Returns plain numbers only (no BigInt — page.evaluate serializes to JSON).
+   */
+  preloadOverlayScenario(): {
+    rows: number;
+    epoch: number;
+    params: { epoch: number; tick: number; tick_multiple: number; dt_ns: number; p0: number; rows: number };
+    dtNs: number;
+    p0: number;
+    step: number;
+    anchorSeq: number;
+    anchorT0NsNum: number;
+    oldest: number;
+    newest: number;
+    centerRow: number;
+    view: { colOffset: number; colScale: number; rowOffset: number; rowScale: number };
+    capacityCols: number;
+  } {
+    const rows = 256;
+    const tick = 0.5;
+    const tickMultiple = 1;
+    const dtNs = 25_000_000;
+    const p0 = 50;
+    const centerRow = 100; // price 100.0 at step 0.5 → row (100-50)/0.5
+    const total = 400;
+
+    this.mips?.dispose();
+    this.heatmap?.dispose();
+    this.ring?.dispose();
+    this.mips = null;
+    this.heatmap = null;
+    this.ring = null;
+    this.history = null;
+    this.normalizer.reset();
+    this.columnCache.reset();
+    this.overlays.reset();
+    this.normSeeded = false;
+
+    const wantLayers = Math.ceil(total / COLS_PER_TILE);
+    const layers = clamp(wantLayers, 2, this.ctx.caps.maxArrayTextureLayers);
+    const ring = new TileRing(this.ctx.gl, rows, layers);
+    this.ring = ring;
+    this.heatmap = new Heatmap(this.ctx, ring, this.lut);
+    this.mips = this.createMips(rows, layers);
+    this.heatmap.mips = this.mips;
+    const cap = ring.capacityCols;
+    this.extentLo = new Int32Array(cap).fill(-1);
+    this.extentHi = new Int32Array(cap).fill(-1);
+    this.decodeScale = 1;
+    this.ramp = RAMP_THERMAL;
+    this.camera.setLimits(limitsFor(rows, cap));
+
+    for (let s = 0; s < total; s++) {
+      const bid = new Float32Array(rows);
+      const ask = new Float32Array(rows);
+      for (let r = 0; r < rows; r++) {
+        const d = Math.abs(r - centerRow);
+        let v = 0;
+        if (d <= 2) v = 6; // persistent wall band around the mid
+        else if (d <= 24) v = 1.2 * (1 - d / 24); // ladder falloff
+        if (v > 0) {
+          if (r <= centerRow) bid[r] = v;
+          else ask[r] = v;
+        }
+      }
+      const col: DepthColumn = {
+        type: MsgType.DEPTH_COL,
+        epoch: 0,
+        col_seq: s,
+        t0_ns: BigInt(s) * BigInt(dtNs),
+        mode: MODE_L2,
+        final: true,
+        bid,
+        ask,
+      };
+      this.writeColumn(col, rows);
+    }
+    this.newestSeq = total - 1;
+    this.heatmap.encoding = { decodeScale: 1, norm: 30, ramp: RAMP_THERMAL };
+
+    // Frame the recent ~200 columns and a price band around the mid.
+    const colScale = 200;
+    const colOffset = total - colScale;
+    const rowScale = 120;
+    const rowOffset = centerRow - 60;
+    this.setViewForTest(colOffset, colScale, rowOffset, rowScale);
+
+    return {
+      rows,
+      epoch: 0,
+      params: { epoch: 0, tick, tick_multiple: tickMultiple, dt_ns: dtNs, p0, rows },
+      dtNs,
+      p0,
+      step: tick * tickMultiple,
+      anchorSeq: this.overlayAnchorSeq,
+      anchorT0NsNum: Number(this.overlayAnchorT0Ns),
+      oldest: 0,
+      newest: total - 1,
+      centerRow,
+      view: { colOffset, colScale, rowOffset, rowScale },
+      capacityCols: cap,
+    };
   }
 
   /** Run a scripted continuous PAN for `durationMs`; resolves with frame timing. */

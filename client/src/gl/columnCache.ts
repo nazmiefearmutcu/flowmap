@@ -72,6 +72,17 @@ export class ColumnCache {
     return this.map.has(colSeq);
   }
 
+  /**
+   * Read-only view of a cached column's exact `bid`/`ask` density arrays (the
+   * volume profile sums these), or null when the column is not cached. Does NOT
+   * touch LRU order (a bulk profile sweep must not reorder the crosshair cache).
+   * Callers must treat the returned arrays as immutable.
+   */
+  arrays(colSeq: number): { bid: Float32Array; ask: Float32Array | null } | null {
+    const e = this.map.get(colSeq);
+    return e === undefined ? null : { bid: e.bid, ask: e.ask };
+  }
+
   /** The nanosecond start time of a cached column, or null if absent. */
   timeAt(colSeq: number): bigint | null {
     return this.map.get(colSeq)?.t0_ns ?? null;

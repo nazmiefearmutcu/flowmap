@@ -1,16 +1,21 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { Renderer } from './gl/renderer';
+import { DEFAULT_OVERLAY_VISIBILITY, type OverlayVisibility } from './gl/overlays/frame';
 import { Crosshair } from './ui/Crosshair';
+import { OverlayToggles } from './ui/OverlayToggles';
+import { PriceAxis } from './ui/PriceAxis';
+import { TimeAxis } from './ui/TimeAxis';
 import { useFlowMapStore } from './state/store';
 
 /**
- * M2 T5 shell: a minimal trading-terminal top bar over the full-viewport GL
- * canvas, plus the live wiring. On mount the {@link Renderer} takes the canvas,
- * subscribes to the store's column stream and auto-follows the right edge, while
- * the store opens the WebSocket to the sim feed. The full UI shell (symbol
- * search, timeline, panels) is T12 — here the bar only surfaces the connection
- * status and the feed capability so the live state is legible.
+ * M2 shell: a minimal trading-terminal top bar over the full-viewport GL canvas
+ * with the price axis (right) + time axis (bottom) gutters (§9), the overlay
+ * toggles, and the live wiring. On mount the {@link Renderer} takes the canvas,
+ * subscribes to the store's column stream and auto-follows the right edge; it also
+ * draws the overlays (trade bubbles, BBO, VWAP, volume profile, markers) over the
+ * heatmap and the axis ticks into the two gutter canvases. The full UI shell
+ * (symbol search, timeline, DOM/tape panels) is T11/T12.
  */
 
 const SIM_MARKET = 'sim';
@@ -39,6 +44,8 @@ function capabilityBadges(capability: Record<string, unknown> | null): string[] 
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const priceAxisRef = useRef<HTMLCanvasElement>(null);
+  const timeAxisRef = useRef<HTMLCanvasElement>(null);
   // Held so the Crosshair overlay can call renderer.probeAt (null in the
   // ?test=heatmap hook mode, which owns the canvas itself).
   const rendererRef = useRef<Renderer | null>(null);
@@ -46,6 +53,7 @@ export function App() {
   const feedState = useFlowMapStore((s) => s.feedState);
   const capability = useFlowMapStore((s) => s.capability);
   const subscription = useFlowMapStore((s) => s.subscription);
+  const [overlays, setOverlays] = useState<OverlayVisibility>(DEFAULT_OVERLAY_VISIBILITY);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -70,9 +78,12 @@ export function App() {
     const perfMode = params.get('perf') === '1';
 
     // Normalization e2e (T9): like perf — no live feed — the spec preloads two
-    // fixed density regions + a known wall via preloadNormalizeScenario and drives
-    // the real normalizer + crosshair.
+    // fixed density regions + a known wall via preloadNormalizeScenario.
     const normalizeMode = params.get('normalize') === '1';
+
+    // Overlays e2e (T10): no live feed — the spec preloads a depth scenario via
+    // preloadOverlayScenario and injects Trade/BBO/BarColumn/Marker via ingestForTest.
+    const overlaysMode = params.get('overlays') === '1';
 
     // Scroll-back e2e (T8): a small full-res budget so the live sim overruns it
     // quickly and panning left exercises the HistoryRequest backfill path.
@@ -84,12 +95,14 @@ export function App() {
 
     const renderer = new Renderer(canvas, useFlowMapStore, rendererOpts);
     rendererRef.current = renderer;
-    if (!perfMode && !normalizeMode) {
+    renderer.attachOverlaySurfaces(priceAxisRef.current, timeAxisRef.current);
+    renderer.setOverlayVisibility(DEFAULT_OVERLAY_VISIBILITY);
+    if (!perfMode && !normalizeMode && !overlaysMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
     }
 
-    // Read-only diagnostics handle for the live-sim / perf / scroll-back / T9 e2e.
-    if (import.meta.env.DEV || perfMode || scrollbackMode || normalizeMode) {
+    // Read-only diagnostics handle for the live-sim / perf / scroll-back / T9 / T10 e2e.
+    if (import.meta.env.DEV || perfMode || scrollbackMode || normalizeMode || overlaysMode) {
       (window as unknown as { __flowmapLive: unknown }).__flowmapLive = {
         renderer,
         store: useFlowMapStore,
@@ -106,6 +119,14 @@ export function App() {
     };
   }, []);
 
+  const toggleOverlay = (key: keyof OverlayVisibility): void => {
+    setOverlays((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      rendererRef.current?.setOverlayVisibility({ [key]: next[key] });
+      return next;
+    });
+  };
+
   const statusText = STATUS_LABEL[status] ?? status;
   const badges = capabilityBadges(capability);
   const symbolText = subscription ? `${subscription.market}:${subscription.symbol}` : SIM_SYMBOL;
@@ -120,6 +141,7 @@ export function App() {
           {statusText}
           {feedState && feedState !== 'live' ? ` · ${feedState}` : ''}
         </span>
+        <OverlayToggles visibility={overlays} onToggle={toggleOverlay} />
         <span className="topbar__badges">
           {badges.map((b) => (
             <span key={b} className="topbar__badge">
@@ -129,8 +151,13 @@ export function App() {
         </span>
       </header>
       <div className="stage">
-        <canvas id="gl" ref={canvasRef} className="gl-canvas" />
-        <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+        <div className="stage__viewport">
+          <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+          <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+        </div>
+        <PriceAxis canvasRef={priceAxisRef} />
+        <TimeAxis canvasRef={timeAxisRef} />
+        <div className="stage__corner" aria-hidden="true" />
       </div>
     </div>
   );
