@@ -120,6 +120,14 @@ body,
   border-radius: 3px;
 }
 
+/* Row: heatmap stage (dominant, flexes) + collapsible right rail (fixed width). */
+.workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
 /* Grid: heatmap viewport (dominant) + price axis gutter (right) + time axis
    gutter (bottom) + a small corner. The gutters share the viewport's height /
    width so axis ticks stay pixel-aligned to the heatmap under pan/zoom (T10). */
@@ -127,6 +135,7 @@ body,
   --price-axis-w: 62px;
   --time-axis-h: 22px;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-columns: 1fr var(--price-axis-w);
@@ -215,4 +224,309 @@ body,
   color: var(--fg);
   border-color: var(--accent);
   background: #10201d;
+}
+
+/* --- right rail (DOM ladder + tape), §9 T11 ---------------------------------- */
+
+:root {
+  --rail-w: 250px;
+  --sell: #d3524f;
+  --bid-bar: rgba(31, 182, 166, 0.28);
+  --ask-bar: rgba(211, 82, 79, 0.28);
+}
+
+.topbar__rail-toggle {
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  padding: 2px 8px;
+  background: #0f131b;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.topbar__rail-toggle.is-on {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: #10201d;
+}
+
+.right-rail {
+  flex: 0 0 var(--rail-w);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-bar);
+  overflow: hidden;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Ladder and tape split the rail; each fills its share, the tape scrolls. */
+.dom-ladder {
+  flex: 1 1 45%;
+  min-height: 150px;
+}
+
+.tape {
+  flex: 1 1 55%;
+  min-height: 140px;
+  border-bottom: none;
+}
+
+.panel__header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px;
+  background: #0d1119;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.panel__collapse {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--fg);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.panel__chevron {
+  color: var(--fg-dim);
+  font-size: 9px;
+  width: 9px;
+}
+
+.panel__title {
+  font-weight: 600;
+}
+
+.panel__badge {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  padding: 1px 5px;
+  background: #0f131b;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+
+.panel__badge--l2 {
+  color: var(--accent);
+  border-color: #1c3b37;
+}
+
+.panel__badge--na {
+  color: var(--sell);
+  border-color: #3b1f1f;
+}
+
+.panel__lock {
+  margin-left: auto;
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  padding: 2px 6px;
+  background: #0f131b;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.panel__lock.is-on {
+  color: #d6a13a;
+  border-color: #3a3016;
+}
+
+.panel__empty {
+  padding: 10px 8px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+}
+
+/* --- DOM ladder rows --------------------------------------------------------- */
+
+.ladder__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ladder__row {
+  display: grid;
+  grid-template-columns: 1fr 58px 1fr;
+  align-items: stretch;
+  height: 17px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid rgba(26, 31, 43, 0.5);
+}
+
+.ladder__cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.ladder__cell--bid {
+  justify-content: flex-end;
+  padding-right: 6px;
+}
+
+.ladder__cell--ask {
+  justify-content: flex-start;
+  padding-left: 6px;
+}
+
+.ladder__bar {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  z-index: 0;
+}
+
+.ladder__bar--bid {
+  right: 0;
+  background: var(--bid-bar);
+}
+
+.ladder__bar--ask {
+  left: 0;
+  background: var(--ask-bar);
+}
+
+.ladder__bar--profile {
+  left: 0;
+  background: rgba(120, 130, 220, 0.3);
+}
+
+.ladder__sz {
+  position: relative;
+  z-index: 1;
+  color: var(--fg);
+}
+
+.ladder__cell--bid .ladder__sz {
+  color: var(--accent);
+}
+
+.ladder__cell--ask .ladder__sz {
+  color: var(--sell);
+}
+
+.ladder__px {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-dim);
+  background: #0c1017;
+  border-left: 1px solid rgba(26, 31, 43, 0.6);
+  border-right: 1px solid rgba(26, 31, 43, 0.6);
+}
+
+.ladder__profile {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding-left: 6px;
+  overflow: hidden;
+}
+
+.ladder__profile .ladder__sz {
+  color: var(--fg);
+}
+
+.ladder__row.is-bestbid {
+  background: rgba(31, 182, 166, 0.08);
+}
+
+.ladder__row.is-bestbid .ladder__px {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ladder__row.is-bestask {
+  background: rgba(211, 82, 79, 0.08);
+}
+
+.ladder__row.is-bestask .ladder__px {
+  color: var(--sell);
+  font-weight: 600;
+}
+
+/* --- time & sales tape ------------------------------------------------------- */
+
+.tape__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.tape__row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  height: 16px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  border-bottom: 1px solid rgba(26, 31, 43, 0.35);
+}
+
+.tape__time {
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.tape__row--buy .tape__px,
+.tape__row--buy .tape__sz {
+  color: var(--accent);
+}
+
+.tape__row--sell .tape__px,
+.tape__row--sell .tape__sz {
+  color: var(--sell);
+}
+
+.tape__row--unknown .tape__px,
+.tape__row--unknown .tape__sz {
+  color: var(--fg-dim);
+}
+
+.tape__row.is-large {
+  font-weight: 700;
+}
+
+.tape__row--buy.is-large {
+  background: rgba(31, 182, 166, 0.12);
+}
+
+.tape__row--sell.is-large {
+  background: rgba(211, 82, 79, 0.12);
 }

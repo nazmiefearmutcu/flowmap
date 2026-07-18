@@ -3,9 +3,12 @@ import { useEffect, useRef, useState } from 'react';
 import { Renderer } from './gl/renderer';
 import { DEFAULT_OVERLAY_VISIBILITY, type OverlayVisibility } from './gl/overlays/frame';
 import { Crosshair } from './ui/Crosshair';
+import { DomLadder } from './ui/DomLadder';
 import { OverlayToggles } from './ui/OverlayToggles';
 import { PriceAxis } from './ui/PriceAxis';
+import { Tape } from './ui/Tape';
 import { TimeAxis } from './ui/TimeAxis';
+import { bookStore } from './state/bookStore';
 import { useFlowMapStore } from './state/store';
 
 /**
@@ -54,6 +57,7 @@ export function App() {
   const capability = useFlowMapStore((s) => s.capability);
   const subscription = useFlowMapStore((s) => s.subscription);
   const [overlays, setOverlays] = useState<OverlayVisibility>(DEFAULT_OVERLAY_VISIBILITY);
+  const [railVisible, setRailVisible] = useState(true);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -85,6 +89,11 @@ export function App() {
     // preloadOverlayScenario and injects Trade/BBO/BarColumn/Marker via ingestForTest.
     const overlaysMode = params.get('overlays') === '1';
 
+    // Panels e2e (T11): no live feed — the spec injects known DepthColumn/BBO/Trade
+    // straight into the bookStore (bypassing the socket) and asserts the ladder/tape
+    // DOM, so a competing live sim stream must NOT also fill the buffer.
+    const panelsMode = params.get('panels') === '1';
+
     // Scroll-back e2e (T8): a small full-res budget so the live sim overruns it
     // quickly and panning left exercises the HistoryRequest backfill path.
     const scrollbackMode = params.get('scrollback') === '1';
@@ -97,15 +106,23 @@ export function App() {
     rendererRef.current = renderer;
     renderer.attachOverlaySurfaces(priceAxisRef.current, timeAxisRef.current);
     renderer.setOverlayVisibility(DEFAULT_OVERLAY_VISIBILITY);
-    if (!perfMode && !normalizeMode && !overlaysMode) {
+    if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
     }
 
-    // Read-only diagnostics handle for the live-sim / perf / scroll-back / T9 / T10 e2e.
-    if (import.meta.env.DEV || perfMode || scrollbackMode || normalizeMode || overlaysMode) {
+    // Read-only diagnostics handle for the live-sim / perf / scroll-back / T9 / T10 / T11 e2e.
+    if (
+      import.meta.env.DEV ||
+      perfMode ||
+      scrollbackMode ||
+      normalizeMode ||
+      overlaysMode ||
+      panelsMode
+    ) {
       (window as unknown as { __flowmapLive: unknown }).__flowmapLive = {
         renderer,
         store: useFlowMapStore,
+        bookStore,
       };
     }
 
@@ -148,16 +165,33 @@ export function App() {
               {b}
             </span>
           ))}
+          <button
+            type="button"
+            className={`topbar__rail-toggle${railVisible ? ' is-on' : ''}`}
+            aria-pressed={railVisible}
+            onClick={() => setRailVisible((v) => !v)}
+            data-testid="rail-toggle"
+          >
+            Rail
+          </button>
         </span>
       </header>
-      <div className="stage">
-        <div className="stage__viewport">
-          <canvas id="gl" ref={canvasRef} className="gl-canvas" />
-          <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+      <div className="workspace">
+        <div className="stage">
+          <div className="stage__viewport">
+            <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+            <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+          </div>
+          <PriceAxis canvasRef={priceAxisRef} />
+          <TimeAxis canvasRef={timeAxisRef} />
+          <div className="stage__corner" aria-hidden="true" />
         </div>
-        <PriceAxis canvasRef={priceAxisRef} />
-        <TimeAxis canvasRef={timeAxisRef} />
-        <div className="stage__corner" aria-hidden="true" />
+        {railVisible && (
+          <aside className="right-rail" data-testid="right-rail">
+            <DomLadder />
+            <Tape />
+          </aside>
+        )}
       </div>
     </div>
   );
