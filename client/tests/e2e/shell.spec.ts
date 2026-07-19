@@ -147,11 +147,16 @@ test('replay toggle + transport send the correct control messages', async ({ pag
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
 
+  // The scrub → Seek path is trailing-throttled (~120 ms), so poll until the
+  // Seek control lands instead of reading the log synchronously.
+  await expect
+    .poll(async () => (await controls(page)).map((c) => c.type))
+    .toContain(SEEK);
+
   const log = await controls(page);
   const types = log.map((c) => c.type);
   expect(types).toContain(PAUSE);
   expect(types).toContain(RESUME);
-  expect(types).toContain(SEEK);
   const setSpeed = log.find((c) => c.type === SET_SPEED);
   expect(setSpeed?.x).toBe(5);
   // The Seek carries a bigint ns (serialized to a string by the tap).
