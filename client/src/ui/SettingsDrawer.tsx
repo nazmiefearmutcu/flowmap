@@ -108,6 +108,29 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             Display
           </span>
 
+          {/* heatmap contrast (drives the perceptual display gamma; live) */}
+          <div className="setting">
+            <span className="setting__label">
+              Contrast
+              <span className="setting__value">{settings.contrast}</span>
+            </span>
+            <input
+              type="range"
+              className="range"
+              min={0}
+              max={100}
+              step={1}
+              value={settings.contrast}
+              aria-label="Heatmap contrast"
+              aria-valuetext={`${settings.contrast}`}
+              data-testid="setting-contrast"
+              onChange={(e) => onChange({ contrast: Number(e.target.value) })}
+            />
+            <span className="setting__hint">
+              Lifts the mid-density field vs. the brightest walls — higher is punchier.
+            </span>
+          </div>
+
           {/* colormap */}
           <div className="setting">
             <span className="setting__label">Colormap</span>

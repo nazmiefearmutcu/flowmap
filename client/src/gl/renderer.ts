@@ -36,7 +36,7 @@
  */
 
 import { COLS_PER_TILE, TileRing } from './tileRing';
-import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
+import { DEFAULT_DISPLAY_GAMMA, Heatmap, selectLevel, type HeatmapView } from './heatmap';
 import { createLUTTexture, rampForMode, RAMP_THERMAL } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
@@ -160,6 +160,9 @@ export class Renderer {
   // Created lazily on the first column, once the row count is known.
   private ring: TileRing | null = null;
   private heatmap: Heatmap | null = null;
+  /** Display gamma (Contrast setting) — kept here so it survives heatmap
+   *  re-creation on session reset and is re-applied to each new Heatmap. */
+  private contrastGamma = DEFAULT_DISPLAY_GAMMA;
   /** SUM-mip chain for correct zoom-out (T7). null when float FBOs are absent. */
   private mips: MipChain | null = null;
   /** Per-slot non-zero row extent (lo/hi), -1 = empty. Sized to ring capacity. */
@@ -390,6 +393,14 @@ export class Renderer {
   /** Bubble draw threshold (min trade size), §9 settings. */
   setBubbleMinSize(minSize: number): void {
     this.overlays.setBubbleMinSize(minSize);
+    this.dirty = true;
+  }
+
+  /** Heatmap display gamma (§8.3 Contrast setting). Applied live + remembered
+   *  so a session reset's fresh Heatmap inherits it. */
+  setContrast(gamma: number): void {
+    this.contrastGamma = gamma;
+    if (this.heatmap) this.heatmap.gamma = gamma;
     this.dirty = true;
   }
 
@@ -734,6 +745,7 @@ export class Renderer {
     this.ringLayers = layers;
     this.ring = new TileRing(this.ctx.gl, rows, layers);
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+    this.heatmap.gamma = this.contrastGamma;
     this.mips?.dispose();
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
@@ -1059,6 +1071,7 @@ export class Renderer {
       this.heatmap = null;
       this.ring = new TileRing(gl, this.ringRows, this.ringLayers);
       this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+    this.heatmap.gamma = this.contrastGamma;
       this.mips = this.createMips(this.ringRows, this.ringLayers);
       this.heatmap.mips = this.mips;
       const cap = this.ring.capacityCols;

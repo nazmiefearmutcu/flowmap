@@ -46,6 +46,21 @@ const MIP2_UNIT = 3;
  */
 export const DEFAULT_DISPLAY_GAMMA = 0.45;
 
+/**
+ * Map a 0–100 "Contrast" slider to a display gamma. HIGHER contrast → HIGHER
+ * gamma → a darker mid-field with punchier walls (more separation); LOWER
+ * contrast → lower gamma → the field is lifted flat/bright (washed, less
+ * separation). The default ({@link DEFAULT_CONTRAST}) lands on
+ * {@link DEFAULT_DISPLAY_GAMMA}. Clamped to the legible band [0.28, 0.72].
+ */
+export function gammaForContrast(contrast: number): number {
+  const c = Math.min(100, Math.max(0, contrast));
+  return 0.28 + (c / 100) * 0.44;
+}
+
+/** Slider position (0–100) whose gamma equals the default — the reset point. */
+export const DEFAULT_CONTRAST = 40;
+
 /** The mip level + tap geometry to sample this frame (see {@link selectLevel}). */
 interface LevelSel {
   level: number;

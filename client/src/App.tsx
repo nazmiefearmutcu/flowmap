@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
 import { attachGlobalKeys } from './input/keys';
 import { decodeFrame } from './proto/decode';
@@ -139,6 +140,7 @@ export function App() {
     // Apply persisted, live-honourable settings at boot.
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
+    renderer.setContrast(gammaForContrast(settingsRef.current.contrast));
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
@@ -177,6 +179,7 @@ export function App() {
     if (r) {
       r.setOverlayVisibility(settings.overlays); // idempotent
       r.setBubbleMinSize(settings.bubbleMinSize); // idempotent
+      r.setContrast(gammaForContrast(settings.contrast)); // idempotent
       // Follow is edge-triggered so it never fights a manual F / Space toggle.
       if (settings.follow !== prevSettingsRef.current.follow) {
         if (settings.follow && !r.following) r.goLive();
