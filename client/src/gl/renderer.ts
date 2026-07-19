@@ -404,6 +404,13 @@ export class Renderer {
     this.dirty = true;
   }
 
+  /** Viewport-normalization percentile (§8.3 white-point / Saturation setting).
+   *  The normalizer reads it fresh each frame, so this takes effect next draw. */
+  setNormPercentile(percentile: number): void {
+    this.normalizer.percentile = Math.min(100, Math.max(50, percentile));
+    this.dirty = true;
+  }
+
   /**
    * Read-only timeline geometry for the minimap + replay seek (§9, T12): the
    * resident column extent, the current visible window in absolute columns, and

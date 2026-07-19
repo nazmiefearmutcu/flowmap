@@ -142,6 +142,7 @@ export function App() {
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
     renderer.setContrast(gammaForContrast(settingsRef.current.contrast));
+    renderer.setNormPercentile(settingsRef.current.normPercentile);
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
@@ -181,6 +182,7 @@ export function App() {
       r.setOverlayVisibility(settings.overlays); // idempotent
       r.setBubbleMinSize(settings.bubbleMinSize); // idempotent
       r.setContrast(gammaForContrast(settings.contrast)); // idempotent
+      r.setNormPercentile(settings.normPercentile); // idempotent
       // Follow is edge-triggered so it never fights a manual F / Space toggle.
       if (settings.follow !== prevSettingsRef.current.follow) {
         if (settings.follow && !r.following) r.goLive();

@@ -115,7 +115,9 @@ export function normMipScale(level: number): number {
 
 export class ViewportNormalizer {
   readonly bins: number;
-  readonly percentile: number;
+  /** Target percentile (§8.3 white-point). Mutable — the Settings "Saturation"
+   *  control retunes it live; it is read fresh off the CDF every frame. */
+  percentile: number;
   readonly colsPerTile: number;
   readonly floor: number;
   readonly alpha: number;
