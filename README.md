@@ -20,10 +20,12 @@ stockodile for US equities) behind one market-agnostic renderer.
   walls don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
   event markers, crosshair with exact liquidity readout, deep scroll-back, replay transport.
 - **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities
-  show what their free data actually supports — a keyless volume-at-price SYNTH profile (Yahoo 1 m
-  bars) that upgrades to Alpaca IEX L1 with zero code change when `ALPACA_API_KEY`/`SECRET` are
-  set. Capability badges (`L2` / `L1` / `SYNTH`, `TAPE TICK` / `TAPE POLL`, `SIDE EXCHANGE` /
-  `SIDE NA`) are always honest — no fabricated depth.
+  show what their free data actually supports — a keyless **two-sided** volume-at-price SYNTH depth
+  (Yahoo 1 m bars, bid below / ask above a reference price that tracks the market) that upgrades to
+  real Alpaca IEX L1 top-of-book with zero code change when `ALPACA_API_KEY`/`SECRET` are set.
+  Synthetic depth renders in a distinct amber ramp and carries a `SYNTH` badge — capability badges
+  (`L2` / `L1` / `SYNTH`, `TAPE TICK` / `TAPE POLL`, `SIDE EXCHANGE` / `SIDE NA`) are always honest,
+  no fabricated depth.
 
 ## Architecture
 
@@ -42,7 +44,7 @@ verification record (live Binance + live equity evidence, perf gates, parity mat
 
 ## Install (macOS)
 
-Download **`FlowMap_1.0.0_aarch64.dmg`** from the
+Download **`FlowMap_1.1.0_aarch64.dmg`** from the
 [latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest), open it, and drag
 **FlowMap.app** to Applications. The app is fully self-contained — it bundles the client and the
 Python server, so there is nothing else to install (no Python, no Node).
@@ -73,8 +75,8 @@ cd client && npm install && npm run dev
 ```
 
 In the top-bar symbol search: pick `SIM-DEMO` (deterministic demo feed), a crypto pair
-(`BTCUSDT` → live Binance), or a US ticker (`AAPL` → keyless SYNTH profile; live tick during
-market hours with Alpaca keys).
+(`BTCUSDT` → live Binance), or a US ticker (`AAPL` → keyless two-sided SYNTH depth; real Alpaca L1
+top-of-book + live tick during market hours with Alpaca keys).
 
 **Optional live tiers** (auto-detected from the environment):
 `ALPACA_API_KEY` + `ALPACA_API_SECRET` → equity L1 tick tape + quotes; `FINNHUB_API_KEY` → equity
