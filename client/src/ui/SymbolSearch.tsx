@@ -24,6 +24,7 @@ import {
 
 import { apiBase } from '../net/serverBase';
 import {
+  capabilityChipClass,
   capabilityChips,
   filterSymbols,
   flattenGroups,
@@ -105,20 +106,34 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     );
 
     const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>): void => {
+      const last = flat.length - 1;
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setOpen(true);
-        setActive((i) => Math.min(flat.length - 1, i + 1));
+        if (flat.length > 0) setActive((i) => (i >= last ? 0 : i + 1));
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setActive((i) => Math.max(0, i - 1));
+        setOpen(true);
+        if (flat.length > 0) setActive((i) => (i <= 0 ? last : i - 1));
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        setActive(0);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        if (flat.length > 0) setActive(last);
       } else if (e.key === 'Enter') {
         e.preventDefault();
         commit(flat[active]);
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        setOpen(false);
-        inputRef.current?.blur();
+        // First press closes/clears while keeping focus; blur only once the menu
+        // is already closed and the query is empty.
+        if (open || query !== '') {
+          setOpen(false);
+          setQuery('');
+        } else {
+          inputRef.current?.blur();
+        }
       }
     };
 
@@ -126,6 +141,20 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     useEffect(() => {
       setActive((i) => (i >= flat.length ? Math.max(0, flat.length - 1) : i));
     }, [flat.length]);
+
+    // Reset to the top match whenever the query changes, so Enter commits the
+    // first result (the hover path still clamps via the effect above).
+    useEffect(() => {
+      setActive(0);
+    }, [query]);
+
+    // Scroll the keyboard-highlighted option into view so arrowing past the fold
+    // never hides the highlight (and never commits an off-screen row).
+    useEffect(() => {
+      if (!open) return;
+      const el = rootRef.current?.querySelector(`#symopt-${active}`);
+      el?.scrollIntoView({ block: 'nearest' });
+    }, [active, open]);
 
     let flatIndex = -1; // running index across groups → maps rows to `active`
 
@@ -151,15 +180,42 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
             onFocus={() => setOpen(true)}
             onKeyDown={onKeyDown}
             aria-label="symbol search"
+            role="combobox"
+            aria-autocomplete="list"
             aria-expanded={open}
+            aria-controls="symsearch-listbox"
+            aria-activedescendant={open && flat.length > 0 ? `symopt-${active}` : undefined}
           />
-          <span className="symsearch__kbd" aria-hidden="true">
-            /
-          </span>
+          {query !== '' ? (
+            <button
+              type="button"
+              className="symsearch__kbd symsearch__clear"
+              aria-label="clear symbol search"
+              data-testid="symbol-search-clear"
+              onMouseDown={(e) => {
+                // mousedown + preventDefault so the input keeps focus.
+                e.preventDefault();
+                setQuery('');
+                inputRef.current?.focus();
+              }}
+            >
+              ×
+            </button>
+          ) : (
+            <span className="symsearch__kbd" aria-hidden="true">
+              /
+            </span>
+          )}
         </div>
 
         {open && (
-          <div className="symsearch__pop" data-testid="symbol-search-pop" role="listbox">
+          <div
+            className="symsearch__pop"
+            data-testid="symbol-search-pop"
+            id="symsearch-listbox"
+            role="listbox"
+            aria-label="symbol results"
+          >
             {flat.length === 0 ? (
               <div className="symsearch__empty">no symbols match “{query}”</div>
             ) : (
@@ -172,6 +228,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                     return (
                       <div
                         key={`${entry.market}:${entry.symbol}`}
+                        id={`symopt-${idx}`}
                         className={`symrow${idx === active ? ' is-active' : ''}`}
                         role="option"
                         aria-selected={idx === active}
@@ -189,7 +246,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                         <span className="symrow__sym">{entry.symbol}</span>
                         <span className="symrow__caps">
                           {capabilityChips(entry.capability).map((c) => (
-                            <span key={c} className="cap">
+                            <span key={c} className={capabilityChipClass(c)}>
                               {c}
                             </span>
                           ))}

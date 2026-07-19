@@ -60,6 +60,13 @@ uniform int u_residentNewest;
 // then divided by the normalization percentile to land in ~[0,1].
 uniform float u_decodeScale;
 uniform float u_norm;
+// Perceptual display curve (§8.3). Order-flow density is heavy-tailed, so a
+// LINEAR map against the p99 white-point crushes ~99% of levels into the near-
+// black floor and the field reads as black-with-walls. u_gamma < 1 (≈0.45)
+// raises the mids while fixing the black + white endpoints (pow(0)=0, pow(1)=1),
+// so the continuous thermal field becomes legible. One ALU op, uniform-only —
+// no per-column CPU cost, the O(1)-in-history invariant is untouched.
+uniform float u_gamma;
 
 // Colormap row: 0 = thermal, 1 = synth (amber).
 uniform int u_ramp;
@@ -126,6 +133,8 @@ void main() {
   // histogram percentile).
   float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
+  // Perceptual display curve: brighten the mid-field, keep black + white fixed.
+  t = pow(t, u_gamma);
 
   int li = int(t * 255.0 + 0.5);
   fragColor = texelFetch(u_lut, ivec2(li, u_ramp), 0);

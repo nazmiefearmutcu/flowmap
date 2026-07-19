@@ -123,7 +123,10 @@ export class Markers {
         const color = code === KIND_CODE.liquidation ? OVERLAY.liquidation.css : OVERLAY.event.css;
         pending.push({
           cssX: gm.cssX(colf) + this.opts.glyphPx + 2,
-          cssY: gm.cssY(hasPrice ? gm.priceToRow(p) + 0.5 : 0) + 3,
+          // Match the glyph's near-top position when there is no price (glyph
+          // draws at clip y 0.94); otherwise cssY(0) maps to grid row 0 (bottom)
+          // and the label lands off-canvas.
+          cssY: hasPrice ? gm.cssY(gm.priceToRow(p) + 0.5) + 3 : 12,
           label: CODE_LABEL[code],
           color,
         });

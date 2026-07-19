@@ -58,11 +58,20 @@ export function ClosedBanner(): JSX.Element | null {
   const showCountdown = remainingMs !== null && remainingMs > 0;
 
   return (
-    <div className="closed-banner" role="status" data-testid="closed-banner">
+    <div
+      className="closed-banner"
+      role="status"
+      aria-label="Market closed"
+      data-testid="closed-banner"
+    >
       <span className="closed-banner__dot" aria-hidden="true" />
       <span className="closed-banner__label">MARKET CLOSED</span>
       {showCountdown && (
-        <span className="closed-banner__countdown" data-testid="closed-countdown">
+        <span
+          className="closed-banner__countdown"
+          aria-live="off"
+          data-testid="closed-countdown"
+        >
           opens in {formatCountdown(remainingMs)}
         </span>
       )}

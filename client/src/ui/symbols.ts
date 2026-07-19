@@ -40,13 +40,19 @@ export function marketGroup(market: string): SymbolGroupKey {
   return 'crypto';
 }
 
-/** Case-insensitive substring filter over symbol AND market (defensive dedupe of the server filter). */
+/**
+ * Case-insensitive substring filter over symbol AND market (defensive dedupe of
+ * the server filter), plus the derived display group key/label so typing
+ * 'crypto' / 'equity' / 'sim' (or 'Simulated') surfaces the whole group.
+ */
 export function filterSymbols(entries: readonly SymbolEntry[], q: string): SymbolEntry[] {
   const needle = q.trim().toLowerCase();
   if (needle === '') return [...entries];
-  return entries.filter(
-    (e) => e.symbol.toLowerCase().includes(needle) || e.market.toLowerCase().includes(needle),
-  );
+  return entries.filter((e) => {
+    if (e.symbol.toLowerCase().includes(needle) || e.market.toLowerCase().includes(needle)) return true;
+    const key = marketGroup(e.market);
+    return key.includes(needle) || GROUP_LABEL[key].toLowerCase().includes(needle);
+  });
 }
 
 /** Partition entries into ordered, non-empty display groups. Order within a group is preserved. */
@@ -87,4 +93,16 @@ export function capabilityChips(capability: Record<string, unknown> | null | und
   const side = capability.trade_side;
   if (typeof side === 'string') chips.push(`SIDE ${side.toUpperCase()}`);
   return chips;
+}
+
+/**
+ * Classify a capability chip into a CSS class so the amber honesty style (§7) can
+ * apply. Synthetic depth ('SYNTH') and polled tape ('TAPE POLL') get `cap--synth`
+ * (amber); real depth tiers get `cap--depth`; other tape chips get `cap--tape`.
+ */
+export function capabilityChipClass(chip: string): string {
+  if (chip === 'SYNTH' || chip === 'TAPE POLL') return 'cap cap--synth';
+  if (chip.startsWith('TAPE ')) return 'cap cap--tape';
+  if (chip.startsWith('SIDE ')) return 'cap';
+  return 'cap cap--depth';
 }

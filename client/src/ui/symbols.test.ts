@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  capabilityChipClass,
   capabilityChips,
   filterSymbols,
   flattenGroups,
@@ -45,6 +46,14 @@ describe('filterSymbols', () => {
     expect(out).toEqual(DIRECTORY);
     expect(out).not.toBe(DIRECTORY);
   });
+
+  it('matches the derived display group key/label so a group name surfaces the whole group', () => {
+    // No market string contains 'crypto' (binance-spot), but the group does.
+    expect(filterSymbols(DIRECTORY, 'crypto')).toEqual([BTC, ETH]);
+    // Group label match is case-insensitive.
+    expect(filterSymbols(DIRECTORY, 'Simulated')).toEqual([SIM]);
+    expect(filterSymbols(DIRECTORY, 'sim')).toEqual([SIM]);
+  });
 });
 
 describe('groupSymbols', () => {
@@ -81,5 +90,21 @@ describe('capabilityChips', () => {
     expect(capabilityChips({ depth: 'L2', trades: 'full' })).toEqual(['L2', 'TAPE FULL']);
     expect(capabilityChips(null)).toEqual([]);
     expect(capabilityChips({})).toEqual([]);
+  });
+});
+
+describe('capabilityChipClass', () => {
+  it('flags synthetic depth and polled tape amber, keeps real tiers neutral', () => {
+    // Amber honesty (§7): SYNTH depth + polled tape.
+    expect(capabilityChipClass('SYNTH')).toBe('cap cap--synth');
+    expect(capabilityChipClass('TAPE POLL')).toBe('cap cap--synth');
+    // Real depth tiers.
+    expect(capabilityChipClass('L2')).toBe('cap cap--depth');
+    expect(capabilityChipClass('L1')).toBe('cap cap--depth');
+    // Real tape tiers.
+    expect(capabilityChipClass('TAPE TICK')).toBe('cap cap--tape');
+    expect(capabilityChipClass('TAPE FULL')).toBe('cap cap--tape');
+    // Side chips stay bare.
+    expect(capabilityChipClass('SIDE INFERRED')).toBe('cap');
   });
 });
