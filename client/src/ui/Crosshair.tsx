@@ -19,6 +19,9 @@
 import { useEffect, useRef, useState, type MutableRefObject, type RefObject } from 'react';
 
 import type { CrosshairReadout, Renderer } from '../gl/renderer';
+import { getSnapshot } from '../state/bookStore';
+import { useFlowMapStore } from '../state/store';
+import { depthTier } from './DomLadder';
 import './Crosshair.css';
 
 interface CrosshairProps {
@@ -32,11 +35,23 @@ interface HoverState {
   readout: CrosshairReadout | null;
 }
 
-/** Compact size formatting — integers big, a couple of decimals small, "—" null. */
-function fmtSize(v: number | null): string {
+/** Thousands-grouped integers for the mid band (1e3..1e4). */
+const GROUP = new Intl.NumberFormat('en-US', { useGrouping: true, maximumFractionDigits: 0 });
+
+/**
+ * Compact size formatting — integers big, a couple of decimals small, "—" null.
+ * A non-finite density is over-range/unusable (e.g. an upstream f16-overflowed
+ * SYNTH volume bucket): show the honest over-range glyph, never "Infinity"/"NaN"
+ * (mirrors DomLadder's `fmtSz` guard, §7 honesty). Large sizes are thousands-
+ * grouped, then K/M-compacted past 10k, keeping the small-size decimal bands.
+ */
+export function fmtSize(v: number | null): string {
   if (v === null) return '—';
+  if (v !== null && !Number.isFinite(v)) return v > 0 ? '∞' : '—';
   if (v === 0) return '0';
-  if (v >= 1000) return v.toFixed(0);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1)}M`;
+  if (v >= 10_000) return `${(v / 1000).toFixed(v >= 100_000 ? 0 : 1)}K`;
+  if (v >= 1000) return GROUP.format(Math.round(v));
   if (v >= 100) return v.toFixed(1);
   return v.toFixed(2);
 }
@@ -45,13 +60,13 @@ function fmtPrice(r: CrosshairReadout): string {
   return r.price === null ? '—' : r.price.toFixed(r.priceDecimals);
 }
 
-/** ns → HH:MM:SS.mmm (UTC; sim columns are session-relative so this reads T+). */
-function fmtTime(ns: bigint | null): string {
+/** ns → HH:MM:SS.mmmz (UTC; the trailing `z` makes the zone explicit). */
+export function fmtTime(ns: bigint | null): string {
   if (ns === null) return '—';
   const ms = Number(ns / 1_000_000n);
   if (!Number.isFinite(ms)) return '—';
   try {
-    return new Date(ms).toISOString().substring(11, 23);
+    return `${new Date(ms).toISOString().substring(11, 23)}z`;
   } catch {
     return '—';
   }
@@ -59,6 +74,7 @@ function fmtTime(ns: bigint | null): string {
 
 export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Element | null {
   const [hover, setHover] = useState<HoverState | null>(null);
+  const capability = useFlowMapStore((s) => s.capability);
   const rafRef = useRef(0);
 
   useEffect(() => {
@@ -96,6 +112,13 @@ export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Eleme
   if (!hover) return null;
   const { x, y, readout } = hover;
 
+  // Depth-source provenance for the readout header (§7 honesty). SYNTH must never
+  // read as real — its size values are marked amber alongside the SYNTH tag.
+  const bookMode = getSnapshot().book?.mode ?? null;
+  const tier = depthTier(capability, bookMode);
+  const isSynth = tier === 'SYNTH';
+  const sizeSynthCls = isSynth ? ' crosshair__val--synth' : '';
+
   // Place the readout box near the cursor, flipping away from the near edge.
   const canvas = canvasRef.current;
   const cw = canvas?.clientWidth ?? 0;
@@ -115,6 +138,17 @@ export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Eleme
       <div className="crosshair__hline" style={{ top: `${y}px` }} />
       {readout && (
         <div className="crosshair__box" data-testid="crosshair-readout" style={boxStyle}>
+          {tier && (
+            <div className="crosshair__line crosshair__line--head">
+              <span className="crosshair__key">src</span>
+              <span
+                className={`crosshair__tag${isSynth ? ' crosshair__tag--synth' : ''}`}
+                data-testid="crosshair-src"
+              >
+                {tier}
+              </span>
+            </div>
+          )}
           <div className="crosshair__line">
             <span className="crosshair__key">t</span>
             <span className="crosshair__val" data-testid="crosshair-time">
@@ -129,13 +163,19 @@ export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Eleme
           </div>
           <div className="crosshair__line">
             <span className="crosshair__key crosshair__key--bid">bid</span>
-            <span className="crosshair__val crosshair__val--bid" data-testid="crosshair-bid">
+            <span
+              className={`crosshair__val crosshair__val--bid${sizeSynthCls}`}
+              data-testid="crosshair-bid"
+            >
               {fmtSize(readout.bid)}
             </span>
           </div>
           <div className="crosshair__line">
             <span className="crosshair__key crosshair__key--ask">ask</span>
-            <span className="crosshair__val crosshair__val--ask" data-testid="crosshair-ask">
+            <span
+              className={`crosshair__val crosshair__val--ask${sizeSynthCls}`}
+              data-testid="crosshair-ask"
+            >
               {fmtSize(readout.ask)}
             </span>
           </div>

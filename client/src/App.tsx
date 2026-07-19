@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
 import { attachGlobalKeys } from './input/keys';
 import { decodeFrame } from './proto/decode';
@@ -7,6 +8,7 @@ import type { StreamMode } from './proto/types';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { DomLadder } from './ui/DomLadder';
+import { HeatLegend } from './ui/HeatLegend';
 import { PriceAxis } from './ui/PriceAxis';
 import { SettingsDrawer } from './ui/SettingsDrawer';
 import { Tape } from './ui/Tape';
@@ -139,6 +141,8 @@ export function App() {
     // Apply persisted, live-honourable settings at boot.
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
+    renderer.setContrast(gammaForContrast(settingsRef.current.contrast));
+    renderer.setNormPercentile(settingsRef.current.normPercentile);
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
@@ -177,6 +181,8 @@ export function App() {
     if (r) {
       r.setOverlayVisibility(settings.overlays); // idempotent
       r.setBubbleMinSize(settings.bubbleMinSize); // idempotent
+      r.setContrast(gammaForContrast(settings.contrast)); // idempotent
+      r.setNormPercentile(settings.normPercentile); // idempotent
       // Follow is edge-triggered so it never fights a manual F / Space toggle.
       if (settings.follow !== prevSettingsRef.current.follow) {
         if (settings.follow && !r.following) r.goLive();
@@ -282,6 +288,7 @@ export function App() {
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+            <HeatLegend />
             <ClosedBanner />
           </div>
           <PriceAxis canvasRef={priceAxisRef} />

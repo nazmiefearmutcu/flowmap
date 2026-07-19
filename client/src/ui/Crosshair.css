@@ -36,13 +36,30 @@
   min-width: 132px;
   padding: 6px 8px;
   background: rgba(3, 5, 8, 0.92);
-  border: 1px solid var(--border, #1a1f2b);
+  border: 1px solid var(--line, #1a1f2b);
   border-radius: 4px;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--fg, #e6edf3);
+  font-family: var(--font-mono, 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: var(--fs-sm, 11px);
+  line-height: 1.35;
+  color: var(--text, #e6edf3);
+}
+
+/* Header row carrying the depth-source provenance tag. */
+.crosshair__line--head {
+  margin-bottom: 2px;
+}
+
+.crosshair__tag {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+  color: var(--text-3, #5b6675);
+}
+
+/* Amber SYNTH tag — synthetic depth must never read as real (§7 honesty). */
+.crosshair__tag--synth {
+  color: var(--warn, #d6a13a);
+  font-weight: 600;
 }
 
 .crosshair__line {
@@ -53,22 +70,22 @@
 }
 
 .crosshair__line--dim {
-  color: var(--fg-dim, #5b6675);
+  color: var(--text-3, #5b6675);
 }
 
 .crosshair__key {
-  color: var(--fg-dim, #5b6675);
+  color: var(--text-3, #5b6675);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-size: 10px;
+  font-size: var(--fs-xs, 10px);
 }
 
 .crosshair__key--bid {
-  color: #1fb6a6;
+  color: var(--accent, #1fb6a6);
 }
 
 .crosshair__key--ask {
-  color: #c65454;
+  color: var(--sell, #c65454);
 }
 
 .crosshair__val {
@@ -77,7 +94,7 @@
 }
 
 .crosshair__val--price {
-  color: #e6edf3;
+  color: var(--text, #e6edf3);
   font-weight: 600;
 }
 
@@ -87,4 +104,9 @@
 
 .crosshair__val--ask {
   color: #e08585;
+}
+
+/* Synthetic sizes rendered amber so SYNTH depth never reads as real (§7). */
+.crosshair__val--synth {
+  color: var(--warn, #d6a13a);
 }

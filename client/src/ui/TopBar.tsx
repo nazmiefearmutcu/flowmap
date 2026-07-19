@@ -31,11 +31,34 @@ const GROUP_VENUE: Record<SymbolGroupKey, string> = {
   sim: 'Sim',
 };
 
-/** Class suffix for a capability chip so depth / tape read in their own hue. */
-function chipClass(chip: string): string {
-  if (chip.startsWith('TAPE')) return 'cap cap--tape';
-  if (chip.startsWith('SIDE')) return 'cap';
+/**
+ * Class suffix for a capability chip so its FIDELITY (not just its channel) reads
+ * in the right hue (§7 honesty): synthetic depth gets the amber `cap--synth` ramp,
+ * and lower-fidelity tape (POLL) / inferred-or-absent side get a `cap--caution`
+ * modifier, while the real tiers (L2/L1/TICK/EXCHANGE) keep the plain accent.
+ */
+export function chipClass(chip: string): string {
+  if (chip.startsWith('TAPE')) {
+    return chip.includes('POLL') ? 'cap cap--tape cap--caution' : 'cap cap--tape';
+  }
+  if (chip.startsWith('SIDE')) {
+    return chip.includes('INFERRED') || chip.includes('NA') ? 'cap cap--caution' : 'cap';
+  }
+  // Depth chip: SYNTH / SYNTH_PROFILE render fabricated depth → amber ramp.
+  if (chip.startsWith('SYNTH')) return 'cap cap--synth';
   return 'cap cap--depth';
+}
+
+/** The viewer's local time-zone abbreviation (e.g. `GMT+3`, `EST`) for labeling the wall clock. */
+function localZoneAbbrev(d: Date): string {
+  try {
+    const part = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+      .formatToParts(d)
+      .find((p) => p.type === 'timeZoneName');
+    return part?.value ?? 'local';
+  } catch {
+    return 'local';
+  }
 }
 
 interface TopBarProps {
@@ -70,6 +93,13 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
   const chips = capabilityChips(capability);
   const statusText = STATUS_LABEL[status] ?? status;
   const wallText = wall.toTimeString().slice(0, 8);
+  const zoneAbbrev = localZoneAbbrev(wall);
+  // For equity sessions the reference clock is US-eastern; show it beside the UTC stream ts.
+  const etText =
+    group === 'equity'
+      ? wall.toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour12: false })
+      : null;
+  const feedSuffix = feedState && feedState !== 'live' ? ` · ${feedState}` : '';
 
   return (
     <header className="topbar">
@@ -86,7 +116,11 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
       </span>
 
       <span className="caps" data-testid="capability-badges">
-        {chips.length === 0 ? (
+        {capability === null ? (
+          // Pre-Hello: caps aren't loaded yet — a neutral placeholder, NOT "none".
+          <span className="cap cap--pending" aria-hidden="true">—</span>
+        ) : chips.length === 0 ? (
+          // Received a descriptor that genuinely advertises no capabilities.
           <span className="cap cap--na">NO CAPS</span>
         ) : (
           chips.map((c) => (
@@ -122,15 +156,30 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         </button>
       </div>
 
-      <span className={`status status--${status}`} data-testid="conn-status">
+      <span
+        className={`status status--${status}`}
+        data-testid="conn-status"
+        role="status"
+        aria-live="polite"
+        aria-label={`Connection ${statusText}${feedSuffix ? `, feed ${feedState}` : ''}`}
+      >
         <span className="status__dot" aria-hidden="true" />
         {statusText}
-        {feedState && feedState !== 'live' ? ` · ${feedState}` : ''}
+        {feedSuffix}
       </span>
 
-      <span className="clock" data-testid="clock">
-        <span className="clock__wall">{wallText}</span>
-        <span className="clock__stream">{streamClock ? `T ${streamClock}` : '—'}</span>
+      <span
+        className="clock"
+        data-testid="clock"
+        aria-label={`Wall clock ${wallText} ${zoneAbbrev}${
+          etText ? `, Eastern ${etText}` : ''
+        }, stream ${streamClock ?? 'none'} UTC`}
+      >
+        <span className="clock__wall">
+          {wallText} <span className="clock__zone">{zoneAbbrev}</span>
+        </span>
+        {etText ? <span className="clock__et">{etText} ET</span> : null}
+        <span className="clock__stream">{streamClock ? `T ${streamClock} UTC` : '— UTC'}</span>
       </span>
 
       <button
@@ -150,8 +199,10 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         onClick={onOpenSettings}
         data-testid="settings-open"
         title="settings"
+        aria-haspopup="dialog"
       >
-        ⚙ Settings
+        {/* Force text (monochrome) presentation of the gear via U+FE0E, not the color emoji. */}
+        <span aria-hidden="true">{'⚙︎'}</span> Settings
       </button>
     </header>
   );

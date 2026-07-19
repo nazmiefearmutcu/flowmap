@@ -10,6 +10,7 @@
  * choice survives reloads and is ready for the renderer to consume.
  */
 
+import { DEFAULT_CONTRAST } from '../gl/heatmap';
 import {
   DEFAULT_OVERLAY_VISIBILITY,
   type OverlayVisibility,
@@ -18,6 +19,8 @@ import {
 export type Colormap = 'thermal' | 'alt';
 
 export interface FlowMapSettings {
+  /** Heatmap display contrast 0–100 (drives the perceptual gamma, §8.3). */
+  contrast: number;
   /** Heatmap colormap family (thermal blue→white, or the alt single-hue ramp). */
   colormap: Colormap;
   /** Viewport-normalization percentile (§8.3; higher = dimmer, more headroom). */
@@ -37,6 +40,7 @@ export interface FlowMapSettings {
 export const SETTINGS_KEY = 'flowmap.settings.v1';
 
 export const DEFAULT_SETTINGS: FlowMapSettings = {
+  contrast: DEFAULT_CONTRAST,
   colormap: 'thermal',
   normPercentile: 99,
   tickGrouping: 1,
@@ -67,6 +71,7 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
     if (typeof overlaysIn[k] === 'boolean') overlays[k] = overlaysIn[k] as boolean;
   }
   return {
+    contrast: Math.round(clampNumber(o.contrast, 0, 100, DEFAULT_SETTINGS.contrast)),
     colormap: o.colormap === 'alt' ? 'alt' : 'thermal',
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
     tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 32, DEFAULT_SETTINGS.tickGrouping)),

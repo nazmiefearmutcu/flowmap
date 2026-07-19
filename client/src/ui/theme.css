@@ -29,7 +29,8 @@
   /* --- text --- */
   --text: #e6edf3;
   --text-2: #93a1b4; /* secondary labels */
-  --text-3: #5b6675; /* dim / placeholder */
+  --text-3: #6f7b8c; /* dim / small data — lifted to ≥4.5:1 on the near-black bg (WCAG AA) */
+  --text-4: #545e6d; /* decorative / placeholder only — NOT for data-bearing text */
   --text-money: #f2f6fa; /* bright numerics */
 
   /* --- accent pair (pinned; see file header) --- */

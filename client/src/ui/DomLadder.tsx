@@ -67,6 +67,11 @@ export interface LadderModel {
   priceDecimals: number;
   /** Fractional mid row (live), or null when it cannot be derived. */
   midRow: number | null;
+  /**
+   * Best-ask − best-bid in price units, or null when only one side genuinely
+   * exists (L1/one-sided) — never fabricated from a synthesized opposite side.
+   */
+  spread: number | null;
 }
 
 /** Map the capability depth tier (falling back to the book mode) to a badge tier. */
@@ -128,7 +133,7 @@ function deriveQuotes(
   snap: BookSnapshot,
   params: EpochParams,
   shape: LadderShape,
-): { bestBidRow: number; bestAskRow: number; midRow: number | null } {
+): { bestBidRow: number; bestAskRow: number; midRow: number | null; spread: number | null } {
   const step = params.tick * params.tick_multiple;
   const rows = params.rows;
   const bbo = snap.bbo;
@@ -136,10 +141,11 @@ function deriveQuotes(
     const bestBidRow = clampRow(Math.round((bbo.bidPx - params.p0) / step), rows);
     const bestAskRow = clampRow(Math.round((bbo.askPx - params.p0) / step), rows);
     const midRow = ((bbo.bidPx + bbo.askPx) / 2 - params.p0) / step;
-    return { bestBidRow, bestAskRow, midRow };
+    // Both sides of a BBO are real — honest spread from the quoted prices.
+    return { bestBidRow, bestAskRow, midRow, spread: bbo.askPx - bbo.bidPx };
   }
   const book = snap.book;
-  if (book === null) return { bestBidRow: -1, bestAskRow: -1, midRow: null };
+  if (book === null) return { bestBidRow: -1, bestAskRow: -1, midRow: null, spread: null };
 
   if (shape === 'profile') {
     // Point-of-control: the densest row of the volume-at-price profile.
@@ -151,7 +157,7 @@ function deriveQuotes(
         pocRow = r;
       }
     }
-    return { bestBidRow: -1, bestAskRow: -1, midRow: pocRow >= 0 ? pocRow : null };
+    return { bestBidRow: -1, bestAskRow: -1, midRow: pocRow >= 0 ? pocRow : null, spread: null };
   }
 
   let bestBidRow = -1;
@@ -171,11 +177,15 @@ function deriveQuotes(
       }
     }
   }
-  if (bestBidRow < 0 && bestAskRow < 0) return { bestBidRow: -1, bestAskRow: -1, midRow: null };
+  // Spread only when BOTH sides genuinely exist — never from a synthesized side.
+  const spread = bestBidRow >= 0 && bestAskRow >= 0 ? (bestAskRow - bestBidRow) * step : null;
+  if (bestBidRow < 0 && bestAskRow < 0) {
+    return { bestBidRow: -1, bestAskRow: -1, midRow: null, spread: null };
+  }
   if (bestBidRow < 0) bestBidRow = bestAskRow - 1;
   if (bestAskRow < 0) bestAskRow = bestBidRow + 1;
   if (bestAskRow <= bestBidRow) bestAskRow = bestBidRow + 1;
-  return { bestBidRow, bestAskRow, midRow: (bestBidRow + bestAskRow) / 2 };
+  return { bestBidRow, bestAskRow, midRow: (bestBidRow + bestAskRow) / 2, spread };
 }
 
 /**
@@ -191,12 +201,17 @@ export function buildLadder(
   centerOverride: number | null,
 ): LadderModel {
   const book = snap.book;
-  if (!book || !params) return { rows: [], priceDecimals: 2, midRow: null };
+  // A live L1 tier can show its BBO before the first book column arrives — the
+  // `l1` shape renders straight from `snap.bbo`, so a null book is fine there.
+  const hasL1Bbo = !book && shape === 'l1' && snap.bbo !== null;
+  if ((!book && !hasL1Bbo) || !params) {
+    return { rows: [], priceDecimals: 2, midRow: null, spread: null };
+  }
 
   const step = params.tick * params.tick_multiple;
   const nrows = params.rows;
   const decimals = priceDecimals(step);
-  const { bestBidRow, bestAskRow, midRow } = deriveQuotes(snap, params, shape);
+  const { bestBidRow, bestAskRow, midRow, spread } = deriveQuotes(snap, params, shape);
 
   const center = centerOverride ?? midRow ?? (nrows - 1) / 2;
   const centerInt = Math.round(center);
@@ -211,14 +226,16 @@ export function buildLadder(
     let askSz = 0;
     let profileSz = 0;
     if (shape === 'profile') {
-      profileSz = inRange ? book.bid[r] : 0;
+      profileSz = inRange && book ? book.bid[r] : 0;
     } else if (shape === 'l1') {
       if (snap.bbo && r === bestBidRow) bidSz = snap.bbo.bidSz;
       if (snap.bbo && r === bestAskRow) askSz = snap.bbo.askSz;
     } else {
       // book: real per-row density (L2, keyed L1 band, or two-sided synthetic).
-      bidSz = inRange ? book.bid[r] : 0;
-      askSz = inRange && book.ask ? book.ask[r] : 0;
+      // `book` is only null for the `l1` shape above, so these branches are
+      // unreachable then — the guard keeps the strict `tsc -b` build happy.
+      bidSz = inRange && book ? book.bid[r] : 0;
+      askSz = inRange && book && book.ask ? book.ask[r] : 0;
     }
     maxSz = Math.max(maxSz, bidSz, askSz, profileSz);
     out.push({
@@ -234,12 +251,14 @@ export function buildLadder(
       isBestAsk: shape !== 'profile' && r === bestAskRow,
     });
   }
+  // Fractional widths (no rounding) with a 2%-wide floor for any nonzero level,
+  // so a sub-1% size never renders a visible number over a 0-width bar.
   for (const row of out) {
-    row.bidPct = Math.round((row.bidSz / maxSz) * 100);
-    row.askPct = Math.round((row.askSz / maxSz) * 100);
-    row.profilePct = Math.round((row.profileSz / maxSz) * 100);
+    row.bidPct = row.bidSz > 0 ? Math.max(2, (row.bidSz / maxSz) * 100) : 0;
+    row.askPct = row.askSz > 0 ? Math.max(2, (row.askSz / maxSz) * 100) : 0;
+    row.profilePct = row.profileSz > 0 ? Math.max(2, (row.profileSz / maxSz) * 100) : 0;
   }
-  return { rows: out, priceDecimals: decimals, midRow };
+  return { rows: out, priceDecimals: decimals, midRow, spread };
 }
 
 /** Compact size formatting (matches the crosshair readout). */
@@ -249,14 +268,26 @@ export function fmtSz(v: number): string {
   // show an honest over-range glyph, not a fabricated number.
   if (!Number.isFinite(v)) return v > 0 ? '∞' : '';
   if (v <= 0) return '';
-  if (v >= 1000) return v.toFixed(0);
+  if (v >= 1e9) return compact(v, 1e9, 'B');
+  if (v >= 1e6) return compact(v, 1e6, 'M');
+  if (v >= 1e3) return compact(v, 1e3, 'K');
   if (v >= 100) return v.toFixed(1);
   return v.toFixed(2);
+}
+
+/** One-decimal SI-suffixed magnitude, trimming a trailing `.0` (2000→"2K"). */
+function compact(v: number, div: number, suffix: string): string {
+  const s = (v / div).toFixed(1);
+  return (s.endsWith('.0') ? s.slice(0, -2) : s) + suffix;
 }
 
 export function DomLadder(): JSX.Element {
   const capability = useFlowMapStore((s) => s.capability);
   const epochs = useFlowMapStore((s) => s.epochs);
+  const gridEpoch = useFlowMapStore((s) => s.gridEpoch);
+  const symbol = useFlowMapStore((s) => s.subscription?.symbol ?? null);
+  const status = useFlowMapStore((s) => s.status);
+  const feedState = useFlowMapStore((s) => s.feedState);
   const [snap, setSnap] = useState<BookSnapshot>(() => getSnapshot());
   const [collapsed, setCollapsed] = useState(false);
   const [locked, setLocked] = useState(false);
@@ -282,18 +313,55 @@ export function DomLadder(): JSX.Element {
   const bookMode = snap.book ? snap.book.mode : null;
   const tier = depthTier(capability, bookMode);
   const shape = ladderShape(tier, bookMode);
-  const center = locked ? frozenCenterRef.current : null;
-  const model = buildLadder(snap, params, shape, visRows, center);
+  const step = params ? params.tick * params.tick_multiple : 0;
+  // The lock pins a PRICE, not a row: re-anchor to a row against the CURRENT
+  // epoch each render, so a mid-stream p0/step change keeps the same price
+  // centered instead of drifting to a stale row index.
+  const centerOverride =
+    locked && frozenCenterRef.current !== null && params && step > 0
+      ? (frozenCenterRef.current - params.p0) / step
+      : null;
+  const model = buildLadder(snap, params, shape, visRows, centerOverride);
 
-  // Track the live mid so locking freezes at the current center.
+  // Track the live mid AS A PRICE so locking freezes at the current center.
   useEffect(() => {
-    if (!locked && model.midRow !== null) frozenCenterRef.current = model.midRow;
+    if (!locked && model.midRow !== null && params) {
+      frozenCenterRef.current = params.p0 + model.midRow * (params.tick * params.tick_multiple);
+    }
   });
 
+  // A grid re-anchor (new epoch geometry) or a symbol switch invalidates any
+  // pinned price — drop the lock and return to follow-mid.
+  useEffect(() => {
+    setLocked(false);
+    frozenCenterRef.current = null;
+  }, [gridEpoch, symbol]);
+
   const badge = tier ?? 'N/A';
+  // Class-safe token: `tier.toLowerCase()` yields 'l2'/'l1'/'synth' (and 'na'
+  // for the no-data case) — never 'n/a', whose slash breaks the CSS selector.
+  const badgeClass = tier ? tier.toLowerCase() : 'na';
+
+  const spreadTicks =
+    model.spread !== null && params && params.tick > 0
+      ? Math.round(model.spread / params.tick)
+      : null;
+  const emptyMsg =
+    feedState === 'closed'
+      ? 'market closed'
+      : status === 'reconnecting' || status === 'closed'
+        ? 'disconnected'
+        : status === 'connecting'
+          ? 'connecting…'
+          : 'waiting for book…';
 
   return (
-    <section className="panel dom-ladder" data-testid="dom-ladder">
+    <section
+      className={`panel dom-ladder${collapsed ? ' is-collapsed' : ''}${
+        tier === 'SYNTH' ? ' dom-ladder--synth' : ''
+      }`}
+      data-testid="dom-ladder"
+    >
       <header className="panel__header">
         <button
           type="button"
@@ -306,11 +374,17 @@ export function DomLadder(): JSX.Element {
           <span className="panel__title">DOM</span>
         </button>
         <span
-          className={`panel__badge panel__badge--${badge.toLowerCase()}`}
+          className={`panel__badge panel__badge--${badgeClass}`}
           data-testid="ladder-badge"
         >
           {badge}
         </span>
+        {spreadTicks !== null && (
+          <span className="panel__spread" data-testid="ladder-spread">
+            spr {model.spread!.toFixed(model.priceDecimals)}
+            {spreadTicks > 0 ? ` (${spreadTicks}t)` : ''}
+          </span>
+        )}
         <button
           type="button"
           className={`panel__lock${locked ? ' is-on' : ''}`}
@@ -325,7 +399,7 @@ export function DomLadder(): JSX.Element {
       {!collapsed && (
         <div className="ladder__body" ref={bodyRef} data-testid="ladder-body">
           {model.rows.length === 0 ? (
-            <div className="panel__empty">waiting for book…</div>
+            <div className="panel__empty">{emptyMsg}</div>
           ) : (
             model.rows.map((r) => (
               <div

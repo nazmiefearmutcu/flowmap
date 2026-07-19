@@ -144,6 +144,11 @@ body,
   color: var(--sell);
   border-color: var(--sell-line);
 }
+.cap--synth {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-dim);
+}
 
 /* --- connection status --- */
 .status {
@@ -554,6 +559,13 @@ body,
   border-bottom: 1px solid var(--line);
 }
 
+/* A collapsed panel drops to its header height and RELEASES its flex-grow so the
+   sibling panel reclaims the freed rail space (instead of leaving a void). */
+.panel.is-collapsed {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
 .dom-ladder {
   flex: 1 1 45%;
   min-height: 150px;
@@ -614,6 +626,20 @@ body,
 .panel__badge--l2 {
   color: var(--accent);
   border-color: var(--accent-line);
+}
+
+/* Synthetic depth: amber, matching the heatmap's SYNTH ramp — reads as
+   "not real resting liquidity" wherever it appears (spec §7 honesty). */
+.panel__badge--synth {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-dim);
+}
+
+/* Real but shallow (keyed L1 top-of-book): neutral, distinct from L2's teal. */
+.panel__badge--l1 {
+  color: var(--text-2);
+  border-color: var(--line-2);
 }
 
 .panel__badge--na {
@@ -771,7 +797,9 @@ body,
 
 .tape__row {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  /* time (fixed content) · price · size — the two numeric tracks are equal and
+     right-aligned so decimal points stack row-to-row (a pro tape read). */
+  grid-template-columns: auto 1fr 1fr;
   gap: var(--sp-3);
   align-items: center;
   height: 16px;
@@ -780,6 +808,11 @@ body,
   font-variant-numeric: tabular-nums;
   color: var(--text);
   border-bottom: 1px solid var(--line-soft);
+}
+
+.tape__px,
+.tape__sz {
+  text-align: right;
 }
 
 .tape__time {
@@ -1247,4 +1280,157 @@ body,
   color: var(--text);
   border-color: var(--accent-line);
   background: var(--accent-dim);
+}
+
+/* ==========================================================================
+   UI overhaul (2026-07-19): honesty tint, spread readout, accessibility,
+   reduced-motion, and micro-interaction feedback. Additive — layered after
+   the base rules so nothing above changes.
+   ========================================================================== */
+
+/* --- DOM ladder: honest two-sided spread + synthetic amber tint --- */
+.panel__spread {
+  margin-left: var(--sp-2);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Synthetic depth ladder: recolour the bid/ask bars amber so fabricated
+   volume-at-price reads as synthetic here exactly as it does on the heatmap. */
+.dom-ladder--synth .ladder__bar--bid,
+.dom-ladder--synth .ladder__bar--ask {
+  background: var(--warn);
+  opacity: 0.62;
+}
+.dom-ladder--synth .ladder__row.is-bestbid,
+.dom-ladder--synth .ladder__row.is-bestask {
+  box-shadow: inset 0 0 0 1px var(--warn-line);
+}
+.dom-ladder--synth .panel__badge {
+  color: var(--warn);
+}
+
+/* --- Accessibility: a single visible focus ring on every interactive control
+   (WCAG 2.4.7). The base rules set `outline: none`; :focus-visible restores a
+   keyboard-only ring without affecting mouse users. --- */
+.tbtn:focus-visible,
+.modeseg__btn:focus-visible,
+.segrow__btn:focus-visible,
+.speeds__btn:focus-visible,
+.overlay-toggle:focus-visible,
+.panel__collapse:focus-visible,
+.panel__lock:focus-visible,
+.transport__play:focus-visible,
+.drawer__close:focus-visible,
+.symrow:focus-visible,
+.symsearch__clear:focus-visible,
+.range:focus-visible,
+.minimap__scrub:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+  border-radius: var(--r-1);
+}
+.gl-canvas:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-line);
+}
+.range:focus-visible::-webkit-slider-thumb,
+.minimap__scrub:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* --- Micro-interactions: a consistent pressed nudge + hover feedback so no
+   control feels mushy (was absent app-wide). --- */
+.tbtn:active,
+.modeseg__btn:active,
+.speeds__btn:active,
+.overlay-toggle:active,
+.transport__play:active:not(:disabled),
+.panel__collapse:active,
+.panel__lock:active {
+  transform: translateY(0.5px);
+}
+.panel__collapse:hover,
+.panel__lock:hover {
+  color: var(--accent-bright);
+}
+.panel__collapse,
+.panel__lock,
+.drawer__close {
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+
+/* --- Reduced motion: kill the infinite status pulse + entrance transforms for
+   users who ask for it (WCAG 2.3.3); keep sub-150ms functional transitions. --- */
+@media (prefers-reduced-motion: reduce) {
+  .status__dot,
+  .status__dot--warn {
+    animation: none !important;
+  }
+  .dropdown,
+  .drawer,
+  .drawer__panel,
+  [class$='__menu'] {
+    animation: none !important;
+  }
+}
+
+/* --- Heatmap liquidity legend (self-documenting colour scale, §9) --- */
+.heat-legend {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: var(--sp-1) 3px;
+  background: var(--scrim);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  pointer-events: none;
+  user-select: none;
+  z-index: 3;
+}
+.heat-legend__bar {
+  width: 8px;
+  height: 92px;
+  border-radius: 2px;
+  /* thermal ramp bottom(low)→top(high), matching gl/lut.ts THERMAL_STOPS */
+  background: linear-gradient(
+    to top,
+    #02040c 0%,
+    #0a165c 15%,
+    #0082c8 40%,
+    #18d0e0 62%,
+    #e8e82c 80%,
+    #ffffff 100%
+  );
+}
+.heat-legend--synth .heat-legend__bar {
+  /* amber ramp, matching SYNTH_STOPS — synthetic liquidity reads amber */
+  background: linear-gradient(
+    to top,
+    #060300 0%,
+    #501e00 25%,
+    #b45a00 55%,
+    #f0aa1e 80%,
+    #fff0c8 100%
+  );
+}
+.heat-legend__cap {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+.heat-legend__tier {
+  margin-top: 2px;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.08em;
+  color: var(--text-2);
+}
+.heat-legend--synth .heat-legend__tier {
+  color: var(--warn);
 }

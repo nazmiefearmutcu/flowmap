@@ -17,6 +17,39 @@ export function niceStep(rough: number): number {
   return nice * pow;
 }
 
+/** Price ticks plus the "nice" step chosen for them (empty ticks ⇒ step 0). */
+export interface PriceTickModel {
+  /** The nice step actually used (grid-clamped); 0 for a degenerate range. */
+  step: number;
+  ticks: number[];
+}
+
+/**
+ * Ascending "nice" price ticks spanning `[pLo, pHi]`, ≈`targetCount` of them, and
+ * never finer than `minStep` (the grid's price increment — no sub-tick labels),
+ * together with the step chosen (so labels can derive minimal decimals from the
+ * TICK step, not the finer grid step).
+ */
+export function priceTickModel(
+  pLo: number,
+  pHi: number,
+  targetCount: number,
+  minStep: number,
+): PriceTickModel {
+  const lo = Math.min(pLo, pHi);
+  const hi = Math.max(pLo, pHi);
+  if (!(hi > lo) || !Number.isFinite(lo) || !Number.isFinite(hi)) return { step: 0, ticks: [] };
+  let step = niceStep((hi - lo) / Math.max(1, targetCount));
+  if (minStep > 0) step = Math.max(step, minStep);
+  const out: number[] = [];
+  const start = Math.ceil(lo / step) * step;
+  // Guard against a pathological tiny step producing a huge array.
+  for (let i = 0, p = start; p <= hi + step * 1e-9 && i < 1000; i++, p = start + i * step) {
+    out.push(Number(p.toFixed(10)));
+  }
+  return { step, ticks: out };
+}
+
 /**
  * Ascending "nice" price ticks spanning `[pLo, pHi]`, ≈`targetCount` of them, and
  * never finer than `minStep` (the grid's price increment — no sub-tick labels).
@@ -27,18 +60,7 @@ export function priceTicks(
   targetCount: number,
   minStep: number,
 ): number[] {
-  const lo = Math.min(pLo, pHi);
-  const hi = Math.max(pLo, pHi);
-  if (!(hi > lo) || !Number.isFinite(lo) || !Number.isFinite(hi)) return [];
-  let step = niceStep((hi - lo) / Math.max(1, targetCount));
-  if (minStep > 0) step = Math.max(step, minStep);
-  const out: number[] = [];
-  const start = Math.ceil(lo / step) * step;
-  // Guard against a pathological tiny step producing a huge array.
-  for (let i = 0, p = start; p <= hi + step * 1e-9 && i < 1000; i++, p = start + i * step) {
-    out.push(Number(p.toFixed(10)));
-  }
-  return out;
+  return priceTickModel(pLo, pHi, targetCount, minStep).ticks;
 }
 
 /** Decimal places implied by a price step (so labels don't show noise digits). */
@@ -80,22 +102,42 @@ export function niceTimeStepNs(spanNs: number, targetCount: number): number {
   return TIME_STEPS_NS[TIME_STEPS_NS.length - 1];
 }
 
+/** Time ticks (ns) plus the human interval chosen for them (empty ⇒ step 0). */
+export interface TimeTickModel {
+  /** The human interval actually used (ns); 0 for a degenerate span. */
+  step: bigint;
+  ticks: bigint[];
+}
+
+/**
+ * Ascending time ticks (ns) spanning `[tLo, tHi]`, ≈`targetCount` of them, snapped
+ * to a human interval and aligned to multiples of that interval, together with the
+ * chosen step (so the axis can pick a sub-second format when step < 1 s).
+ */
+export function timeTickModel(
+  tLoNs: bigint,
+  tHiNs: bigint,
+  targetCount: number,
+): TimeTickModel {
+  const lo = tLoNs < tHiNs ? tLoNs : tHiNs;
+  const hi = tLoNs < tHiNs ? tHiNs : tLoNs;
+  const spanNs = Number(hi - lo);
+  if (!(spanNs > 0)) return { step: 0n, ticks: [] };
+  const step = BigInt(Math.round(niceTimeStepNs(spanNs, targetCount)));
+  if (step <= 0n) return { step: 0n, ticks: [] };
+  const out: bigint[] = [];
+  let t = (lo / step) * step;
+  if (t < lo) t += step;
+  for (let i = 0; t <= hi && i < 1000; i++, t += step) out.push(t);
+  return { step, ticks: out };
+}
+
 /**
  * Ascending time ticks (ns) spanning `[tLo, tHi]`, ≈`targetCount` of them, snapped
  * to a human interval and aligned to multiples of that interval.
  */
 export function timeTicks(tLoNs: bigint, tHiNs: bigint, targetCount: number): bigint[] {
-  const lo = tLoNs < tHiNs ? tLoNs : tHiNs;
-  const hi = tLoNs < tHiNs ? tHiNs : tLoNs;
-  const spanNs = Number(hi - lo);
-  if (!(spanNs > 0)) return [];
-  const step = BigInt(Math.round(niceTimeStepNs(spanNs, targetCount)));
-  if (step <= 0n) return [];
-  const out: bigint[] = [];
-  let t = (lo / step) * step;
-  if (t < lo) t += step;
-  for (let i = 0; t <= hi && i < 1000; i++, t += step) out.push(t);
-  return out;
+  return timeTickModel(tLoNs, tHiNs, targetCount).ticks;
 }
 
 /** ns → HH:MM:SS (UTC; sim columns are session-relative so this reads T+). */

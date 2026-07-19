@@ -16,7 +16,13 @@ import { useEffect, useRef, useState, type ChangeEvent, type RefObject } from 'r
 
 import type { Renderer } from '../gl/renderer';
 import { useFlowMapStore } from '../state/store';
-import { SPEED_STEPS, seekTargetNs, type TimeExtent } from './replay';
+import {
+  SPEED_STEPS,
+  formatDurationNs,
+  fractionOfExtent,
+  seekTargetNs,
+  type TimeExtent,
+} from './replay';
 
 /** Minimap poll interval (ms). */
 const POLL_MS = 200;
@@ -49,6 +55,9 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
   const [geom, setGeom] = useState<MinimapGeom>(EMPTY_GEOM);
   const [scrub, setScrub] = useState(0); // 0..1000 scrubber position (replay)
   const geomRef = useRef<MinimapGeom>(EMPTY_GEOM);
+  const draggingRef = useRef(false); // true while the user actively scrubs
+  const seekTimerRef = useRef<number | null>(null); // trailing-throttle handle
+  const pendingFracRef = useRef(0); // latest scrub fraction awaiting a seek
   const isReplay = mode === 'replay';
 
   // ≤5 Hz poll of the renderer's timeline geometry → minimap extent + window box.
@@ -66,11 +75,20 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
       const leftPct = clamp01((tl.viewStartCol - tl.oldestSeq) / span) * 100;
       const rightPct = clamp01((tl.viewEndCol - tl.oldestSeq) / span) * 100;
       let extent: TimeExtent | null = null;
+      let toNs: ((col: number) => bigint) | null = null;
       if (tl.timeBase) {
         const { anchorSeq, anchorT0Ns, dtNs } = tl.timeBase;
-        const toNs = (col: number): bigint =>
+        toNs = (col: number): bigint =>
           anchorT0Ns + BigInt(Math.round((col - anchorSeq) * dtNs));
         extent = { startNs: toNs(tl.oldestSeq), endNs: toNs(tl.newestSeq) };
+      }
+      // Advance the playhead: map the newest column to ns and drive the scrubber
+      // from its fraction of the session extent — unless the user is scrubbing.
+      // Also self-corrects a stale thumb across session/symbol switches.
+      if (extent && toNs && !draggingRef.current) {
+        const f = fractionOfExtent(toNs(tl.newestSeq), extent);
+        const nv = Math.round(f * 1000);
+        setScrub((prev) => (prev === nv ? prev : nv));
       }
       const next: MinimapGeom = {
         leftPct,
@@ -91,26 +109,70 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
     return () => window.clearInterval(id);
   }, [rendererRef]);
 
+  // Drop any pending trailing-throttle seek if we unmount mid-drag.
+  useEffect(() => {
+    return () => {
+      if (seekTimerRef.current !== null) {
+        window.clearTimeout(seekTimerRef.current);
+        seekTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Emit a Seek at the given scrubber fraction. Early-return on a null extent so
+  // no bogus Seek{0} (1970 epoch) is sent before a session's timebase is known.
+  const commitSeek = (fraction: number): void => {
+    const extent = geomRef.current.extent;
+    if (!extent) return;
+    seek(seekTargetNs(fraction, extent));
+  };
+
+  // While dragging: immediate thumb feedback (setScrub) but only a trailing,
+  // throttled seek so we don't spam the connection with a Seek per input event.
   const onScrub = (e: ChangeEvent<HTMLInputElement>): void => {
     const v = Number(e.target.value);
     setScrub(v);
-    const extent = geomRef.current.extent ?? { startNs: 0n, endNs: 0n };
-    seek(seekTargetNs(v / 1000, extent));
+    draggingRef.current = true;
+    pendingFracRef.current = v / 1000;
+    if (seekTimerRef.current === null) {
+      seekTimerRef.current = window.setTimeout(() => {
+        seekTimerRef.current = null;
+        commitSeek(pendingFracRef.current);
+      }, 120);
+    }
   };
+
+  // Pointer/key release: flush any pending throttled seek and release the drag
+  // gate so the poll effect resumes driving the playhead.
+  const onScrubCommit = (): void => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    if (seekTimerRef.current !== null) {
+      window.clearTimeout(seekTimerRef.current);
+      seekTimerRef.current = null;
+    }
+    commitSeek(pendingFracRef.current);
+  };
+
+  const extent = geom.extent;
+  const durationNs = extent ? extent.endNs - extent.startNs : 0n;
+  const positionNs = extent ? seekTargetNs(scrub / 1000, extent) - extent.startNs : 0n;
+  const playing = isReplay && !paused;
 
   return (
     <footer className="timeline" data-testid="timeline">
       <div className="transport" data-testid="transport">
         <button
           type="button"
-          className={`transport__play${isReplay && !paused ? ' is-playing' : ''}`}
+          className={`transport__play${playing ? ' is-playing' : ''}`}
           disabled={!isReplay}
           data-testid="transport-play"
-          aria-label={paused ? 'play' : 'pause'}
-          title={isReplay ? (paused ? 'play' : 'pause') : 'replay only'}
+          aria-label={playing ? 'pause' : 'play'}
+          aria-pressed={playing}
+          title={isReplay ? (playing ? 'pause' : 'play') : 'replay only'}
           onClick={() => (paused ? resume() : pause())}
         >
-          {isReplay && !paused ? '❚❚' : '▶'}
+          {playing ? '❚❚' : '▶'}
         </button>
         <div className="speeds" role="group" aria-label="replay speed" data-testid="speeds">
           {SPEED_STEPS.map((s) => (
@@ -155,7 +217,17 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
             data-testid="seek-scrubber"
             aria-label="replay seek"
             onChange={onScrub}
+            onPointerUp={onScrubCommit}
+            onKeyUp={onScrubCommit}
+            onBlur={onScrubCommit}
           />
+        </div>
+        <div
+          className="minimap__readout"
+          data-testid="time-readout"
+          style={{ fontVariantNumeric: 'tabular-nums' }}
+        >
+          {formatDurationNs(positionNs)} / {formatDurationNs(durationNs)}
         </div>
       </div>
     </footer>

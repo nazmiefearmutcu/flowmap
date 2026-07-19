@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { SPEED_STEPS, clampSpeed, fractionOfExtent, seekTargetNs } from './replay';
+import { SPEED_STEPS, clampSpeed, formatDurationNs, fractionOfExtent, seekTargetNs } from './replay';
 
 describe('SPEED_STEPS', () => {
   it('is the 1–100× ladder from §9', () => {
@@ -50,5 +50,21 @@ describe('fractionOfExtent', () => {
     expect(fractionOfExtent(0n, extent)).toBe(0);
     expect(fractionOfExtent(9_000_000_000n, extent)).toBe(1);
     expect(fractionOfExtent(5n, { startNs: 5n, endNs: 5n })).toBe(0);
+  });
+});
+
+describe('formatDurationNs', () => {
+  it('renders HH:MM:SS.mmm from a ns duration', () => {
+    expect(formatDurationNs(0n)).toBe('00:00:00.000');
+    expect(formatDurationNs(1_000_000n)).toBe('00:00:00.001'); // 1 ms
+    expect(formatDurationNs(1_500_000_000n)).toBe('00:00:01.500'); // 1.5 s
+    expect(formatDurationNs(61_000_000_000n)).toBe('00:01:01.000'); // 1 m 1 s
+    expect(formatDurationNs(3_661_250_000_000n)).toBe('01:01:01.250'); // 1h 1m 1s 250ms
+  });
+
+  it('clamps negatives to zero and keeps ns precision on long sessions', () => {
+    expect(formatDurationNs(-5n)).toBe('00:00:00.000');
+    // 10h 0m 0s 999ms
+    expect(formatDurationNs(36_000_000_000_000n + 999_000_000n)).toBe('10:00:00.999');
   });
 });

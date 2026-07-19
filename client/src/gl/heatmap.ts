@@ -38,6 +38,29 @@ const LUT_UNIT = 1;
 const MIP1_UNIT = 2;
 const MIP2_UNIT = 3;
 
+/**
+ * Default perceptual display gamma (§8.3). Order-flow density is heavy-tailed;
+ * a linear tone map buries the mid-field in the near-black ramp floor. ~0.45
+ * lifts the mids while fixing black/white, making the continuous thermal field
+ * legible (the settings drawer can override this — see the "Contrast" control).
+ */
+export const DEFAULT_DISPLAY_GAMMA = 0.45;
+
+/**
+ * Map a 0–100 "Contrast" slider to a display gamma. HIGHER contrast → HIGHER
+ * gamma → a darker mid-field with punchier walls (more separation); LOWER
+ * contrast → lower gamma → the field is lifted flat/bright (washed, less
+ * separation). The default ({@link DEFAULT_CONTRAST}) lands on
+ * {@link DEFAULT_DISPLAY_GAMMA}. Clamped to the legible band [0.28, 0.72].
+ */
+export function gammaForContrast(contrast: number): number {
+  const c = Math.min(100, Math.max(0, contrast));
+  return 0.28 + (c / 100) * 0.44;
+}
+
+/** Slider position (0–100) whose gamma equals the default — the reset point. */
+export const DEFAULT_CONTRAST = 40;
+
 /** The mip level + tap geometry to sample this frame (see {@link selectLevel}). */
 interface LevelSel {
   level: number;
@@ -109,6 +132,7 @@ type UniformName =
   | 'u_residentNewest'
   | 'u_decodeScale'
   | 'u_norm'
+  | 'u_gamma'
   | 'u_ramp'
   | 'u_level'
   | 'u_blk'
@@ -127,6 +151,13 @@ export class Heatmap {
   mips: MipChain | null = null;
 
   encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_THERMAL };
+
+  /**
+   * Perceptual display gamma applied to the normalized intensity before the LUT
+   * (§8.3). Kept separate from {@link encoding} so it survives the per-session
+   * encoding reassignments; the settings drawer's Contrast control writes it.
+   */
+  gamma = DEFAULT_DISPLAY_GAMMA;
 
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
@@ -179,6 +210,7 @@ export class Heatmap {
       u_residentNewest: loc('u_residentNewest'),
       u_decodeScale: loc('u_decodeScale'),
       u_norm: loc('u_norm'),
+      u_gamma: loc('u_gamma'),
       u_ramp: loc('u_ramp'),
       u_level: loc('u_level'),
       u_blk: loc('u_blk'),
@@ -244,6 +276,7 @@ export class Heatmap {
 
     gl.uniform1f(this.u.u_decodeScale, this.encoding.decodeScale);
     gl.uniform1f(this.u.u_norm, this.encoding.norm);
+    gl.uniform1f(this.u.u_gamma, this.gamma);
     gl.uniform1i(this.u.u_ramp, this.encoding.ramp);
 
     // Rows collapsing into one device pixel drive the mip level (§8.3): coarser

@@ -107,7 +107,7 @@ export function Tape(): JSX.Element {
   const badge = tapeBadge(capability);
 
   return (
-    <section className="panel tape" data-testid="tape">
+    <section className={`panel tape${collapsed ? ' is-collapsed' : ''}`} data-testid="tape">
       <header className="panel__header">
         <button
           type="button"
