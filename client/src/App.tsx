@@ -8,6 +8,7 @@ import type { StreamMode } from './proto/types';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { DomLadder } from './ui/DomLadder';
+import { HeatLegend } from './ui/HeatLegend';
 import { PriceAxis } from './ui/PriceAxis';
 import { SettingsDrawer } from './ui/SettingsDrawer';
 import { Tape } from './ui/Tape';
@@ -285,6 +286,7 @@ export function App() {
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+            <HeatLegend />
             <ClosedBanner />
           </div>
           <PriceAxis canvasRef={priceAxisRef} />
