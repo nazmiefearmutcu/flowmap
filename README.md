@@ -3,6 +3,10 @@
 **An institutional-grade, dual-market order-flow visualizer — real-time liquidity heatmap, DOM
 ladder, time & sales, and order-flow overlays for crypto and US equities, in one renderer.**
 
+![FlowMap rendering live Binance BTCUSDT order flow](docs/media/heatmap-btcusdt-live.png)
+<sub>Live `binance-spot:BTCUSDT` — WebGL2 liquidity heatmap, DOM ladder, and tick tape, ~15 minutes
+into a session. Columns are rasterized once on the GPU, so pan/zoom cost never grows with history.</sub>
+
 FlowMap is a ground-up rebuild of an earlier PyQt6 desktop app that re-rasterized the entire visible
 history on the CPU every pan/zoom frame, so scrolling back through history collapsed to ~1 fps.
 FlowMap puts history in a WebGL2 texture and makes pan/zoom a pure view transform — **interaction cost
@@ -26,6 +30,13 @@ stockodile for US equities) behind one market-agnostic renderer.
   Synthetic depth renders in a distinct amber ramp and carries a `SYNTH` badge — capability badges
   (`L2` / `L1` / `SYNTH`, `TAPE TICK` / `TAPE POLL`, `SIDE EXCHANGE` / `SIDE NA`) are always honest,
   no fabricated depth.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![equity:AAPL on the keyless SYNTH tier, replaying a recorded market-hours session](docs/media/equity-aapl-synth-replay.png) <br><sub>`equity:AAPL` on the keyless SYNTH tier, replaying a recorded market-hours session — distinct amber ramp, honest `SYNTH` / `TAPE POLL` badges, market-closed banner, synthetic book in the DOM.</sub> | ![sim:SIM-DEMO deterministic feed with walls and liquidation markers](docs/media/sim-demo-markers.png) <br><sub>`sim:SIM-DEMO` deterministic feed — liquidity walls, buy/sell trade bubbles, VWAP line, and `LIQ` liquidation event markers.</sub> |
+| ![Crosshair with the exact per-cell liquidity readout](docs/media/crosshair-readout.png) <br><sub>Crosshair with the exact per-cell readout: source tier, column timestamp, price, and resting bid/ask liquidity.</sub> | ![Settings drawer over the live heatmap](docs/media/settings-drawer.png) <br><sub>The display pipeline is live: contrast (gamma), colormap, normalization percentile, tick grouping, bubble threshold, and per-overlay toggles.</sub> |
 
 ## Architecture
 
