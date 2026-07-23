@@ -11,7 +11,7 @@
 import type { GLContext } from './context';
 import { initGL } from './context';
 import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
-import { createLUTTexture, RAMP_SYNTH, RAMP_THERMAL } from './lut';
+import { createLUTTexture, RAMP_SYNTH, RAMP_INFERNO } from './lut';
 import { MipChain } from './mips';
 import { COLS_PER_TILE, TileRing, type ResidentRange } from './tileRing';
 
@@ -106,7 +106,7 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
       state.heatmap.encoding = {
         decodeScale,
         norm,
-        ramp: synth ? RAMP_SYNTH : RAMP_THERMAL,
+        ramp: synth ? RAMP_SYNTH : RAMP_INFERNO,
       };
     },
 

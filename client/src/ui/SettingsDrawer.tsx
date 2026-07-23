@@ -13,7 +13,25 @@ import { useEffect, useRef } from 'react';
 
 import type { OverlayVisibility } from '../gl/overlays/frame';
 import { OverlayToggles } from './OverlayToggles';
-import { DEFAULT_SETTINGS, type Colormap, type FlowMapSettings } from './settings';
+import {
+  DEFAULT_SETTINGS,
+  PRICE_BANDS,
+  type Colormap,
+  type FlowMapSettings,
+  type PriceBand,
+} from './settings';
+
+/** Human labels + the honest trade-off for each server price band (§8.1). */
+const BAND_LABEL: Record<PriceBand, string> = {
+  native: 'Native',
+  wide: '±50%',
+  full: '−100/+1000%',
+};
+const BAND_HINT: Record<PriceBand, string> = {
+  native: 'Finest price rows, narrowest coverage — the trading default.',
+  wide: 'About 50× coarser rows; far-out resting size becomes visible.',
+  full: 'Range SCAN only: rows get so coarse the live book collapses to a few of them.',
+};
 
 interface SettingsDrawerProps {
   settings: FlowMapSettings;
@@ -135,7 +153,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
           <div className="setting">
             <span className="setting__label">Colormap</span>
             <div className="segrow" role="group" aria-label="colormap" data-testid="setting-colormap">
-              {(['thermal', 'alt'] as Colormap[]).map((c) => (
+              {(['inferno', 'classic'] as Colormap[]).map((c) => (
                 <button
                   type="button"
                   key={c}
@@ -144,10 +162,14 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`colormap-${c}`}
                   onClick={() => onChange({ colormap: c })}
                 >
-                  {c === 'thermal' ? 'Thermal' : 'Alt'}
+                  {c === 'inferno' ? 'Inferno' : 'Classic'}
                 </button>
               ))}
             </div>
+            <span className="setting__hint">
+              Inferno separates size by hue (indigo → red → gold → white); Classic is the
+              legacy blue→cyan→white ramp. Synthetic depth always stays amber.
+            </span>
           </div>
 
           {/* normalization percentile */}
@@ -169,6 +191,33 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               onChange={(e) => onChange({ normPercentile: Number(e.target.value) })}
             />
             <span className="setting__hint">Higher percentile → dimmer, more dynamic-range headroom.</span>
+          </div>
+
+          {/* heatmap tolerance — the black point on normalized density (live) */}
+          <div className="setting">
+            <span className="setting__label">
+              Tolerance
+              <span className="setting__value">
+                {settings.tolerance > 0 ? settings.tolerance : 'off'}
+              </span>
+            </span>
+            <input
+              type="range"
+              className="range"
+              min={0}
+              max={100}
+              step={1}
+              value={settings.tolerance}
+              aria-label="Heatmap tolerance"
+              aria-valuetext={settings.tolerance > 0 ? `${settings.tolerance}` : 'off'}
+              data-testid="setting-tolerance"
+              onChange={(e) => onChange({ tolerance: Number(e.target.value) })}
+            />
+            <span className="setting__hint">
+              Black point: hides cells below this share of the viewport&rsquo;s density
+              percentile, so only liquidity worth reading paints. It is relative to what is
+              on screen, not a fixed lot size.
+            </span>
           </div>
 
           <span className="drawer__section" data-testid="section-trades">
@@ -232,9 +281,42 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-follow"
             onClick={() => onChange({ follow: !settings.follow })}
           >
-            Follow live edge
+            Follow live edge (time)
             <span className="check__box" aria-hidden="true" />
           </button>
+
+          {/* price auto-follow */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={settings.followPrice}
+            className={`check${settings.followPrice ? ' is-on' : ''}`}
+            data-testid="toggle-follow-price"
+            onClick={() => onChange({ followPrice: !settings.followPrice })}
+          >
+            Track price (keeps your zoom)
+            <span className="check__box" aria-hidden="true" />
+          </button>
+
+          {/* server price band — changing it re-subscribes */}
+          <div className="setting">
+            <span className="setting__label">Price range</span>
+            <div className="segrow" role="group" aria-label="price range" data-testid="setting-priceBand">
+              {PRICE_BANDS.map((b) => (
+                <button
+                  type="button"
+                  key={b}
+                  className={`segrow__btn${settings.priceBand === b ? ' is-on' : ''}`}
+                  aria-pressed={settings.priceBand === b}
+                  data-testid={`priceBand-${b}`}
+                  onClick={() => onChange({ priceBand: b })}
+                >
+                  {BAND_LABEL[b]}
+                </button>
+              ))}
+            </div>
+            <span className="setting__hint">{BAND_HINT[settings.priceBand]}</span>
+          </div>
 
           {/* right rail */}
           <button

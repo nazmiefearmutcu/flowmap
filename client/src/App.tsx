@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { gammaForContrast } from './gl/heatmap';
+import { floorForTolerance, gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
 import { attachGlobalKeys } from './input/keys';
 import { decodeFrame } from './proto/decode';
@@ -142,7 +142,13 @@ export function App() {
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
     renderer.setContrast(gammaForContrast(settingsRef.current.contrast));
+    renderer.setTolerance(floorForTolerance(settingsRef.current.tolerance));
+    renderer.setColormap(settingsRef.current.colormap);
     renderer.setNormPercentile(settingsRef.current.normPercentile);
+    // Follow policy is remembered by the renderer (`want*`) so the lazy ring
+    // creation on the first column cannot discard it.
+    renderer.setFollowTime(settingsRef.current.follow);
+    renderer.setPriceFollow(settingsRef.current.followPrice ? 'fit' : 'off');
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
@@ -182,11 +188,22 @@ export function App() {
       r.setOverlayVisibility(settings.overlays); // idempotent
       r.setBubbleMinSize(settings.bubbleMinSize); // idempotent
       r.setContrast(gammaForContrast(settings.contrast)); // idempotent
+      r.setTolerance(floorForTolerance(settings.tolerance)); // idempotent
+      r.setColormap(settings.colormap); // idempotent
       r.setNormPercentile(settings.normPercentile); // idempotent
-      // Follow is edge-triggered so it never fights a manual F / Space toggle.
-      if (settings.follow !== prevSettingsRef.current.follow) {
-        if (settings.follow && !r.following) r.goLive();
-        else if (!settings.follow && r.following) r.toggleFollow();
+      // Both follows are edge-triggered so they never fight a manual gesture,
+      // and each compares against the renderer's LIVE state (a gesture changes
+      // the camera without writing settings, so comparing only against the
+      // previous settings value would leave the switch showing a stale ON).
+      if (settings.follow !== prevSettingsRef.current.follow && settings.follow !== r.following) {
+        // setFollowTime, not goLive: re-pinning the right edge must not discard
+        // the price zoom the user has chosen.
+        r.setFollowTime(settings.follow);
+      }
+      if (settings.followPrice !== prevSettingsRef.current.followPrice) {
+        const wantOn = settings.followPrice;
+        if (wantOn && r.priceFollow === 'off') r.setPriceFollow('fit');
+        else if (!wantOn && r.priceFollow !== 'off') r.setPriceFollow('off');
       }
     }
     prevSettingsRef.current = settings;
@@ -288,7 +305,7 @@ export function App() {
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
-            <HeatLegend />
+            <HeatLegend colormap={settings.colormap} />
             <ClosedBanner />
           </div>
           <PriceAxis canvasRef={priceAxisRef} />

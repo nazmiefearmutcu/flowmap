@@ -171,14 +171,14 @@ test('settings persist across a reload', async ({ page }) => {
   await expect(page.locator('[data-testid="settings-drawer"]')).toBeVisible();
 
   // Change the colormap and flip follow off.
-  await page.locator('[data-testid="colormap-alt"]').click();
+  await page.locator('[data-testid="colormap-classic"]').click();
   await page.locator('[data-testid="toggle-follow"]').click();
 
   // Written straight to localStorage.
   const stored = await page.evaluate(() => localStorage.getItem('flowmap.settings.v1'));
   expect(stored).toBeTruthy();
   const parsed = JSON.parse(stored as string);
-  expect(parsed.colormap).toBe('alt');
+  expect(parsed.colormap).toBe('classic');
   expect(parsed.follow).toBe(false);
 
   // Reload → the choice survives.
@@ -192,7 +192,7 @@ test('settings persist across a reload', async ({ page }) => {
     { timeout: 45_000 },
   );
   await page.locator('[data-testid="settings-open"]').click();
-  await expect(page.locator('[data-testid="colormap-alt"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-testid="colormap-classic"]')).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('Space toggles follow and `/` focuses the symbol search', async ({ page }) => {

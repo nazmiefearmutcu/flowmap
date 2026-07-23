@@ -4,24 +4,51 @@
  * unit-tested without a real browser.
  *
  * Everything the drawer controls lives here and is written to localStorage on
- * every change, and re-read + applied on boot. Fields the renderer can honour live
- * (bubble threshold, overlays, follow, rail) are applied by App; the display knobs
- * (colormap / normalization percentile / tick grouping) are persisted so the
- * choice survives reloads and is ready for the renderer to consume.
+ * every change, and re-read + applied on boot. Almost all of it is honoured LIVE
+ * by the renderer (contrast, tolerance, colormap, normalization, bubble
+ * threshold, overlays, both follow axes, rail); `priceBand` is applied by
+ * re-subscribing (it changes the SERVER's grid geometry), and `tickGrouping` is
+ * persisted-only for now.
+ *
+ * **Migration policy.** `normalizeSettings` is a total coercion over an
+ * arbitrary parsed blob with a per-field default, so a stored payload that
+ * predates any field adopts that field's default with no migration code and no
+ * `SETTINGS_KEY` bump. The one deliberate exception is `colormap`: its legacy
+ * values (`'thermal'` / `'alt'`) were persisted on every mount but NEVER applied
+ * to the renderer, so a stored value carries no user intent — honouring it would
+ * mean returning users silently never see the new default ramp. Both legacy
+ * strings therefore fall through to {@link DEFAULT_COLORMAP} on purpose.
  */
 
-import { DEFAULT_CONTRAST } from '../gl/heatmap';
+import { DEFAULT_CONTRAST, DEFAULT_TOLERANCE } from '../gl/heatmap';
+import { DEFAULT_COLORMAP, type Colormap } from '../gl/lut';
 import {
   DEFAULT_OVERLAY_VISIBILITY,
   type OverlayVisibility,
 } from '../gl/overlays/frame';
 
-export type Colormap = 'thermal' | 'alt';
+export type { Colormap };
+
+/**
+ * Server price-grid coverage around the reference price (§8.1). The grid is a
+ * LINEAR affine over a fixed row count, so range and resolution are the same
+ * knob — widening the band coarsens every row. See the drawer hint.
+ *   - `native` — today's grid: finest rows, narrowest coverage.
+ *   - `wide`   — ±50% around mid.
+ *   - `full`   — −100% / +1000%. A range SCAN mode: at this width the live book
+ *     collapses into a couple of rows on a major, so it answers "are there walls
+ *     far out?", not "what is the ladder doing".
+ */
+export type PriceBand = 'native' | 'wide' | 'full';
+
+export const PRICE_BANDS: readonly PriceBand[] = ['native', 'wide', 'full'] as const;
 
 export interface FlowMapSettings {
   /** Heatmap display contrast 0–100 (drives the perceptual gamma, §8.3). */
   contrast: number;
-  /** Heatmap colormap family (thermal blue→white, or the alt single-hue ramp). */
+  /** Heatmap black point 0–100 — how much density a cell needs to paint at all. */
+  tolerance: number;
+  /** Heatmap colormap family. */
   colormap: Colormap;
   /** Viewport-normalization percentile (§8.3; higher = dimmer, more headroom). */
   normPercentile: number;
@@ -29,8 +56,12 @@ export interface FlowMapSettings {
   tickGrouping: number;
   /** Minimum trade size drawn as a tape bubble overlay. */
   bubbleMinSize: number;
-  /** Auto-follow the live right edge. */
+  /** Auto-follow the live right edge — the TIME axis. */
   follow: boolean;
+  /** Auto-track price on the PRICE axis (keeps your zoom, recentres on drift). */
+  followPrice: boolean;
+  /** Server price-grid coverage. Changing it re-subscribes. */
+  priceBand: PriceBand;
   /** Right rail (DOM ladder + tape) visibility. */
   railVisible: boolean;
   /** Which heatmap overlays are on. */
@@ -41,11 +72,14 @@ export const SETTINGS_KEY = 'flowmap.settings.v1';
 
 export const DEFAULT_SETTINGS: FlowMapSettings = {
   contrast: DEFAULT_CONTRAST,
-  colormap: 'thermal',
+  tolerance: DEFAULT_TOLERANCE,
+  colormap: DEFAULT_COLORMAP,
   normPercentile: 99,
   tickGrouping: 1,
   bubbleMinSize: 0,
   follow: true,
+  followPrice: true,
+  priceBand: 'native',
   railVisible: true,
   overlays: { ...DEFAULT_OVERLAY_VISIBILITY },
 };
@@ -72,11 +106,20 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
   }
   return {
     contrast: Math.round(clampNumber(o.contrast, 0, 100, DEFAULT_SETTINGS.contrast)),
-    colormap: o.colormap === 'alt' ? 'alt' : 'thermal',
+    tolerance: Math.round(clampNumber(o.tolerance, 0, 100, DEFAULT_SETTINGS.tolerance)),
+    // Only 'classic' is honoured; every other stored value (including the legacy
+    // 'thermal' / 'alt' from the never-applied knob) adopts the default. See the
+    // migration note in the module docblock.
+    colormap: o.colormap === 'classic' ? 'classic' : DEFAULT_COLORMAP,
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
     tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 32, DEFAULT_SETTINGS.tickGrouping)),
     bubbleMinSize: clampNumber(o.bubbleMinSize, 0, 1e9, DEFAULT_SETTINGS.bubbleMinSize),
     follow: typeof o.follow === 'boolean' ? o.follow : DEFAULT_SETTINGS.follow,
+    followPrice:
+      typeof o.followPrice === 'boolean' ? o.followPrice : DEFAULT_SETTINGS.followPrice,
+    priceBand: PRICE_BANDS.includes(o.priceBand as PriceBand)
+      ? (o.priceBand as PriceBand)
+      : DEFAULT_SETTINGS.priceBand,
     railVisible: typeof o.railVisible === 'boolean' ? o.railVisible : DEFAULT_SETTINGS.railVisible,
     overlays,
   };

@@ -36,8 +36,14 @@
  */
 
 import { COLS_PER_TILE, TileRing } from './tileRing';
-import { DEFAULT_DISPLAY_GAMMA, Heatmap, selectLevel, type HeatmapView } from './heatmap';
-import { createLUTTexture, rampForMode, RAMP_THERMAL } from './lut';
+import {
+  DEFAULT_DISPLAY_GAMMA,
+  Heatmap,
+  selectLevel,
+  TOLERANCE_MAX_FLOOR,
+  type HeatmapView,
+} from './heatmap';
+import { createLUTTexture, rampForMode, RAMP_INFERNO, type Colormap } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import {
@@ -68,7 +74,7 @@ import {
 import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
-import { MODE_L2, MsgType, type DepthColumn } from '../proto/types';
+import { MODE_L2, MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
 import { OverlayManager } from './overlays/manager';
 import type { OverlayVisibility } from './overlays/frame';
 import { remapRow, remapRowSpan, type PriceMap, type TimeMap } from './overlays/coords';
@@ -221,8 +227,15 @@ export class Renderer {
   private normSeeded = false;
   /** Fixed per-instrument decode scale (capability-driven; 1 for the sim). */
   private decodeScale = 1;
-  /** Current colormap row (thermal / synth), set per column mode. */
-  private ramp = RAMP_THERMAL;
+  /** Current colormap row (inferno / synth / classic), from mode + user choice. */
+  private ramp = RAMP_INFERNO;
+  /** The user's colormap family. Remembered here, like {@link contrastGamma},
+   *  so it survives Heatmap re-creation on session reset / context restore. */
+  private colormap: Colormap = 'inferno';
+  /** Render mode of the last column, for re-deriving the ramp on a knob change. */
+  private lastColMode: number | null = null;
+  /** Black point (§9 Tolerance), re-applied to every freshly built Heatmap. */
+  private toleranceFloor = 0;
 
   private newestSeq = -1;
   private view: HeatmapView;
@@ -355,7 +368,7 @@ export class Renderer {
   }
 
   /**
-   * Active colormap row (RAMP_THERMAL 0 / RAMP_SYNTH 1) — the heatmap encoding's
+   * Active colormap row (RAMP_INFERNO 0 / RAMP_SYNTH 1) — the heatmap encoding's
    * ramp when a heatmap exists, else the mode selected by the last column.
    * Diagnostics / e2e (asserts a SYNTH_PROFILE session renders the amber ramp).
    */
@@ -474,6 +487,47 @@ export class Renderer {
     this.dirty = true;
   }
 
+  /**
+   * Re-derive the active colormap row from the CURRENT column mode, the feed's
+   * honesty tier and the user's colormap choice, and push it into the heatmap.
+   *
+   * The §7 tier check inside {@link rampForMode} is unconditional, so this is
+   * safe to call at any time — including with no column seen yet, where the
+   * mode falls back to the synthetic-safe MODE_SYNTH_PROFILE rather than
+   * assuming real depth. That matters because `currentRamp` is exactly what the
+   * parity e2e asserts, and a colormap click mid-session-reset must never make a
+   * SYNTH session report a real-depth ramp.
+   */
+  private applyRamp(): void {
+    const depthTier = (this.store.getState().capability as { depth?: unknown } | null)?.depth;
+    const mode = this.lastColMode ?? MODE_SYNTH_PROFILE;
+    this.ramp = rampForMode(mode, depthTier, this.colormap);
+    if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
+      this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
+    }
+  }
+
+  /** Heatmap colormap family (§9). Honesty (§7) still wins: a SYNTH feed keeps
+   *  the amber ramp whatever the user picks. */
+  setColormap(colormap: Colormap): void {
+    this.colormap = colormap;
+    this.applyRamp();
+    this.dirty = true;
+  }
+
+  /**
+   * Heatmap black point (§9 Tolerance) — the normalized-density level below
+   * which a cell renders as background. Clamped to the legible band and
+   * guarded against non-finite input (a NaN floor blanks the whole heatmap, and
+   * this is reachable from `window.__flowmapLive` in dev/e2e builds).
+   */
+  setTolerance(floor: number): void {
+    const f = Number.isFinite(floor) ? floor : 0;
+    this.toleranceFloor = Math.min(TOLERANCE_MAX_FLOOR, Math.max(0, f));
+    if (this.heatmap) this.heatmap.floor = this.toleranceFloor;
+    this.dirty = true;
+  }
+
   /** Viewport-normalization percentile (§8.3 white-point / Saturation setting).
    *  The normalizer reads it fresh each frame, so this takes effect next draw. */
   setNormPercentile(percentile: number): void {
@@ -567,7 +621,8 @@ export class Renderer {
     this.overlays.reset();
     this.normSeeded = false;
     this.decodeScale = 1;
-    this.ramp = RAMP_THERMAL;
+    this.ramp = RAMP_INFERNO;
+    this.lastColMode = null;
     this.overlayIngestWarned = false;
 
     // Rewind the per-session cursors used for auto-follow + overlay anchoring so
@@ -801,11 +856,8 @@ export class Renderer {
     // Apply it to the heatmap encoding right away so the ramp is correct even on
     // a frame where the viewport normalizer has no data yet (updateNormalization
     // early-returns then); it re-affirms the same ramp once histograms exist.
-    const depthTier = (this.store.getState().capability as { depth?: unknown } | null)?.depth;
-    this.ramp = rampForMode(col.mode, depthTier);
-    if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
-      this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
-    }
+    this.lastColMode = col.mode;
+    this.applyRamp();
 
     this.updateView();
     this.dirty = true;
@@ -889,6 +941,8 @@ export class Renderer {
     this.ring = new TileRing(this.ctx.gl, rows, layers);
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
     this.heatmap.gamma = this.contrastGamma;
+    this.heatmap.floor = this.toleranceFloor;
+    this.applyRamp();
     this.mips?.dispose();
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
@@ -1344,7 +1398,9 @@ export class Renderer {
       this.heatmap = null;
       this.ring = new TileRing(gl, this.ringRows, this.ringLayers);
       this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
-    this.heatmap.gamma = this.contrastGamma;
+      this.heatmap.gamma = this.contrastGamma;
+      this.heatmap.floor = this.toleranceFloor;
+      this.applyRamp();
       this.mips = this.createMips(this.ringRows, this.ringLayers);
       this.heatmap.mips = this.mips;
       const cap = this.ring.capacityCols;
@@ -1548,7 +1604,7 @@ export class Renderer {
       this.extentSeq[slot] = s;
     }
     this.newestSeq = n - 1;
-    heatmap.encoding = { decodeScale: 1, norm: 150, ramp: RAMP_THERMAL };
+    heatmap.encoding = { decodeScale: 1, norm: 150, ramp: RAMP_INFERNO };
     this.camera.reset(ring.residentRange(), rows);
     this.updateView();
     this.dirty = true;
@@ -1623,7 +1679,7 @@ export class Renderer {
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
-    this.ramp = RAMP_THERMAL;
+    this.ramp = RAMP_INFERNO;
     this.camera.setLimits(limitsFor(rows, cap));
 
     for (let s = 0; s < total; s++) {
@@ -1814,7 +1870,7 @@ export class Renderer {
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
-    this.ramp = RAMP_THERMAL;
+    this.ramp = RAMP_INFERNO;
     this.camera.setLimits(limitsFor(rows, cap));
 
     for (let s = 0; s < total; s++) {
@@ -1843,7 +1899,7 @@ export class Renderer {
       this.writeColumn(col, rows);
     }
     this.newestSeq = total - 1;
-    this.heatmap.encoding = { decodeScale: 1, norm: 30, ramp: RAMP_THERMAL };
+    this.heatmap.encoding = { decodeScale: 1, norm: 30, ramp: RAMP_INFERNO };
 
     // Frame the recent ~200 columns and a price band around the mid.
     const colScale = 200;

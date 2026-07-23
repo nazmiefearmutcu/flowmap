@@ -10,7 +10,7 @@
  */
 
 import { checkGLError, type GLContext } from './context';
-import { RAMP_THERMAL } from './lut';
+import { RAMP_INFERNO } from './lut';
 import type { MipChain } from './mips';
 import { HEATMAP_FRAG, HEATMAP_VERT } from './shaders/heatmap';
 import { TileRing } from './tileRing';
@@ -29,7 +29,7 @@ export interface HeatmapEncoding {
   decodeScale: number;
   /** Normalization divisor (percentile) mapping intensity into ~[0,1]. */
   norm: number;
-  /** Colormap row: RAMP_THERMAL | RAMP_SYNTH. */
+  /** Colormap row: RAMP_INFERNO | RAMP_SYNTH | RAMP_CLASSIC. */
   ramp: number;
 }
 
@@ -50,8 +50,10 @@ export const DEFAULT_DISPLAY_GAMMA = 0.45;
  * Map a 0–100 "Contrast" slider to a display gamma. HIGHER contrast → HIGHER
  * gamma → a darker mid-field with punchier walls (more separation); LOWER
  * contrast → lower gamma → the field is lifted flat/bright (washed, less
- * separation). The default ({@link DEFAULT_CONTRAST}) lands on
- * {@link DEFAULT_DISPLAY_GAMMA}. Clamped to the legible band [0.28, 0.72].
+ * separation). The default ({@link DEFAULT_CONTRAST}) lands on 0.456 — CLOSE to
+ * but not equal to {@link DEFAULT_DISPLAY_GAMMA}; the two are independent
+ * defaults and the identity is deliberately not asserted anywhere. Clamped to
+ * the legible band [0.28, 0.72].
  */
 export function gammaForContrast(contrast: number): number {
   const c = Math.min(100, Math.max(0, contrast));
@@ -60,6 +62,36 @@ export function gammaForContrast(contrast: number): number {
 
 /** Slider position (0–100) whose gamma equals the default — the reset point. */
 export const DEFAULT_CONTRAST = 40;
+
+/**
+ * Largest black point the Tolerance slider can reach. Capped well below 1: at
+ * `floor → 1` the `1/(1-floor)` re-expansion degenerates and even the p99 white
+ * point maps to LUT entry 0, i.e. the whole heatmap goes black — which breaks
+ * the "both endpoints stay fixed" promise rather than implementing it.
+ */
+export const TOLERANCE_MAX_FLOOR = 0.5;
+
+/** Default Tolerance slider position. 0 = off, an exact algebraic no-op. */
+export const DEFAULT_TOLERANCE = 0;
+
+/**
+ * Map a 0–100 "Tolerance" slider to the shader's black point.
+ *
+ * QUADRATIC, not linear, because the useful floors are tiny: order-flow density
+ * is heavy-tailed and the default gamma ≈0.46 lifts the mid-field hard, so a
+ * normalized density of just 0.01 already renders as visible dark indigo
+ * (0.01^0.46 ≈ 0.11 → LUT index ~29). A linear 0→0.5 map would spend most of the
+ * slider in "everything is already gone" territory; the square gives fine
+ * control where it matters and still reaches the cap.
+ *
+ * Non-finite input yields 0 rather than NaN — a NaN floor would blank the entire
+ * heatmap, and this is reachable from `window.__flowmapLive` in dev/e2e builds.
+ */
+export function floorForTolerance(tolerance: number): number {
+  if (!Number.isFinite(tolerance)) return 0;
+  const t = Math.min(100, Math.max(0, tolerance)) / 100;
+  return TOLERANCE_MAX_FLOOR * t * t;
+}
 
 /** The mip level + tap geometry to sample this frame (see {@link selectLevel}). */
 interface LevelSel {
@@ -133,6 +165,8 @@ type UniformName =
   | 'u_decodeScale'
   | 'u_norm'
   | 'u_gamma'
+  | 'u_floor'
+  | 'u_floorScale'
   | 'u_ramp'
   | 'u_level'
   | 'u_blk'
@@ -150,7 +184,7 @@ export class Heatmap {
   /** SUM-mip chain (T7). null → the shader stays on the level-0 single-tap path. */
   mips: MipChain | null = null;
 
-  encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_THERMAL };
+  encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_INFERNO };
 
   /**
    * Perceptual display gamma applied to the normalized intensity before the LUT
@@ -158,6 +192,14 @@ export class Heatmap {
    * encoding reassignments; the settings drawer's Contrast control writes it.
    */
   gamma = DEFAULT_DISPLAY_GAMMA;
+
+  /**
+   * Black point on the normalized intensity (§9 Tolerance), in the same units as
+   * `t` BEFORE the mip footprint is folded in — `draw()` scales it per frame.
+   * Kept outside {@link encoding} so `updateNormalization`'s per-frame
+   * reassignment of that object cannot clobber it, exactly like {@link gamma}.
+   */
+  floor = 0;
 
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
@@ -211,6 +253,8 @@ export class Heatmap {
       u_decodeScale: loc('u_decodeScale'),
       u_norm: loc('u_norm'),
       u_gamma: loc('u_gamma'),
+      u_floor: loc('u_floor'),
+      u_floorScale: loc('u_floorScale'),
       u_ramp: loc('u_ramp'),
       u_level: loc('u_level'),
       u_blk: loc('u_blk'),
@@ -290,6 +334,18 @@ export class Heatmap {
     gl.uniform1i(this.u.u_level, sel.level);
     gl.uniform1i(this.u.u_blk, sel.blk);
     gl.uniform1i(this.u.u_nRowTaps, sel.nRowTaps);
+
+    // Scale the black point by the pixel's ROW footprint. `intensity` sums
+    // nRowTaps rows of a blk-row block and divides only the COLUMN dimension by
+    // blk, and normMipScale(level) is 1 by design (gl/normalize.ts) — so t grows
+    // with price zoom-out and an unscaled floor would hide a different amount of
+    // size at every zoom. Clamped below 1 so the re-expansion never degenerates.
+    const floor = Math.min(
+      TOLERANCE_MAX_FLOOR,
+      Math.max(0, this.floor) * sel.nRowTaps * sel.blk,
+    );
+    gl.uniform1f(this.u.u_floor, floor);
+    gl.uniform1f(this.u.u_floorScale, 1 / Math.max(1 - floor, 1e-6));
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
