@@ -22,7 +22,7 @@ TAURI_DIR="$REPO_ROOT/app/src-tauri"
 PYRUNTIME="$TAURI_DIR/resources/pyruntime"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP_PATH="$TAURI_DIR/target/release/bundle/macos/FlowMap.app"
 DMG_DIR="$TAURI_DIR/target/release/bundle/dmg"
 DMG_PATH="$DMG_DIR/FlowMap_${VERSION}_aarch64.dmg"
