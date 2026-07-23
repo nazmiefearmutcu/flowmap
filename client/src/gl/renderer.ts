@@ -40,17 +40,38 @@ import { DEFAULT_DISPLAY_GAMMA, Heatmap, selectLevel, type HeatmapView } from '.
 import { createLUTTexture, rampForMode, RAMP_THERMAL } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
-import { Camera, limitsFor, screenToGrid } from './camera';
+import {
+  Camera,
+  KILL_TIME,
+  KILL_PRICE,
+  limitsFor,
+  priceFrame,
+  screenToGrid,
+  type PriceFollow,
+} from './camera';
+import {
+  approach,
+  isColVisible,
+  panFollowKill,
+  PRICE_GLIDE_TAU_MS,
+  PRICE_SNAP_ROWS,
+  priceFollowTarget,
+  trackedRow,
+} from './follow';
 import { ViewportNormalizer } from './normalize';
 import { ColumnCache } from './columnCache';
-import { attachGestures, type CameraController } from '../input/gestures';
+import {
+  attachAxisGestures,
+  attachGestures,
+  type CameraController,
+} from '../input/gestures';
 import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
 import { MODE_L2, MsgType, type DepthColumn } from '../proto/types';
 import { OverlayManager } from './overlays/manager';
 import type { OverlayVisibility } from './overlays/frame';
-import type { PriceMap, TimeMap } from './overlays/coords';
+import { remapRow, remapRowSpan, type PriceMap, type TimeMap } from './overlays/coords';
 
 /** The renderer only needs the store's imperative surface, not the React hook. */
 interface RendererStore {
@@ -168,6 +189,15 @@ export class Renderer {
   /** Per-slot non-zero row extent (lo/hi), -1 = empty. Sized to ring capacity. */
   private extentLo: Int32Array | null = null;
   private extentHi: Int32Array | null = null;
+  /**
+   * Absolute col_seq each extent slot was written for (-1 = never written).
+   * REQUIRED, not belt-and-braces: `Residency.note()` (gl/tileRing.ts) is a pure
+   * interval, so ONE backfilled column instantly makes `residentRange()` claim a
+   * whole capacity-wide window whose slots still hold the PREVIOUS live columns'
+   * extents. The price auto-fit scans that window, so without this stamp it would
+   * fit to a foreign price band mid-backfill.
+   */
+  private extentSeq: Int32Array | null = null;
   /** Ring geometry, remembered so context-restore can rebuild identically. */
   private ringRows = 0;
   private ringLayers = 0;
@@ -197,6 +227,30 @@ export class Renderer {
   private newestSeq = -1;
   private view: HeatmapView;
 
+  // --- price auto-follow (gl/follow.ts) ---------------------------------------
+  /** Row the live book is currently centred on, or null before any column. */
+  private trackedRowN: number | null = null;
+  /** Epoch `trackedRowN` / the camera's price frame are expressed in. */
+  private priceEpoch: number | null = null;
+  /** Armed recentre target (rows); null while price sits inside the deadband. */
+  private priceTarget: number | null = null;
+  /** True once the glide has settled, so a stalled ease stops re-dirtying. */
+  private priceStalled = false;
+  /** Timestamp of the last price-follow step, for the frame-rate-independent ease. */
+  private priceStepTs = 0;
+  /** Memoized price auto-fit: the extent union is only re-scanned when the
+   *  visible window or the live edge actually moves. */
+  private priceFitMemo: { lo: number; hi: number; newest: number; rowBottom: number; rowSpan: number } | null =
+    null;
+  /**
+   * The follow policy the USER/settings asked for, re-asserted after every
+   * `camera.reset()`. Without it the first depth column's `createRing()` reset
+   * silently discards persisted follow state (the ring is created lazily, always
+   * after App's mount effect has run).
+   */
+  private wantFollowTime = true;
+  private wantPriceFollow: PriceFollow = 'fit';
+
   private dirty = false;
   /** The view moved this frame → ask the HistoryLoader to ensure visible range. */
   private viewMoved = false;
@@ -218,6 +272,8 @@ export class Renderer {
   private readonly unsubscribeStream: () => void;
   private readonly resizeObserver: ResizeObserver;
   private readonly gesturesDispose: () => void;
+  /** Price-gutter gesture disposer; null until the gutter canvas is attached. */
+  private axisGesturesDispose: (() => void) | null = null;
   /** The camera-control surface the gestures drive; also the app-keyboard target. */
   private readonly controller: CameraController;
 
@@ -285,7 +341,12 @@ export class Renderer {
 
   /** Whether the camera is auto-following the live right edge. Diagnostics. */
   get following(): boolean {
-    return this.camera.follow;
+    return this.camera.followTime;
+  }
+
+  /** How the PRICE axis is auto-scaling ('fit' | 'track' | 'off'). Diagnostics. */
+  get priceFollow(): PriceFollow {
+    return this.camera.followPrice;
   }
 
   /** A copy of the current view uniforms. Diagnostics / e2e. */
@@ -360,6 +421,7 @@ export class Renderer {
       this.onContextRestored as EventListener,
     );
     this.gesturesDispose();
+    this.axisGesturesDispose?.();
     this.unsubscribeStream();
     this.overlays.dispose();
     this.mips?.dispose();
@@ -376,6 +438,14 @@ export class Renderer {
     timeAxisCanvas: HTMLCanvasElement | null,
   ): void {
     this.overlays.attachAxes(priceAxisCanvas, timeAxisCanvas);
+    // The price gutter is a CONTROL surface (§9): wheel = price zoom, vertical
+    // drag = price scale, double-click = auto-fit. Listeners live on the canvas
+    // so the AUTO chip can be an absolutely-positioned sibling whose clicks
+    // never reach it. Re-attachable — the old disposer runs first.
+    this.axisGesturesDispose?.();
+    this.axisGesturesDispose = priceAxisCanvas
+      ? attachAxisGestures(priceAxisCanvas, this.controller)
+      : null;
     this.dirty = true;
   }
 
@@ -487,6 +557,7 @@ export class Renderer {
     this.history = null;
     this.extentLo = null;
     this.extentHi = null;
+    this.extentSeq = null;
     this.ringRows = 0;
     this.ringLayers = 0;
 
@@ -502,6 +573,11 @@ export class Renderer {
     // Rewind the per-session cursors used for auto-follow + overlay anchoring so
     // the new session's first (typically lower) col_seq becomes the newest again.
     this.newestSeq = -1;
+    this.trackedRowN = null;
+    this.priceEpoch = null;
+    this.priceTarget = null;
+    this.priceStalled = false;
+    this.priceFitMemo = null;
     this.overlayAnchorSeq = -1;
     this.overlayAnchorT0Ns = 0n;
     this.overlayAnchorEpoch = 0;
@@ -511,6 +587,7 @@ export class Renderer {
     // follow frame fits the price axis to the new book.
     this.camera.setLimits(limitsFor(1, this.opts.capacityColsTarget));
     this.camera.reset(null);
+    this.applyWantedFollow();
     this.view = this.camera.toView();
 
     // Wipe the old image now — preserveDrawingBuffer would otherwise keep the
@@ -529,32 +606,38 @@ export class Renderer {
     const cssW = (): number => Math.max(1, this.canvas.clientWidth);
     const cssH = (): number => Math.max(1, this.canvas.clientHeight);
     return {
-      panByPixels: (dx, dy) => {
+      panByPixels: (dx, dy, drag) => {
         // Natural drag: content follows the cursor. Right → earlier columns
         // (colCenter decreases); down → higher rows (rowCenter increases).
         const dCols = -(dx / cssW()) * this.view.colScale;
         const dRows = (dy / cssH()) * this.view.rowScale;
-        this.camera.pan(dCols, dRows);
+        // Per-axis release from PEAK displacement, so a deliberately horizontal
+        // drag keeps price tracking (gl/follow.ts panFollowKill).
+        this.camera.pan(dCols, dRows, panFollowKill(drag.peakDx, drag.peakDy));
         this.onCameraChanged();
       },
-      zoomTimeAtPixel: (factor, cursorX) => {
-        const anchorCol = this.view.colOffset + this.view.colScale * (cursorX / cssW());
+      zoomTimeAtFraction: (factor, fracX) => {
+        const anchorCol = this.view.colOffset + this.view.colScale * fracX;
         this.camera.zoomTime(factor, anchorCol);
         this.onCameraChanged();
       },
-      zoomPriceAtPixel: (factor, cursorY) => {
+      zoomPriceAtFraction: (factor, fracFromTop) => {
         // uv.y = 0 at the bottom of the grid; the cursor's y grows downward.
-        const uvY = 1 - cursorY / cssH();
+        const uvY = 1 - fracFromTop;
         const anchorRow = this.view.rowOffset + this.view.rowScale * uvY;
         this.camera.zoomPrice(factor, anchorRow);
         this.onCameraChanged();
       },
+      scalePriceCentered: (factor) => {
+        this.camera.zoomPrice(factor, this.camera.state.rowCenter);
+        this.onCameraChanged();
+      },
       panTimeSteps: (dir) => {
-        this.camera.pan(dir * this.view.colScale * KEY_PAN_FRAC, 0);
+        this.camera.pan(dir * this.view.colScale * KEY_PAN_FRAC, 0, KILL_TIME);
         this.onCameraChanged();
       },
       panPriceSteps: (dir) => {
-        this.camera.pan(0, dir * this.view.rowScale * KEY_PAN_FRAC);
+        this.camera.pan(0, dir * this.view.rowScale * KEY_PAN_FRAC, KILL_PRICE);
         this.onCameraChanged();
       },
       zoomTimeCentered: (factor) => {
@@ -562,24 +645,57 @@ export class Renderer {
         this.onCameraChanged();
       },
       toggleFollow: () => {
-        if (this.camera.follow) {
-          this.camera.state.follow = false; // freeze on the current view
-        } else {
-          this.camera.state.follow = true;
-          this.updateView(); // snap back to the live edge immediately
-        }
-        this.dirty = true;
+        this.setFollowTime(!this.camera.followTime);
+      },
+      togglePriceFollow: () => {
+        this.setPriceFollow(this.camera.followPrice === 'off' ? 'track' : 'off');
+      },
+      setPriceFollow: (mode) => {
+        this.setPriceFollow(mode);
+      },
+      setFollowTime: (on) => {
+        this.setFollowTime(on);
       },
       goLive: () => {
+        this.wantFollowTime = true;
+        this.wantPriceFollow = 'fit';
         this.camera.reset(this.residentRange(), this.ring?.rows);
         // Leaving scroll-back: allow live appends to re-anchor the ring at the
         // live edge and let the loader probe again on the next pan.
         this.history?.reset();
+        this.priceTarget = null;
+        this.priceStalled = false;
+        this.priceFitMemo = null;
         this.updateView();
         this.dirty = true;
         this.viewMoved = true;
       },
     };
+  }
+
+  /** Turn TIME follow on/off (`Space` in live mode, `F`, the transport pill). */
+  setFollowTime(on: boolean): void {
+    this.wantFollowTime = on;
+    this.camera.setFollowTime(on);
+    // Releasing time promotes a fitted price axis to 'track' (camera.applyKill),
+    // so remember whatever the camera settled on.
+    this.wantPriceFollow = this.camera.followPrice;
+    if (on) this.updateView();
+    this.view = this.camera.toView();
+    this.dirty = true;
+    this.viewMoved = true;
+  }
+
+  /** Set the PRICE follow mode (`P`, the axis chip, a gutter double-click). */
+  setPriceFollow(mode: PriceFollow): void {
+    this.wantPriceFollow = mode;
+    this.camera.setPriceFollow(mode);
+    this.priceTarget = null;
+    this.priceStalled = false;
+    this.priceFitMemo = null;
+    this.updateView();
+    this.view = this.camera.toView();
+    this.dirty = true;
   }
 
   /** A user gesture changed the camera: recompute uniforms, request a redraw. */
@@ -646,6 +762,16 @@ export class Renderer {
       return;
     }
 
+    // Epoch change: the server moved p0, so a USER-OWNED price window (track /
+    // off) is now pointing at different prices. Remap the camera + tracked row
+    // through the two affines. `priceEpoch` only advances when the remap
+    // actually succeeded — the store may not hold the new epoch's params yet
+    // (onDepthColumn already tolerates that ordering above), and advancing
+    // regardless would strand a locked window on the old p0 forever.
+    if (this.priceEpoch !== col.epoch) {
+      this.remapPriceEpoch(col.epoch);
+    }
+
     if (col.col_seq > this.newestSeq) this.newestSeq = col.col_seq;
 
     // Deep scroll-back gate (T8): when the user has panned back into history
@@ -654,7 +780,7 @@ export class Renderer {
     // column stays on the server and is recoverable on go-live; the resident
     // window keeps tracking the scrolled-back region the loader is filling.
     const range = ring.residentRange();
-    if (!this.camera.follow && range !== null && col.col_seq > range.newest + 1) {
+    if (!this.camera.followTime && range !== null && col.col_seq > range.newest + 1) {
       return;
     }
 
@@ -716,9 +842,19 @@ export class Renderer {
 
     const cap = ring.capacityCols;
     const slot = ((col.col_seq % cap) + cap) % cap;
-    const [lo, hi] = columnExtent(col.bid, col.ask, rows);
+    const [lo, hi, bidTop, askBot] = columnExtent(col.bid, col.ask, rows);
     this.extentLo![slot] = lo;
     this.extentHi![slot] = hi;
+    this.extentSeq![slot] = col.col_seq;
+    // Price auto-follow tracks the LIVE edge only: a backfilled history column
+    // must never move the tracked row (renderer.ts spliceColumn shares this path).
+    if (col.col_seq >= this.newestSeq) {
+      const tracked = trackedRow(bidTop, askBot, lo, hi);
+      if (tracked !== null) this.trackedRowN = tracked;
+    }
+    // The fit memo is keyed on the visible window; a new column inside it
+    // invalidates the cached extent union.
+    this.priceFitMemo = null;
 
     // T9: feed the exact CPU cache (crosshair readout) and the per-tile
     // histogram (viewport normalization). The DepthColumn arrays are fresh,
@@ -759,12 +895,25 @@ export class Renderer {
     const cap = this.ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
+    this.extentSeq = new Int32Array(cap).fill(-1);
 
     this.history = this.createHistoryLoader();
 
     // Real geometry known: update the camera's clamps and (re)frame live.
     this.camera.setLimits(limitsFor(rows, cap));
     this.camera.reset(this.ring.residentRange(), rows);
+    this.applyWantedFollow();
+  }
+
+  /**
+   * Re-assert the follow policy the user/settings asked for after a
+   * `camera.reset()`. The ring is created lazily on the FIRST depth column —
+   * always after App's mount effect has applied persisted settings — so without
+   * this the reset silently reverts the user to {time on, price fit}.
+   */
+  private applyWantedFollow(): void {
+    this.camera.setFollowTime(this.wantFollowTime);
+    this.camera.setPriceFollow(this.wantPriceFollow);
   }
 
   /** Wire a {@link HistoryLoader} to the store transport + this ring/mips. */
@@ -805,18 +954,22 @@ export class Renderer {
   // --- view + draw --------------------------------------------------------------
 
   /**
-   * Recompute the view uniforms. When FOLLOWING, re-derive the auto-follow frame
-   * (time pinned to the newest columns, price fit to the visible book) and hand
-   * it to the camera; when the user has taken over (follow off) the camera's
-   * pan/zoom state is authoritative and only the uniform cache is refreshed.
+   * Recompute the view uniforms. The two axes are INDEPENDENT: time re-derives
+   * the follow frame while `followTime` is on, price re-derives the auto-fit
+   * frame while `followPrice === 'fit'`. Either can be user-owned without
+   * freezing the other — scrolling back through history keeps the price axis
+   * auto-scaling, and zooming price keeps the right edge pinned to now. Where
+   * the user owns an axis, the camera's pan/zoom state is authoritative and only
+   * the uniform cache is refreshed.
    */
   private updateView(): void {
-    if (this.camera.follow) this.applyFollowFrame();
+    if (this.camera.followTime) this.applyTimeFollowFrame();
+    if (this.camera.followPrice === 'fit') this.applyPriceFitFrame();
     this.view = this.camera.toView();
   }
 
-  /** Time = right edge at newest; price = fit to non-zero book over the window. */
-  private applyFollowFrame(): void {
+  /** Time half of the follow frame: right edge pinned to the newest column. */
+  private applyTimeFollowFrame(): void {
     const ring = this.ring;
     if (ring === null) return;
     const range = ring.residentRange();
@@ -829,37 +982,111 @@ export class Renderer {
     // Fill the width with what we have, then lock and scroll once it's full.
     visible = Math.min(visible, cap, range.count);
 
-    const newest = range.newest;
-    const colLeft = newest - visible + 1;
+    this.camera.setTimeFrame(range.newest - visible + 1, visible);
+  }
 
-    // Price fit: union of non-zero row extents over the visible columns.
-    let lo = Infinity;
-    let hi = -Infinity;
-    const oldestVisible = Math.max(colLeft, range.oldest);
-    for (let s = oldestVisible; s <= newest; s++) {
-      const slot = ((s % cap) + cap) % cap;
+  /**
+   * Price half: fit to the union of non-zero row extents over the CURRENT
+   * visible column window (not the follow window), so auto-fit keeps working
+   * after the user has scrolled back through history.
+   *
+   * Three properties worth stating, each of which is a bug if dropped:
+   *  - Slots whose `extentSeq` does not match the column being read are SKIPPED.
+   *    `Residency` over-claims during backfill (see {@link extentSeq}), so the
+   *    unfiltered scan would union a foreign price band into the fit.
+   *  - When the scan finds nothing the price frame is LEFT ALONE. Snapping to
+   *    the whole grid here would detonate rowScale ~17× the moment the user pans
+   *    into a sparse region — the genuinely-empty case is the `range === null`
+   *    early return above it.
+   *  - The result is memoized on {lo, hi, newest}, so the common case (a frozen
+   *    window while columns stream in) costs one comparison per column, not a
+   *    rescan. `writeColumn` invalidates the memo.
+   */
+  private applyPriceFitFrame(): void {
+    const ring = this.ring;
+    if (ring === null) return;
+    const range = ring.residentRange();
+    if (range === null) return;
+
+    const cap = ring.capacityCols;
+    const st = this.camera.state;
+    const lo = Math.max(range.oldest, Math.floor(st.colCenter - st.colSpan / 2));
+    const hi = Math.min(range.newest, Math.ceil(st.colCenter + st.colSpan / 2));
+    if (hi < lo) return;
+
+    const memo = this.priceFitMemo;
+    if (memo !== null && memo.lo === lo && memo.hi === hi && memo.newest === range.newest) {
+      this.camera.setPriceFrame(memo.rowBottom, memo.rowSpan);
+      return;
+    }
+
+    let rowLo = Infinity;
+    let rowHi = -Infinity;
+    for (let c = lo; c <= hi; c++) {
+      const slot = ((c % cap) + cap) % cap;
+      if (this.extentSeq![slot] !== c) continue; // stale slot (see extentSeq)
       const elo = this.extentLo![slot];
       if (elo < 0) continue;
       const ehi = this.extentHi![slot];
-      if (elo < lo) lo = elo;
-      if (ehi > hi) hi = ehi;
+      if (elo < rowLo) rowLo = elo;
+      if (ehi > rowHi) rowHi = ehi;
     }
+    if (rowHi < rowLo) return; // nothing to fit — keep the frame we have
 
-    let rowBottom: number;
-    let rowSpan: number;
-    if (hi < lo) {
-      // No non-zero rows yet: show the whole price grid.
-      rowBottom = 0;
-      rowSpan = ring.rows;
-    } else {
-      const pad = Math.max(MIN_ROW_PAD, Math.round((hi - lo) * ROW_PAD_FRACTION));
-      const bottom = Math.max(0, lo - pad);
-      const top = Math.min(ring.rows, hi + pad + 1);
-      rowBottom = bottom;
-      rowSpan = Math.max(1, top - bottom);
+    const frame = priceFrame(rowLo, rowHi, ring.rows, ROW_PAD_FRACTION, MIN_ROW_PAD);
+    this.priceFitMemo = { lo, hi, newest: range.newest, ...frame };
+    this.camera.setPriceFrame(frame.rowBottom, frame.rowSpan);
+  }
+
+  /**
+   * Price auto-follow, `'track'` mode: keep the user's `rowSpan` and ease
+   * `rowCenter` onto the tracked row whenever price leaves the central deadband
+   * (gl/follow.ts). Called once per frame.
+   *
+   * Gated on the live edge being VISIBLE: when the user has scrolled back into
+   * history, "now"'s price has nothing to do with the columns on screen, and
+   * tracking it would drag the price window off the region being read and fight
+   * the history backfill. Price simply freezes there and resumes on return.
+   *
+   * The ease only re-dirties the frame when `rowCenter` actually moved by more
+   * than a sub-pixel; once it settles, `priceStalled` latches so a converged
+   * glide cannot hold the renderer at 60 fps for a whole session.
+   */
+  private stepPriceFollow(ts: number): void {
+    const prevTs = this.priceStepTs;
+    this.priceStepTs = ts;
+    // A scripted perf run owns the camera; never contend with it.
+    if (this.perf !== null) return;
+    if (this.camera.followPrice !== 'track') return;
+    if (this.trackedRowN === null || this.newestSeq < 0) return;
+    if (!isColVisible(this.view, this.newestSeq)) return;
+
+    const st = this.camera.state;
+    if (this.priceTarget === null) {
+      this.priceTarget = priceFollowTarget(st.rowCenter, st.rowSpan, this.trackedRowN);
+      if (this.priceTarget === null) return; // still inside the deadband
+      this.priceStalled = false;
     }
+    if (this.priceStalled) return;
 
-    this.camera.setFollowFrame(colLeft, visible, rowBottom, rowSpan);
+    const target = this.priceTarget;
+    const dt = prevTs > 0 ? ts - prevTs : PRICE_GLIDE_TAU_MS;
+    const next = approach(st.rowCenter, target, dt, PRICE_GLIDE_TAU_MS);
+    const moved = Math.abs(next - st.rowCenter);
+    const subPixel = st.rowSpan / Math.max(1, this.canvas.clientHeight);
+
+    if (Math.abs(target - st.rowCenter) <= PRICE_SNAP_ROWS || moved <= subPixel) {
+      // Settled: land exactly and disarm until price drifts out again.
+      this.camera.setRowCenter(target);
+      this.view = this.camera.toView();
+      this.priceTarget = null;
+      this.priceStalled = true;
+      this.dirty = true;
+      return;
+    }
+    this.camera.setRowCenter(next);
+    this.view = this.camera.toView();
+    this.dirty = true;
   }
 
   private resize(): void {
@@ -1016,6 +1243,45 @@ export class Renderer {
     });
   }
 
+  /**
+   * Move the price axis into `epoch`'s row coordinates. No-op (and no epoch
+   * advance) when either affine is unknown or the remap is not finite, so a
+   * missing EpochParams can never write NaN into the camera.
+   */
+  private remapPriceEpoch(epoch: number): void {
+    const epochs = this.store.getState().epochs;
+    const to = epochs.get(epoch);
+    if (to === undefined) return;
+    const toMap: PriceMap = { p0: to.p0, step: to.tick * to.tick_multiple };
+
+    const prev = this.priceEpoch;
+    if (prev === null) {
+      this.priceEpoch = epoch; // first epoch: nothing to remap from
+      return;
+    }
+    const from = epochs.get(prev);
+    if (from === undefined) return;
+    const fromMap: PriceMap = { p0: from.p0, step: from.tick * from.tick_multiple };
+
+    const st = this.camera.state;
+    const rowCenter = remapRow(st.rowCenter, fromMap, toMap);
+    const rowSpan = remapRowSpan(st.rowSpan, fromMap, toMap);
+    if (!Number.isFinite(rowCenter) || !Number.isFinite(rowSpan) || rowSpan <= 0) return;
+    this.camera.remapPrice(rowCenter, rowSpan);
+
+    if (this.trackedRowN !== null) {
+      const tracked = remapRow(this.trackedRowN, fromMap, toMap);
+      const rows = this.ring?.rows ?? 0;
+      this.trackedRowN = Number.isFinite(tracked)
+        ? Math.min(Math.max(tracked, 0), rows)
+        : null;
+    }
+    this.priceTarget = null;
+    this.priceStalled = false;
+    this.priceFitMemo = null;
+    this.priceEpoch = epoch;
+  }
+
   /** Row→price affine for the current grid epoch, or null before any epoch. */
   private overlayPriceMap(): PriceMap | null {
     const st = this.store.getState();
@@ -1084,6 +1350,7 @@ export class Renderer {
       const cap = this.ring.capacityCols;
       this.extentLo = new Int32Array(cap).fill(-1);
       this.extentHi = new Int32Array(cap).fill(-1);
+      this.extentSeq = new Int32Array(cap).fill(-1);
       this.history = this.createHistoryLoader();
       this.camera.setLimits(limitsFor(this.ringRows, cap));
       // Recover by re-following the live edge: the ring came back empty and the
@@ -1116,6 +1383,10 @@ export class Renderer {
       this.stepPerf(perf);
       this.dirty = true; // force a redraw every frame while measuring
     }
+
+    // Price auto-follow glide (O(1): a handful of scalars). No-op unless the
+    // camera is in 'track' mode with the live edge on screen.
+    this.stepPriceFollow(ts);
 
     // T8: on frames where the view moved, ask the loader to ensure the visible
     // range is populated. This guard is O(1) (visible-left vs resident-oldest) —
@@ -1261,6 +1532,7 @@ export class Renderer {
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
+    this.extentSeq = new Int32Array(cap).fill(-1);
     this.camera.setLimits(limitsFor(rows, cap));
 
     const bid = new Float32Array(rows);
@@ -1273,6 +1545,7 @@ export class Renderer {
       const [lo, hi] = columnExtent(bid, ask, rows);
       this.extentLo[slot] = lo;
       this.extentHi[slot] = hi;
+      this.extentSeq[slot] = s;
     }
     this.newestSeq = n - 1;
     heatmap.encoding = { decodeScale: 1, norm: 150, ramp: RAMP_THERMAL };
@@ -1348,6 +1621,7 @@ export class Renderer {
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
+    this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
     this.ramp = RAMP_THERMAL;
     this.camera.setLimits(limitsFor(rows, cap));
@@ -1408,7 +1682,8 @@ export class Renderer {
       colSpan: colScale,
       rowCenter: rowOffset + rowScale / 2,
       rowSpan: rowScale,
-      follow: false,
+      followTime: false,
+      followPrice: 'off',
     };
     this.view = this.camera.toView();
     this.dirty = true;
@@ -1537,6 +1812,7 @@ export class Renderer {
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
+    this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
     this.ramp = RAMP_THERMAL;
     this.camera.setLimits(limitsFor(rows, cap));
@@ -1595,7 +1871,8 @@ export class Renderer {
 
   /** Run a scripted continuous PAN for `durationMs`; resolves with frame timing. */
   perfPan(durationMs: number, panStepCols = 2): Promise<PerfResult> {
-    this.camera.state.follow = false;
+    this.camera.setFollowTime(false);
+    this.camera.setPriceFollow('off');
     return new Promise((resolve) => {
       this.perf = {
         kind: 'pan',
@@ -1614,7 +1891,8 @@ export class Renderer {
 
   /** Run a scripted continuous time ZOOM for `durationMs`; resolves with timing. */
   perfZoom(durationMs: number): Promise<PerfResult> {
-    this.camera.state.follow = false;
+    this.camera.setFollowTime(false);
+    this.camera.setPriceFollow('off');
     const range = this.residentRange();
     const zoomMax = Math.min(
       this.camera.limits.maxColSpan,
@@ -1646,16 +1924,22 @@ function columnExtent(
   bid: Float32Array,
   ask: Float32Array | null,
   rows: number,
-): [number, number] {
+): [number, number, number, number] {
   let lo = -1;
   let hi = -1;
+  let bidTop = -1;
+  let askBot = -1;
   for (let r = 0; r < rows; r++) {
-    if (bid[r] > 0 || (ask !== null && ask[r] > 0)) {
+    const b = bid[r] > 0;
+    const a = ask !== null && ask[r] > 0;
+    if (b) bidTop = r; // last one wins → the highest bid row
+    if (a && askBot < 0) askBot = r; // first one wins → the lowest ask row
+    if (b || a) {
       if (lo < 0) lo = r;
       hi = r;
     }
   }
-  return [lo, hi];
+  return [lo, hi, bidTop, askBot];
 }
 
 /**

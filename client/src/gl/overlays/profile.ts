@@ -88,9 +88,16 @@ export class Profile {
     const colLo = Math.max(range.lo, range.hi - this.opts.maxCols + 1);
     const colHi = range.hi;
 
-    // Visible absolute row band from the view.
+    // Visible absolute row band from the view, clamped to the GRID on both ends.
+    // The price camera can overscroll a full viewport past either edge (see
+    // gl/camera.ts rowCenterBounds), and rows outside [0, rows) hold nothing —
+    // without the upper clamp the per-frame `new Float64Array(rowHi-rowLo+1)`
+    // would be sized by how far the user has scrolled into empty background
+    // rather than by what is actually on the grid.
+    const gridRows = frame.columnArrays(colHi)?.bid.length ?? 0;
+    if (gridRows <= 0) return;
     const rowLo = Math.max(0, Math.floor(gm.view.rowOffset));
-    const rowHi = Math.ceil(gm.view.rowOffset + gm.view.rowScale);
+    const rowHi = Math.min(gridRows - 1, Math.ceil(gm.view.rowOffset + gm.view.rowScale));
     if (rowHi < rowLo) return;
 
     const result = accumulateProfile(colLo, colHi, rowLo, rowHi, frame.columnArrays);

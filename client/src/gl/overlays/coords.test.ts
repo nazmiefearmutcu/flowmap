@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { GridMap, toBigNs, visibleColRange, type SurfaceDims } from './coords';
+import {
+  GridMap,
+  remapRow,
+  remapRowSpan,
+  toBigNs,
+  visibleColRange,
+  type PriceMap,
+  type SurfaceDims,
+} from './coords';
 import type { HeatmapView } from '../heatmap';
 
 const view: HeatmapView = { colOffset: 100, colScale: 200, rowOffset: 50, rowScale: 100 };
@@ -99,5 +107,39 @@ describe('visibleColRange', () => {
 
   it('returns null when the view is entirely outside the resident window', () => {
     expect(visibleColRange(view, { oldest: 500, newest: 600 })).toBeNull();
+  });
+});
+
+describe('remapRow / remapRowSpan — surviving an epoch re-anchor', () => {
+  // The server bumps the epoch and moves p0 when mid leaves the grid's central
+  // band. The tile ring is epoch-agnostic and the shader applies ONE row affine,
+  // so a user-locked price window must be re-expressed or it silently points at
+  // different prices.
+  const A: PriceMap = { p0: 100, step: 0.5 };
+  const B: PriceMap = { p0: 150, step: 0.5 }; // pure translation (p0 +50)
+
+  it('preserves the PRICE a row denotes across a p0 shift', () => {
+    // row 40 in A is price 120; in B that is row (120-150)/0.5 = -60.
+    expect(remapRow(40, A, B)).toBe(-60);
+  });
+
+  it('is the identity when the epochs share an affine', () => {
+    expect(remapRow(40, A, A)).toBe(40);
+    expect(remapRowSpan(120, A, A)).toBe(120);
+  });
+
+  it('round-trips exactly', () => {
+    expect(remapRow(remapRow(40, A, B), B, A)).toBeCloseTo(40, 9);
+  });
+
+  it('rescales a span by the step ratio only (p0 cancels)', () => {
+    const C: PriceMap = { p0: 999, step: 2 };
+    expect(remapRowSpan(120, A, C)).toBe(30); // 120 * 0.5 / 2
+  });
+
+  it('returns NaN — not a bogus row — when the target affine is unusable', () => {
+    const dead: PriceMap = { p0: 0, step: 0 };
+    expect(Number.isNaN(remapRow(40, A, dead))).toBe(true);
+    expect(Number.isNaN(remapRowSpan(40, A, dead))).toBe(true);
   });
 });

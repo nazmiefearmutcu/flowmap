@@ -181,3 +181,28 @@ export function visibleColRange(
   if (hi < lo) return null;
   return { lo, hi };
 }
+
+/**
+ * Re-express a fractional ROW in another epoch's coordinates. The server bumps
+ * the epoch and moves `p0` whenever mid leaves the grid's central band; the tile
+ * ring is epoch-agnostic and the shader applies ONE row affine to every column,
+ * so a locked (user-owned) price window must be remapped through the two affines
+ * or it silently ends up pointing at different prices.
+ *
+ * Composition of `rowToPrice(from)` then `priceToRow(to)`. Returns NaN when
+ * either affine is unusable (`to.step === 0`), which the caller must treat as
+ * "remap failed, keep the old epoch" rather than writing NaN into the camera.
+ */
+export function remapRow(row: number, from: PriceMap, to: PriceMap): number {
+  if (to.step === 0) return Number.NaN;
+  return (from.p0 + row * from.step - to.p0) / to.step;
+}
+
+/**
+ * Re-express a row SPAN in another epoch's coordinates. A span is a difference,
+ * so only the step ratio matters — `p0` cancels.
+ */
+export function remapRowSpan(rowSpan: number, from: PriceMap, to: PriceMap): number {
+  if (to.step === 0) return Number.NaN;
+  return (rowSpan * from.step) / to.step;
+}

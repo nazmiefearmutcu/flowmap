@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  applyKill,
   Camera,
   clampCamera,
   fit,
   follow,
+  KILL_BOTH,
+  KILL_PRICE,
+  KILL_TIME,
   limitsFor,
   MIN_COL_SPAN,
   MIN_ROW_SPAN,
   pan,
+  priceFrame,
   reset,
+  rowCenterBounds,
   screenToGrid,
   toView,
   viewToGrid,
@@ -31,7 +37,7 @@ function range(oldest: number, newest: number): ResidentRange {
 
 /** A mid-grid, mid-history state well away from every clamp. */
 function baseState(): CameraState {
-  return { colCenter: 1000, colSpan: 200, rowCenter: 256, rowSpan: 120, follow: false };
+  return { colCenter: 1000, colSpan: 200, rowCenter: 256, rowSpan: 120, followTime: false, followPrice: 'off' };
 }
 
 /** Absolute column under the cursor for a given fractional viewport position. */
@@ -46,13 +52,13 @@ function rowAtFrac(s: CameraState, frac: number): number {
 
 describe('camera view mapping', () => {
   it('maps center+span to the shader edge/scale uniforms', () => {
-    const v = toView({ colCenter: 100, colSpan: 40, rowCenter: 200, rowSpan: 80, follow: false });
+    const v = toView({ colCenter: 100, colSpan: 40, rowCenter: 200, rowSpan: 80, followTime: false, followPrice: 'off' });
     expect(v).toEqual({ colOffset: 80, colScale: 40, rowOffset: 160, rowScale: 80 });
   });
 });
 
 describe('viewToGrid / screenToGrid — the crosshair inverse (T9)', () => {
-  const view = toView({ colCenter: 1000, colSpan: 200, rowCenter: 256, rowSpan: 120, follow: false });
+  const view = toView({ colCenter: 1000, colSpan: 200, rowCenter: 256, rowSpan: 120, followTime: false, followPrice: 'off' });
   // colOffset=900, colScale=200, rowOffset=196, rowScale=120.
 
   it('is the exact algebraic inverse of the shader forward map', () => {
@@ -97,14 +103,25 @@ describe('viewToGrid / screenToGrid — the crosshair inverse (T9)', () => {
 });
 
 describe('pan', () => {
-  it('shifts both centers by the delta and disables follow', () => {
-    const s = { ...baseState(), follow: true };
+  it('shifts both centers by the delta and disables both follows', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'fit' };
     const p = pan(s, LIMITS, 30, -10);
     expect(p.colCenter).toBe(1030);
     expect(p.rowCenter).toBe(246);
     expect(p.colSpan).toBe(200); // zoom unchanged
     expect(p.rowSpan).toBe(120);
-    expect(p.follow).toBe(false);
+    expect(p.followTime).toBe(false);
+    expect(p.followPrice).toBe('off');
+  });
+
+  it('an axis-scoped pan releases only that axis', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'track' };
+    const t = pan(s, LIMITS, 30, 0, KILL_TIME);
+    expect(t.followTime).toBe(false);
+    expect(t.followPrice).toBe('track'); // price keeps tracking
+    const r = pan(s, LIMITS, 0, 10, KILL_PRICE);
+    expect(r.followTime).toBe(true); // right edge still pinned
+    expect(r.followPrice).toBe('off');
   });
 
   it('leaves the input state untouched (pure)', () => {
@@ -114,9 +131,19 @@ describe('pan', () => {
     expect(s.rowCenter).toBe(256);
   });
 
-  it('clamps rowCenter to the price grid (no absurd vertical pan)', () => {
-    expect(pan(baseState(), LIMITS, 0, +100_000).rowCenter).toBe(ROWS);
-    expect(pan(baseState(), LIMITS, 0, -100_000).rowCenter).toBe(0);
+  it('allows a FULL viewport of overscroll past each edge of the price grid', () => {
+    // "Look infinitely far up/down": the grid can be pushed entirely off screen
+    // in either direction, where the shader paints background.
+    const span = baseState().rowSpan; // 120
+    expect(pan(baseState(), LIMITS, 0, +100_000).rowCenter).toBe(ROWS + span);
+    expect(pan(baseState(), LIMITS, 0, -100_000).rowCenter).toBe(-span);
+  });
+
+  it('overscroll is span-relative, so it feels the same at every price zoom', () => {
+    const zoomedIn: CameraState = { ...baseState(), rowSpan: 10 };
+    const zoomedOut: CameraState = { ...baseState(), rowSpan: 400 };
+    expect(pan(zoomedIn, LIMITS, 0, -100_000).rowCenter).toBe(-10);
+    expect(pan(zoomedOut, LIMITS, 0, -100_000).rowCenter).toBe(-400);
   });
 
   it('does NOT clamp colCenter — history scrolls freely in both directions', () => {
@@ -133,7 +160,7 @@ describe('zoomTime — cursor anchored', () => {
     expect(z.colSpan).toBe(100);
     // The same fractional position still maps to the same absolute column.
     expect(colAtFrac(z, 0.25)).toBeCloseTo(anchor, 9);
-    expect(z.follow).toBe(false);
+    expect(z.followTime).toBe(false);
   });
 
   it('keeps the column under the cursor fixed when zooming OUT', () => {
@@ -148,6 +175,14 @@ describe('zoomTime — cursor anchored', () => {
     const s = baseState();
     const z = zoomTime(s, LIMITS, 0.5, s.colCenter);
     expect(z.colCenter).toBeCloseTo(s.colCenter, 9);
+  });
+
+  it('releases TIME follow only — the price axis keeps auto-scaling', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'fit' };
+    const z = zoomTime(s, LIMITS, 0.5, s.colCenter);
+    expect(z.followTime).toBe(false);
+    // 'fit' is promoted to 'track': the fitted span is kept and still tracks.
+    expect(z.followPrice).toBe('track');
   });
 
   it('cannot zoom past 1 column (min span clamp)', () => {
@@ -178,7 +213,18 @@ describe('zoomPrice — cursor anchored', () => {
     const z = zoomPrice(s, LIMITS, 0.5, anchor);
     expect(z.rowSpan).toBe(60);
     expect(rowAtFrac(z, 0.4)).toBeCloseTo(anchor, 9);
-    expect(z.follow).toBe(false);
+  });
+
+  it('keeps TIME follow and ADOPTS the span the user just chose', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'fit' };
+    const z = zoomPrice(s, LIMITS, 0.5, s.rowCenter);
+    expect(z.followTime).toBe(true); // right edge still pinned to now
+    expect(z.followPrice).toBe('track'); // user owns the span now
+  });
+
+  it('never re-enables a price follow the user switched off', () => {
+    const s: CameraState = { ...baseState(), followPrice: 'off' };
+    expect(zoomPrice(s, LIMITS, 0.5, s.rowCenter).followPrice).toBe('off');
   });
 
   it('cannot zoom price past 1 row', () => {
@@ -199,7 +245,8 @@ describe('fit', () => {
     expect(f.colCenter).toBe((200 + 699 + 1) / 2); // 450
     expect(f.rowSpan).toBe(ROWS);
     expect(f.rowCenter).toBe(ROWS / 2);
-    expect(f.follow).toBe(false);
+    expect(f.followTime).toBe(false);
+    expect(f.followPrice).toBe('off');
     // The framed view spans exactly [oldest, newest+1) on the time axis.
     const v = toView(f);
     expect(v.colOffset).toBe(200);
@@ -215,7 +262,8 @@ describe('fit', () => {
 describe('reset / go-live', () => {
   it('pins the right edge to the newest column and turns follow ON', () => {
     const r = reset(LIMITS, range(500, 999), ROWS);
-    expect(r.follow).toBe(true);
+    expect(r.followTime).toBe(true);
+    expect(r.followPrice).toBe('fit');
     const v = toView(r);
     // Right edge sits just past the newest column.
     expect(v.colOffset + v.colScale).toBe(1000);
@@ -224,7 +272,8 @@ describe('reset / go-live', () => {
 
   it('works with no resident range (fresh session)', () => {
     const r = reset(LIMITS);
-    expect(r.follow).toBe(true);
+    expect(r.followTime).toBe(true);
+    expect(r.followPrice).toBe('fit');
     expect(r.colSpan).toBe(CAP);
     expect(r.rowSpan).toBe(ROWS);
   });
@@ -234,7 +283,7 @@ describe('follow — snap right edge', () => {
   it('moves the right edge to newest+1 keeping the current span', () => {
     const s = { ...baseState(), colSpan: 300 };
     const f = follow(s, range(0, 4999));
-    expect(f.follow).toBe(true);
+    expect(f.followTime).toBe(true);
     expect(f.colSpan).toBe(300); // span preserved
     const v = toView(f);
     expect(v.colOffset + v.colScale).toBe(5000);
@@ -247,20 +296,47 @@ describe('follow — snap right edge', () => {
 describe('clampCamera', () => {
   it('clamps every axis independently', () => {
     const c = clampCamera(
-      { colCenter: -50, colSpan: 0.1, rowCenter: 9999, rowSpan: 99999, follow: false },
+      {
+        colCenter: -50,
+        colSpan: 0.1,
+        rowCenter: 9999,
+        rowSpan: 99999,
+        followTime: false,
+        followPrice: 'off',
+      },
       LIMITS,
     );
     expect(c.colCenter).toBe(-50); // time center free
     expect(c.colSpan).toBe(MIN_COL_SPAN);
-    expect(c.rowCenter).toBe(ROWS);
+    expect(c.rowSpan).toBe(ROWS); // span still tops out at the grid height
+    // rowCenter is bounded by the POST-clamp span, not the 99999 it came in with.
+    expect(c.rowCenter).toBe(ROWS + ROWS);
+  });
+
+  it('clamps rowSpan BEFORE deriving the rowCenter band (order matters)', () => {
+    // If the band were derived from the pre-clamp span (500), rowCenter would be
+    // allowed out to 1012; it must use the clamped span (ROWS) → 1024.
+    const c = clampCamera(
+      {
+        colCenter: 0,
+        colSpan: 100,
+        rowCenter: 1e9,
+        rowSpan: 5000,
+        followTime: false,
+        followPrice: 'off',
+      },
+      LIMITS,
+    );
     expect(c.rowSpan).toBe(ROWS);
+    expect(c.rowCenter).toBe(rowCenterBounds(ROWS, LIMITS).hi);
   });
 });
 
 describe('Camera (imperative wrapper)', () => {
   it('starts following and converts to view uniforms', () => {
     const cam = new Camera(LIMITS);
-    expect(cam.follow).toBe(true);
+    expect(cam.followTime).toBe(true);
+    expect(cam.followPrice).toBe('fit');
     const v = cam.toView();
     expect(v.colScale).toBe(CAP);
     expect(v.rowScale).toBe(ROWS);
@@ -269,9 +345,29 @@ describe('Camera (imperative wrapper)', () => {
   it('a pan gesture clears follow; go-live restores it', () => {
     const cam = new Camera(LIMITS);
     cam.pan(10, 10);
-    expect(cam.follow).toBe(false);
+    expect(cam.followTime).toBe(false);
+    expect(cam.followPrice).toBe('off');
     cam.reset(range(0, 999), ROWS);
-    expect(cam.follow).toBe(true);
+    expect(cam.followTime).toBe(true);
+    expect(cam.followPrice).toBe('fit');
+  });
+
+  it('setFollowTime(false) promotes a fitted price axis to tracking', () => {
+    const cam = new Camera(LIMITS);
+    cam.setFollowTime(false);
+    expect(cam.followTime).toBe(false);
+    expect(cam.followPrice).toBe('track'); // fitted span kept, still tracking
+  });
+
+  it('setRowCenter recentres price without disturbing the span or the follows', () => {
+    const cam = new Camera(LIMITS);
+    cam.setPriceFollow('track');
+    const before = cam.toView().rowScale;
+    cam.setRowCenter(120);
+    expect(cam.toView().rowScale).toBe(before);
+    expect(cam.state.rowCenter).toBe(120);
+    expect(cam.followTime).toBe(true);
+    expect(cam.followPrice).toBe('track');
   });
 
   it('setFollowFrame reproduces the renderer edge-form framing', () => {
@@ -279,7 +375,7 @@ describe('Camera (imperative wrapper)', () => {
     cam.setFollowFrame(100, 200, 40, 80);
     const v = cam.toView();
     expect(v).toEqual({ colOffset: 100, colScale: 200, rowOffset: 40, rowScale: 80 });
-    expect(cam.follow).toBe(true);
+    expect(cam.followTime).toBe(true);
   });
 
   it('re-clamps state when limits shrink', () => {
@@ -287,5 +383,53 @@ describe('Camera (imperative wrapper)', () => {
     cam.setFollowFrame(0, 100, 0, 500); // rowSpan 500 within 512
     cam.setLimits(limitsFor(256, CAP)); // grid shrinks to 256 rows
     expect(cam.toView().rowScale).toBe(256);
+  });
+});
+
+
+describe('applyKill — the follow release policy', () => {
+  const s: CameraState = { ...baseState(), followTime: true, followPrice: 'fit' };
+
+  it('promotes fit -> track when TIME is released (scroll back, keep the span)', () => {
+    const out = applyKill(s, KILL_TIME);
+    expect(out.followTime).toBe(false);
+    expect(out.followPrice).toBe('track');
+  });
+
+  it('switches price OFF when PRICE is released, whatever it was', () => {
+    expect(applyKill(s, KILL_PRICE).followPrice).toBe('off');
+    expect(applyKill({ ...s, followPrice: 'track' }, KILL_PRICE).followPrice).toBe('off');
+    expect(applyKill(s, KILL_PRICE).followTime).toBe(true);
+  });
+
+  it('a both-axis kill switches price off rather than promoting it', () => {
+    const out = applyKill(s, KILL_BOTH);
+    expect(out.followTime).toBe(false);
+    expect(out.followPrice).toBe('off');
+  });
+
+  it('never promotes track or off on a time kill', () => {
+    expect(applyKill({ ...s, followPrice: 'off' }, KILL_TIME).followPrice).toBe('off');
+    expect(applyKill({ ...s, followPrice: 'track' }, KILL_TIME).followPrice).toBe('track');
+  });
+});
+
+describe('priceFrame — the pure auto-fit framing rule', () => {
+  it('pads proportionally and clamps to the grid', () => {
+    const f = priceFrame(100, 200, ROWS, 0.08, 3);
+    expect(f.rowBottom).toBe(92); // 100 - round(100*0.08)
+    expect(f.rowSpan).toBe(117); // (200+8+1) - 92
+  });
+
+  it('honours the minimum pad for a razor-thin book', () => {
+    const f = priceFrame(300, 300, ROWS, 0.08, 3);
+    expect(f.rowBottom).toBe(297);
+    expect(f.rowSpan).toBe(7); // 304 - 297
+  });
+
+  it('never runs off either end of the grid', () => {
+    expect(priceFrame(0, 5, ROWS, 0.08, 3).rowBottom).toBe(0);
+    const top = priceFrame(ROWS - 2, ROWS - 1, ROWS, 0.08, 3);
+    expect(top.rowBottom + top.rowSpan).toBe(ROWS);
   });
 });
