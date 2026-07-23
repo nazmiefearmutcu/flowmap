@@ -31,10 +31,14 @@ stockodile for US equities) behind one market-agnostic renderer.
   the window recentring only when price leaves a central deadband. Price pans a full viewport
   past either end of the grid. A **Tolerance** black point hides sub-threshold density so only
   liquidity worth reading paints.
-- **Configurable price coverage.** The grid is a linear affine over a fixed row count, so range
-  and resolution are the same knob. `native` keeps the finest rows; `±50%` and `−100%/+1000%`
-  trade resolution for reach. The widest preset is a range **scan** mode — at that width the live
-  book collapses into a couple of rows on a major — and the drawer says so.
+- **Configurable price coverage, including one that does not compromise.** On a linear grid range
+  and resolution are the same knob: `native` keeps the finest rows, `±50%` and `−100%/+1000%`
+  trade resolution for reach, and the widest of those is a range **scan** mode. **`Deep`** breaks
+  the tie with a piecewise scale — a linear core at the instrument's native tick, wrapped in
+  logarithmic wings. On BTC at $60k that is **±0.853% at $0.50/row — the exact ladder the narrow
+  grid gives — plus coverage to −99%/+1000% at ~0.34%/row**. The trade is that its frame is fixed
+  for the session, so a sustained move walks the book out into the coarse wings; the drawer says
+  so, and `native` remains the default.
 - **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities
   show what their free data actually supports — a keyless **two-sided** volume-at-price SYNTH depth
   (Yahoo 1 m bars, bid below / ask above a reference price that tracks the market) that upgrades to
