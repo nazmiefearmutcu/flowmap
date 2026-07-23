@@ -38,10 +38,15 @@ export type { Colormap };
  *   - `full`   — −100% / +1000%. A range SCAN mode: at this width the live book
  *     collapses into a couple of rows on a major, so it answers "are there walls
  *     far out?", not "what is the ladder doing".
+ *   - `deep`   — −99% / +1000% with the LADDER INTACT. The only preset that is
+ *     not linear: it spends half the rows on a native-step core around the
+ *     reference price and the rest on logarithmic wings, so the tradeable band
+ *     keeps its full resolution AND the far field is covered. The trade is that
+ *     the frame is frozen for the session — see the drawer hint.
  */
-export type PriceBand = 'native' | 'wide' | 'full';
+export type PriceBand = 'native' | 'wide' | 'full' | 'deep';
 
-export const PRICE_BANDS: readonly PriceBand[] = ['native', 'wide', 'full'] as const;
+export const PRICE_BANDS: readonly PriceBand[] = ['native', 'wide', 'full', 'deep'] as const;
 
 export interface FlowMapSettings {
   /** Heatmap display contrast 0–100 (drives the perceptual gamma, §8.3). */

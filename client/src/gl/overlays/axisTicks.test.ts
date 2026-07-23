@@ -10,6 +10,7 @@ import {
   priceTicks,
   timeTickModel,
   timeTicks,
+  logPriceTickModel,
 } from './axisTicks';
 
 describe('niceStep', () => {
@@ -116,5 +117,61 @@ describe('fmtClock', () => {
   it('formats ns as HH:MM:SS (session-relative)', () => {
     expect(fmtClock(0n)).toBe('00:00:00');
     expect(fmtClock(3_661_000_000_000n)).toBe('01:01:01');
+  });
+});
+
+describe('logPriceTickModel — the decade ladder for a wide, non-uniform axis', () => {
+  it('places ticks at constant RATIOS, not constant differences', () => {
+    const { ticks } = logPriceTickModel(600, 660_000, 8);
+    expect(ticks.length).toBeGreaterThan(3);
+    // Every tick is a 1/2/5 × 10^k value.
+    for (const t of ticks) {
+      const k = Math.floor(Math.log10(t));
+      const m = t / 10 ** k;
+      expect([1, 2, 3, 4, 5, 6, 8]).toContain(Math.round(m));
+    }
+    // ...and they are strictly increasing and inside the window.
+    for (let i = 1; i < ticks.length; i++) expect(ticks[i]).toBeGreaterThan(ticks[i - 1]);
+    expect(ticks[0]).toBeGreaterThanOrEqual(600);
+    expect(ticks[ticks.length - 1]).toBeLessThanOrEqual(660_000);
+  });
+
+  it('spreads ticks evenly IN LOG SPACE across a very wide window', () => {
+    // The whole point: an arithmetic step over 600→660k is invisible at the
+    // bottom and the only tick at the top.
+    const { ticks } = logPriceTickModel(600, 660_000, 8);
+    const logs = ticks.map((t) => Math.log10(t));
+    const gaps = logs.slice(1).map((v, i) => v - logs[i]);
+    const max = Math.max(...gaps);
+    const min = Math.min(...gaps);
+    expect(max / min).toBeLessThan(4); // roughly uniform in log space
+  });
+
+  it('gets finer when the window is narrow', () => {
+    const wide = logPriceTickModel(600, 660_000, 8).ticks.length;
+    const narrow = logPriceTickModel(59_000, 61_000, 8).ticks.length;
+    // A sub-decade window still produces ticks rather than going blank.
+    expect(narrow).toBeGreaterThan(0);
+    expect(wide).toBeGreaterThan(0);
+  });
+
+  it('survives a non-positive low bound instead of going blank', () => {
+    // The camera overscrolls past the bottom of the grid, where an extrapolated
+    // price can reach 0 or below; the axis must still label.
+    const { ticks } = logPriceTickModel(0, 1000, 6);
+    expect(ticks.length).toBeGreaterThan(0);
+    expect(ticks.every((t) => t > 0 && t <= 1000)).toBe(true);
+  });
+
+  it('returns nothing for a degenerate window rather than looping', () => {
+    expect(logPriceTickModel(100, 100, 6).ticks).toEqual([]);
+    expect(logPriceTickModel(500, 100, 6).ticks).toEqual([]);
+    expect(logPriceTickModel(1, Number.NaN, 6).ticks).toEqual([]);
+  });
+
+  it('stays bounded on an absurdly wide window (decade striding)', () => {
+    const { ticks } = logPriceTickModel(1e-6, 1e12, 8);
+    expect(ticks.length).toBeLessThan(40);
+    expect(ticks.length).toBeGreaterThan(2);
   });
 });

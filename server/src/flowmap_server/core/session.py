@@ -60,6 +60,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import Protocol
 
+import msgspec
 import numpy as np
 
 from flowmap_server.config import Config
@@ -903,10 +904,37 @@ _EQUITY_SYNTH_DEPTHS = frozenset({"SYNTH", "SYNTH_PROFILE"})
 # Because tick_multiple = ceil(span / (rows*tick)) can only round UP, a preset
 # is a literal no-op for any symbol cheap enough that the native span already
 # covers the band.
-BANDS: dict[str, tuple[float, float] | None] = {
+class BandSpec(msgspec.Struct, frozen=True):
+    """Coverage around the reference price, and how the rows are spent.
+
+    ``hybrid=False`` keeps the LINEAR grid, where range and resolution are the
+    same knob. ``hybrid=True`` switches to the piecewise scale
+    (``core/price_scale.py``): a linear CORE at the instrument's native step
+    surrounded by logarithmic wings, so the tradeable ladder near the money is
+    unchanged AND the far field is covered. That is the only preset for which a
+    -99%/+1000% band is a trading view rather than a range scan.
+    """
+
+    up: float
+    down: float
+    hybrid: bool = False
+    #: Rows for the linear core; 0 => rows // 2.
+    core_rows: int = 0
+    #: Grid height override for this band (0 => the market default).
+    rows: int = 0
+
+
+BANDS: dict[str, BandSpec | None] = {
     "native": None,
-    "wide": (0.5, 0.5),
-    "full": (10.0, 1.0),
+    "wide": BandSpec(up=0.5, down=0.5),
+    "full": BandSpec(up=10.0, down=1.0),
+    # -99%/+1000% with the ladder INTACT: 4096 rows, half of them a native-step
+    # core. On BTC at $60k that is +/-0.853% at $0.50/row — the coverage AND
+    # resolution of the `native` grid — plus wings reaching -99%/+1000% at
+    # ~0.34%/row. Registered as a NEW name rather than re-pointing `full`:
+    # priceBand is persisted in localStorage, so re-pointing would silently move
+    # every existing `full` user onto a piecewise scale on their next load.
+    "deep": BandSpec(up=10.0, down=0.99, hybrid=True, core_rows=2048, rows=4096),
 }
 
 DEFAULT_BAND = "native"
@@ -971,7 +999,10 @@ class SessionManager:
         rows = min(_SIM_ROWS, self._cfg.max_rows)
         step = _SIM_TICK  # tick_multiple 1
         p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
-        up_down = BANDS.get(band)
+        spec = BANDS.get(band)
+        if spec is not None and spec.rows > 0:
+            rows = min(spec.rows, self._cfg.max_rows)
+            p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
         return Grid(
             GridCfg(
                 tick=_SIM_TICK,
@@ -981,8 +1012,10 @@ class SessionManager:
                 rows=rows,
                 ring_columns=self._cfg.ring_columns,
                 mode=events.MODE_L2,
-                band_up=up_down[0] if up_down else None,
-                band_down=up_down[1] if up_down else None,
+                band_up=spec.up if spec else None,
+                band_down=spec.down if spec else None,
+                band_hybrid=spec.hybrid if spec else False,
+                core_rows=spec.core_rows if spec else 0,
             )
         )
 
@@ -1003,7 +1036,7 @@ class SessionManager:
         rows = min(_EQUITY_ROWS, self._cfg.max_rows)
         tick = _EQUITY_TICK
         p0 = round((_EQUITY_P0_NOMINAL - rows * tick / 2.0) / tick) * tick
-        up_down = BANDS.get(band)
+        spec = BANDS.get(band)
         return Grid(
             GridCfg(
                 tick=tick,
@@ -1013,8 +1046,10 @@ class SessionManager:
                 rows=rows,
                 ring_columns=self._cfg.ring_columns,
                 mode=mode,
-                band_up=up_down[0] if up_down else None,
-                band_down=up_down[1] if up_down else None,
+                band_up=spec.up if spec else None,
+                band_down=spec.down if spec else None,
+                band_hybrid=spec.hybrid if spec else False,
+                core_rows=spec.core_rows if spec else 0,
             )
         )
 

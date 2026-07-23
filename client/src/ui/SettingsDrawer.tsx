@@ -26,11 +26,13 @@ const BAND_LABEL: Record<PriceBand, string> = {
   native: 'Native',
   wide: '±50%',
   full: '−100/+1000%',
+  deep: 'Deep',
 };
 const BAND_HINT: Record<PriceBand, string> = {
   native: 'Finest price rows, narrowest coverage — the trading default.',
   wide: 'About 50× coarser rows; far-out resting size becomes visible.',
   full: 'Range SCAN only: rows get so coarse the live book collapses to a few of them.',
+  deep: 'Full ladder resolution near the price AND coverage to −99%/+1000%. The frame is fixed for the session, so a sustained move walks the book out into the coarse wings until you reconnect.',
 };
 
 interface SettingsDrawerProps {

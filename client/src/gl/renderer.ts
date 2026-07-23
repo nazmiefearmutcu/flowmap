@@ -74,10 +74,27 @@ import {
 import { HistoryLoader } from '../net/history';
 import type { StreamMsg } from '../net/connection';
 import type { FlowMapState } from '../state/store';
-import { MODE_L2, MODE_SYNTH_PROFILE, MsgType, type DepthColumn } from '../proto/types';
+import {
+  MODE_L2,
+  MODE_SYNTH_PROFILE,
+  MsgType,
+  type DepthColumn,
+  type EpochParams,
+} from '../proto/types';
 import { OverlayManager } from './overlays/manager';
 import type { OverlayVisibility } from './overlays/frame';
-import { remapRow, remapRowSpan, type PriceMap, type TimeMap } from './overlays/coords';
+import {
+  mapScale,
+  remapRow,
+  remapRowSpan,
+  type PriceMap,
+  type TimeMap,
+} from './overlays/coords';
+import {
+  rowToPrice as scaleRowToPrice,
+  scaleFromEpoch,
+  stepAtRow as scaleStepAtRow,
+} from './priceScale';
 
 /** The renderer only needs the store's imperative surface, not the React hook. */
 interface RendererStore {
@@ -125,6 +142,11 @@ export interface CrosshairReadout {
   /** Price at the hovered row via `p0 + row·tick·tick_multiple`, or null off-grid. */
   price: number | null;
   /** Price-format decimals derived from the tick, for the UI. */
+  /** Price at the BOTTOM of the grouped cell (null off-grid). */
+  priceLo: number | null;
+  /** Price at the TOP of the grouped cell — NOT priceLo + group*step on a
+   *  non-uniform grid, which is exactly why it is reported. */
+  priceHi: number | null;
   priceDecimals: number;
   /** Exact summed bid size at the (grouped) cell, or null when not cached. */
   bid: number | null;
@@ -1087,6 +1109,19 @@ export class Renderer {
     }
     if (rowHi < rowLo) return; // nothing to fit — keep the frame we have
 
+    // On a non-uniform grid, confine the auto-fit to the LINEAR CORE. The book
+    // legitimately has size out in the log wings, but fitting to it would zoom
+    // the view out to the whole -99%/+1000% band and bury the tradeable ladder
+    // in two rows — the exact failure the hybrid scale exists to avoid.
+    const scale = this.overlayPriceMap()?.scale;
+    if (scale !== undefined && scale.kind === 'hybrid') {
+      const coreLo = scale.dnRows;
+      const coreHi = scale.dnRows + scale.coreRows - 1;
+      rowLo = Math.max(rowLo, coreLo);
+      rowHi = Math.min(rowHi, coreHi);
+      if (rowHi < rowLo) return;
+    }
+
     const frame = priceFrame(rowLo, rowHi, ring.rows, ROW_PAD_FRACTION, MIN_ROW_PAD);
     this.priceFitMemo = { lo, hi, newest: range.newest, ...frame };
     this.camera.setPriceFrame(frame.rowBottom, frame.rowSpan);
@@ -1237,20 +1272,32 @@ export class Renderer {
     const st = this.store.getState();
     const epoch = this.columnCache.epochAt(colSeq) ?? st.gridEpoch ?? 0;
     const params = st.epochs.get(epoch);
-    const step = params ? params.tick * params.tick_multiple : 0;
-    const price = params && onGrid ? params.p0 + row * step : null;
-    const priceDecimals = step > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(step)))) : 2;
+    const pmap = params ? this.priceMapFor(params) : null;
+    const scale = pmap ? mapScale(pmap) : null;
+    const price = scale && onGrid ? scaleRowToPrice(scale, row) : null;
+    // Decimals from the LOCAL row height, not a global step: on a non-uniform
+    // grid a wing row is worth hundreds of ticks and 8 decimals there is noise.
+    const localStep = scale ? scaleStepAtRow(scale, row) : 0;
+    const priceDecimals =
+      localStep > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(localStep)))) : 2;
 
     // Exact grouped size (block = 4^level rows, aligned like the shader).
     const blk = 4 ** this.currentLevel();
     const rowStart = Math.floor(row / blk) * blk;
     const size = onGrid ? this.columnCache.sizeAt(colSeq, rowStart, blk) : null;
+    // The group's true price EXTENT. A grouped cell spans `blk` ROWS, and on a
+    // non-uniform grid that is emphatically not `blk * step` of price — so the
+    // readout reports the real [lo, hi) rather than implying a uniform width.
+    const priceLo = scale && onGrid ? scaleRowToPrice(scale, rowStart) : null;
+    const priceHi = scale && onGrid ? scaleRowToPrice(scale, rowStart + blk) : null;
 
     return {
       colSeq,
       row,
       group: blk,
       price,
+      priceLo,
+      priceHi,
       priceDecimals,
       bid: size ? size.bid : null,
       ask: size ? size.ask : null,
@@ -1306,7 +1353,7 @@ export class Renderer {
     const epochs = this.store.getState().epochs;
     const to = epochs.get(epoch);
     if (to === undefined) return;
-    const toMap: PriceMap = { p0: to.p0, step: to.tick * to.tick_multiple };
+    const toMap = this.priceMapFor(to);
 
     const prev = this.priceEpoch;
     if (prev === null) {
@@ -1315,11 +1362,14 @@ export class Renderer {
     }
     const from = epochs.get(prev);
     if (from === undefined) return;
-    const fromMap: PriceMap = { p0: from.p0, step: from.tick * from.tick_multiple };
+    const fromMap = this.priceMapFor(from);
 
     const st = this.camera.state;
     const rowCenter = remapRow(st.rowCenter, fromMap, toMap);
-    const rowSpan = remapRowSpan(st.rowSpan, fromMap, toMap);
+    // The span is measured AROUND the current centre: on a non-uniform grid the
+    // same row count spans a different price distance depending on where it
+    // sits, so a position-blind ratio would silently resize the user's zoom.
+    const rowSpan = remapRowSpan(st.rowSpan, fromMap, toMap, st.rowCenter);
     if (!Number.isFinite(rowCenter) || !Number.isFinite(rowSpan) || rowSpan <= 0) return;
     this.camera.remapPrice(rowCenter, rowSpan);
 
@@ -1341,7 +1391,22 @@ export class Renderer {
     const st = this.store.getState();
     const ep = st.gridEpoch !== null ? st.epochs.get(st.gridEpoch) : undefined;
     if (ep === undefined) return null;
-    return { p0: ep.p0, step: ep.tick * ep.tick_multiple };
+    return this.priceMapFor(ep);
+  }
+
+  /**
+   * The price map an epoch denotes. `p0`/`step` stay populated as the epoch's
+   * representative (core) values so anything that only wants a nominal tick
+   * size keeps working, but `scale` is the authority — every actual row/price
+   * mapping goes through it, which is what makes a non-uniform grid correct.
+   */
+  private priceMapFor(ep: EpochParams): PriceMap {
+    const scale = scaleFromEpoch(ep);
+    return {
+      p0: scale.kind === 'hybrid' ? scale.coreP0 : scale.p0,
+      step: scale.kind === 'hybrid' ? scale.coreStep : scale.step,
+      scale,
+    };
   }
 
   /** Column⇄time affine anchored on the newest written column, or null. */

@@ -13,7 +13,14 @@
  * scraping canvas pixels.
  */
 
-import { fmtClock, fmtClockMs, priceDecimals, priceTickModel, timeTickModel } from './axisTicks';
+import {
+  fmtClock,
+  fmtClockMs,
+  logPriceTickModel,
+  priceDecimals,
+  priceTickModel,
+  timeTickModel,
+} from './axisTicks';
 import type { GridMap } from './coords';
 import { OVERLAY } from './palette';
 import type { TextLayer } from '../textLayer';
@@ -32,10 +39,10 @@ export function priceAxisModel(gm: GridMap, cssH: number): AxisLabel[] {
   if (gm.price === null) return [];
   const pLo = gm.rowToPrice(gm.view.rowOffset);
   const pHi = gm.rowToPrice(gm.view.rowOffset + gm.view.rowScale);
-  const { step, ticks } = priceTickModel(pLo, pHi, PRICE_TARGET, gm.price.step);
+  const { step, ticks } = axisTicks(gm, pLo, pHi);
   // Decimals from the TICK step, not the finer grid step, so whole-number ticks
   // don't show a spurious '.00'.
-  const dec = priceDecimals(step > 0 ? step : gm.price.step);
+  const dec = priceDecimals(step > 0 ? step : localStep(gm));
   const out: AxisLabel[] = [];
   for (const price of ticks) {
     const y = gm.cssY(gm.priceToRow(price));
@@ -43,6 +50,32 @@ export function priceAxisModel(gm: GridMap, cssH: number): AxisLabel[] {
     out.push({ pos: y, label: price.toFixed(dec) });
   }
   return out;
+}
+
+/** The grid's row height at the CENTRE of the current view — the right
+ *  "smallest meaningful step" for a non-uniform axis. */
+function localStep(gm: GridMap): number {
+  const s = gm.stepAtRow(gm.view.rowOffset + gm.view.rowScale / 2);
+  return Number.isFinite(s) && s > 0 ? s : 0;
+}
+
+/**
+ * Pick the tick ladder for the current price window.
+ *
+ * A uniform grid — and a non-uniform one the user has zoomed into the linear
+ * core — takes the arithmetic ladder verbatim, so those axes are pixel-identical
+ * to before. Only a genuinely wide window on a non-uniform scale (more than a
+ * 1.5× price ratio top-to-bottom, which a linear axis cannot meaningfully even
+ * express since its `pLo` may be negative) switches to a decade ladder, where a
+ * single arithmetic step would otherwise be invisible at the bottom of the view
+ * and the only tick at the top.
+ */
+function axisTicks(gm: GridMap, pLo: number, pHi: number): { step: number; ticks: number[] } {
+  const nonUniform = gm.price?.scale !== undefined && gm.price.scale.kind !== 'linear';
+  if (nonUniform && pLo > 0 && pHi / pLo > 1.5) {
+    return { step: 0, ticks: logPriceTickModel(pLo, pHi, PRICE_TARGET).ticks };
+  }
+  return priceTickModel(pLo, pHi, PRICE_TARGET, localStep(gm) || gm.price!.step);
 }
 
 /** Time ticks with their gutter x (CSS px). Empty when no time affine. */
@@ -74,7 +107,7 @@ export function priceTickPositions(gm: GridMap, cssH: number): number[] {
   const pLo = gm.rowToPrice(gm.view.rowOffset);
   const pHi = gm.rowToPrice(gm.view.rowOffset + gm.view.rowScale);
   const out: number[] = [];
-  for (const price of priceTickModel(pLo, pHi, PRICE_TARGET, gm.price.step).ticks) {
+  for (const price of axisTicks(gm, pLo, pHi).ticks) {
     const y = gm.cssY(gm.priceToRow(price));
     if (y < -1 || y > cssH + 1) continue;
     out.push(y);

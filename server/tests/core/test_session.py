@@ -1042,5 +1042,91 @@ def test_bands_table_is_ordered_and_native_is_the_default():
     assert BANDS[DEFAULT_BAND] is None, "the default must be the legacy grid"
     wide, full = BANDS["wide"], BANDS["full"]
     assert wide is not None and full is not None
-    assert full[0] > wide[0] and full[1] >= wide[1]
-    assert full == (10.0, 1.0), "full is -100% / +1000%"
+    assert full.up > wide.up and full.down >= wide.down
+    assert (full.up, full.down) == (10.0, 1.0), "full is -100% / +1000%"
+    # The linear presets must STAY linear — `deep` is the only piecewise one.
+    assert not wide.hybrid and not full.hybrid
+
+
+def test_deep_band_is_the_hybrid_preset_and_is_a_NEW_name():
+    """`deep` must not be a re-point of `full`.
+
+    priceBand is persisted in localStorage and re-sent on every subscribe, so
+    re-pointing an existing preset would silently move every current `full` user
+    onto a piecewise price scale on their next page load, with no action and no
+    consent.
+    """
+    from flowmap_server.core.session import BANDS
+
+    deep = BANDS["deep"]
+    assert deep is not None
+    assert deep.hybrid is True
+    assert BANDS["full"] is not None and BANDS["full"].hybrid is False
+    # -99% floor, not -100%: log space has no zero.
+    assert deep.down == 0.99
+    assert deep.up == 10.0
+    # Half the rows go to a native-step core; the rest reach the band edges.
+    assert deep.rows == 4096
+    assert deep.core_rows == 2048
+
+
+def test_deep_band_builds_a_hybrid_grid_that_keeps_the_native_ladder():
+    """End-to-end through the grid: the `deep` preset must give the SAME
+    resolution near the money as `native`, and still cover the band."""
+    from flowmap_server.core.price_scale import SCALE_HYBRID, row_to_price, step_at_row
+
+    cfg = Config(recording_enabled=False)
+    mgr = SessionManager(cfg)
+    feed = SimFeed(seed=1, dt_ns=250_000_000, start_ns=0)
+    grid = mgr._grid_for(feed, "deep")
+    assert grid.cfg.rows == 4096
+    assert grid.scale.kind != SCALE_HYBRID  # linear until the first real mid
+
+    # A BTC-like mid: the $0.50 tick is small relative to the price, which is
+    # the regime the hybrid exists for.
+    mid = 60_000.0
+    ep = grid.maybe_reanchor(mid)
+    assert ep is not None
+    s = grid.scale
+    assert s.kind == SCALE_HYBRID
+    # Core keeps the native tick EXACTLY — nothing is lost near the money.
+    assert step_at_row(s, s.dn_rows + 10) == pytest.approx(grid.cfg.tick, rel=1e-9)
+    # ...and the core covers what the narrow `native` grid covered (±0.853%).
+    core_pct = (s.core_hi - s.core_p0) / 2 / mid * 100
+    assert core_pct == pytest.approx(0.853, abs=0.01)
+    # ...and the wings reach the requested band.
+    assert row_to_price(s, 0) == pytest.approx(mid * 0.01, rel=1e-9)
+    assert row_to_price(s, s.rows) == pytest.approx(mid * 11.0, rel=1e-9)
+    # The epoch PUBLISHES the scale so the client can label the same rows back.
+    assert ep.scale_kind == SCALE_HYBRID
+    assert ep.core_p0 == pytest.approx(s.core_p0, rel=1e-12)
+    assert ep.dn_rows == s.dn_rows
+    # The frame is FROZEN: a later mid must not rebuild it, because the shader
+    # applies ONE row map to every already-uploaded column.
+    assert grid.maybe_reanchor(mid * 3) is None
+    assert grid.scale == s
+
+
+def test_deep_band_degrades_to_linear_when_the_core_already_spans_the_band():
+    """An honest no-op, not a crash.
+
+    For an instrument whose native grid is already absurdly wide relative to its
+    price — the sim is exactly that, a $0.50 tick on a $100 price, so 2048 core
+    rows alone span ±512% — a -99%/+1000% band is NARROWER than the core and the
+    hybrid is the wrong tool. `make_hybrid` refuses, and the grid must stay on
+    the linear path rather than install a broken map.
+    """
+    from flowmap_server.core.price_scale import SCALE_HYBRID
+
+    cfg = Config(recording_enabled=False)
+    mgr = SessionManager(cfg)
+    feed = SimFeed(seed=1, dt_ns=250_000_000, start_ns=0)
+    grid = mgr._grid_for(feed, "deep")
+
+    assert grid.maybe_reanchor(100.0) is None  # refused, no epoch bump
+    assert grid.scale.kind != SCALE_HYBRID
+    # And the grid still bins normally afterwards — no poisoned state.
+    px = np.array([99.0, 100.0, 101.0])
+    sz = np.array([1.0, 2.0, 3.0])
+    grid.on_book(0, px, sz, px + 0.5, sz)
+    assert grid.current_partial() is not None

@@ -156,3 +156,70 @@ export function fmtClockMs(ns: bigint): string {
   const ms = Number((ns / 1_000_000n) % 1000n);
   return `${fmtClock(ns)}.${String(((ms % 1000) + 1000) % 1000).padStart(3, '0')}`;
 }
+
+/**
+ * Tick prices for a LOGARITHMIC price axis — a 1/2/5×10^k decade ladder.
+ *
+ * `priceTickModel` picks a single "nice" arithmetic step, which is exactly wrong
+ * for an axis whose row height grows geometrically: one step is either invisible
+ * at the bottom or the only tick at the top. A decade ladder instead places
+ * ticks at constant RATIOS, so they stay evenly spread down a log axis.
+ *
+ * `pLo` must be > 0 (log space has no zero); a non-positive low bound is raised
+ * to a small fraction of `pHi` rather than rejected, so an over-scrolled axis
+ * still labels rather than going blank. Pure + unit-tested.
+ */
+export function logPriceTickModel(
+  pLo: number,
+  pHi: number,
+  targetCount: number,
+): { ticks: number[] } {
+  if (!Number.isFinite(pHi) || pHi <= 0) return { ticks: [] };
+  const lo = pLo > 0 ? pLo : pHi * 1e-6;
+  if (!(pHi > lo)) return { ticks: [] };
+
+  const target = Math.max(2, targetCount);
+  const decades = Math.log10(pHi / lo);
+
+  // Choose the (mantissa set, decade stride) whose resulting tick count lands
+  // closest to the target, rather than guessing thresholds — a 3-decade window
+  // at target 8 wants [1,2,5] (~9 ticks), which a coarse `perDecade >= 3` test
+  // would miss by a hair and leave with 3 ticks.
+  // Candidates: either sub-divide each decade (stride 1, finer mantissas) OR
+  // skip whole decades (stride > 1, mantissa [1] ONLY). Combining a fine
+  // mantissa set with a stride is degenerate — it clumps several ticks into
+  // every Nth decade and leaves the decades between them completely bare.
+  const candidates: Array<{ set: number[]; stride: number }> = [
+    { set: [1, 2, 3, 4, 5, 6, 8], stride: 1 },
+    { set: [1, 2, 5], stride: 1 },
+    { set: [1], stride: 1 },
+  ];
+  for (let st = 2; st <= Math.max(2, Math.ceil(decades)); st++) {
+    candidates.push({ set: [1], stride: st });
+  }
+  let mantissas = candidates[0].set;
+  let stride = 1;
+  let best = Infinity;
+  for (const c of candidates) {
+    const count = (decades / c.stride) * c.set.length;
+    const err = Math.abs(count - target);
+    if (err < best) {
+      best = err;
+      mantissas = c.set;
+      stride = c.stride;
+    }
+  }
+
+  const ticks: number[] = [];
+  const kLo = Math.floor(Math.log10(lo));
+  const kHi = Math.ceil(Math.log10(pHi));
+  for (let k = kLo; k <= kHi; k += stride) {
+    const base = 10 ** k;
+    for (const m of mantissas) {
+      const v = m * base;
+      if (v >= lo && v <= pHi) ticks.push(v);
+    }
+  }
+  ticks.sort((a, b) => a - b);
+  return { ticks };
+}

@@ -31,6 +31,15 @@ export interface ProfileResult {
 /**
  * Sum exact column density into per-row bins over a column × row window. Pure —
  * `getArrays(col)` returns the column's `{bid, ask}` (or null for uncached).
+ *
+ * `rowWidth`, when supplied, gives each row's PRICE width and switches the bins
+ * to density-per-unit-price. That is not cosmetic: this is a histogram, and on a
+ * non-uniform price grid the bins have unequal widths — a log-wing row can cover
+ * hundreds of times the price range of a core row, so on raw sums the wings win
+ * the point-of-control contest on bucket width alone. The POC is rendered as
+ * both a highlight and a printed price, so that would be a confidently wrong
+ * quantitative claim. Omit it (the linear grid) and the raw sums are kept
+ * bit-for-bit, so uniform-grid bar lengths and the POC row are unchanged.
  */
 export function accumulateProfile(
   colLo: number,
@@ -38,6 +47,7 @@ export function accumulateProfile(
   rowLo: number,
   rowHi: number,
   getArrays: (col: number) => { bid: Float32Array; ask: Float32Array | null } | null,
+  rowWidth?: (row: number) => number,
 ): ProfileResult {
   const nRows = Math.max(0, rowHi - rowLo + 1);
   const bins = new Float64Array(nRows);
@@ -48,6 +58,12 @@ export function accumulateProfile(
     const hi = Math.min(rowHi, bid.length - 1);
     for (let r = Math.max(rowLo, 0); r <= hi; r++) {
       bins[r - rowLo] += bid[r] + (ask !== null ? ask[r] : 0);
+    }
+  }
+  if (rowWidth !== undefined) {
+    for (let i = 0; i < nRows; i++) {
+      const w = rowWidth(rowLo + i);
+      bins[i] = w > 0 && Number.isFinite(w) ? bins[i] / w : 0;
     }
   }
   let max = 0;
@@ -100,7 +116,18 @@ export class Profile {
     const rowHi = Math.min(gridRows - 1, Math.ceil(gm.view.rowOffset + gm.view.rowScale));
     if (rowHi < rowLo) return;
 
-    const result = accumulateProfile(colLo, colHi, rowLo, rowHi, frame.columnArrays);
+    // Unequal-width bins on a non-uniform grid must be normalized by price
+    // width, or the wings win the POC on bucket width alone. Uniform grids pass
+    // no width function and keep the raw sums exactly.
+    const scale = gm.price?.scale;
+    const result = accumulateProfile(
+      colLo,
+      colHi,
+      rowLo,
+      rowHi,
+      frame.columnArrays,
+      scale !== undefined && scale.kind !== 'linear' ? (row) => gm.stepAtRow(row) : undefined,
+    );
     this.last = result;
     if (result.max <= 0) return;
 
@@ -125,7 +152,11 @@ export class Profile {
     // POC price label at the right edge.
     if (result.pocRow >= 0) {
       const price = gm.rowToPrice(result.pocRow + 0.5);
-      const decimals = gm.price.step > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(gm.price.step)))) : 2;
+      // Decimals from the POC row's OWN height — a wing row is worth hundreds
+      // of ticks, so the core's step would print meaningless precision there.
+      const localStep = gm.stepAtRow(result.pocRow);
+      const decimals =
+        localStep > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(localStep)))) : 2;
       const y = gm.cssY(result.pocRow + 0.5);
       text.badge(cssW - 3, y, `POC ${price.toFixed(decimals)}`, {
         align: 'right',

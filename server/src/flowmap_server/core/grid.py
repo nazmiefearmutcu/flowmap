@@ -41,6 +41,14 @@ import math
 import msgspec
 import numpy as np
 
+from flowmap_server.core.price_scale import (
+    SCALE_HYBRID,
+    PriceScale,
+    epoch_scale_fields,
+    linear_scale,
+    make_hybrid,
+)
+from flowmap_server.core.price_scale_np import rows_for_prices
 from flowmap_server.proto.events import (
     MODE_SYNTH_PROFILE,
     SIDE_BUY,
@@ -80,6 +88,11 @@ class GridCfg(msgspec.Struct, frozen=True):
     # (``tick_multiple`` as given, ``p0`` recentred on the central-70% rule).
     band_up: float | None = None
     band_down: float | None = None
+    # Opt into the HYBRID price scale (log wing / linear core / log wing) for
+    # this band. Off by default, so every existing grid stays linear.
+    band_hybrid: bool = False
+    # Rows given to the linear core; 0 => rows // 2.
+    core_rows: int = 0
 
 
 def band_frame(
@@ -151,6 +164,10 @@ class Grid:
         self._banded = cfg.band_up is not None and cfg.band_down is not None
         self._anchor_mid: float | None = None
         self._band_anchored = False
+        # The row<->price map. For a linear grid this is kept in lockstep with
+        # _p0/_step, which remain the truth there; a hybrid band replaces it
+        # wholesale on its first real-mid anchor.
+        self._scale: PriceScale = linear_scale(self._p0, self._step, cfg.rows)
         # Per-epoch params table (spec §6.3): snapshot/history must be able to
         # announce EVERY epoch still present in the ring, not just the current
         # one. Populated here (epoch 0) and on every re-anchor; kept for the
@@ -163,7 +180,8 @@ class Grid:
                 dt_ns=cfg.dt_ns,
                 p0=cfg.p0,
                 rows=cfg.rows,
-            )
+            )  # epoch 0 is always the linear seed; a band installs its own on
+            #  the first real mid, which bumps the epoch.
         }
 
         rows = cfg.rows
@@ -429,7 +447,16 @@ class Grid:
         finite = np.isfinite(px64) & np.isfinite(sz64)
         px64 = px64[finite]
         sz64 = sz64[finite]
-        r = np.rint((px64 - self._p0) / self._step).astype(np.int64)
+        if self._scale.kind == SCALE_HYBRID:
+            # Non-uniform grid: rows come from the piecewise map. It returns NaN
+            # for a non-positive price (log space has no zero), so re-filter —
+            # an unfiltered rint(NaN) would bin those onto row 0.
+            rf = rows_for_prices(self._scale, px64)
+            ok = np.isfinite(rf)
+            r = np.rint(rf[ok]).astype(np.int64)
+            sz64 = sz64[ok]
+        else:
+            r = np.rint((px64 - self._p0) / self._step).astype(np.int64)
         mask = (r >= 0) & (r < rows)
         return np.bincount(r[mask], weights=sz64[mask], minlength=rows)
 
@@ -615,6 +642,38 @@ class Grid:
         if not math.isfinite(mid):
             return None
 
+        if self._banded and cfg.band_hybrid:
+            assert cfg.band_up is not None and cfg.band_down is not None
+            if self._band_anchored:
+                # The hybrid frame is FROZEN for the session. Re-anchoring it
+                # would change the row<->price map wholesale (not the integer
+                # translation a linear re-anchor is), and the fragment shader
+                # applies ONE row map to every resident column — so every
+                # already-uploaded column would be redrawn at the wrong prices.
+                # The core is wide enough that ordinary intraday movement stays
+                # inside it; a sustained move walks the book into the wings,
+                # which is stated plainly in the drawer copy.
+                return None
+            core_rows = cfg.core_rows if cfg.core_rows > 0 else cfg.rows // 2
+            scale = make_hybrid(
+                mid=mid,
+                rows=cfg.rows,
+                core_rows=core_rows,
+                core_step=cfg.tick * cfg.tick_multiple,
+                up_mult=1.0 + cfg.band_up,
+                dn_floor=max(1e-6, 1.0 - cfg.band_down),
+            )
+            if scale is None:
+                return None  # degenerate request: stay on the linear grid
+            self._scale = scale
+            self._band_anchored = True
+            self._anchor_mid = mid
+            # The core's step becomes the grid's nominal step; p0 is the core's
+            # base so the legacy scalars still describe the tradeable band.
+            self._p0 = scale.core_p0
+            self._step = scale.core_step
+            return self._commit_anchor(scale.core_p0, rebuild_state=True)
+
         if self._banded:
             assert cfg.band_up is not None and cfg.band_down is not None
             if not self._band_anchored:
@@ -675,6 +734,10 @@ class Grid:
             bid_px, bid_sz, ask_px, ask_sz = self._last_book
             self._state[0] = self._map_levels(bid_px, bid_sz)
             self._state[1] = self._map_levels(ask_px, ask_sz)
+        # Keep the linear scale in lockstep with p0/step; a hybrid scale was
+        # already installed by its own branch and must not be overwritten here.
+        if self._scale.kind != SCALE_HYBRID:
+            self._scale = linear_scale(new_p0, self._step, cfg.rows)
         params = EpochParams(
             epoch=self._epoch,
             tick=cfg.tick,
@@ -682,6 +745,7 @@ class Grid:
             dt_ns=cfg.dt_ns,
             p0=new_p0,
             rows=cfg.rows,
+            **epoch_scale_fields(self._scale),
         )
         self._epoch_params[self._epoch] = params
         return params
@@ -692,6 +756,11 @@ class Grid:
         Raises ``KeyError`` for epochs the grid never entered.
         """
         return self._epoch_params[epoch]
+
+    @property
+    def scale(self) -> PriceScale:
+        """The live row<->price map (linear unless a hybrid band anchored)."""
+        return self._scale
 
     def current_epoch_params(self) -> EpochParams:
         """Params of the live (current) epoch."""
