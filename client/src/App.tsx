@@ -319,7 +319,7 @@ export function App() {
             <HeatLegend colormap={settings.colormap} />
             <ClosedBanner />
           </div>
-          <PriceAxis canvasRef={priceAxisRef} />
+          <PriceAxis canvasRef={priceAxisRef} rendererRef={rendererRef} />
           <TimeAxis canvasRef={timeAxisRef} />
           <div className="stage__corner" aria-hidden="true" />
         </div>

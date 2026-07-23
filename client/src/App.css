@@ -497,6 +497,42 @@ body,
   grid-row: 1;
   border-left: 1px solid var(--line);
   background: var(--bg-2);
+  /* Control surface (§9): wheel = price zoom, vertical drag = price scale,
+     dblclick = re-fit. `position: relative` anchors the AUTO chip; touch-action
+     stops a touchpad/touch drag from scrolling the page instead of scaling.
+     NOTE the gutter is assumed to share the GL canvas's HEIGHT exactly (the
+     .stage grid guarantees it, and gl/overlays/manager.ts relies on it) — adding
+     vertical padding or a horizontal border here silently breaks wheel anchoring. */
+  position: relative;
+  touch-action: none;
+  cursor: ns-resize;
+}
+
+/* Price auto-scale chip — a SIBLING of the axis canvas, so its clicks never
+   reach the gutter's gesture listeners. Modelled on .panel__lock. */
+.axis-auto {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  z-index: 2;
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  padding: 3px 5px;
+  color: var(--text-3);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.axis-auto:hover {
+  color: var(--text-2);
+}
+.axis-auto.is-on {
+  color: var(--accent-bright);
+  border-color: var(--accent-line);
 }
 
 .time-axis {
