@@ -20,9 +20,21 @@ stockodile for US equities) behind one market-agnostic renderer.
   re-rasterized; pan and both zoom axes only change a uniform. Measured: draw cost is ~0.2 ms
   whether 200 or 10 000 columns are resident (history-independent — the old 1-fps bug is
   structurally gone).
-- **Professional order flow:** liquidity heatmap (thermal, with correct SUM-mip zoom-out so
-  walls don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
+- **Professional order flow:** liquidity heatmap (inferno ramp — indigo → red → gold → white, so
+  relative size reads by hue and not just brightness — with correct SUM-mip zoom-out so walls
+  don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
   event markers, crosshair with exact liquidity readout, deep scroll-back, replay transport.
+- **Chart controls that behave like the tools you already use.** The price gutter is a control
+  surface: wheel scales price at the cursor, a vertical drag scales the axis, double-click
+  re-fits. The two axes follow independently — scroll back through time and price keeps
+  auto-scaling; zoom price and the right edge stays pinned to now, with your zoom preserved and
+  the window recentring only when price leaves a central deadband. Price pans a full viewport
+  past either end of the grid. A **Tolerance** black point hides sub-threshold density so only
+  liquidity worth reading paints.
+- **Configurable price coverage.** The grid is a linear affine over a fixed row count, so range
+  and resolution are the same knob. `native` keeps the finest rows; `±50%` and `−100%/+1000%`
+  trade resolution for reach. The widest preset is a range **scan** mode — at that width the live
+  book collapses into a couple of rows on a major — and the drawer says so.
 - **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities
   show what their free data actually supports — a keyless **two-sided** volume-at-price SYNTH depth
   (Yahoo 1 m bars, bid below / ask above a reference price that tracks the market) that upgrades to
@@ -36,7 +48,7 @@ stockodile for US equities) behind one market-agnostic renderer.
 | | |
 |---|---|
 | ![equity:AAPL on the keyless SYNTH tier, replaying a recorded market-hours session](docs/media/equity-aapl-synth-replay.png) <br><sub>`equity:AAPL` on the keyless SYNTH tier, replaying a recorded market-hours session — distinct amber ramp, honest `SYNTH` / `TAPE POLL` badges, market-closed banner, synthetic book in the DOM.</sub> | ![sim:SIM-DEMO deterministic feed with walls and liquidation markers](docs/media/sim-demo-markers.png) <br><sub>`sim:SIM-DEMO` deterministic feed — liquidity walls, buy/sell trade bubbles, VWAP line, and `LIQ` liquidation event markers.</sub> |
-| ![Crosshair with the exact per-cell liquidity readout](docs/media/crosshair-readout.png) <br><sub>Crosshair with the exact per-cell readout: source tier, column timestamp, price, and resting bid/ask liquidity.</sub> | ![Settings drawer over the live heatmap](docs/media/settings-drawer.png) <br><sub>The display pipeline is live: contrast (gamma), colormap, normalization percentile, tick grouping, bubble threshold, and per-overlay toggles.</sub> |
+| ![Crosshair with the exact per-cell liquidity readout](docs/media/crosshair-readout.png) <br><sub>Crosshair with the exact per-cell readout: source tier, column timestamp, price, and resting bid/ask liquidity.</sub> | ![Settings drawer over the live heatmap](docs/media/settings-drawer.png) <br><sub>The display pipeline is live: contrast (gamma), colormap, tolerance (black point), normalization percentile, tick grouping, bubble threshold, price range, both follow axes, and per-overlay toggles.</sub> |
 
 ## Architecture
 
