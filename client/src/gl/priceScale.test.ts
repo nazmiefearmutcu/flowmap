@@ -7,6 +7,8 @@ import {
   priceToRow,
   rowToPrice,
   stepAtRow,
+  scaleFromEpoch,
+  SCALE_KIND_HYBRID,
   upperRows,
   type HybridScale,
   type LinearScale,
@@ -294,5 +296,64 @@ describe('cross-language parity with the SERVER price scale', () => {
     expect(s.coreP0).toBe(golden.btc_hybrid.scale.coreP0);
     expect(s.loPrice).toBe(golden.btc_hybrid.scale.loPrice);
     expect(s.hiPrice).toBe(golden.btc_hybrid.scale.hiPrice);
+  });
+});
+
+describe('scaleFromEpoch — the wire compatibility rule', () => {
+  const linearEp = { tick: 0.01, tick_multiple: 5, p0: 90, rows: 2048 };
+
+  it('reads an epoch with NO scale fields as the legacy affine', () => {
+    // Every epoch written before the hybrid existed, and every linear epoch
+    // written after it (the server omits the defaults).
+    const s = scaleFromEpoch(linearEp);
+    expect(s.kind).toBe('linear');
+    expect(s).toEqual({ kind: 'linear', p0: 90, step: 0.05, rows: 2048 });
+  });
+
+  it('reads scale_kind 0 as linear too', () => {
+    expect(scaleFromEpoch({ ...linearEp, scale_kind: 0 }).kind).toBe('linear');
+  });
+
+  it('reconstructs a hybrid frame exactly', () => {
+    const h = btc();
+    const s = scaleFromEpoch({
+      tick: 0.5,
+      tick_multiple: 1,
+      p0: 0,
+      rows: h.rows,
+      scale_kind: SCALE_KIND_HYBRID,
+      dn_rows: h.dnRows,
+      core_rows: h.coreRows,
+      core_p0: h.coreP0,
+      core_step: h.coreStep,
+      lo_price: h.loPrice,
+      hi_price: h.hiPrice,
+    });
+    expect(s).toEqual(h);
+  });
+
+  it('degrades an UNKNOWN scale kind to linear (forward compatibility)', () => {
+    // A newer server must never make an older client silently mis-read a
+    // piecewise grid as a uniform one.
+    expect(scaleFromEpoch({ ...linearEp, scale_kind: 99 }).kind).toBe('linear');
+  });
+
+  it('degrades an UNUSABLE hybrid frame to linear rather than mapping garbage', () => {
+    const s = scaleFromEpoch({
+      ...linearEp,
+      scale_kind: SCALE_KIND_HYBRID,
+      dn_rows: 100,
+      core_rows: 200,
+      core_p0: 50,
+      core_step: 0.5,
+      lo_price: 0, // log space has no zero
+      hi_price: 999,
+    });
+    expect(s.kind).toBe('linear');
+  });
+
+  it('tolerates a hybrid frame with missing optional fields', () => {
+    // Should not throw or produce undefined-driven NaN; falls back to linear.
+    expect(scaleFromEpoch({ ...linearEp, scale_kind: SCALE_KIND_HYBRID }).kind).toBe('linear');
   });
 });

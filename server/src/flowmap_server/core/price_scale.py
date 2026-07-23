@@ -236,3 +236,48 @@ def make_hybrid(
         hi_price=hi_price,
     )
     return scale if scale.usable else None
+
+
+def scale_of(ep) -> PriceScale:
+    """The :class:`PriceScale` an ``EpochParams`` denotes.
+
+    The single place the "missing / unknown fields means today's behaviour" rule
+    lives. An epoch whose ``scale_kind`` is 0, absent, or a kind this build does
+    not know falls back to the linear affine — which is what lets a hybrid
+    server talk to an older client without it silently mis-reading a piecewise
+    grid as a uniform one. An unusable hybrid falls back the same way.
+    """
+    kind = getattr(ep, "scale_kind", 0)
+    linear = linear_scale(ep.p0, ep.tick * ep.tick_multiple, ep.rows)
+    if kind != SCALE_HYBRID:
+        return linear
+    s = PriceScale(
+        kind=SCALE_HYBRID,
+        rows=ep.rows,
+        dn_rows=ep.dn_rows,
+        core_rows=ep.core_rows,
+        core_p0=ep.core_p0,
+        core_step=ep.core_step,
+        lo_price=ep.lo_price,
+        hi_price=ep.hi_price,
+    )
+    return s if s.usable else linear
+
+
+def epoch_scale_fields(s: PriceScale) -> dict:
+    """The seven wire fields for a scale, ready to splat into ``EpochParams``.
+
+    A linear scale yields every field at its default, so ``omit_defaults``
+    drops them all and the encoded bytes are unchanged.
+    """
+    if s.kind != SCALE_HYBRID:
+        return {}
+    return {
+        "scale_kind": SCALE_HYBRID,
+        "dn_rows": s.dn_rows,
+        "core_rows": s.core_rows,
+        "core_p0": s.core_p0,
+        "core_step": s.core_step,
+        "lo_price": s.lo_price,
+        "hi_price": s.hi_price,
+    }

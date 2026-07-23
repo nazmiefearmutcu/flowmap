@@ -226,3 +226,57 @@ export function makeHybrid(spec: HybridSpec): HybridScale | null {
   };
   return isUsableHybrid(scale) ? scale : null;
 }
+
+/**
+ * Minimal structural view of the wire's epoch geometry — declared here rather
+ * than imported so this module stays free of the proto layer and testable in
+ * isolation.
+ */
+export interface EpochScaleFields {
+  tick: number;
+  tick_multiple: number;
+  p0: number;
+  rows: number;
+  scale_kind?: number;
+  dn_rows?: number;
+  core_rows?: number;
+  core_p0?: number;
+  core_step?: number;
+  lo_price?: number;
+  hi_price?: number;
+}
+
+/** Wire discriminator for the hybrid scale (mirrors the server's SCALE_HYBRID). */
+export const SCALE_KIND_HYBRID = 1;
+
+/**
+ * The scale an epoch denotes — the SINGLE place the compatibility rule lives.
+ *
+ * An epoch whose `scale_kind` is 0, absent, or a kind this build does not know
+ * decodes to the legacy affine. That is what lets a newer server talk to an
+ * older client without it silently mis-reading a piecewise grid as a uniform
+ * one, and it is why a hybrid only ever ships under a band an old client would
+ * never request. A hybrid frame that fails {@link isUsableHybrid} — a garbage
+ * `loPrice`, an inverted wing — falls back the same way rather than producing a
+ * non-monotone map that would scatter liquidity across the grid.
+ */
+export function scaleFromEpoch(ep: EpochScaleFields): PriceScale {
+  const linear: LinearScale = {
+    kind: 'linear',
+    p0: ep.p0,
+    step: ep.tick * ep.tick_multiple,
+    rows: ep.rows,
+  };
+  if (ep.scale_kind !== SCALE_KIND_HYBRID) return linear;
+  const hybrid: HybridScale = {
+    kind: 'hybrid',
+    rows: ep.rows,
+    dnRows: ep.dn_rows ?? 0,
+    coreRows: ep.core_rows ?? 0,
+    coreP0: ep.core_p0 ?? 0,
+    coreStep: ep.core_step ?? 0,
+    loPrice: ep.lo_price ?? 0,
+    hiPrice: ep.hi_price ?? 0,
+  };
+  return isUsableHybrid(hybrid) ? hybrid : linear;
+}

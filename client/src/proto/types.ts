@@ -69,7 +69,19 @@ export type MarkerKind =
 export type FeedState = 'live' | 'degraded' | 'closed' | 'reconnecting';
 export type StreamMode = 'live' | 'replay';
 
-/** Shared epoch geometry; nested inside Hello / EpochStart (never framed alone). */
+/**
+ * Shared epoch geometry; nested inside Hello / EpochStart (never framed alone).
+ *
+ * The first six fields describe the LINEAR affine `price = p0 + row·step`
+ * (`step = tick · tick_multiple`) and remain the whole story for every grid that
+ * has not opted into a non-uniform price scale.
+ *
+ * The trailing seven describe a piecewise scale (gl/priceScale.ts) and are
+ * OPTIONAL: the server omits them entirely for a linear epoch, so a linear
+ * payload is byte-identical to before and every golden fixture is unchanged.
+ * Never read them directly — go through `scaleFromEpoch`, which owns the
+ * "absent or unknown kind means the legacy affine" rule.
+ */
 export interface EpochParams {
   epoch: number;
   tick: number;
@@ -77,6 +89,14 @@ export interface EpochParams {
   dt_ns: number;
   p0: number;
   rows: number;
+  /** 0 = linear (default/absent), 1 = hybrid. */
+  scale_kind?: number;
+  dn_rows?: number;
+  core_rows?: number;
+  core_p0?: number;
+  core_step?: number;
+  lo_price?: number;
+  hi_price?: number;
 }
 
 // --- Hot (hand-packed binary) messages -----------------------------------------

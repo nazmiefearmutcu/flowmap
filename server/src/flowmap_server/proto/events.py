@@ -41,13 +41,38 @@ FeedState = Literal["live", "degraded", "closed", "reconnecting"]
 StreamMode = Literal["live", "replay"]
 
 
-class EpochParams(msgspec.Struct):
+class EpochParams(msgspec.Struct, omit_defaults=True):
+    """Row<->price geometry for one epoch.
+
+    The first six fields describe the LINEAR affine ``price = p0 + row * step``
+    (``step = tick * tick_multiple``) and remain the whole story for every grid
+    that has not opted into a non-uniform price scale.
+
+    The trailing seven describe a piecewise scale (see
+    ``core/price_scale.py``): ``scale_kind`` 0 = linear, 1 = hybrid (log wing /
+    linear core / log wing). They are appended LAST, default to the linear
+    state, and the struct is ``omit_defaults`` — so a linear epoch encodes to
+    BYTE-IDENTICAL JSON to before, which is what keeps ``cold_hello.bin`` and
+    every golden-vector assertion untouched. Verified in both skew directions:
+    an old payload decodes here with all-default (linear) fields, and an old
+    client decodes a hybrid payload by ignoring the extras — degrading to the
+    linear reading of ``p0``/``tick_multiple``, which is why the hybrid ships
+    only under an opt-in band a stale client would never request.
+    """
+
     epoch: int
     tick: float
     tick_multiple: int
     dt_ns: int
     p0: float
     rows: int
+    scale_kind: int = 0
+    dn_rows: int = 0
+    core_rows: int = 0
+    core_p0: float = 0.0
+    core_step: float = 0.0
+    lo_price: float = 0.0
+    hi_price: float = 0.0
 
 
 # --- Cold (JSON) messages ------------------------------------------------------

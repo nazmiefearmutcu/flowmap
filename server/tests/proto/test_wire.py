@@ -1,3 +1,4 @@
+import msgspec
 import struct
 
 import pytest
@@ -152,3 +153,66 @@ def test_golden_vectors_stable():
     d = pathlib.Path(__file__).parent / "golden"
     for name, ev in golden_fixture_events().items():
         assert wire.encode(ev) == (d / f"{name}.bin").read_bytes(), name
+
+
+def test_epoch_params_scale_fields_are_wire_invisible_when_linear():
+    """The seven price-scale fields must not move a single byte for a LINEAR
+    epoch, or every golden vector and the client's byte-identity assertions
+    break. ``omit_defaults=True`` on the struct is what buys that — this test is
+    what stops someone removing it."""
+    from flowmap_server.proto.events import EpochParams
+
+    ep = EpochParams(epoch=3, tick=0.01, tick_multiple=5, dt_ns=250_000_000,
+                     p0=90.0, rows=2048)
+    encoded = msgspec.json.encode(ep)
+    assert b"scale_kind" not in encoded
+    assert b"core_p0" not in encoded
+    assert encoded == (
+        b'{"epoch":3,"tick":0.01,"tick_multiple":5,"dt_ns":250000000,'
+        b'"p0":90.0,"rows":2048}'
+    )
+
+
+def test_epoch_params_round_trips_a_hybrid_scale():
+    from flowmap_server.core.price_scale import SCALE_HYBRID, epoch_scale_fields, make_hybrid, scale_of
+    from flowmap_server.proto.events import EpochParams
+
+    hyb = make_hybrid(mid=60_000.0, rows=4096, core_rows=2048, core_step=0.5,
+                      up_mult=11.0, dn_floor=0.01)
+    assert hyb is not None
+    ep = EpochParams(epoch=1, tick=0.5, tick_multiple=1, dt_ns=250_000_000,
+                     p0=0.0, rows=4096, **epoch_scale_fields(hyb))
+    back = msgspec.json.decode(msgspec.json.encode(ep), type=EpochParams)
+    assert back.scale_kind == SCALE_HYBRID
+    assert scale_of(back) == hyb
+
+
+def test_old_payload_decodes_as_linear_and_new_client_reads_it():
+    """Forward compat: a recorded/streamed epoch written before this change has
+    no scale fields, and must decode to exactly the legacy affine."""
+    from flowmap_server.core.price_scale import SCALE_LINEAR, scale_of
+    from flowmap_server.proto.events import EpochParams
+
+    old = b'{"epoch":3,"tick":0.01,"tick_multiple":5,"dt_ns":250000000,"p0":90.0,"rows":2048}'
+    ep = msgspec.json.decode(old, type=EpochParams)
+    assert ep.scale_kind == 0
+    s = scale_of(ep)
+    assert s.kind == SCALE_LINEAR
+    assert s.p0 == 90.0
+    assert s.step == 0.01 * 5
+
+
+def test_scale_of_falls_back_to_linear_on_an_unusable_or_unknown_kind():
+    """A malformed or future scale must degrade to the affine, never produce a
+    non-monotone map that would scatter liquidity across the grid."""
+    from flowmap_server.core.price_scale import SCALE_LINEAR, scale_of
+    from flowmap_server.proto.events import EpochParams
+
+    base = dict(epoch=1, tick=0.5, tick_multiple=1, dt_ns=250_000_000, p0=7.0, rows=4096)
+    # kind 1 but a garbage frame (lo_price 0 -> log space blows up)
+    bad = EpochParams(**base, scale_kind=1, dn_rows=100, core_rows=200,
+                      core_p0=50.0, core_step=0.5, lo_price=0.0, hi_price=999.0)
+    assert scale_of(bad).kind == SCALE_LINEAR
+    # a kind this build does not know
+    future = EpochParams(**base, scale_kind=99)
+    assert scale_of(future).kind == SCALE_LINEAR
