@@ -25,6 +25,12 @@
  */
 
 import type { HeatmapView } from '../heatmap';
+import {
+  priceToRow as scalePriceToRow,
+  rowToPrice as scaleRowToPrice,
+  stepAtRow as scaleStepAtRow,
+  type PriceScale,
+} from '../priceScale';
 
 /** Device + CSS pixel dimensions of the drawing surface for one frame. */
 export interface SurfaceDims {
@@ -50,11 +56,31 @@ export interface TimeMap {
   dtNs: number;
 }
 
-/** Row⇄price affine for the current epoch: `price = p0 + row·step`. */
+/**
+ * Row⇄price map for the current epoch.
+ *
+ * `p0`/`step` describe the LINEAR affine (`price = p0 + row·step`) and remain
+ * the whole story for every grid that has not opted into a wide price band —
+ * so the default path is byte-identical to before.
+ *
+ * `scale`, when present, is authoritative and may be non-uniform (a linear core
+ * with logarithmic wings; see gl/priceScale.ts). `p0`/`step` are still populated
+ * alongside it as the CORE's values, purely so that code which only needs a
+ * representative tick size keeps working — but anything that maps an actual row
+ * or price MUST go through the accessors below, never the two scalars, because
+ * under a hybrid scale a row's price height depends on where it sits.
+ */
 export interface PriceMap {
   p0: number;
-  /** `tick · tick_multiple` — grid price increment per row. */
+  /** `tick · tick_multiple` — grid price increment per row (the CORE's, if hybrid). */
   step: number;
+  /** Non-uniform scale, when the epoch declares one. Authoritative if set. */
+  scale?: PriceScale;
+}
+
+/** The scale a PriceMap denotes — its explicit one, or the linear affine. */
+export function mapScale(p: PriceMap): PriceScale {
+  return p.scale ?? { kind: 'linear', p0: p.p0, step: p.step, rows: 0 };
 }
 
 /**
@@ -101,18 +127,31 @@ export class GridMap {
     return t.anchorT0Ns + BigInt(Math.round((col - t.anchorSeq) * t.dtNs));
   }
 
-  /** Fractional row of a price, or NaN when the price affine is unknown. */
+  /** Fractional row of a price, or NaN when the price map is unknown. */
   priceToRow(price: number): number {
     const p = this.price;
-    if (p === null || p.step === 0) return Number.NaN;
-    return (price - p.p0) / p.step;
+    if (p === null) return Number.NaN;
+    return scalePriceToRow(mapScale(p), price);
   }
 
-  /** Price at a (fractional) row, or NaN when the price affine is unknown. */
+  /** Price at a (fractional) row, or NaN when the price map is unknown. */
   rowToPrice(row: number): number {
     const p = this.price;
     if (p === null) return Number.NaN;
-    return p.p0 + row * p.step;
+    return scaleRowToPrice(mapScale(p), row);
+  }
+
+  /**
+   * LOCAL price height of one row at `row` — what a "tick" is worth THERE.
+   *
+   * Constant on a linear grid; position-dependent on a hybrid one. Every
+   * consumer that used to read `price.step` to size a rung, a profile bin or a
+   * tick label must use this, or it will label the wings with the core's step.
+   */
+  stepAtRow(row: number): number {
+    const p = this.price;
+    if (p === null) return Number.NaN;
+    return scaleStepAtRow(mapScale(p), row);
   }
 
   // --- grid space → clip space (WebGL, y-up) ------------------------------------
@@ -194,15 +233,33 @@ export function visibleColRange(
  * "remap failed, keep the old epoch" rather than writing NaN into the camera.
  */
 export function remapRow(row: number, from: PriceMap, to: PriceMap): number {
-  if (to.step === 0) return Number.NaN;
-  return (from.p0 + row * from.step - to.p0) / to.step;
+  return scalePriceToRow(mapScale(to), scaleRowToPrice(mapScale(from), row));
 }
 
 /**
- * Re-express a row SPAN in another epoch's coordinates. A span is a difference,
- * so only the step ratio matters — `p0` cancels.
+ * Re-express a row SPAN in another epoch's coordinates.
+ *
+ * On two linear grids a span is a pure ratio and `p0` cancels. On a non-uniform
+ * grid it is not: the same number of rows covers a different price distance
+ * depending on where it sits, so the caller passes `aroundRow` (the centre the
+ * span is measured about) and the endpoints are remapped individually.
  */
-export function remapRowSpan(rowSpan: number, from: PriceMap, to: PriceMap): number {
-  if (to.step === 0) return Number.NaN;
-  return (rowSpan * from.step) / to.step;
+export function remapRowSpan(
+  rowSpan: number,
+  from: PriceMap,
+  to: PriceMap,
+  aroundRow = 0,
+): number {
+  const f = mapScale(from);
+  const t = mapScale(to);
+  if (f.kind === 'linear' && t.kind === 'linear') {
+    // Fast, exact path — and provably the old arithmetic.
+    return t.step === 0 ? Number.NaN : (rowSpan * f.step) / t.step;
+  }
+  // A span is only meaningful as a difference, and under a non-uniform scale a
+  // difference depends on WHERE it is measured — so remap the two endpoints of
+  // the span centred on `aroundRow` and take the new distance between them.
+  const lo = scaleRowToPrice(f, aroundRow - rowSpan / 2);
+  const hi = scaleRowToPrice(f, aroundRow + rowSpan / 2);
+  return scalePriceToRow(t, hi) - scalePriceToRow(t, lo);
 }

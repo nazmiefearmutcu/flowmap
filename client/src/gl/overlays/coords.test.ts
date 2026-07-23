@@ -10,6 +10,7 @@ import {
   type SurfaceDims,
 } from './coords';
 import type { HeatmapView } from '../heatmap';
+import { makeHybrid, priceToRow, rowToPrice } from '../priceScale';
 
 const view: HeatmapView = { colOffset: 100, colScale: 200, rowOffset: 50, rowScale: 100 };
 const dims: SurfaceDims = { drawW: 1600, drawH: 800, cssW: 800, cssH: 400 };
@@ -141,5 +142,87 @@ describe('remapRow / remapRowSpan — surviving an epoch re-anchor', () => {
     const dead: PriceMap = { p0: 0, step: 0 };
     expect(Number.isNaN(remapRow(40, A, dead))).toBe(true);
     expect(Number.isNaN(remapRowSpan(40, A, dead))).toBe(true);
+  });
+});
+
+describe('GridMap under a NON-UNIFORM price scale', () => {
+  // A hybrid scale: linear core with log wings. The whole point is that a row's
+  // price height depends on where it sits, so every mapping must go through the
+  // scale rather than the two representative scalars.
+  const hybrid = makeHybrid({
+    mid: 60_000,
+    rows: 4096,
+    coreRows: 2048,
+    coreStep: 0.5,
+    upMult: 11,
+    dnFloor: 0.01,
+  })!;
+  const pm: PriceMap = { p0: hybrid.coreP0, step: hybrid.coreStep, scale: hybrid };
+  const gm = new GridMap(view, dims, null, pm);
+
+  it('maps rows and prices through the SCALE, not p0 + row*step', () => {
+    const linearAnswer = pm.p0 + 3900 * pm.step;
+    expect(gm.rowToPrice(3900)).not.toBeCloseTo(linearAnswer, 0);
+    // ...and agrees with the scale module exactly.
+    expect(gm.rowToPrice(3900)).toBe(rowToPrice(hybrid, 3900));
+    expect(gm.priceToRow(500_000)).toBe(priceToRow(hybrid, 500_000));
+  });
+
+  it('round-trips through the GridMap accessors', () => {
+    for (const r of [10, 1348, 2400, 3400, 4000]) {
+      expect(gm.priceToRow(gm.rowToPrice(r))).toBeCloseTo(r, 6);
+    }
+  });
+
+  it('reports a POSITION-DEPENDENT row height', () => {
+    const inCore = gm.stepAtRow(hybrid.dnRows + 100);
+    const inWing = gm.stepAtRow(hybrid.dnRows + hybrid.coreRows + 100);
+    expect(inCore).toBeCloseTo(0.5, 9); // native ladder preserved
+    expect(inWing).toBeGreaterThan(inCore * 10); // wings are far coarser
+  });
+
+  it('still reports a CONSTANT row height on a linear map (no regression)', () => {
+    const lin = new GridMap(view, dims, null, { p0: 100, step: 0.5 });
+    expect(lin.stepAtRow(0)).toBe(0.5);
+    expect(lin.stepAtRow(9999)).toBe(0.5);
+  });
+
+  it('remapRowSpan measures the span WHERE it sits under a non-uniform scale', () => {
+    // Same span, two places on the same grid → different price distances, so a
+    // remap that ignored position would silently resize the user's price zoom.
+    const other = makeHybrid({
+      mid: 66_000, // the epoch re-anchored 10% higher
+      rows: 4096,
+      coreRows: 2048,
+      coreStep: 0.5,
+      upMult: 11,
+      dnFloor: 0.01,
+    })!;
+    const to: PriceMap = { p0: other.coreP0, step: other.coreStep, scale: other };
+    const inCore = remapRowSpan(200, pm, to, hybrid.dnRows + 1000);
+    const inWing = remapRowSpan(200, pm, to, hybrid.dnRows + hybrid.coreRows + 300);
+    expect(inCore).not.toBeCloseTo(inWing, 1);
+    // Both stay finite and positive — a remap must never invert the axis.
+    expect(inCore).toBeGreaterThan(0);
+    expect(inWing).toBeGreaterThan(0);
+  });
+
+  it('remapRow preserves the PRICE a row denotes across epochs', () => {
+    const other = makeHybrid({
+      mid: 66_000, rows: 4096, coreRows: 2048, coreStep: 0.5, upMult: 11, dnFloor: 0.01,
+    })!;
+    const to: PriceMap = { p0: other.coreP0, step: other.coreStep, scale: other };
+    for (const r of [500, 2000, 3500]) {
+      const price = rowToPrice(hybrid, r);
+      expect(rowToPrice(other, remapRow(r, pm, to))).toBeCloseTo(price, 3);
+    }
+  });
+
+  it('keeps the linear remap arithmetic EXACT (byte-identical fast path)', () => {
+    const a: PriceMap = { p0: 100, step: 0.5 };
+    const b: PriceMap = { p0: 150, step: 0.5 };
+    expect(remapRow(40, a, b)).toBe(-60);
+    expect(remapRowSpan(120, a, b)).toBe(120);
+    expect(remapRowSpan(120, a, { p0: 999, step: 2 })).toBe(30);
   });
 });
