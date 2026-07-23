@@ -36,6 +36,12 @@ class Config(msgspec.Struct, frozen=True):
     dt_equity_keyed_ns: int = 10**9
     dt_equity_keyless_ns: int = 10 * 10**9
     max_rows: int = 4096
+    # Levels per side kept when a crypto book is emitted (see feeds/crypto.py
+    # BOOK_TOP_N). The cap exists so one array build cannot blow up on a venue
+    # that streams a very deep book; it is NOT a fidelity choice, and it is the
+    # binding constraint on how far out the wide/full price bands can ever show
+    # resting size.
+    book_top_n: int = 20_000
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -70,5 +76,6 @@ class Config(msgspec.Struct, frozen=True):
             ),
             alpaca_key=alpaca_key,
             alpaca_secret=alpaca_secret,
+            book_top_n=max(1, int(env.get("FLOWMAP_BOOK_TOP_N", "20000"))),
             finnhub_key=env.get("FINNHUB_API_KEY"),
         )

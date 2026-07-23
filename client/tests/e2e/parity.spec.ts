@@ -19,7 +19,7 @@ import { expect, test, type Page } from '@playwright/test';
  * injected data). Per §7:
  *
  *   feature      crypto (L2/tick)            equity keyless (SYNTH/poll)
- *   heatmap      RAMP_THERMAL                RAMP_SYNTH (amber) — ramps DIFFER
+ *   heatmap      RAMP_INFERNO                RAMP_SYNTH (amber) — ramps DIFFER
  *   DOM ladder   full bid/ask book, L2      SYNTH profile, SYNTH badge, no bid/ask
  *   tape         TAPE TICK                  TAPE POLL
  *   CVD / side   SIDE EXCHANGE (real)       SIDE NA (keyless)
@@ -52,7 +52,7 @@ const SIDE_SELL = 1;
 const SIDE_UNKNOWN = 2;
 const SIDE_SRC_EXCHANGE = 0;
 const SIDE_SRC_NA = 2;
-const RAMP_THERMAL = 0;
+const RAMP_INFERNO = 0;
 const RAMP_SYNTH = 1;
 
 const TAGS = {
@@ -361,14 +361,36 @@ async function assertCrosshairAndReplay(page: Page): Promise<void> {
   });
   await page.mouse.move(box!.x - 5, box!.y - 5); // leave → hide, no residual state
 
-  expect(await page.locator('[data-testid="transport"]').count(), 'replay transport present').toBe(1);
-  expect(await page.locator('[data-testid="speeds"]').count(), 'replay speeds present').toBe(1);
+  // The transport is now MODE-GATED: replay controls exist only in replay mode.
+  // This helper boots `?panels=1`, which never subscribes, so mode is always
+  // 'live' — asserting the controls are merely absent would be vacuous and would
+  // leave the §7 `replay_controls` matrix cell unevidenced. Flip the store into
+  // replay, assert the controls mount, then restore.
+  expect(await page.locator('[data-testid="transport"]').count(), 'transport present').toBe(1);
+  await page.evaluate(() => {
+    const live = (window as unknown as { __flowmapLive: { store: any } }).__flowmapLive;
+    const sub = live.store.getState().subscription;
+    live.store.setState({
+      subscription: { ...(sub ?? { market: 'sim', symbol: 'SIM-DEMO' }), mode: 'replay' },
+    });
+  });
+  await expect(page.locator('[data-testid="speed-cycle"]'), 'replay speed control').toHaveCount(1);
+  await expect(page.locator('[data-testid="seek-scrubber"]'), 'replay scrubber').toHaveCount(1);
+  await expect(page.locator('[data-testid="transport-play"]'), 'replay play/pause').toHaveCount(1);
+  await page.evaluate(() => {
+    const live = (window as unknown as { __flowmapLive: { store: any } }).__flowmapLive;
+    const sub = live.store.getState().subscription;
+    live.store.setState({ subscription: { ...sub, mode: 'live' } });
+  });
+  // ...and in LIVE they are gone entirely — the point of the simplification.
+  await expect(page.locator('[data-testid="speed-cycle"]'), 'no dead speed control in live').toHaveCount(0);
+  await expect(page.locator('[data-testid="seek-scrubber"]'), 'no dead scrubber in live').toHaveCount(0);
 }
 
 /** Assert the crypto column of the §7 table (full-fidelity L2/tick). */
 async function assertCryptoCells(page: Page, cap: Captured): Promise<void> {
   // heatmap: thermal ramp.
-  expect(cap.ramp, 'crypto heatmap is RAMP_THERMAL').toBe(RAMP_THERMAL);
+  expect(cap.ramp, 'crypto heatmap is RAMP_INFERNO').toBe(RAMP_INFERNO);
 
   // Wait for the throttled (~10 Hz) bookStore flush to paint the L2 ladder.
   await page.waitForFunction(() => !!document.querySelector('[data-testid="ladder-row"]'), undefined, {
@@ -521,7 +543,7 @@ test('§7 parity — both markets through ONE renderer: ramps differ + matrix', 
   );
 
   // The headline honest-parity claim: the SAME renderer paints DIFFERENT ramps.
-  expect(crypto.ramp, 'crypto → thermal').toBe(RAMP_THERMAL);
+  expect(crypto.ramp, 'crypto → inferno (real depth)').toBe(RAMP_INFERNO);
   expect(equity.ramp, 'equity → SYNTH amber').toBe(RAMP_SYNTH);
   expect(crypto.ramp, 'ramps differ across markets').not.toBe(equity.ramp);
 
@@ -535,7 +557,7 @@ test('§7 parity — both markets through ONE renderer: ramps differ + matrix', 
     spec: '§7 capability model — honest dual-market parity',
     renderer: 'one market-agnostic WebGL2 renderer (crypto + equity, same instance)',
     features: {
-      heatmap: { crypto: 'thermal (RAMP_THERMAL)', equity_keyless: 'SYNTH amber (RAMP_SYNTH)', differ: crypto.ramp !== equity.ramp },
+      heatmap: { crypto: 'inferno (RAMP_INFERNO)', equity_keyless: 'SYNTH amber (RAMP_SYNTH)', differ: crypto.ramp !== equity.ramp },
       dom_ladder: { crypto: 'L2 full book (bid+ask columns)', equity_keyless: 'SYNTH volume-at-price profile, no bid/ask' },
       tape: { crypto: 'TAPE TICK', equity_keyless: 'TAPE POLL (display-only)' },
       cvd_side: { crypto: 'SIDE EXCHANGE (real)', equity_keyless: 'SIDE NA (explicit N/A)' },

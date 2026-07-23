@@ -96,7 +96,12 @@ describe('FlowMap store', () => {
     const store = useFlowMapStore;
 
     store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
-    expect(store.getState().subscription).toEqual({ market: 'crypto', symbol: 'BTCUSDT', mode: 'live' });
+    expect(store.getState().subscription).toEqual({
+      market: 'crypto',
+      symbol: 'BTCUSDT',
+      mode: 'live',
+      band: 'native',
+    });
     expect(store.getState().status).toBe('connecting');
 
     sockets[0].open();
@@ -212,6 +217,7 @@ describe('FlowMap store — replay transport', () => {
       market: 'binance-spot',
       symbol: 'BTCUSDT',
       mode: 'replay',
+      band: 'native',
     });
     sockets[0].open();
 

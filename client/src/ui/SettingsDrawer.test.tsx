@@ -120,7 +120,7 @@ describe('SettingsDrawer restore defaults', () => {
     const patches: Array<Partial<FlowMapSettings>> = [];
     const { container } = render(
       <SettingsDrawer
-        settings={settings({ colormap: 'alt', follow: false })}
+        settings={settings({ colormap: 'classic', follow: false })}
         onChange={(p) => patches.push(p)}
         onClose={() => {}}
       />,

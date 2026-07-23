@@ -60,6 +60,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import Protocol
 
+import msgspec
 import numpy as np
 
 from flowmap_server.config import Config
@@ -527,6 +528,25 @@ class Session:
         self._clients.add(client)
         return self._snapshot_frames()
 
+    @property
+    def client_count(self) -> int:
+        """Attached clients (the session's refcount)."""
+        return len(self._clients)
+
+    def teardown_now(self) -> None:
+        """Tear down immediately, skipping the detach grace period.
+
+        Used when a session is being REPLACED (a price-band switch on the same
+        symbol): waiting out ``GRACE_S`` would pin a whole ring
+        (``ring_columns*2*rows*2`` bytes) for a minute and can trip
+        ``max_sessions``. Safe on an already-closed or still-watched session —
+        ``_teardown`` returns early in both cases.
+        """
+        if self._grace_handle is not None:
+            self._grace_handle.cancel()
+            self._grace_handle = None
+        self._teardown()
+
     def detach(self, client: ClientTx) -> None:
         # Idempotent: the refcount IS len(_clients), so a double-detach of the
         # same client cannot decrement twice and orphan a live subscriber.
@@ -870,6 +890,67 @@ _EQUITY_DEPTH_MODE: dict[object, int] = {
 # Synthetic (keyless) depth tiers run the slower Yahoo-friendly cadence.
 _EQUITY_SYNTH_DEPTHS = frozenset({"SYNTH", "SYNTH_PROFILE"})
 
+# Price-grid coverage presets, as (band_up, band_down) fractions of the
+# reference price. ``None`` = the legacy fixed-absolute-span grid.
+#
+# The grid is a LINEAR affine over a FIXED row count, so range and resolution
+# are the SAME knob — a wider band can only make every row coarser. Concretely,
+# on BTC at $60k with 2048 rows and a $0.5 tick:
+#   native  fixed $1024 span   -> $0.50/row   (about +/-0.85% around mid)
+#   wide    +/-50%             -> ~$43.5/row  (about $89k of coverage)
+#   full    -100% / +1000%     -> ~$403/row   (the live book collapses into a
+#                                 couple of rows: a range SCAN mode for finding
+#                                 far-out walls, NOT a ladder-reading view)
+# Because tick_multiple = ceil(span / (rows*tick)) can only round UP, a preset
+# is a literal no-op for any symbol cheap enough that the native span already
+# covers the band.
+class BandSpec(msgspec.Struct, frozen=True):
+    """Coverage around the reference price, and how the rows are spent.
+
+    ``hybrid=False`` keeps the LINEAR grid, where range and resolution are the
+    same knob. ``hybrid=True`` switches to the piecewise scale
+    (``core/price_scale.py``): a linear CORE at the instrument's native step
+    surrounded by logarithmic wings, so the tradeable ladder near the money is
+    unchanged AND the far field is covered. That is the only preset for which a
+    -99%/+1000% band is a trading view rather than a range scan.
+    """
+
+    up: float
+    down: float
+    hybrid: bool = False
+    #: Rows for the linear core; 0 => rows // 2.
+    core_rows: int = 0
+    #: Grid height override for this band (0 => the market default).
+    rows: int = 0
+
+
+BANDS: dict[str, BandSpec | None] = {
+    "native": None,
+    "wide": BandSpec(up=0.5, down=0.5),
+    "full": BandSpec(up=10.0, down=1.0),
+    # -99%/+1000% with the ladder INTACT: 4096 rows, half of them a native-step
+    # core. On BTC at $60k that is +/-0.853% at $0.50/row — the coverage AND
+    # resolution of the `native` grid — plus wings reaching -99%/+1000% at
+    # ~0.34%/row. Registered as a NEW name rather than re-pointing `full`:
+    # priceBand is persisted in localStorage, so re-pointing would silently move
+    # every existing `full` user onto a piecewise scale on their next load.
+    "deep": BandSpec(up=10.0, down=0.99, hybrid=True, core_rows=2048, rows=4096),
+}
+
+DEFAULT_BAND = "native"
+
+
+def canonical_band(band: str | None) -> str:
+    """Coerce a wire ``band`` to a known preset name.
+
+    Done at the WS boundary so an arbitrary string can never reach the
+    SessionManager key: ``band`` is unvalidated client text, and each distinct
+    value would otherwise mint its own Session — four junk subscribes would
+    exhaust ``max_sessions`` at 256 MiB (crypto) / 512 MiB (equity) of ring
+    apiece.
+    """
+    return band if band in BANDS else DEFAULT_BAND
+
 
 class SessionManager:
     """Owns sessions keyed by (market, symbol, mode, source); refcounted."""
@@ -893,7 +974,9 @@ class SessionManager:
         # wires one in from Config for the real server).
         self._recorder = recorder
         self._wall_clock = wall_clock
-        self._sessions: dict[tuple[str, str, str, str | None], Session] = {}
+        # Keyed by (market, symbol, mode, source, band) — the band is part of
+        # the grid geometry, so two bands are genuinely two grids.
+        self._sessions: dict[tuple[str, str, str, str | None, str], Session] = {}
 
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
         if sub.market == "sim":
@@ -910,12 +993,16 @@ class SessionManager:
             f"(sim + crypto {sorted(CRYPTO_MARKETS)} + equity {sorted(EQUITY_MARKETS)})"
         )
 
-    def _grid_for(self, feed: Feed) -> Grid:
+    def _grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         if feed.market in EQUITY_MARKETS:
-            return self._equity_grid_for(feed)
+            return self._equity_grid_for(feed, band)
         rows = min(_SIM_ROWS, self._cfg.max_rows)
         step = _SIM_TICK  # tick_multiple 1
         p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
+        spec = BANDS.get(band)
+        if spec is not None and spec.rows > 0:
+            rows = min(spec.rows, self._cfg.max_rows)
+            p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
         return Grid(
             GridCfg(
                 tick=_SIM_TICK,
@@ -925,10 +1012,14 @@ class SessionManager:
                 rows=rows,
                 ring_columns=self._cfg.ring_columns,
                 mode=events.MODE_L2,
+                band_up=spec.up if spec else None,
+                band_down=spec.down if spec else None,
+                band_hybrid=spec.hybrid if spec else False,
+                core_rows=spec.core_rows if spec else 0,
             )
         )
 
-    def _equity_grid_for(self, feed: Feed) -> Grid:
+    def _equity_grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         """Equity-appropriate grid (spec §7): mode and column cadence honestly
         derived from the feed's capability. Keyless SYNTH_PROFILE runs a
         single-channel (bid-only) density at the 10 s keyless cadence; keyed
@@ -945,6 +1036,7 @@ class SessionManager:
         rows = min(_EQUITY_ROWS, self._cfg.max_rows)
         tick = _EQUITY_TICK
         p0 = round((_EQUITY_P0_NOMINAL - rows * tick / 2.0) / tick) * tick
+        spec = BANDS.get(band)
         return Grid(
             GridCfg(
                 tick=tick,
@@ -954,6 +1046,10 @@ class SessionManager:
                 rows=rows,
                 ring_columns=self._cfg.ring_columns,
                 mode=mode,
+                band_up=spec.up if spec else None,
+                band_down=spec.down if spec else None,
+                band_hybrid=spec.hybrid if spec else False,
+                core_rows=spec.core_rows if spec else 0,
             )
         )
 
@@ -962,9 +1058,19 @@ class SessionManager:
         starting the session if needed (≤ ``cfg.max_sessions`` distinct keys).
         The snapshot frames are enqueued into ``client`` before returning, so
         they precede every live broadcast."""
-        key = (sub.market, sub.symbol, sub.mode, sub.source)
+        band = canonical_band(sub.band)
+        key = (sub.market, sub.symbol, sub.mode, sub.source, band)
+        # The band is part of the key (two clients on the same symbol with
+        # different bands must NOT silently share one grid — the second would
+        # inherit the first's step and never know). But a band switch on an
+        # otherwise-identical key must EVICT the old variant immediately rather
+        # than wait out GRACE_S: each session holds a
+        # ring_columns*2*rows*2-byte ring (256 MiB crypto / 512 MiB equity), and
+        # flipping the preset three times would otherwise pin ~1 GiB for a
+        # minute and trip max_sessions.
         session = self._sessions.get(key)
         if session is None:
+            self._evict_other_bands(key)
             if len(self._sessions) >= self._cfg.max_sessions:
                 raise SessionLimitError(
                     f"session limit reached ({self._cfg.max_sessions}); "
@@ -974,7 +1080,7 @@ class SessionManager:
             session = Session(
                 f"{sub.market}:{sub.symbol}:{sub.mode}:{uuid.uuid4().hex[:12]}",
                 feed=feed,
-                grid=self._grid_for(feed),
+                grid=self._grid_for(feed, band),
                 clock=self._clock,
                 timer=self._timer,
                 # Live mode only: replay sessions (M3) never self-record.
@@ -995,8 +1101,25 @@ class SessionManager:
             client.offer(frame, col_msg=False, t0_ns=None, protected=True)
         return session
 
+    def _evict_other_bands(self, key: tuple[str, str, str, str | None, str]) -> None:
+        """Tear down sessions that differ from ``key`` ONLY in the band.
+
+        Called before creating a new band variant. Idle variants (no attached
+        clients) are torn down at once; a variant someone else is still watching
+        is left alone — it is a legitimate concurrent session, not a leak.
+        """
+        market, symbol, mode, source, _band = key
+        for other in list(self._sessions):
+            if other == key or other[:4] != (market, symbol, mode, source):
+                continue
+            sess = self._sessions.get(other)
+            if sess is None or sess.client_count > 0:
+                continue
+            self._sessions.pop(other, None)
+            sess.teardown_now()
+
     def _make_remover(
-        self, key: tuple[str, str, str, str | None], session: Session
+        self, key: tuple[str, str, str, str | None, str], session: Session
     ) -> Callable[[], None]:
         def _remove() -> None:
             # Identity-guarded: a stale grace timer from a torn-down session

@@ -497,6 +497,42 @@ body,
   grid-row: 1;
   border-left: 1px solid var(--line);
   background: var(--bg-2);
+  /* Control surface (§9): wheel = price zoom, vertical drag = price scale,
+     dblclick = re-fit. `position: relative` anchors the AUTO chip; touch-action
+     stops a touchpad/touch drag from scrolling the page instead of scaling.
+     NOTE the gutter is assumed to share the GL canvas's HEIGHT exactly (the
+     .stage grid guarantees it, and gl/overlays/manager.ts relies on it) — adding
+     vertical padding or a horizontal border here silently breaks wheel anchoring. */
+  position: relative;
+  touch-action: none;
+  cursor: ns-resize;
+}
+
+/* Price auto-scale chip — a SIBLING of the axis canvas, so its clicks never
+   reach the gutter's gesture listeners. Modelled on .panel__lock. */
+.axis-auto {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  z-index: 2;
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  padding: 3px 5px;
+  color: var(--text-3);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.axis-auto:hover {
+  color: var(--text-2);
+}
+.axis-auto.is-on {
+  color: var(--accent-bright);
+  border-color: var(--accent-line);
 }
 
 .time-axis {
@@ -868,6 +904,9 @@ body,
   align-items: center;
   gap: var(--sp-3);
   flex: 0 0 auto;
+  /* Reserve the GO LIVE slot so its mount/unmount cannot resize .minimap
+     (which is flex: 1 1 auto) and rescale the scrubber under the cursor. */
+  min-width: 132px;
 }
 
 .transport__play {
@@ -884,48 +923,80 @@ body,
   cursor: pointer;
   transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
 }
-.transport__play:hover:not(:disabled) {
+.transport__play:hover {
   border-color: var(--accent-line);
   color: var(--accent);
-}
-.transport__play:disabled {
-  opacity: 0.35;
-  cursor: default;
 }
 .transport__play.is-playing {
   color: var(--warn);
   border-color: var(--warn-line);
 }
 
-.speeds {
-  display: inline-flex;
-  padding: 2px;
+.speed-cycle {
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  min-width: 42px;
+  padding: 6px 9px;
+  color: var(--text);
   background: var(--bg-inset);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-2);
   border-radius: var(--r-2);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
 }
-.speeds__btn {
+.speed-cycle:hover {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+/* GO LIVE — mounted ONLY while the camera is scrolled back, so the live+following
+   case (the overwhelming majority) shows no control at all. Its slot is reserved
+   structurally by .transport's grid so its appearance cannot jitter the minimap. */
+.go-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-family: inherit;
   font-size: var(--fs-2xs);
-  color: var(--text-3);
-  background: none;
-  border: none;
-  padding: 3px 7px;
-  border-radius: var(--r-1);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 6px 9px;
+  color: var(--accent);
+  background: var(--bg-inset);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-2);
   cursor: pointer;
-  transition: color var(--t-fast), background var(--t-fast);
+  white-space: nowrap;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
 }
-.speeds__btn:hover:not(:disabled) {
+.go-live:hover {
+  color: var(--bg);
+  background: var(--accent);
+}
+.go-live__behind {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  opacity: 0.75;
+}
+
+/* Transport state pill — about the CAMERA (FOLLOWING / SCROLLED BACK), never
+   about feed health: the top bar's connection chip already owns that word. */
+.state-pill {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+  outline: none;
+}
+.state-pill--live-following {
+  color: var(--accent);
+}
+.state-pill--live-detached {
+  color: var(--warn);
+}
+.state-pill--replay-playing,
+.state-pill--replay-paused {
   color: var(--text-2);
-}
-.speeds__btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.speeds__btn.is-on {
-  color: var(--text);
-  background: var(--bg-3);
-  box-shadow: inset 0 0 0 1px var(--line-2);
 }
 
 /* --- minimap + scrubber --- */
@@ -946,12 +1017,6 @@ body,
   letter-spacing: 0.06em;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
-}
-.minimap__label .is-live {
-  color: var(--accent);
-}
-.minimap__label .is-replay {
-  color: var(--warn);
 }
 
 .minimap__track {

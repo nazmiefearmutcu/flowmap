@@ -60,6 +60,21 @@ function fmtPrice(r: CrosshairReadout): string {
   return r.price === null ? '—' : r.price.toFixed(r.priceDecimals);
 }
 
+/**
+ * The grouped cell's true price EXTENT, e.g. ` 59488.0–59490.0`.
+ *
+ * A group of N covers N ROWS, and on a non-uniform price grid that is not
+ * `N × step` of price — in the log wings one row can be worth hundreds of ticks.
+ * Printing just `N×` there would imply a uniform width the grid does not have,
+ * so the real span is shown alongside it. Empty when the extent is unknown or
+ * the grid is uniform enough that the span is exactly the obvious one.
+ */
+function fmtBand(r: CrosshairReadout): string {
+  if (r.priceLo === null || r.priceHi === null) return '';
+  const d = r.priceDecimals;
+  return `  ${r.priceLo.toFixed(d)}–${r.priceHi.toFixed(d)}`;
+}
+
 /** ns → HH:MM:SS.mmmz (UTC; the trailing `z` makes the zone explicit). */
 export function fmtTime(ns: bigint | null): string {
   if (ns === null) return '—';
@@ -183,7 +198,7 @@ export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Eleme
             <div className="crosshair__line crosshair__line--dim">
               <span className="crosshair__key">grp</span>
               <span className="crosshair__val" data-testid="crosshair-group">
-                {readout.group}×
+                {readout.group}×{fmtBand(readout)}
               </span>
             </div>
           )}

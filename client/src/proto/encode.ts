@@ -56,16 +56,20 @@ export interface SubscribeInit {
   mode: StreamMode;
   source?: string | null;
   start_t?: bigint | null;
+  /** Price-grid coverage preset ('native' | 'wide' | 'full'). */
+  band?: string | null;
 }
 
 export function encodeSubscribe(s: SubscribeInit): Uint8Array {
-  // Key order mirrors events.Subscribe: market, symbol, mode, source, start_t.
+  // Key order mirrors events.Subscribe: market, symbol, mode, source, start_t,
+  // band (appended LAST there, so the pre-band field order is unchanged).
   return coldFrame(MsgType.SUBSCRIBE, {
     market: s.market,
     symbol: s.symbol,
     mode: s.mode,
     source: s.source ?? null,
     start_t: s.start_t ?? null,
+    band: s.band ?? null,
   });
 }
 

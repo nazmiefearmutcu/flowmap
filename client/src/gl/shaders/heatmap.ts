@@ -68,7 +68,23 @@ uniform float u_norm;
 // no per-column CPU cost, the O(1)-in-history invariant is untouched.
 uniform float u_gamma;
 
-// Colormap row: 0 = thermal, 1 = synth (amber).
+// Black point (§9 "Tolerance"). Density below u_floor collapses to LUT entry 0 —
+// bit-identical to what background() returns — so small resting size falls back
+// to background instead of painting, and only liquidity worth reading survives.
+// The survivors are RE-EXPANDED by u_floorScale (= 1/(1-u_floor), precomputed on
+// the CPU) so the white point still lands on the viewport percentile rather than
+// dimming as the floor rises: both endpoints stay fixed, which is the promise the
+// gamma curve below also keeps. At u_floor == 0 this is algebraically and
+// numerically the identity, so every existing pixel spec is untouched.
+//
+// NOTE u_floor arrives ALREADY scaled by the frame's rows-per-pixel footprint
+// (nRowTaps * blk). intensity SUMS rows and only divides the COLUMN dimension
+// by blk, so t grows with price zoom-out; an unscaled floor would silently mean
+// something different at every zoom level.
+uniform float u_floor;
+uniform float u_floorScale;
+
+// Colormap row: 0 = inferno (default), 1 = synth (amber), 2 = classic thermal.
 uniform int u_ramp;
 
 // Mip level selection (§8.3 / T7). All three are per-draw CONSTANTS (the CPU
@@ -133,6 +149,10 @@ void main() {
   // histogram percentile).
   float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
+  // Black point, then the perceptual display curve. Order matters: clipping
+  // AFTER gamma would clip a curve, not a density, and the floor would mean a
+  // different amount of size at every contrast setting.
+  t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);
   // Perceptual display curve: brighten the mid-field, keep black + white fixed.
   t = pow(t, u_gamma);
 

@@ -38,6 +38,7 @@ import {
   MODE_SYNTH_PROFILE,
   type EpochParams,
 } from '../proto/types';
+import { priceToRow, rowToPrice, scaleFromEpoch, stepAtRow } from '../gl/priceScale';
 import { subscribe, getSnapshot, type BookSnapshot } from '../state/bookStore';
 import { useFlowMapStore } from '../state/store';
 
@@ -118,6 +119,11 @@ export function priceDecimals(step: number): number {
 }
 
 function clampRow(r: number, rows: number): number {
+  // NaN guard FIRST: priceToRow returns NaN for a non-positive price on a
+  // non-uniform (log-winged) grid, and `NaN < 0` / `NaN > rows-1` are both
+  // false — so an unguarded clamp would return NaN and quietly poison every
+  // downstream row comparison. -1 is the established "no such row" sentinel.
+  if (!Number.isFinite(r)) return -1;
   if (r < 0) return 0;
   if (r > rows - 1) return rows - 1;
   return r;
@@ -134,13 +140,13 @@ function deriveQuotes(
   params: EpochParams,
   shape: LadderShape,
 ): { bestBidRow: number; bestAskRow: number; midRow: number | null; spread: number | null } {
-  const step = params.tick * params.tick_multiple;
+  const scale = scaleFromEpoch(params);
   const rows = params.rows;
   const bbo = snap.bbo;
   if (bbo && shape !== 'profile') {
-    const bestBidRow = clampRow(Math.round((bbo.bidPx - params.p0) / step), rows);
-    const bestAskRow = clampRow(Math.round((bbo.askPx - params.p0) / step), rows);
-    const midRow = ((bbo.bidPx + bbo.askPx) / 2 - params.p0) / step;
+    const bestBidRow = clampRow(Math.round(priceToRow(scale, bbo.bidPx)), rows);
+    const bestAskRow = clampRow(Math.round(priceToRow(scale, bbo.askPx)), rows);
+    const midRow = priceToRow(scale, (bbo.bidPx + bbo.askPx) / 2);
     // Both sides of a BBO are real — honest spread from the quoted prices.
     return { bestBidRow, bestAskRow, midRow, spread: bbo.askPx - bbo.bidPx };
   }
@@ -178,7 +184,13 @@ function deriveQuotes(
     }
   }
   // Spread only when BOTH sides genuinely exist — never from a synthesized side.
-  const spread = bestBidRow >= 0 && bestAskRow >= 0 ? (bestAskRow - bestBidRow) * step : null;
+  // Spread from the two rows' PRICES, not (rowΔ × step): on a non-uniform grid
+  // a row's price width depends on where it sits, so scaling a row delta by a
+  // single step would misreport the spread anywhere off the core.
+  const spread =
+    bestBidRow >= 0 && bestAskRow >= 0
+      ? rowToPrice(scale, bestAskRow) - rowToPrice(scale, bestBidRow)
+      : null;
   if (bestBidRow < 0 && bestAskRow < 0) {
     return { bestBidRow: -1, bestAskRow: -1, midRow: null, spread: null };
   }
@@ -208,13 +220,16 @@ export function buildLadder(
     return { rows: [], priceDecimals: 2, midRow: null, spread: null };
   }
 
-  const step = params.tick * params.tick_multiple;
+  const scale = scaleFromEpoch(params);
   const nrows = params.rows;
-  const decimals = priceDecimals(step);
   const { bestBidRow, bestAskRow, midRow, spread } = deriveQuotes(snap, params, shape);
 
   const center = centerOverride ?? midRow ?? (nrows - 1) / 2;
   const centerInt = Math.round(center);
+  // Decimals from the row height WHERE THE LADDER IS, not a global step: on a
+  // non-uniform grid a wing row is worth hundreds of ticks and printing 8
+  // decimals there is noise, while the core still gets full precision.
+  const decimals = priceDecimals(stepAtRow(scale, centerInt));
   const half = Math.floor(Math.max(1, visRows) / 2);
 
   const out: LadderRowVM[] = [];
@@ -240,7 +255,7 @@ export function buildLadder(
     maxSz = Math.max(maxSz, bidSz, askSz, profileSz);
     out.push({
       row: r,
-      price: params.p0 + r * step,
+      price: rowToPrice(scale, r),
       bidSz,
       askSz,
       profileSz,
@@ -313,20 +328,20 @@ export function DomLadder(): JSX.Element {
   const bookMode = snap.book ? snap.book.mode : null;
   const tier = depthTier(capability, bookMode);
   const shape = ladderShape(tier, bookMode);
-  const step = params ? params.tick * params.tick_multiple : 0;
+  const scale = params ? scaleFromEpoch(params) : null;
   // The lock pins a PRICE, not a row: re-anchor to a row against the CURRENT
   // epoch each render, so a mid-stream p0/step change keeps the same price
   // centered instead of drifting to a stale row index.
   const centerOverride =
-    locked && frozenCenterRef.current !== null && params && step > 0
-      ? (frozenCenterRef.current - params.p0) / step
+    locked && frozenCenterRef.current !== null && scale !== null
+      ? priceToRow(scale, frozenCenterRef.current)
       : null;
   const model = buildLadder(snap, params, shape, visRows, centerOverride);
 
   // Track the live mid AS A PRICE so locking freezes at the current center.
   useEffect(() => {
     if (!locked && model.midRow !== null && params) {
-      frozenCenterRef.current = params.p0 + model.midRow * (params.tick * params.tick_multiple);
+      frozenCenterRef.current = rowToPrice(scale!, model.midRow);
     }
   });
 

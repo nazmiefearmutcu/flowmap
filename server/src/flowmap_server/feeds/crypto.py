@@ -88,8 +88,21 @@ logger = logging.getLogger(__name__)
 # spot vs USD-M futures ws endpoints) or bare "<exchange>".
 CRYPTO_MARKETS = frozenset({"binance-spot", "binance-usdm", "okx"})
 
-# Cap per side on emitted BookState arrays; the closest-to-touch levels win.
-BOOK_TOP_N = 2000
+# Default cap per side on emitted BookState arrays; the closest-to-touch levels
+# win. Overridable via Config.book_top_n / FLOWMAP_BOOK_TOP_N.
+#
+# This cap — not the grid — is what actually decides how far from the touch a
+# resting order can be and still reach the client. At 2000 levels BTCUSDT is
+# truncated a few hundred dollars from mid (well under 1%), so the wide/full
+# price bands would render an empty far field no matter how tall the grid was.
+# The sort below is over the FULL book either way, so raising the cap costs only
+# a larger array build, not a bigger sort.
+#
+# Be honest about the remaining limit: venues also enforce order price-band
+# filters (Binance PERCENT_PRICE / PERCENT_PRICE_BY_SIDE), so on the majors
+# resting orders at +1000% of mid mostly cannot legally exist. A wide band shows
+# what IS there; it cannot conjure liquidity the venue does not accept.
+BOOK_TOP_N = 20_000
 
 _SIDE_MAP = {Side.BUY: SIDE_BUY, Side.SELL: SIDE_SELL}
 
@@ -113,8 +126,13 @@ class _BridgeSink(Sink):
     ``Marker{kind=gap}`` first, then snapshot-replace.
     """
 
-    def __init__(self, emit: Callable[[FeedEvent], None]) -> None:
+    def __init__(
+        self,
+        emit: Callable[[FeedEvent], None],
+        book_top_n: int = BOOK_TOP_N,
+    ) -> None:
         self._emit = emit
+        self._book_top_n = max(1, book_top_n)
         self._bids: dict[float, float] = {}
         self._asks: dict[float, float] = {}
         self._initialized = False
@@ -201,8 +219,9 @@ class _BridgeSink(Sink):
     def _emit_book(self, ts_ns: int) -> None:
         # Best-first, closest-to-touch BOOK_TOP_N levels per side. Sorting
         # ~1000-level dicts at ~10 Hz is negligible; no throttling by design.
-        bids = sorted(self._bids.items(), key=lambda kv: -kv[0])[:BOOK_TOP_N]
-        asks = sorted(self._asks.items())[:BOOK_TOP_N]
+        cap = self._book_top_n
+        bids = sorted(self._bids.items(), key=lambda kv: -kv[0])[:cap]
+        asks = sorted(self._asks.items())[:cap]
         bid = np.array(bids, dtype=np.float64).reshape(-1, 2)
         ask = np.array(asks, dtype=np.float64).reshape(-1, 2)
         self._emit(
@@ -325,7 +344,7 @@ class CryptoFeed:
 
     async def events(self) -> AsyncIterator[FeedEvent]:
         queue: asyncio.Queue[FeedEvent | _FeedEnd] = asyncio.Queue()
-        sink = _BridgeSink(queue.put_nowait)
+        sink = _BridgeSink(queue.put_nowait, self._cfg.book_top_n)
         conn = self._connector_factory(sink)
         if conn.transport is None:
             conn.transport = self._transport_factory(conn.ws_url)

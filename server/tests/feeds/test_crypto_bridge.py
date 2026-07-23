@@ -364,3 +364,36 @@ def test_session_factory_routing() -> None:
         mgr._default_feed_factory(
             pe.Subscribe(market="nasdaq", symbol="AAPL", mode="live")
         )
+
+
+def test_book_top_n_is_configurable_and_keeps_the_closest_levels():
+    """The emit cap — not the grid — decides how far from the touch a resting
+    order can be and still reach the client, so the wide/full price bands are
+    bounded by it. Verify it is honoured and that it keeps the CLOSEST levels."""
+    from flowmap_server.feeds.crypto import _BridgeSink
+
+    out: list = []
+    sink = _BridgeSink(out.append, book_top_n=3)
+    sink._initialized = True
+    # 10 bids below and 10 asks above a 100/101 touch.
+    for i in range(10):
+        sink._bids[100.0 - i] = 1.0
+        sink._asks[101.0 + i] = 1.0
+    sink._emit_book(123)
+
+    book = out[-1]
+    assert len(book.bid_px) == 3
+    assert len(book.ask_px) == 3
+    # Best-first, closest to the touch.
+    assert list(book.bid_px) == [100.0, 99.0, 98.0]
+    assert list(book.ask_px) == [101.0, 102.0, 103.0]
+
+
+def test_book_top_n_default_is_deep_enough_for_a_wide_band():
+    from flowmap_server.config import Config
+    from flowmap_server.feeds.crypto import BOOK_TOP_N
+
+    # A 2000-level cap truncates BTCUSDT a few hundred dollars from mid, which
+    # would leave the wide/full bands rendering an empty far field.
+    assert BOOK_TOP_N >= 20_000
+    assert Config().book_top_n == BOOK_TOP_N

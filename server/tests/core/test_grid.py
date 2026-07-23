@@ -15,6 +15,7 @@ import pytest
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.proto import wire
 from flowmap_server.proto.events import (
+    MODE_L2,
     SIDE_BUY,
     SIDE_SELL,
     SIDE_UNKNOWN,
@@ -587,3 +588,126 @@ def test_preload_validation():
     g3.preload([], [ep0])
     assert g3.history(before_t_ns=10**18, n=10) == []
     assert g3.oldest_retained_t0_ns() is None
+
+
+# --- percentage price band (§8.1) -------------------------------------------
+
+
+def test_band_frame_covers_the_requested_range():
+    from flowmap_server.core.grid import band_frame
+
+    mid, rows, tick = 60_000.0, 2048, 0.5
+    frame = band_frame(mid, 10.0, 1.0, tick, rows)
+    assert frame is not None
+    p0, tm = frame
+    step = tick * tm
+    lo, hi = p0, p0 + rows * step
+    # The whole -100%/+1000% range is inside the grid.
+    assert lo <= mid * 0.0
+    assert hi >= mid * 11.0
+    # ...and it is genuinely coarse. That is the physics, not a bug: the grid is
+    # a LINEAR affine over a FIXED row count, so range and resolution trade off.
+    assert step > 300.0
+
+
+def test_band_frame_is_monotone_in_width():
+    from flowmap_server.core.grid import band_frame
+
+    wide = band_frame(60_000.0, 0.5, 0.5, 0.5, 2048)
+    full = band_frame(60_000.0, 10.0, 1.0, 0.5, 2048)
+    assert wide is not None and full is not None
+    assert full[1] > wide[1]  # a wider band can only coarsen the rows
+
+
+def test_band_frame_rejects_garbage_mid_instead_of_raising():
+    from flowmap_server.core.grid import band_frame
+
+    # Reached straight off feed data inside maybe_reanchor, which the session
+    # calls with no try — a raise here would kill the session task.
+    for bad in (float("nan"), float("inf"), 0.0, -5.0):
+        assert band_frame(bad, 10.0, 1.0, 0.5, 2048) is None
+
+
+def _banded_grid(band_up=10.0, band_down=1.0, rows=256):
+    return Grid(
+        GridCfg(
+            tick=0.5,
+            tick_multiple=1,
+            dt_ns=250_000_000,
+            p0=0.0,
+            rows=rows,
+            ring_columns=64,
+            mode=MODE_L2,
+            band_up=band_up,
+            band_down=band_down,
+        )
+    )
+
+
+def test_band_anchors_once_then_freezes_tick_multiple():
+    """The load-bearing invariant: step NEVER changes after the first anchor.
+
+    The fragment shader applies ONE row affine to every resident column, so a
+    mid-session step change would redraw all already-uploaded history at the
+    wrong prices.
+    """
+    g = _banded_grid()
+    first = g.maybe_reanchor(60_000.0)
+    assert first is not None
+    tm = first.tick_multiple
+    assert tm > 1  # the band forced a coarser grid
+
+    # Drive mid far enough to trip the ratio guard several times.
+    seen = [first]
+    for mid in (100_000.0, 200_000.0, 20_000.0, 5_000.0):
+        ep = g.maybe_reanchor(mid)
+        if ep is not None:
+            seen.append(ep)
+    assert len(seen) > 1, "the ratio trip must fire on a big move"
+    assert all(ep.tick_multiple == tm for ep in seen), "tick_multiple must be frozen"
+    # Every re-anchor moved p0 by a WHOLE number of rows, so it is a pure
+    # translation on the same grid (the legacy _shift_rows path).
+    step = seen[0].tick * tm
+    for a, b in zip(seen, seen[1:]):
+        rows_moved = (b.p0 - a.p0) / step
+        assert abs(rows_moved - round(rows_moved)) < 1e-6
+
+
+def test_band_does_not_storm_epochs_on_a_stable_mid():
+    """The asymmetric-band bug: with -100%/+1000%, mid sits at ~1/11 of the
+    span, i.e. permanently below a central-70% low guard — which would
+    re-anchor on EVERY book update."""
+    g = _banded_grid()
+    assert g.maybe_reanchor(60_000.0) is not None  # the initial anchor
+    for _ in range(200):
+        assert g.maybe_reanchor(60_000.0) is None
+    # Small drifts inside the ratio trip are also quiet.
+    for mid in (61_000.0, 59_000.0, 65_000.0, 55_000.0):
+        assert g.maybe_reanchor(mid) is None
+
+
+def test_band_ignores_garbage_mid():
+    g = _banded_grid()
+    assert g.maybe_reanchor(float("nan")) is None
+    assert g.maybe_reanchor(0.0) is None
+    assert g.maybe_reanchor(60_000.0) is not None  # still anchors on a good one
+
+
+def test_unbanded_grid_keeps_the_legacy_central_70_rule():
+    g = Grid(
+        GridCfg(
+            tick=0.5,
+            tick_multiple=1,
+            dt_ns=250_000_000,
+            p0=0.0,
+            rows=256,
+            ring_columns=64,
+            mode=MODE_L2,
+        )
+    )
+    span = 256 * 0.5  # 128.0
+    assert g.maybe_reanchor(span * 0.5) is None  # dead centre
+    assert g.maybe_reanchor(span * 0.2) is None  # inside the central 70%
+    ep = g.maybe_reanchor(span * 0.95)  # outside
+    assert ep is not None
+    assert ep.tick_multiple == 1  # legacy path never touches the multiple

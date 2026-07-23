@@ -1,26 +1,43 @@
 /**
  * Timeline minimap + replay transport (§9 bottom strip, T12).
  *
- * Left: the replay transport — play/pause, a 1–100× speed ladder, all wired to
- * the store's replay controls (which send `Pause`/`Resume`/`SetSpeed`/`Seek` on
- * the connection). Right: a minimap of the loaded session extent with the current
- * viewport window marked, and — in replay — a seek scrubber over it.
+ * **Mode-gated, deliberately.** The transport used to render a play/pause button
+ * plus a six-rung speed ladder plus a scrubber unconditionally, every one of
+ * them `disabled` in LIVE — eight dead controls in the mode the user is in
+ * almost all the time, which is exactly what made the tool read as confusing.
+ * Now:
+ *   - LIVE   → one state pill, plus a GO LIVE button that appears ONLY when the
+ *              camera has actually been scrolled back off the live edge.
+ *   - REPLAY → play/pause + ONE cycling speed button (the 1–100× ladder is
+ *              unchanged as the DOMAIN, only its presentation collapses) + the
+ *              seek scrubber + the time readout.
  *
- * In LIVE mode the transport is inert (disabled) and the minimap just tracks the
- * view; in REPLAY mode the transport drives the server's replay clock. The minimap
- * geometry is polled off the renderer at ≤5 Hz (never per-frame / per-column), so
- * this stays clear of the GL loop and the React high-frequency path.
+ * The pill replaces — rather than adds to — the old minimap LIVE/REPLAY label,
+ * and is phrased about the CAMERA (FOLLOWING / SCROLLED BACK), because the top
+ * bar's connection chip already owns feed health and a second widget saying
+ * "LIVE" in a different sense would make the word meaningless.
+ *
+ * Right: a minimap of the loaded session extent with the current viewport window
+ * marked, and — in replay — a seek scrubber over it. Geometry is polled off the
+ * renderer at ≤5 Hz (never per-frame / per-column), so this stays clear of the
+ * GL loop and the React high-frequency path; `following` and the behind-readout
+ * ride that SAME poll rather than adding a timer.
  */
 
 import { useEffect, useRef, useState, type ChangeEvent, type RefObject } from 'react';
 
 import type { Renderer } from '../gl/renderer';
+import { colsBehind } from '../gl/follow';
 import { useFlowMapStore } from '../state/store';
 import {
-  SPEED_STEPS,
+  behindNs,
+  formatDurationCoarseNs,
   formatDurationNs,
   fractionOfExtent,
+  nextSpeed,
+  phaseLabel,
   seekTargetNs,
+  transportPhase,
   type TimeExtent,
 } from './replay';
 
@@ -41,9 +58,11 @@ function clamp01(x: number): number {
 
 interface TimelineProps {
   rendererRef: RefObject<Renderer | null>;
+  /** Return the chart to the live edge and re-arm the persisted follow flags. */
+  onGoLive: () => void;
 }
 
-export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
+export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element {
   const mode = useFlowMapStore((s) => s.subscription?.mode ?? 'live');
   const paused = useFlowMapStore((s) => s.paused);
   const speed = useFlowMapStore((s) => s.speed);
@@ -54,21 +73,29 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
 
   const [geom, setGeom] = useState<MinimapGeom>(EMPTY_GEOM);
   const [scrub, setScrub] = useState(0); // 0..1000 scrubber position (replay)
+  // Camera follow state + how far behind the live edge it sits, from the SAME
+  // ≤5 Hz poll as the minimap (a plain boolean getter and a subtraction).
+  const [following, setFollowing] = useState(true);
+  const [behind, setBehind] = useState('');
   const geomRef = useRef<MinimapGeom>(EMPTY_GEOM);
   const draggingRef = useRef(false); // true while the user actively scrubs
   const seekTimerRef = useRef<number | null>(null); // trailing-throttle handle
   const pendingFracRef = useRef(0); // latest scrub fraction awaiting a seek
+  const pillRef = useRef<HTMLSpanElement | null>(null);
   const isReplay = mode === 'replay';
 
   // ≤5 Hz poll of the renderer's timeline geometry → minimap extent + window box.
   useEffect(() => {
     const id = window.setInterval(() => {
-      const tl = rendererRef.current?.timeline();
+      const r = rendererRef.current;
+      const tl = r?.timeline();
+      if (r) setFollowing((f) => (f === r.following ? f : r.following));
       if (!tl) {
         if (geomRef.current !== EMPTY_GEOM) {
           geomRef.current = EMPTY_GEOM;
           setGeom(EMPTY_GEOM);
         }
+        setBehind((b) => (b === '' ? b : ''));
         return;
       }
       const span = Math.max(1, tl.newestSeq - tl.oldestSeq);
@@ -82,6 +109,14 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
           anchorT0Ns + BigInt(Math.round((col - anchorSeq) * dtNs));
         extent = { startNs: toNs(tl.oldestSeq), endNs: toNs(tl.newestSeq) };
       }
+      // How far the right edge trails the newest column, as HH:MM:SS.
+      const dtNs = tl.timeBase?.dtNs ?? 0;
+      const lag = colsBehind(
+        { colOffset: tl.viewStartCol, colScale: tl.viewEndCol - tl.viewStartCol, rowOffset: 0, rowScale: 1 },
+        tl.newestSeq,
+      );
+      const nextBehind = lag > 0 && dtNs > 0 ? formatDurationCoarseNs(behindNs(lag, dtNs)) : '';
+      setBehind((b) => (b === nextBehind ? b : nextBehind));
       // Advance the playhead: map the newest column to ns and drive the scrubber
       // from its fraction of the session extent — unless the user is scrubbing.
       // Also self-corrects a stale thumb across session/symbol switches.
@@ -109,15 +144,20 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
     return () => window.clearInterval(id);
   }, [rendererRef]);
 
-  // Drop any pending trailing-throttle seek if we unmount mid-drag.
+  // Reset the scrub gate on a mode switch, and drop any pending throttled seek.
+  // Keyed on `isReplay` — NOT `[]` — because Timeline never unmounts (App renders
+  // it unconditionally): a replay→live switch mid-drag would otherwise leak a
+  // Seek onto a LIVE subscription and leave draggingRef stuck true, freezing the
+  // playhead for the rest of the session.
   useEffect(() => {
     return () => {
+      draggingRef.current = false;
       if (seekTimerRef.current !== null) {
         window.clearTimeout(seekTimerRef.current);
         seekTimerRef.current = null;
       }
     };
-  }, []);
+  }, [isReplay]);
 
   // Emit a Seek at the given scrubber fraction. Early-return on a null extent so
   // no bogus Seek{0} (1970 epoch) is sent before a session's timebase is known.
@@ -154,49 +194,88 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
     commitSeek(pendingFracRef.current);
   };
 
+  // Read the speed at CLICK time, not from the render closure, so a fast
+  // double-click steps 1→2→5 instead of emitting SetSpeed(2) twice.
+  const onCycleSpeed = (e: React.MouseEvent): void => {
+    const current = useFlowMapStore.getState().speed;
+    setSpeed(nextSpeed(current, e.shiftKey ? -1 : 1));
+  };
+
+  // GO LIVE unmounts itself the moment it succeeds, so move focus somewhere
+  // sane first or the browser drops it to <body>.
+  const onGoLiveClick = (): void => {
+    pillRef.current?.focus();
+    onGoLive();
+    setFollowing(true); // optimistic; the poll confirms within 200 ms
+  };
+
   const extent = geom.extent;
   const durationNs = extent ? extent.endNs - extent.startNs : 0n;
   const positionNs = extent ? seekTargetNs(scrub / 1000, extent) - extent.startNs : 0n;
   const playing = isReplay && !paused;
+  const phase = transportPhase(isReplay, paused, following);
 
   return (
     <footer className="timeline" data-testid="timeline">
       <div className="transport" data-testid="transport">
-        <button
-          type="button"
-          className={`transport__play${playing ? ' is-playing' : ''}`}
-          disabled={!isReplay}
-          data-testid="transport-play"
-          aria-label={playing ? 'pause' : 'play'}
-          aria-pressed={playing}
-          title={isReplay ? (playing ? 'pause' : 'play') : 'replay only'}
-          onClick={() => (paused ? resume() : pause())}
-        >
-          {playing ? '❚❚' : '▶'}
-        </button>
-        <div className="speeds" role="group" aria-label="replay speed" data-testid="speeds">
-          {SPEED_STEPS.map((s) => (
+        {isReplay && (
+          <>
             <button
               type="button"
-              key={s}
-              className={`speeds__btn${speed === s ? ' is-on' : ''}`}
-              disabled={!isReplay}
-              data-testid={`speed-${s}`}
-              data-speed={s}
-              aria-pressed={speed === s}
-              onClick={() => setSpeed(s)}
+              className={`transport__play${playing ? ' is-playing' : ''}`}
+              data-testid="transport-play"
+              aria-label={playing ? 'pause' : 'play'}
+              aria-pressed={playing}
+              title={playing ? 'pause' : 'play'}
+              onClick={() => (paused ? resume() : pause())}
             >
-              {s}×
+              {playing ? '❚❚' : '▶'}
             </button>
-          ))}
-        </div>
+            <button
+              type="button"
+              className="speed-cycle"
+              data-testid="speed-cycle"
+              data-speed={speed}
+              aria-label={`replay speed ${speed}×, click to change`}
+              title="replay speed — click to step up, shift-click to step down"
+              onClick={onCycleSpeed}
+            >
+              {speed}×
+            </button>
+          </>
+        )}
+        {!following && (
+          <button
+            type="button"
+            className="go-live"
+            data-testid="go-live"
+            title="return the chart to the live edge (R)"
+            onClick={onGoLiveClick}
+          >
+            <span aria-hidden="true">⏭</span> GO LIVE
+            {behind && <span className="go-live__behind">−{behind}</span>}
+          </button>
+        )}
       </div>
 
       <div className={`minimap${isReplay ? ' minimap--replay' : ''}`}>
         <div className="minimap__label">
-          <span>SESSION</span>
-          <span className={isReplay ? 'is-replay' : 'is-live'}>
-            {isReplay ? `REPLAY ${speed}× ${paused ? 'PAUSED' : 'PLAYING'}` : 'LIVE'}
+          <span
+            ref={pillRef}
+            tabIndex={-1}
+            className={`state-pill state-pill--${phase}`}
+            data-testid="transport-state"
+          >
+            {phaseLabel(phase, speed)}
+          </span>
+          <span
+            className="minimap__readout"
+            data-testid="time-readout"
+            style={{ fontVariantNumeric: 'tabular-nums' }}
+          >
+            {isReplay
+              ? `${formatDurationNs(positionNs)} / ${formatDurationNs(durationNs)}`
+              : formatDurationNs(durationNs)}
           </span>
         </div>
         <div className="minimap__track" data-testid="minimap-track">
@@ -206,28 +285,22 @@ export function Timeline({ rendererRef }: TimelineProps): JSX.Element {
             data-testid="minimap-window"
             style={{ left: `${geom.leftPct}%`, width: `${geom.widthPct}%` }}
           />
-          <input
-            type="range"
-            className="minimap__scrub"
-            min={0}
-            max={1000}
-            step={1}
-            value={scrub}
-            disabled={!isReplay}
-            data-testid="seek-scrubber"
-            aria-label="replay seek"
-            onChange={onScrub}
-            onPointerUp={onScrubCommit}
-            onKeyUp={onScrubCommit}
-            onBlur={onScrubCommit}
-          />
-        </div>
-        <div
-          className="minimap__readout"
-          data-testid="time-readout"
-          style={{ fontVariantNumeric: 'tabular-nums' }}
-        >
-          {formatDurationNs(positionNs)} / {formatDurationNs(durationNs)}
+          {isReplay && (
+            <input
+              type="range"
+              className="minimap__scrub"
+              min={0}
+              max={1000}
+              step={1}
+              value={scrub}
+              data-testid="seek-scrubber"
+              aria-label="replay seek"
+              onChange={onScrub}
+              onPointerUp={onScrubCommit}
+              onKeyUp={onScrubCommit}
+              onBlur={onScrubCommit}
+            />
+          )}
         </div>
       </div>
     </footer>
