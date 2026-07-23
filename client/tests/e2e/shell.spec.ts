@@ -135,9 +135,20 @@ test('replay toggle + transport send the correct control messages', async ({ pag
   await page.locator('[data-testid="transport-play"]').click(); // resume
   await expect.poll(async () => (await storeState(page)).paused).toBe(false);
 
-  // Speed 5×.
-  await page.locator('[data-testid="speed-5"]').click();
+  // Speed: ONE cycling button now exposes the whole 1–100× ladder. Step twice
+  // (1→2→5) and assert the intermediate rung, so a handler that ignored the
+  // live store value and emitted the same speed twice would fail here.
+  const speedBtn = page.locator('[data-testid="speed-cycle"]');
+  await speedBtn.click();
+  await expect(speedBtn).toHaveAttribute('data-speed', '2');
+  await expect.poll(async () => (await storeState(page)).speed).toBe(2);
+  await speedBtn.click();
+  await expect(speedBtn).toHaveAttribute('data-speed', '5');
   await expect.poll(async () => (await storeState(page)).speed).toBe(5);
+  // ...and the control frames send exactly that sequence.
+  await expect
+    .poll(async () => (await controls(page)).filter((c) => c.type === SET_SPEED).map((c) => c.x))
+    .toEqual([2, 5]);
 
   // Seek: set the scrubber and dispatch a native input so React's onChange fires.
   await page.locator('[data-testid="seek-scrubber"]').evaluate((el) => {
@@ -157,8 +168,9 @@ test('replay toggle + transport send the correct control messages', async ({ pag
   const types = log.map((c) => c.type);
   expect(types).toContain(PAUSE);
   expect(types).toContain(RESUME);
-  const setSpeed = log.find((c) => c.type === SET_SPEED);
-  expect(setSpeed?.x).toBe(5);
+  // The cycling control emits one SetSpeed per click, so assert the LAST one.
+  const speeds = log.filter((c) => c.type === SET_SPEED);
+  expect(speeds.at(-1)?.x).toBe(5);
   // The Seek carries a bigint ns (serialized to a string by the tap).
   const seek = log.find((c) => c.type === SEEK);
   expect(typeof seek?.t).toBe('string');

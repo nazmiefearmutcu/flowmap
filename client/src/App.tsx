@@ -283,6 +283,17 @@ export function App() {
     useFlowMapStore.getState().connectAndSubscribe(market, symbol, mode);
   }, []);
 
+  // GO LIVE routes through App (not straight to the renderer) so it also re-arms
+  // the PERSISTED follow flags. Without that, a user who scrolled back would find
+  // the drawer's follow switches still reading ON while the camera was frozen —
+  // and the next drawer interaction would fight the camera.
+  const onGoLive = useCallback(() => {
+    rendererRef.current?.goLive();
+    setSettings((prev) =>
+      prev.follow && prev.followPrice ? prev : { ...prev, follow: true, followPrice: true },
+    );
+  }, []);
+
   const toggleRail = useCallback(
     () => setSettings((prev) => ({ ...prev, railVisible: !prev.railVisible })),
     [],
@@ -320,7 +331,7 @@ export function App() {
         )}
       </div>
 
-      <Timeline rendererRef={rendererRef} />
+      <Timeline rendererRef={rendererRef} onGoLive={onGoLive} />
 
       {settingsOpen && (
         <SettingsDrawer

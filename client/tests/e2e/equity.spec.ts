@@ -14,8 +14,10 @@ import { expect, test } from '@playwright/test';
  * equity epoch to the store, feeds a cumulative volume-at-price SYNTH_PROFILE
  * book (mode==2, ask=null) into BOTH the renderer (heatmap) and the bookStore
  * (DOM ladder), and drives a terminal closed Status. It asserts:
- *   (a) the heatmap renders the SYNTH amber ramp (RAMP_SYNTH), NOT thermal, and
- *       an amber pixel lands at the profile's point-of-control;
+ *   (a) the heatmap renders the SYNTH amber ramp (RAMP_SYNTH), NOT a real-depth
+ *       ramp: amber pixels land at the profile's point-of-control AND no COOL
+ *       (blue-over-green) pixel appears there — the synth ramp is warm at every
+ *       index, so a cool pixel could only come from the real-depth ramp;
  *   (b) the DOM ladder shows the SYNTH volume-at-price tier — badge `SYNTH`,
  *       profile rungs, and NO bid/ask size columns (no fabricated two-sided book);
  *   (c) the tape badge reads `TAPE POLL`;
@@ -119,7 +121,7 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
     return { pocRow, pocCss, ramp: r.currentRamp, effBbo: r.overlayEffectiveBboForTest() };
   }, { DEPTH, MODE_SYNTH_PROFILE });
 
-  // (a) The renderer selected the SYNTH ramp, not thermal.
+  // (a) The renderer selected the SYNTH ramp, not a real-depth ramp.
   expect(poc.ramp, 'heatmap ramp is RAMP_SYNTH (amber)').toBe(RAMP_SYNTH);
   // (d) The BBO overlay would draw nothing fabricated for keyless equity.
   expect(poc.effBbo, 'BBO overlay draws no fabricated quote').toBeNull();
@@ -138,9 +140,18 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
   mkdirSync(ARTIFACT_DIR, { recursive: true });
   writeFileSync(join(ARTIFACT_DIR, 'equity.png'), await page.screenshot());
 
-  // (a) An amber pixel sits at the profile's POC (r >> b, warm single hue) — the
-  // SYNTH ramp actually rendered, distinct from the thermal (cyan/white) look.
-  const amber = await page.evaluate((p) => {
+  // (a) The SYNTH ramp actually rendered, distinct from the real-depth ramp.
+  //
+  // Two probes, because ONE is not enough any more. The default real-depth ramp
+  // (inferno) legitimately passes through orange in its top third, so an
+  // "is it amber" test at the POC — the profile's HIGHEST density, i.e. the top
+  // of the ramp — would also pass on a real-depth heatmap and would prove
+  // nothing. The verified discriminator is the COOL band: the synth ramp is warm
+  // (G >= B) at EVERY index, while inferno is cool (B >= G) for indices
+  // 0..SYNTH_HUE_SAFE_MAX-1 — i.e. across the low/mid density that fills most of
+  // the profile. So: amber pixels must be present AND cool pixels must be
+  // absent. gl/lut.test.ts pins both halves of that claim.
+  const probe = await page.evaluate((p) => {
     const c = document.querySelector('canvas#gl') as HTMLCanvasElement;
     const dpr = c.width / Math.max(1, c.clientWidth);
     const off = document.createElement('canvas');
@@ -153,6 +164,7 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
     const cy = Math.round(p.pocCss.y * dpr);
     const rad = Math.round(10 * dpr);
     let n = 0;
+    let cool = 0;
     for (let dy = -rad; dy <= rad; dy++) {
       for (let dx = -rad; dx <= rad; dx++) {
         const px = cx + dx;
@@ -164,11 +176,18 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
         const bb = img[i + 2];
         // Amber: red-dominant, blue-starved, green below red (never cyan/white).
         if (rr > 110 && rr > bb + 55 && gg < rr) n++;
+        // Cool: blue over green. IMPOSSIBLE anywhere on the synth ramp; the
+        // signature of inferno's indigo/violet/magenta low-and-mid field.
+        if (bb > gg + 10) cool++;
       }
     }
-    return n;
+    return { amber: n, cool };
   }, poc);
-  expect(amber, 'SYNTH amber pixels at the profile POC').toBeGreaterThan(4);
+  expect(probe.amber, 'SYNTH amber pixels at the profile POC').toBeGreaterThan(4);
+  expect(
+    probe.cool,
+    'NO cool (blue-over-green) pixels — a real-depth ramp would paint them here',
+  ).toBe(0);
 
   // (b) DOM ladder: SYNTH tier badge + profile rungs, NO bid/ask size columns.
   await expect(page.locator('[data-testid="ladder-badge"]')).toHaveText('SYNTH');

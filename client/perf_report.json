@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-18T12:08:58.342Z",
+  "generated_at": "2026-07-23T12:17:45.249Z",
   "gpu": "ANGLE/SwiftShader (software GL, headless Chromium) — absolute fps is lower than real GPU; the O(1) history-independence property is the substantive gate",
   "geometry": {
     "rows": 2048,
@@ -8,37 +8,37 @@
     "resident_cols": 10000,
     "ring_bytes": 83886080
   },
-  "fps_pan": 59.9,
-  "fps_zoom": 59.9,
-  "latency_p95_ms": 18.5,
+  "fps_pan": 74.6,
+  "fps_zoom": 74.6,
+  "latency_p95_ms": 27.8,
   "latency_note": "p95 of pan rAF frame intervals — an upper bound on input→frame for a dirty-driven loop. True CDP present-timestamp is not readable in headless SwiftShader (noted per task).",
   "ring_mem_mb": 80,
   "history_independence": {
     "cols_small": 200,
     "cols_big": 10000,
-    "draw_ms_median_200col": 0.45,
-    "draw_ms_median_10k_col": 0.4,
-    "ratio_10k_over_200": 0.889,
+    "draw_ms_median_200col": 11.5,
+    "draw_ms_median_10k_col": 11.9,
+    "ratio_10k_over_200": 1.035,
     "verdict": "PASS — frame cost is ~constant in history depth (v1 1-fps bug structurally gone)"
   },
   "detail": {
     "pan10k": {
       "frames": 142,
-      "delta_ms_median": 16.7,
-      "delta_ms_p95": 18.5,
-      "draw_ms_p95": 20.8,
-      "uncapped_fps": 2500
+      "delta_ms_median": 13.4,
+      "delta_ms_p95": 27.8,
+      "draw_ms_p95": 30.1,
+      "uncapped_fps": 84
     },
     "pan200": {
-      "frames": 144,
-      "delta_ms_median": 16.7,
-      "draw_ms_p95": 20.6,
-      "uncapped_fps": 2222.2
+      "frames": 115,
+      "delta_ms_median": 13.5,
+      "draw_ms_p95": 40.4,
+      "uncapped_fps": 87
     },
     "zoom10k": {
-      "frames": 151,
-      "delta_ms_median": 16.7,
-      "draw_ms_median": 0.2
+      "frames": 175,
+      "delta_ms_median": 13.4,
+      "draw_ms_median": 5.3
     },
     "real_cdp_input": {
       "framesFromRealInput": 16,
