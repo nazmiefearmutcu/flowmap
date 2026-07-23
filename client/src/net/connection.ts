@@ -103,6 +103,9 @@ interface Subscription {
   market: string;
   symbol: string;
   mode: StreamMode;
+  /** Server price-grid coverage preset — part of the stream's IDENTITY, since
+   *  it changes the grid geometry the columns arrive in. */
+  band: string;
 }
 
 interface HistoryWaiter {
@@ -123,7 +126,12 @@ const defaultClearTimeout: ClearTimeoutFn = (handle) =>
   globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>);
 
 function sameSub(a: Subscription, b: Subscription): boolean {
-  return a.market === b.market && a.symbol === b.symbol && a.mode === b.mode;
+  return (
+    a.market === b.market &&
+    a.symbol === b.symbol &&
+    a.mode === b.mode &&
+    a.band === b.band
+  );
 }
 
 export class Connection {
@@ -204,8 +212,13 @@ export class Connection {
    * (Unsubscribe → Subscribe when it differs); otherwise it is sent on the next
    * open. Connects automatically when there is no socket yet.
    */
-  subscribe(market: string, symbol: string, mode: StreamMode = 'live'): void {
-    this.desiredSub = { market, symbol, mode };
+  subscribe(
+    market: string,
+    symbol: string,
+    mode: StreamMode = 'live',
+    band = 'native',
+  ): void {
+    this.desiredSub = { market, symbol, mode, band };
     if (this.socket !== null && this.socketOpen) {
       this.sendSubscribe();
     } else {
@@ -358,7 +371,14 @@ export class Connection {
       this.rawSend(encodeUnsubscribe());
     }
     this.rawSend(
-      encodeSubscribe({ market: next.market, symbol: next.symbol, mode: next.mode, source: null, start_t: null }),
+      encodeSubscribe({
+        market: next.market,
+        symbol: next.symbol,
+        mode: next.mode,
+        source: null,
+        start_t: null,
+        band: next.band,
+      }),
     );
     this.activeSub = next;
   }

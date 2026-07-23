@@ -36,6 +36,8 @@ accumulates into the current interval's bar and never finalizes columns.
 
 from __future__ import annotations
 
+import math
+
 import msgspec
 import numpy as np
 
@@ -51,6 +53,18 @@ from flowmap_server.proto.events import (
 _NAN = float("nan")
 
 
+# Extra coverage factor applied to a percentage band, so the grid still holds
+# the requested range after mid drifts within it and the re-anchor trip fires.
+BAND_MARGIN = 1.25
+
+# How far mid may drift, as a RATIO of the anchor mid, before the grid
+# re-anchors. A ratio trip, not a span-fraction trip: with an asymmetric band
+# (e.g. -100%/+1000%) mid sits at ~1/11 of the span, i.e. permanently below a
+# `p0 + 0.15*span` low guard, which would re-anchor on EVERY book update and
+# storm epochs forever.
+BAND_TRIP_RATIO = 1.25
+
+
 class GridCfg(msgspec.Struct, frozen=True):
     """Immutable grid configuration for one session."""
 
@@ -61,6 +75,51 @@ class GridCfg(msgspec.Struct, frozen=True):
     rows: int
     ring_columns: int
     mode: int  # MODE_L2 | MODE_L1_BAND | MODE_SYNTH_PROFILE
+    # Percentage coverage around the reference price, as fractions: ``band_up``
+    # 9.0 means "+900% above mid". ``None`` selects the legacy fixed-span grid
+    # (``tick_multiple`` as given, ``p0`` recentred on the central-70% rule).
+    band_up: float | None = None
+    band_down: float | None = None
+
+
+def band_frame(
+    mid: float,
+    band_up: float,
+    band_down: float,
+    tick: float,
+    rows: int,
+) -> tuple[float, int] | None:
+    """``(p0, tick_multiple)`` covering ``[mid*(1-down), mid*(1+up)]``.
+
+    The grid is a LINEAR affine over a FIXED row count, so range and resolution
+    are the same knob: widening the band can only make ``tick_multiple`` — and
+    therefore every row — coarser. That is inherent, not an implementation
+    choice, and it is why the default band is ``None``.
+
+    ``tick_multiple`` is derived from the SNAPPED frame (p0 is rounded onto the
+    step grid first, then the multiple is re-checked), so the returned frame
+    provably covers the requested range rather than falling one row short.
+
+    Returns ``None`` for a non-finite or non-positive ``mid``: a feed-derived
+    NaN reaching ``math.ceil`` would raise inside :meth:`Grid.maybe_reanchor`,
+    which the session calls with no ``try`` — killing the session task.
+    """
+    if not math.isfinite(mid) or mid <= 0.0 or rows <= 0 or tick <= 0.0:
+        return None
+    lo = mid * max(0.0, 1.0 - band_down)
+    hi = mid * (1.0 + band_up)
+    span = (hi - lo) * BAND_MARGIN
+    if not math.isfinite(span) or span <= 0.0:
+        return None
+    tm = max(1, math.ceil(span / (rows * tick)))
+    step = tick * tm
+    p0 = round((mid - span / 2.0) / step) * step
+    # Re-check against the SNAPPED frame; rounding p0 down can uncover the top.
+    while p0 + rows * step < hi and tm < 1 << 30:
+        tm += 1
+        step = tick * tm
+        p0 = round((mid - span / 2.0) / step) * step
+    return (p0, tm)
 
 
 class FinalizedColumn(msgspec.Struct):
@@ -81,9 +140,17 @@ class Grid:
         if cfg.rows <= 0 or cfg.ring_columns <= 0 or cfg.dt_ns <= 0:
             raise ValueError("rows, ring_columns and dt_ns must be positive")
         self._cfg = cfg
+        # tick_multiple is MUTABLE only until the first real-mid band anchor,
+        # then frozen for the session (see maybe_reanchor).
+        self._tick_multiple = cfg.tick_multiple
         self._step = cfg.tick * cfg.tick_multiple
         self._p0 = cfg.p0
         self._epoch = 0
+        # Band state. `_anchor_mid` is the mid the current frame was built for;
+        # the ratio trip is measured against it. None until the first book.
+        self._banded = cfg.band_up is not None and cfg.band_down is not None
+        self._anchor_mid: float | None = None
+        self._band_anchored = False
         # Per-epoch params table (spec §6.3): snapshot/history must be able to
         # announce EVERY epoch still present in the ring, not just the current
         # one. Populated here (epoch 0) and on every re-anchor; kept for the
@@ -177,16 +244,25 @@ class Grid:
         missing = {c.epoch for c in columns} - ep_map.keys()
         if missing:
             raise ValueError(f"columns reference unknown epochs {sorted(missing)}")
+        # In band mode tick_multiple is DERIVED from the first real mid, so a
+        # recorded tail legitimately carries a different one from cfg; it must
+        # still be consistent across the tail (one frozen multiple per session).
+        tail_multiples = {e.tick_multiple for e in ep_map.values()}
+        expect_tm = (
+            next(iter(tail_multiples))
+            if self._banded and len(tail_multiples) == 1
+            else cfg.tick_multiple
+        )
         for e in ep_map.values():
             if (e.tick, e.tick_multiple, e.dt_ns, e.rows) != (
                 cfg.tick,
-                cfg.tick_multiple,
+                expect_tm,
                 cfg.dt_ns,
                 cfg.rows,
             ):
                 raise ValueError(
                     f"epoch {e.epoch} params {e} do not match grid cfg "
-                    f"(tick={cfg.tick}, tick_multiple={cfg.tick_multiple}, "
+                    f"(tick={cfg.tick}, tick_multiple={expect_tm}, "
                     f"dt_ns={cfg.dt_ns}, rows={cfg.rows})"
                 )
         columns = columns[-cfg.ring_columns :]
@@ -225,6 +301,16 @@ class Grid:
         self._epoch = last.epoch
         self._epoch_params.update(ep_map)
         self._p0 = ep_map[last.epoch].p0
+        # Adopt the tail's frame, including its FROZEN tick_multiple, and
+        # reconstruct the band anchor from the restored p0. Without this a
+        # rehydrated banded session would treat its first book as the initial
+        # anchor and emit a spurious EpochStart (and, worse, recompute the
+        # multiple against a grid whose history was written with another one).
+        self._tick_multiple = ep_map[last.epoch].tick_multiple
+        self._step = self._cfg.tick * self._tick_multiple
+        if self._banded:
+            self._band_anchored = True
+            self._anchor_mid = self._p0 + (self._cfg.rows * self._step) / 2.0
         # Bar continuity across the restart.
         self._prev_close = last.bar.c
         self._o = self._h = self._l = self._c = last.bar.c
@@ -500,33 +586,99 @@ class Grid:
     # -- epochs / re-anchor ----------------------------------------------------
 
     def maybe_reanchor(self, mid: float) -> EpochParams | None:
-        """Re-anchor if ``mid`` sits outside the central 70 % of the span.
+        """Re-anchor the price frame around ``mid`` when it has drifted too far.
 
-        Bumps the epoch, recenters ``p0`` (snapped to the tick*multiple grid)
-        and returns the new :class:`EpochParams`. History in the ring is NEVER
-        rewritten; the in-progress accumulator is shifted into the new row
-        coordinates so the current column stays exact under the new epoch.
+        Two regimes:
+
+        - **Legacy (no band):** re-anchor if ``mid`` sits outside the central
+          70 % of the fixed span, recentring ``p0``.
+        - **Banded:** the FIRST call with a usable mid builds the percentage
+          frame and FREEZES ``tick_multiple`` for the session; afterwards a
+          re-anchor fires on a RATIO trip (``mid`` outside
+          ``[anchor/BAND_TRIP_RATIO, anchor*BAND_TRIP_RATIO]``) and moves
+          ``p0`` ONLY.
+
+        Freezing the multiple is load-bearing, not tidiness. In band mode the
+        multiple is proportional to mid, so recomputing it on every re-anchor
+        would CHANGE ``step`` mid-session — and the fragment shader applies ONE
+        row affine to every resident column (gl/shaders/heatmap.ts), so all the
+        already-uploaded history would be redrawn at the wrong prices. With the
+        multiple frozen, a re-anchor is a pure integer row translation on the
+        same step grid, exactly the legacy ``_shift_rows`` path.
+
+        History in the ring is NEVER rewritten; the in-progress accumulator is
+        shifted into the new row coordinates so the current column stays exact.
+        A non-finite / non-positive ``mid`` is ignored rather than raised — this
+        is called straight off feed data with no ``try`` around it.
         """
         cfg = self._cfg
+        if not math.isfinite(mid):
+            return None
+
+        if self._banded:
+            assert cfg.band_up is not None and cfg.band_down is not None
+            if not self._band_anchored:
+                frame = band_frame(mid, cfg.band_up, cfg.band_down, cfg.tick, cfg.rows)
+                if frame is None:
+                    return None
+                new_p0, tm = frame
+                # First real anchor: adopt the multiple and freeze it.
+                self._tick_multiple = tm
+                self._step = cfg.tick * tm
+                self._band_anchored = True
+                self._anchor_mid = mid
+                return self._commit_anchor(new_p0, rebuild_state=True)
+
+            anchor = self._anchor_mid
+            if anchor is None or anchor <= 0.0:
+                self._anchor_mid = mid
+                return None
+            ratio = mid / anchor
+            if 1.0 / BAND_TRIP_RATIO <= ratio <= BAND_TRIP_RATIO:
+                return None
+            # p0 ONLY — the multiple is frozen, so this is an exact row shift.
+            span = cfg.rows * self._step
+            new_p0 = round((mid - span / 2.0) / self._step) * self._step
+            self._anchor_mid = mid
+            return self._commit_anchor(new_p0, rebuild_state=True)
+
+        # --- legacy fixed-span rule --------------------------------------
         span = cfg.rows * self._step
         lo = self._p0 + 0.15 * span
         hi = self._p0 + 0.85 * span
         if lo <= mid <= hi:
             return None
-
         new_p0 = round((mid - span / 2.0) / self._step) * self._step
-        offset = round((new_p0 - self._p0) / self._step)  # exact: both on grid
-        self._shift_rows(self._acc, offset)
+        return self._commit_anchor(new_p0, rebuild_state=True)
+
+    def _commit_anchor(self, new_p0: float, *, rebuild_state: bool) -> EpochParams:
+        """Move the frame to ``new_p0``, bump the epoch, publish the params.
+
+        The in-progress accumulator is row-shifted by the p0 delta when that
+        delta is an exact whole number of rows (always true when the step is
+        unchanged); when the step itself just changed — only possible on the
+        FIRST band anchor, before any column of this session has been
+        finalized — the accumulator is zeroed instead, because there is no
+        integer row mapping between the two grids.
+        """
+        cfg = self._cfg
+        if self._step == cfg.tick * self._tick_multiple and self._p0 != new_p0:
+            delta = (new_p0 - self._p0) / self._step
+            offset = round(delta)
+            if abs(delta - offset) < 1e-9:
+                self._shift_rows(self._acc, offset)
+            else:
+                self._acc[:] = 0.0
         self._p0 = new_p0
         self._epoch += 1
-        if self._last_book is not None:
+        if rebuild_state and self._last_book is not None:
             bid_px, bid_sz, ask_px, ask_sz = self._last_book
             self._state[0] = self._map_levels(bid_px, bid_sz)
             self._state[1] = self._map_levels(ask_px, ask_sz)
         params = EpochParams(
             epoch=self._epoch,
             tick=cfg.tick,
-            tick_multiple=cfg.tick_multiple,
+            tick_multiple=self._tick_multiple,
             dt_ns=cfg.dt_ns,
             p0=new_p0,
             rows=cfg.rows,

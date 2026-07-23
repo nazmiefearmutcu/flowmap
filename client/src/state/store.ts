@@ -30,6 +30,8 @@ export interface Subscription {
   market: string;
   symbol: string;
   mode: StreamMode;
+  /** Server price-grid coverage preset ('native' | 'wide' | 'full'). */
+  band: string;
 }
 
 export interface FlowMapState {
@@ -52,7 +54,12 @@ export interface FlowMapState {
   paused: boolean;
 
   // --- actions ---
-  connectAndSubscribe: (market: string, symbol: string, mode?: StreamMode) => void;
+  connectAndSubscribe: (
+    market: string,
+    symbol: string,
+    mode?: StreamMode,
+    band?: string,
+  ) => void;
   requestHistory: (before_t: bigint, n: number) => Promise<HistoryResponse>;
   /** Replay transport controls — send the matching control message + track UI state. */
   setSpeed: (x: number) => void;
@@ -104,7 +111,7 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   speed: 1,
   paused: false,
 
-  connectAndSubscribe(market, symbol, mode = 'live') {
+  connectAndSubscribe(market, symbol, mode = 'live', band = 'native') {
     if (conn === null) {
       conn = new Connection({
         ...transportOverrides,
@@ -150,8 +157,8 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
     }
     // A fresh subscription resets the transport (a new replay clock starts at 1×,
     // playing; live mode ignores these but they must not carry over stale state).
-    set({ subscription: { market, symbol, mode }, speed: 1, paused: false });
-    conn.subscribe(market, symbol, mode);
+    set({ subscription: { market, symbol, mode, band }, speed: 1, paused: false });
+    conn.subscribe(market, symbol, mode, band);
   },
 
   requestHistory(before_t, n) {

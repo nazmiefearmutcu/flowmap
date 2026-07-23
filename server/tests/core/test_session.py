@@ -1016,3 +1016,31 @@ async def test_equity_routed_by_default_feed_factory():
     )
     assert isinstance(feed, EquityFeed)
     assert feed.market == EQUITY_MARKET and feed.symbol == "MSFT"
+
+
+# --- price-band session keying (§8.1) ---------------------------------------
+
+
+def test_canonical_band_rejects_arbitrary_client_text():
+    """`band` is unvalidated wire text and is part of the SessionManager key.
+
+    Without canonicalization every distinct string would mint its own Session,
+    each holding a ring_columns*2*rows*2-byte grid — four junk subscribes would
+    exhaust max_sessions at hundreds of MiB apiece.
+    """
+    from flowmap_server.core.session import BANDS, DEFAULT_BAND, canonical_band
+
+    for good in BANDS:
+        assert canonical_band(good) == good
+    for junk in (None, "", "NATIVE", "wide ", "../etc/passwd", "x" * 5000):
+        assert canonical_band(junk) == DEFAULT_BAND
+
+
+def test_bands_table_is_ordered_and_native_is_the_default():
+    from flowmap_server.core.session import BANDS, DEFAULT_BAND
+
+    assert BANDS[DEFAULT_BAND] is None, "the default must be the legacy grid"
+    wide, full = BANDS["wide"], BANDS["full"]
+    assert wide is not None and full is not None
+    assert full[0] > wide[0] and full[1] >= wide[1]
+    assert full == (10.0, 1.0), "full is -100% / +1000%"

@@ -89,6 +89,11 @@ class Subscribe(msgspec.Struct):
     mode: StreamMode
     source: str | None = None
     start_t: int | None = None
+    # Price-grid coverage preset ("native" | "wide" | "full"). Appended LAST so
+    # the golden cold-Subscribe field order is otherwise unchanged. Unknown /
+    # missing values are canonicalized to the default AT THE WS BOUNDARY, before
+    # the value can reach the SessionManager key (see api/ws.py).
+    band: str | None = None
 
 
 class Unsubscribe(msgspec.Struct):

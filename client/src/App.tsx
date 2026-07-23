@@ -151,7 +151,9 @@ export function App() {
     renderer.setPriceFollow(settingsRef.current.followPrice ? 'fit' : 'off');
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
-      useFlowMapStore.getState().connectAndSubscribe(SIM_MARKET, SIM_SYMBOL);
+      useFlowMapStore
+        .getState()
+        .connectAndSubscribe(SIM_MARKET, SIM_SYMBOL, 'live', settingsRef.current.priceBand);
     }
 
     if (
@@ -199,6 +201,19 @@ export function App() {
         // setFollowTime, not goLive: re-pinning the right edge must not discard
         // the price zoom the user has chosen.
         r.setFollowTime(settings.follow);
+      }
+      // The band is a SERVER grid property, so changing it must re-subscribe.
+      // Edge-triggered: a re-subscribe tears down the ring and refetches.
+      if (settings.priceBand !== prevSettingsRef.current.priceBand) {
+        const sub = useFlowMapStore.getState().subscription;
+        useFlowMapStore
+          .getState()
+          .connectAndSubscribe(
+            sub?.market ?? SIM_MARKET,
+            sub?.symbol ?? SIM_SYMBOL,
+            sub?.mode ?? 'live',
+            settings.priceBand,
+          );
       }
       if (settings.followPrice !== prevSettingsRef.current.followPrice) {
         const wantOn = settings.followPrice;
@@ -273,14 +288,20 @@ export function App() {
   // --- symbol / mode actions ---------------------------------------------------
   const onSelectSymbol = useCallback((market: string, symbol: string) => {
     const mode = useFlowMapStore.getState().subscription?.mode ?? 'live';
-    useFlowMapStore.getState().connectAndSubscribe(market, symbol, mode);
+    // The band MUST ride along: without it a symbol switch silently reverts the
+    // server grid to `native` while the drawer keeps showing the chosen preset.
+    useFlowMapStore
+      .getState()
+      .connectAndSubscribe(market, symbol, mode, settingsRef.current.priceBand);
   }, []);
 
   const onSetMode = useCallback((mode: StreamMode) => {
     const sub = useFlowMapStore.getState().subscription;
     const market = sub?.market ?? SIM_MARKET;
     const symbol = sub?.symbol ?? SIM_SYMBOL;
-    useFlowMapStore.getState().connectAndSubscribe(market, symbol, mode);
+    useFlowMapStore
+      .getState()
+      .connectAndSubscribe(market, symbol, mode, settingsRef.current.priceBand);
   }, []);
 
   // GO LIVE routes through App (not straight to the renderer) so it also re-arms
