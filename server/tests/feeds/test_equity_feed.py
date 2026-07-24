@@ -448,6 +448,7 @@ def test_tier_keyless_when_no_keys():
         "depth": "SYNTH",
         "tape": "poll",
         "trade_side": "na",
+        "cvd": "na",  # GOAL 3: SIDE_UNKNOWN is never counted -> cvd is meaningless
         "vwap": "approx",
         "markers": ["gap", "session_break"],
     }
@@ -461,6 +462,7 @@ def test_tier_alpaca_when_both_keys():
     assert feed.capability["depth"] == "L1"
     assert feed.capability["trade_side"] == "inferred"
     assert feed.capability["tape"] == "tick"
+    assert feed.capability["cvd"] == "inferred"  # GOAL 3: inferred side -> inferred cvd
 
 
 def test_tier_finnhub_when_finnhub_key_only():
@@ -468,6 +470,7 @@ def test_tier_finnhub_when_finnhub_key_only():
     assert feed.tier == "finnhub"
     assert feed.capability["depth"] == "N/A"
     assert feed.capability["trade_side"] == "inferred"
+    assert feed.capability["cvd"] == "inferred"
 
 
 def test_symbol_uppercased():

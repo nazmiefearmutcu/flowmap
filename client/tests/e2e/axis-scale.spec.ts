@@ -154,8 +154,11 @@ test('§9 price gutter scales price like TradingView, and never touches time', a
   await expect(chip).toHaveAttribute('aria-pressed', 'false');
   expect((await follow(page)).priceFollow).toBe('off');
   await chip.click();
-  await expect(chip).toHaveText('FIT');
-  expect((await follow(page)).priceFollow).toBe('fit');
+  // Re-enabling from LOCK resumes 'track' (keeps the user's zoom), NOT 'fit'
+  // (which would re-frame the book and discard the scale). Explicit re-fit stays
+  // on the gutter double-click — asserted in step (e) above.
+  await expect(chip).toHaveText('TRACK');
+  expect((await follow(page)).priceFollow).toBe('track');
 
   // --- (g) clean run ---------------------------------------------------------
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(' | ')}`).toEqual([]);

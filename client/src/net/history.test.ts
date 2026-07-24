@@ -182,6 +182,28 @@ describe('HistoryLoader (T8 backfill)', () => {
     expect(h.loader.requestCount).toBe(0);
   });
 
+  it('prefetch loads history toward the target but stops short of the ring budget', async () => {
+    // Server has effectively unlimited older data; ask for far more than the ring.
+    const h = harness(/* oldestAvailable */ -1_000_000_000n, /* serverFloorSeq */ -1_000_000, /* budget */ 256);
+    h.loader.noteColumn(100, BigInt(100 * DT));
+
+    await h.loader.prefetch(1_000_000); // absurd target → must clamp to budget − headroom
+
+    const count = h.win.newest - h.win.oldest + 1;
+    // Never fills past the ring budget (the live-edge-eviction guard)…
+    expect(count).toBeLessThanOrEqual(256);
+    // …and it DID load a meaningful chunk (near budget − RESIDENT_HEADROOM_COLS=32).
+    expect(count).toBeGreaterThanOrEqual(200);
+    // Stopped in a couple of pages, not the 64-page runaway cap.
+    expect(h.loader.requestCount).toBeLessThan(4);
+  });
+
+  it('prefetch is a no-op for a non-positive target', async () => {
+    const h = harness(-1_000_000n);
+    await h.loader.prefetch(0);
+    expect(h.loader.requestCount).toBe(0);
+  });
+
   it('derives before_t from oldest-known t0 minus k·dt when the exact t0 is absent', async () => {
     const h = harness(-1_000_000n);
     // Only a NEWER column's t0 is known; oldest resident (100) has no cached t0.

@@ -72,7 +72,7 @@ export class Bbo {
       const y = gm.clipY(rowf);
       if (y < -1.02 || y > 1.02) return; // off-screen vertically
       solid.begin();
-      solid.addThickLine(-1, y, 1, y, 1.4, color.gl, cssW, cssH);
+      solid.addThickLine(-1, y, 1, y, 2.6, color.gl, cssW, cssH);
       solid.flush();
       // Right-edge badge: e.g. "A 100.75 ×8·L2".
       const label = `${key} ${price.toFixed(decimals)}${sz > 0 ? ` ×${fmtSize(sz)}` : ''}${tag}`;

@@ -21,7 +21,9 @@ import { DEFAULT_OVERLAY_VISIBILITY, type OverlayFrame, type OverlayVisibility }
 import { Markers } from './markers';
 import { OVERLAY } from './palette';
 import { PointBatch, SolidBatch } from './primitives';
+import { PriceLine } from './priceLine';
 import { Profile } from './profile';
+import { Cvd } from './cvd';
 import { Vwap } from './vwap';
 import { TextLayer } from '../textLayer';
 import type { HeatmapView } from '../heatmap';
@@ -52,8 +54,13 @@ export class OverlayManager {
   private readonly bubbles = new Bubbles();
   private readonly bbo = new Bbo();
   private readonly vwap = new Vwap();
+  private readonly priceLine = new PriceLine();
   private readonly profile = new Profile();
   private readonly markers = new Markers();
+  /** CVD is a bar-derived series (like VWAP) but is rendered in a SEPARATE lower
+   *  pane (it is not a price), so the manager only owns its DATA; the CvdPane
+   *  reads {@link cvdSeries} + the camera transform and draws its own canvas. */
+  private readonly cvd = new Cvd();
 
   private visibility: OverlayVisibility = { ...DEFAULT_OVERLAY_VISIBILITY };
 
@@ -125,15 +132,19 @@ export class OverlayManager {
 
   onBar(b: BarColumn): void {
     this.vwap.add(b);
+    this.priceLine.add(b);
+    this.cvd.add(b);
   }
 
   onMarker(m: Marker): void {
     this.markers.add(m);
   }
 
-  /** Prune per-window overlay memory (VWAP map) to the resident range. */
+  /** Prune per-window overlay memory (col_seq-keyed maps) to the resident range. */
   prune(oldest: number, newest: number, pad = 64): void {
     this.vwap.prune(oldest, newest, pad);
+    this.priceLine.prune(oldest, newest, pad);
+    this.cvd.prune(oldest, newest, pad);
   }
 
   /** Drop all overlay data (context loss / go-live re-seed / test reset). */
@@ -141,9 +152,26 @@ export class OverlayManager {
     this.bubbles.reset();
     this.bbo.reset();
     this.vwap.reset();
+    this.priceLine.reset();
+    this.cvd.reset();
     this.markers.reset();
     this.channelBbo = null;
     this.hasChannelBbo = false;
+  }
+
+  /**
+   * The CVD points inside `[loCol, hiCol]` in ascending column order, for the
+   * lower CVD pane to draw against the shared time transform. Read fresh each
+   * frame so scroll-back / time-follow stay in lock-step with the heatmap.
+   */
+  cvdSeries(loCol: number, hiCol: number): Array<{ col: number; cvd: number }> {
+    return this.cvd.series(loCol, hiCol);
+  }
+
+  /** Cumulative CVD at one column (O(1)) — lets the pane detect a live-tip change
+   *  and repaint, since the forming column mutates without any view field moving. */
+  cvdValueAt(colSeq: number): number {
+    return this.cvd.valueAt(colSeq);
   }
 
   /** Overlay data counts + last profile result (deterministic e2e assertions). */
@@ -168,7 +196,7 @@ export class OverlayManager {
   /** Whether any overlay could draw (used by the renderer to skip cheaply). */
   get anyVisible(): boolean {
     const v = this.visibility;
-    return v.bubbles || v.bbo || v.vwap || v.profile || v.markers || v.axes;
+    return v.bubbles || v.bbo || v.vwap || v.profile || v.markers || v.axes || v.price;
   }
 
   // --- draw ---------------------------------------------------------------------
@@ -193,6 +221,7 @@ export class OverlayManager {
     // GL overlays in spec draw order (each flushes its own geometry → z-order).
     if (this.visibility.profile) this.profile.draw(frame);
     if (this.visibility.vwap) this.vwap.draw(frame);
+    if (this.visibility.price) this.priceLine.draw(frame);
     if (this.visibility.bbo) {
       this.bbo.set(this.effectiveBbo(ctx));
       this.bbo.draw(frame);

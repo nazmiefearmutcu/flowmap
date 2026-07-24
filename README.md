@@ -22,23 +22,31 @@ stockodile for US equities) behind one market-agnostic renderer.
   structurally gone).
 - **Professional order flow:** liquidity heatmap (inferno ramp — indigo → red → gold → white, so
   relative size reads by hue and not just brightness — with correct SUM-mip zoom-out so walls
-  don't dilute), DOM ladder, time & sales tape, trade bubbles, BBO, VWAP, volume profile,
-  event markers, crosshair with exact liquidity readout, deep scroll-back, replay transport.
+  don't dilute), DOM ladder, time & sales tape, prominent trade bubbles, a bright **last-price
+  line** that persists as far back as the book, BBO, VWAP, a **CVD** (cumulative volume delta)
+  lower pane locked to the chart's time axis, volume profile, event markers, crosshair with exact
+  liquidity readout, deep scroll-back, replay transport. Every overlay toggles individually.
 - **Chart controls that behave like the tools you already use.** The price gutter is a control
   surface: wheel scales price at the cursor, a vertical drag scales the axis, double-click
   re-fits. The two axes follow independently — scroll back through time and price keeps
   auto-scaling; zoom price and the right edge stays pinned to now, with your zoom preserved and
-  the window recentring only when price leaves a central deadband. Price pans a full viewport
-  past either end of the grid. A **Tolerance** black point hides sub-threshold density so only
-  liquidity worth reading paints.
+  the window recentring only when price leaves a central deadband. Re-arming price-follow **keeps
+  your zoom** (it never re-frames the book out from under you); an in-chart **Go Live / Track
+  Price** pill appears the moment you scroll off the live edge. Price and time both zoom out far
+  past the grid, so nothing hits an artificial wall. A **Tolerance** black point (calibrated with a
+  sensible non-zero default) hides sub-threshold density so only liquidity worth reading paints.
+- **A command palette for the whole market.** Press **⌘K / Ctrl-K** (or `/`) for a centre-screen
+  search over every crypto + equity symbol both engines reach — fuzzy-ranked, with the day's top
+  movers, live price, % change and a mini sparkline, and honest capability chips per row. On first
+  launch you choose from the settings how much history to pull straight onto the chart.
 - **Configurable price coverage, including one that does not compromise.** On a linear grid range
   and resolution are the same knob: `native` keeps the finest rows, `±50%` and `−100%/+1000%`
   trade resolution for reach, and the widest of those is a range **scan** mode. **`Deep`** breaks
   the tie with a piecewise scale — a linear core at the instrument's native tick, wrapped in
   logarithmic wings. On BTC at $60k that is **±0.853% at $0.50/row — the exact ladder the narrow
-  grid gives — plus coverage to −99%/+1000% at ~0.34%/row**. The trade is that its frame is fixed
-  for the session, so a sustained move walks the book out into the coarse wings; the drawer says
-  so, and `native` remains the default.
+  grid gives — plus coverage to −99%/+1000% at ~0.34%/row**. `Deep` is now the **default**, so
+  price zooms out to the full range out of the box; `native` (finest rows, narrowest coverage) is
+  one click away in the drawer.
 - **Two markets, one renderer, honest tiers:** crypto shows full L2 depth + tick tape; US equities
   show what their free data actually supports — a keyless **two-sided** volume-at-price SYNTH depth
   (Yahoo 1 m bars, bid below / ask above a reference price that tracks the market) that upgrades to
@@ -69,19 +77,31 @@ normalizes every market into that stream + a capability descriptor. See
 `docs/superpowers/plans/m1-verification.md`, `m2-verification.md`, `m3-verification.md` for the
 verification record (live Binance + live equity evidence, perf gates, parity matrix).
 
-## Install (macOS)
+## Install
 
-Download **`FlowMap_1.1.0_aarch64.dmg`** from the
-[latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest), open it, and drag
-**FlowMap.app** to Applications. The app is fully self-contained — it bundles the client and the
-Python server, so there is nothing else to install (no Python, no Node).
+Every installer on the [latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest)
+is **fully self-contained** — it bundles the WebGL2 client *and* a relocatable Python 3.13 running
+the server, so there is nothing else to install (no Python, no Node, no `uv`). Pick your platform:
 
-> **First launch — Gatekeeper.** The app is ad-hoc signed but **not notarized** (that needs a paid
-> Apple Developer ID, which this project doesn't have), so macOS will warn on first open. Either
-> **right-click → Open** (then confirm once), or run once in Terminal:
-> `xattr -cr /Applications/FlowMap.app`. After that it launches normally.
+| Platform | Download | Install |
+|---|---|---|
+| **macOS — Apple Silicon** | `FlowMap_1.2.0_aarch64.dmg` | open the dmg, drag **FlowMap.app** to Applications |
+| **macOS — Intel** | `FlowMap_1.2.0_x86_64.dmg` | same as above |
+| **Windows x64** | `FlowMap_1.2.0_x64-setup.exe` (NSIS) or `FlowMap_1.2.0_x64_en-US.msi` (MSI) | run the installer |
+| **Linux x64** | `FlowMap_1.2.0_amd64.AppImage` (portable) or `flowmap_1.2.0_amd64.deb` (Debian/Ubuntu) | `chmod +x` the AppImage, or `sudo apt install ./flowmap_1.2.0_amd64.deb` |
 
-Apple Silicon only. Intel Macs and other platforms: run from source (below).
+> **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
+> (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for
+> this project), so the OS will warn on first open:
+> - **macOS:** **right-click → Open** (confirm once), or run `xattr -cr /Applications/FlowMap.app`.
+> - **Windows:** SmartScreen → **More info → Run anyway**.
+> - **Linux:** the AppImage needs `libwebkit2gtk-4.1`, `libgtk-3` and `libayatana-appindicator3`
+>   present (the `.deb` declares these as dependencies and pulls them in automatically).
+>
+> After the first confirmation the app launches normally.
+
+Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Any platform
+without a prebuilt installer — including Linux on arm — can **run from source** (below).
 
 ## Run it
 

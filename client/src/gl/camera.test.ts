@@ -191,10 +191,15 @@ describe('zoomTime — cursor anchored', () => {
     expect(z.colSpan).toBe(MIN_COL_SPAN);
   });
 
-  it('cannot zoom out beyond the max span', () => {
-    const s = { ...baseState(), colSpan: CAP / 2 };
-    const z = zoomTime(s, LIMITS, 100, s.colCenter);
-    expect(z.colSpan).toBe(CAP);
+  it('lets the user zoom time out far past the ring, up to the zoom cap', () => {
+    // Zoom-out is decoupled from the framing/ring cap: a 100x from CAP/2 lands
+    // well past CAP (no artificial wall at the resident-column count).
+    const past = zoomTime({ ...baseState(), colSpan: CAP / 2 }, LIMITS, 100, 1000);
+    expect(past.colSpan).toBe((CAP / 2) * 100);
+    expect(past.colSpan).toBeGreaterThan(LIMITS.maxColSpan);
+    // ...but there is still a hard ceiling (maxColSpanZoom) for numeric safety.
+    const capped = zoomTime({ ...baseState(), colSpan: CAP / 2 }, LIMITS, 1e9, 1000);
+    expect(capped.colSpan).toBe(LIMITS.maxColSpanZoom);
   });
 
   it('anchor stays exact even when the span clamps at the minimum', () => {

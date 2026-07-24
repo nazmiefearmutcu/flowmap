@@ -205,6 +205,9 @@ class SimFeed:
             "depth": "L2",
             "tape": "tick",
             "trade_side": "exchange",
+            # Exchange-true aggressor side -> honest per-bar CVD in grid.on_trade
+            # (SIDE_BUY/SIDE_SELL are counted; spec §7 dual-market parity).
+            "cvd": "exchange",
             "markers": ["liquidation", "gap"],
         }
 

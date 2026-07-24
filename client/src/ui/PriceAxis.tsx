@@ -55,7 +55,10 @@ export function PriceAxis({ canvasRef, rendererRef }: PriceAxisProps): JSX.Eleme
   const onToggle = (): void => {
     const r = rendererRef.current;
     if (!r) return;
-    const next: PriceFollow = r.priceFollow === 'off' ? 'fit' : 'off';
+    // Enabling restores 'track' (keeps the user's zoom, recentres on drift), NOT
+    // 'fit' (which re-frames to the book and discards the scale). Explicit auto-
+    // fit stays on the axis double-click / Shift+P.
+    const next: PriceFollow = r.priceFollow === 'off' ? 'track' : 'off';
     r.setPriceFollow(next);
     setMode(next); // optimistic; the poll confirms
   };

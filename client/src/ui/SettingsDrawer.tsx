@@ -15,9 +15,11 @@ import type { OverlayVisibility } from '../gl/overlays/frame';
 import { OverlayToggles } from './OverlayToggles';
 import {
   DEFAULT_SETTINGS,
+  HISTORY_DEPTHS,
   PRICE_BANDS,
   type Colormap,
   type FlowMapSettings,
+  type HistoryDepth,
   type PriceBand,
 } from './settings';
 
@@ -33,6 +35,15 @@ const BAND_HINT: Record<PriceBand, string> = {
   wide: 'About 50× coarser rows; far-out resting size becomes visible.',
   full: 'Range SCAN only: rows get so coarse the live book collapses to a few of them.',
   deep: 'Full ladder resolution near the price AND coverage to −99%/+1000%. The frame is fixed for the session, so a sustained move walks the book out into the coarse wings until you reconnect.',
+};
+
+/** Human labels for the first-launch history-depth choices. */
+const HISTORY_LABEL: Record<HistoryDepth, string> = {
+  off: 'Off',
+  '1h': '1H',
+  '4h': '4H',
+  '1d': '1D',
+  max: 'Max',
 };
 
 interface SettingsDrawerProps {
@@ -183,7 +194,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             <input
               type="range"
               className="range"
-              min={90}
+              min={80}
               max={100}
               step={0.5}
               value={settings.normPercentile}
@@ -192,7 +203,10 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               data-testid="setting-normPercentile"
               onChange={(e) => onChange({ normPercentile: Number(e.target.value) })}
             />
-            <span className="setting__hint">Higher percentile → dimmer, more dynamic-range headroom.</span>
+            <span className="setting__hint">
+              White point: the density percentile mapped to full brightness. Lower (p80) makes
+              the field punchy and saturated; higher (p100) is dim with more headroom.
+            </span>
           </div>
 
           {/* heatmap tolerance — the black point on normalized density (live) */}
@@ -318,6 +332,29 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               ))}
             </div>
             <span className="setting__hint">{BAND_HINT[settings.priceBand]}</span>
+          </div>
+
+          {/* first-launch history depth */}
+          <div className="setting">
+            <span className="setting__label">History on launch</span>
+            <div className="segrow" role="group" aria-label="history depth" data-testid="setting-historyDepth">
+              {HISTORY_DEPTHS.map((d) => (
+                <button
+                  type="button"
+                  key={d}
+                  className={`segrow__btn${settings.historyDepth === d ? ' is-on' : ''}`}
+                  aria-pressed={settings.historyDepth === d}
+                  data-testid={`historyDepth-${d}`}
+                  onClick={() => onChange({ historyDepth: d })}
+                >
+                  {HISTORY_LABEL[d]}
+                </button>
+              ))}
+            </div>
+            <span className="setting__hint">
+              How much past data to pull into the chart when a symbol loads. Applies on the next
+              symbol switch or reload. Bounded by what the server retains.
+            </span>
           </div>
 
           {/* right rail */}

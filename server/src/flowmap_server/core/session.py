@@ -64,6 +64,7 @@ import msgspec
 import numpy as np
 
 from flowmap_server.config import Config
+from flowmap_server.core.backfill import BackfillFn, columns_from_candles
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.feeds.base import BookState, Feed
@@ -327,6 +328,8 @@ class Session:
         grace_s: float = GRACE_S,
         recorder: Recorder | None = None,
         wall_clock: Clock = time.time_ns,
+        backfill_fn: BackfillFn | None = None,
+        backfill_max_cols: int = 0,
     ) -> None:
         self.session_id = session_id
         self.run_task: asyncio.Task | None = None
@@ -349,6 +352,15 @@ class Session:
         self._cols_since_flush = 0
         self._boot_done = False
         self._start_lock = asyncio.Lock()
+
+        # First-launch history backfill (GOAL 1): a cold subscribe seeds the ring
+        # with reconstructed candle history so the client's eager requestHistory
+        # returns real data. Runs in _boot only when no Parquet tail rehydrated.
+        # When it seeds columns the session badges Hello/Status capability with
+        # ``history: 'reconstructed'`` (candle volume-at-price, not resting L2).
+        self._backfill_fn = backfill_fn
+        self._backfill_max_cols = backfill_max_cols
+        self._history_reconstructed = False
 
         self._clients: set[ClientTx] = set()
         self._grace_handle: TimerHandle | None = None
@@ -391,29 +403,113 @@ class Session:
         return self.run_task
 
     async def _boot(self) -> None:
-        """Open the session recorder and rehydrate the grid (spec §8.1).
+        """Open the session recorder, rehydrate (spec §8.1) or backfill the grid.
 
-        Any failure here is logged and degrades to a cold start with
-        recording disabled — never propagated into subscribe/attach.
+        Any failure here is logged and degrades to a cold start (recording
+        disabled on a recorder error) — never propagated into subscribe/attach.
+        Precedence: a fresh Parquet tail wins; only a cold ring (no tail) is
+        seeded from the first-launch candle backfill (GOAL 1).
         """
-        if self._recorder_root is None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-            rec, tail = await loop.run_in_executor(None, self._boot_blocking)
-        except Exception:
-            logger.exception(
-                "recording boot failed; recording disabled for session %s",
-                self.session_id,
-            )
-            return
-        self._rec = rec
-        if tail is not None:
-            self._apply_tail(tail)
-        # Initial epoch params (cold: epoch 0; rehydrated: the tail's current
-        # epoch — duplicates across part files are fine, load dedups by key).
+        tail_applied = False
+        if self._recorder_root is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                rec, tail = await loop.run_in_executor(None, self._boot_blocking)
+            except Exception:
+                logger.exception(
+                    "recording boot failed; recording disabled for session %s",
+                    self.session_id,
+                )
+            else:
+                self._rec = rec
+                if tail is not None:
+                    self._apply_tail(tail)
+                    tail_applied = True
+
+        # Backfill only a genuinely cold ring — never on top of a rehydrated tail
+        # (the grid is no longer virgin; preload would raise).
+        if not tail_applied:
+            await self._run_backfill()
+
+        # Initial epoch params (cold: epoch 0; rehydrated/backfilled: the
+        # seeded current epoch — duplicates across part files are fine, load
+        # dedups by key). No-op without a recorder.
         params = self._grid.current_epoch_params()
         self._record(lambda r: r.record_epoch(params))
+
+    async def _run_backfill(self) -> None:
+        """Seed the ring with reconstructed candle history (GOAL 1).
+
+        Behind the injectable ``backfill_fn`` seam (pytest feeds canned candles;
+        no network). Any failure degrades cleanly to cold start. Reconstructed
+        columns are seeded but NOT recorded — only live columns persist to
+        Parquet. On success, marks the session so Hello/Status advertise
+        ``history: 'reconstructed'`` and emits a gap Marker to live.
+        """
+        if self._backfill_fn is None or self._backfill_max_cols <= 0:
+            return
+        try:
+            candles = await self._backfill_fn(
+                self._feed.market,
+                self._feed.symbol,
+                max_cols=self._backfill_max_cols,
+                now_ns=self._wall_clock(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "backfill fetch failed; cold start for session %s",
+                self.session_id,
+                exc_info=True,
+            )
+            return
+        if not candles:
+            return
+        try:
+            result = columns_from_candles(candles, self._grid.cfg)
+            if result is None:
+                return
+            columns, epoch = result
+            self._grid.preload(columns, [epoch])
+        except Exception:
+            logger.warning(
+                "backfill conversion/preload failed; cold start for session %s",
+                self.session_id,
+                exc_info=True,
+            )
+            return
+        self._history_reconstructed = True
+        dt = self._grid.cfg.dt_ns
+        end_ns = columns[-1].t0_ns + dt
+        gap = events.Marker(
+            ts_ns=end_ns - 1,
+            kind="gap",
+            text=(
+                f"backfill: reconstructed history ends {end_ns}, "
+                f"live resumes ~{self._wall_clock()}"
+            ),
+        )
+        self._markers.append(gap)
+        # Record the gap marker (live provenance) but NOT the reconstructed
+        # columns — only genuine live columns should persist for rehydration.
+        self._record(lambda r: r.record_marker(gap))
+        logger.info(
+            "session %s backfilled %d reconstructed columns (t0 %d..%d)",
+            self.session_id,
+            len(columns),
+            columns[0].t0_ns,
+            columns[-1].t0_ns,
+        )
+
+    def _capability(self) -> dict[str, object]:
+        """Feed capability, plus ``history: 'reconstructed'`` when the ring was
+        seeded from candle backfill (GOAL 1/3 honesty badge). Returns the feed's
+        own dict unchanged otherwise, so non-backfilled sessions are byte-identical
+        to before."""
+        if not self._history_reconstructed:
+            return self._feed.capability
+        return {**self._feed.capability, "history": "reconstructed"}
 
     def _boot_blocking(self) -> tuple[SessionRecorder, TailData | None]:
         """Blocking recorder IO for :meth:`_boot` (runs in the executor)."""
@@ -737,7 +833,7 @@ class Session:
         self._feed_state = "closed"
         status = events.Status(
             feed_state="closed",
-            capability=self._feed.capability,
+            capability=self._capability(),
             latency_ms=0.0,
             clock_skew_ms=0.0,
             next_open_ts=getattr(self._feed, "next_open_ts", None),
@@ -750,7 +846,7 @@ class Session:
         self._feed_state = state
         status = events.Status(
             feed_state=state,  # type: ignore[arg-type]
-            capability=self._feed.capability,
+            capability=self._capability(),
             latency_ms=0.0,
             clock_skew_ms=0.0,
         )
@@ -800,7 +896,7 @@ class Session:
             session_id=self.session_id,
             grid_epoch=ep.epoch,
             epoch_params=ep,
-            capability=self._feed.capability,
+            capability=self._capability(),
             norm_seed=self._norm_seed(),
         )
         # Hello first, then EpochStart for EVERY distinct epoch appearing in
@@ -964,6 +1060,7 @@ class SessionManager:
         feed_factory: Callable[[events.Subscribe], Feed] | None = None,
         recorder: Recorder | None = None,
         wall_clock: Clock = time.time_ns,
+        backfill_fn: BackfillFn | None = None,
     ) -> None:
         self._cfg = cfg
         self._clock = clock
@@ -974,6 +1071,9 @@ class SessionManager:
         # wires one in from Config for the real server).
         self._recorder = recorder
         self._wall_clock = wall_clock
+        # First-launch history backfill seam (GOAL 1). None disables it — the
+        # default for deterministic tests; create_app wires the network seam in.
+        self._backfill_fn = backfill_fn
         # Keyed by (market, symbol, mode, source, band) — the band is part of
         # the grid geometry, so two bands are genuinely two grids.
         self._sessions: dict[tuple[str, str, str, str | None, str], Session] = {}
@@ -1086,6 +1186,12 @@ class SessionManager:
                 # Live mode only: replay sessions (M3) never self-record.
                 recorder=self._recorder if sub.mode == "live" else None,
                 wall_clock=self._wall_clock,
+                # Live mode only: a replay session reads its own recording, never
+                # a live candle backfill.
+                backfill_fn=self._backfill_fn if sub.mode == "live" else None,
+                backfill_max_cols=self._cfg.backfill_max_cols
+                if self._cfg.backfill_enabled
+                else 0,
             )
             session._on_teardown = self._make_remover(key, session)
             self._sessions[key] = session

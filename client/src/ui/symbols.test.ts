@@ -5,6 +5,8 @@ import {
   capabilityChips,
   filterSymbols,
   flattenGroups,
+  fuzzyRank,
+  fuzzyScore,
   groupSymbols,
   marketGroup,
   type SymbolEntry,
@@ -106,5 +108,40 @@ describe('capabilityChipClass', () => {
     expect(capabilityChipClass('TAPE FULL')).toBe('cap cap--tape');
     // Side chips stay bare.
     expect(capabilityChipClass('SIDE INFERRED')).toBe('cap');
+  });
+});
+
+describe('fuzzyScore — tiered ranking', () => {
+  it('ranks exact > prefix > substring > subsequence > no-match', () => {
+    const exact = fuzzyScore('btc', 'btc');
+    const prefix = fuzzyScore('btc', 'btcusdt');
+    const sub = fuzzyScore('usd', 'btcusdt');
+    const seq = fuzzyScore('bcd', 'btcusdt'); // b..c..d scattered
+    expect(exact).toBeGreaterThan(prefix);
+    expect(prefix).toBeGreaterThan(sub);
+    expect(sub).toBeGreaterThan(seq);
+    expect(seq).toBeGreaterThanOrEqual(0);
+    expect(fuzzyScore('xyz', 'btcusdt')).toBe(-1);
+  });
+  it('empty query matches everything with score 0', () => {
+    expect(fuzzyScore('', 'anything')).toBe(0);
+  });
+});
+
+describe('fuzzyRank — best symbol match first', () => {
+  const uni: SymbolEntry[] = [
+    { market: 'binance-spot', symbol: 'BTCUSDT', capability: {} },
+    { market: 'binance-spot', symbol: 'ETHUSDT', capability: {} },
+    { market: 'equity', symbol: 'MSFT', capability: {} },
+    { market: 'binance-spot', symbol: 'WBTC', capability: {} },
+  ];
+  it('puts the prefix match ahead of a mid-string match', () => {
+    const r = fuzzyRank(uni, 'btc');
+    expect(r[0].symbol).toBe('BTCUSDT'); // prefix beats WBTC's substring
+    expect(r.map((e) => e.symbol)).toContain('WBTC');
+  });
+  it('drops non-matches and respects the limit', () => {
+    expect(fuzzyRank(uni, 'zzz')).toEqual([]);
+    expect(fuzzyRank(uni, '', 2).length).toBe(2);
   });
 });

@@ -1,21 +1,22 @@
-"""REST routes (M1 T8; equity capability M3 T2): health + symbol directory
-(spec §5).
+"""REST routes (M1 T8; equity capability M3 T2; universe GOAL 2): health +
+symbol directory (spec §5).
 
-Handlers are pure in-memory lookups — network calls are FORBIDDEN here (the
-T9 crypto discovery still owns live crypto symbol enumeration). The directory
-is:
+Handlers are pure in-memory lookups — network calls are FORBIDDEN here. The
+directory is now the FULL bundled universe (``data/universe.py``): the sim
+symbol, a curated crypto shortlist, and a curated large-cap US equity list —
+each with a capability read off its real feed so the directory can never drift
+from what a subscribe actually delivers:
 
-- the sim symbol, with its capability read off :class:`SimFeed` so the
-  directory can never drift from what a ``sim`` subscribe actually delivers;
-- a static crypto shortlist. Crypcodile's ``InstrumentRegistry``
-  (``crypcodile.instruments.registry``) was checked: it is an empty
-  in-memory map populated by live connectors at runtime, so enumerating real
-  symbols would require network — hence the static list, noted "live in T9";
-- a static equity top-tickers shortlist whose capability is read off
-  :class:`EquityFeed` (M3 T2). Equity is live: the keyless tier serves a
-  genuine two-sided SYNTH depth (Yahoo 1 m warmup + slow last-price poll), and
-  the descriptor mirrors the feed's env-selected tier so it can never lie about
-  what an equity subscribe delivers.
+- the sim symbol, capability from :class:`SimFeed`;
+- the curated crypto shortlist (live market-wide enumeration is unavailable
+  offline in the pinned deps, so the LIST is bundled; live price/mover data for
+  these symbols is served separately by ``/api/movers`` + ``/api/quote`` through
+  the network cache);
+- the curated equity list, capability read off :class:`EquityFeed` (the keyless
+  SYNTH tier on this machine; keyed tiers activate with no code change).
+
+``current_directory()`` is shared with the ``/api/universe`` handler
+(``api/discovery.py``) so both surfaces stay identical and honest.
 """
 
 from __future__ import annotations
@@ -26,23 +27,33 @@ from fastapi import APIRouter
 
 from flowmap_server import __version__
 from flowmap_server.config import Config
+from flowmap_server.data.universe import build_directory, filter_directory
 from flowmap_server.feeds.equity import EquityFeed
 from flowmap_server.feeds.sim import SimFeed
 
-__all__ = ["router"]
+__all__ = ["router", "current_directory", "CRYPTO_CAPABILITY"]
 
 router = APIRouter(prefix="/api")
 
 # SimFeed's constructor does no I/O; seed is irrelevant for the capability.
 _SIM_CAPABILITY = SimFeed(seed=0).capability
 
+# Crypto directory capability (spec §7 honesty; GOAL 3 cvd). Mirrors the core
+# keys a crypto subscribe delivers — L2 depth, tick tape, exchange-true side and
+# CVD. (Per-market marker lists live on the feed itself.)
+CRYPTO_CAPABILITY: dict[str, object] = {
+    "depth": "L2",
+    "tape": "tick",
+    "trade_side": "exchange",
+    "cvd": "exchange",
+}
+
 
 def _equity_capability() -> dict[str, object]:
-    """Equity capability mirrored from :class:`EquityFeed`'s own tier
-    selection so the directory never lies about an equity subscribe. Keys are
-    auto-detected from env (spec §7): keyless -> SYNTH (two-sided) on this
-    machine; the Alpaca/Finnhub keyed tiers activate with no code change.
-    Construction is pure (no I/O)."""
+    """Equity capability mirrored from :class:`EquityFeed`'s own tier selection
+    so the directory never lies about an equity subscribe. Keys are auto-detected
+    from env (spec §7): keyless -> SYNTH on this machine; Alpaca/Finnhub keyed
+    tiers activate with no code change. Construction is pure (no I/O)."""
     try:
         cfg = Config.from_env(os.environ)
     except Exception:  # noqa: BLE001 — a bad env falls back to keyless defaults
@@ -50,28 +61,14 @@ def _equity_capability() -> dict[str, object]:
     return EquityFeed("AAPL", cfg).capability
 
 
-_CRYPTO_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
-_CRYPTO_CAPABILITY: dict[str, object] = {"depth": "L2", "tape": "tick"}
-_EQUITY_SYMBOLS = ("AAPL", "MSFT", "NVDA", "TSLA", "SPY")
-_EQUITY_CAPABILITY = _equity_capability()
-
-_DIRECTORY: tuple[dict[str, object], ...] = (
-    {"market": "sim", "symbol": SimFeed.symbol, "capability": _SIM_CAPABILITY},
-    *(
-        {
-            "market": "binance-spot",
-            "symbol": s,
-            "capability": _CRYPTO_CAPABILITY,
-            "note": "live in T9",
-        }
-        for s in _CRYPTO_SYMBOLS
-    ),
-    *(
-        # Live (keyless SYNTH tier): no "live in ..." note — like sim.
-        {"market": "equity", "symbol": s, "capability": _EQUITY_CAPABILITY}
-        for s in _EQUITY_SYMBOLS
-    ),
-)
+def current_directory() -> tuple[dict[str, object], ...]:
+    """The full merged directory with live-derived capabilities (no I/O)."""
+    return build_directory(
+        sim_symbol=SimFeed.symbol,
+        sim_capability=_SIM_CAPABILITY,
+        crypto_capability=CRYPTO_CAPABILITY,
+        equity_capability=_equity_capability(),
+    )
 
 
 @router.get("/health")
@@ -81,8 +78,8 @@ async def health() -> dict[str, str]:
 
 @router.get("/symbols")
 async def symbols(q: str = "") -> dict[str, list[dict[str, object]]]:
-    """Merged symbol directory, filtered by case-insensitive substring."""
-    needle = q.lower()
-    return {
-        "symbols": [e for e in _DIRECTORY if needle in str(e["symbol"]).lower()]
-    }
+    """Merged symbol directory, filtered by case-insensitive substring.
+
+    Returns the FULL bundled universe (kept backward-compatible: the legacy
+    sim/crypto/equity shortlist symbols are all still present)."""
+    return {"symbols": filter_directory(current_directory(), q=q)}

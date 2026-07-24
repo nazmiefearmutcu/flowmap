@@ -68,7 +68,9 @@ test('shell renders as a trading terminal + screenshot', async ({ page }) => {
 
   // The core chrome is present and framed around the heatmap.
   await expect(page.locator('.topbar')).toBeVisible();
-  await expect(page.locator('[data-testid="symbol-search-input"]')).toBeVisible();
+  // Search is a centred palette now: the top bar shows a trigger; the input
+  // exists once the palette is opened.
+  await expect(page.locator('[data-testid="symbol-search-trigger"]')).toBeVisible();
   await expect(page.locator('[data-testid="venue"]')).toContainText('Sim');
   await expect(page.locator('[data-testid="capability-badges"]')).toBeVisible();
   await expect(page.locator('[data-testid="mode-toggle"]')).toBeVisible();
@@ -89,8 +91,8 @@ test('shell renders as a trading terminal + screenshot', async ({ page }) => {
 test('symbol search queries /api/symbols and switching re-subscribes', async ({ page }) => {
   await bootLive(page);
 
-  // Type a crypto query; the dropdown populates from /api/symbols.
-  await page.locator('[data-testid="symbol-search-input"]').click();
+  // Open the palette, then type a crypto query; results fuzzy-match the universe.
+  await page.locator('[data-testid="symbol-search-trigger"]').click();
   await page.locator('[data-testid="symbol-search-input"]').fill('btc');
   const row = page.locator('[data-testid="symbol-row"][data-symbol="BTCUSDT"]');
   await expect(row).toBeVisible({ timeout: 10_000 });
@@ -177,6 +179,10 @@ test('replay toggle + transport send the correct control messages', async ({ pag
 });
 
 test('settings persist across a reload', async ({ page }) => {
+  // This test boots live TWICE (once, then again after a reload). The reload
+  // path's waitForFunction already allows 45s, so the default 30s test budget was
+  // too small under parallel load (the reconnect can exceed it) — give it room.
+  test.setTimeout(90_000);
   await bootLive(page);
 
   await page.locator('[data-testid="settings-open"]').click();

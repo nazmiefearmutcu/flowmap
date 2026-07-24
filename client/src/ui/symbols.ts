@@ -80,6 +80,53 @@ export function flattenGroups(groups: readonly SymbolGroup[]): SymbolEntry[] {
 }
 
 /**
+ * Fuzzy score of `query` against `text` (higher = better; -1 = no match). Tiers,
+ * highest first: exact → prefix → substring → scattered subsequence. Within the
+ * subsequence tier, contiguous runs and a start-of-string hit are rewarded, and
+ * shorter texts win ties — so "BT" ranks BTCUSDT above a coincidental match in a
+ * longer ticker. This is the ranking the substring-only server filter lacked.
+ */
+export function fuzzyScore(query: string, text: string): number {
+  const q = query.trim().toLowerCase();
+  const t = text.toLowerCase();
+  if (q === '') return 0;
+  if (t === q) return 1000;
+  if (t.startsWith(q)) return 800 - t.length;
+  const sub = t.indexOf(q);
+  if (sub >= 0) return 600 - sub - t.length * 0.1;
+  let qi = 0;
+  let score = 0;
+  let run = 0;
+  let prev = -2;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) {
+      run = ti === prev + 1 ? run + 1 : 1;
+      score += run;
+      if (ti === 0) score += 5;
+      prev = ti;
+      qi += 1;
+    }
+  }
+  if (qi < q.length) return -1; // not every query char was consumed → no match
+  return 100 + score - t.length * 0.1;
+}
+
+/**
+ * Fuzzy-rank a directory by the query, best first. A match on the SYMBOL ranks
+ * above a match on the market/venue. Empty query returns the input order (capped).
+ */
+export function fuzzyRank(entries: readonly SymbolEntry[], q: string, limit = 60): SymbolEntry[] {
+  if (q.trim() === '') return entries.slice(0, limit);
+  const scored: Array<{ entry: SymbolEntry; score: number }> = [];
+  for (const e of entries) {
+    const s = Math.max(fuzzyScore(q, e.symbol), fuzzyScore(q, e.market) - 60);
+    if (s >= 0) scored.push({ entry: e, score: s });
+  }
+  scored.sort((a, b) => b.score - a.score || a.entry.symbol.length - b.entry.symbol.length);
+  return scored.slice(0, limit).map((r) => r.entry);
+}
+
+/**
  * Small capability chips for a directory row / the top bar. Honest (§7): shows the
  * real depth + tape tiers straight off the capability descriptor, uppercased.
  */

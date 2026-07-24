@@ -41,12 +41,30 @@ fn free_loopback_port() -> std::io::Result<u16> {
     Ok(port)
 }
 
-/// Locate the bundled interpreter inside the .app (Contents/Resources/pyruntime).
+/// Locate the bundled interpreter inside the resource dir (macOS:
+/// `Contents/Resources/pyruntime`, Windows/Linux: the platform resource dir).
+///
+/// The interpreter sub-path is OS-specific: astral's python-build-standalone
+/// puts the Windows interpreter at the runtime ROOT (`python.exe`, no `bin/`),
+/// while the macOS/Linux interpreter lives under `bin/`. We also try a
+/// `resources/pyruntime/` root so the resolver works whether the tree was
+/// placed by the Tauri `resources` map (→ `<res>/pyruntime`) or the macOS
+/// `ditto` injection in build-dmg.sh (→ `<res>/pyruntime`) — and a defensive
+/// `resources/pyruntime` fallback covers a list-form `resources` layout.
 fn resolve_python(app: &tauri::App) -> Option<PathBuf> {
-    for candidate in ["pyruntime/bin/python3.13", "pyruntime/bin/python3"] {
-        if let Ok(p) = app.path().resolve(candidate, BaseDirectory::Resource) {
-            if p.exists() {
-                return Some(p);
+    // Windows candidates FIRST on Windows; unix candidates on macOS/Linux.
+    #[cfg(windows)]
+    let interpreters: &[&str] = &["python.exe", "python3.13.exe"];
+    #[cfg(unix)]
+    let interpreters: &[&str] = &["bin/python3.13", "bin/python3"];
+
+    for root in ["pyruntime", "resources/pyruntime"] {
+        for interp in interpreters {
+            let rel = format!("{root}/{interp}");
+            if let Ok(p) = app.path().resolve(&rel, BaseDirectory::Resource) {
+                if p.exists() {
+                    return Some(p);
+                }
             }
         }
     }
@@ -95,9 +113,17 @@ fn kill_sidecar(state: &SidecarState) {
         Err(poisoned) => poisoned.into_inner(),
     };
     if let Some(mut child) = guard.take() {
+        // Ask for a graceful shutdown. On unix that's SIGTERM (uvicorn traps it
+        // and drains); Windows has no SIGTERM, so we go straight to a hard
+        // terminate — child.kill() below in the loop tail is the same call, but
+        // issuing it up front lets the try_wait loop reap the process promptly.
         #[cfg(unix)]
         unsafe {
             libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = child.kill();
         }
         for _ in 0..20 {
             match child.try_wait() {

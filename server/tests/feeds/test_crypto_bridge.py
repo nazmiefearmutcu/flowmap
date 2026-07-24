@@ -124,6 +124,7 @@ def test_capability_shape() -> None:
         "depth": "L2",
         "tape": "tick",
         "trade_side": "exchange",
+        "cvd": "exchange",  # GOAL 3: exchange-true aggressor -> honest CVD
         "markers": ["liquidation", "gap"],
     }
     assert feed.market == "binance-usdm"

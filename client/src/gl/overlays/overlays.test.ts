@@ -6,24 +6,24 @@ import { accumulateProfile } from './profile';
 import { sessionVwap } from './vwap';
 
 const BUBBLE_DEFAULTS: Required<BubbleOptions> = {
-  capacity: 6000,
+  capacity: 120_000,
   minSize: 0,
-  refSize: 4,
-  baseRadiusPx: 5,
-  minRadiusPx: 2,
-  maxRadiusPx: 26,
+  refSize: 2,
+  baseRadiusPx: 9,
+  minRadiusPx: 3,
+  maxRadiusPx: 44,
 };
 
 describe('bubbleRadiusPx (√-area scaling, clamped)', () => {
   it('maps the reference size to the base radius', () => {
-    expect(bubbleRadiusPx(4, BUBBLE_DEFAULTS)).toBeCloseTo(5);
+    expect(bubbleRadiusPx(2, BUBBLE_DEFAULTS)).toBeCloseTo(9);
   });
   it('scales with √size', () => {
-    expect(bubbleRadiusPx(16, BUBBLE_DEFAULTS)).toBeCloseTo(10); // 5·√(16/4)
+    expect(bubbleRadiusPx(8, BUBBLE_DEFAULTS)).toBeCloseTo(18); // 9·√(8/2)
   });
   it('clamps to the min/max radius', () => {
-    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(2);
-    expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(26);
+    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(3);
+    expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(44);
   });
 });
 

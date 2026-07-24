@@ -80,12 +80,12 @@ export class Vwap {
     const cssW = gm.dims.cssW;
     const cssH = gm.dims.cssH;
     for (let i = 1; i < pts.length; i++) {
-      solid.addThickLine(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, 1.6, OVERLAY.vwap.gl, cssW, cssH);
+      solid.addThickLine(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, 2.4, OVERLAY.vwap.gl, cssW, cssH);
     }
     // A single visible vertex: draw a short dash so it's still visible.
     if (pts.length === 1) {
       const dx = gm.pxToClipW(3);
-      solid.addThickLine(pts[0].x - dx, pts[0].y, pts[0].x + dx, pts[0].y, 1.6, OVERLAY.vwap.gl, cssW, cssH);
+      solid.addThickLine(pts[0].x - dx, pts[0].y, pts[0].x + dx, pts[0].y, 2.4, OVERLAY.vwap.gl, cssW, cssH);
     }
     solid.flush();
   }

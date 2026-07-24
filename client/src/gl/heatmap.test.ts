@@ -17,9 +17,15 @@ function remap(t: number, floor: number): number {
 }
 
 describe('floorForTolerance — the Tolerance slider → shader black point', () => {
-  it('is off (an exact no-op) at the default', () => {
-    expect(DEFAULT_TOLERANCE).toBe(0);
-    expect(floorForTolerance(DEFAULT_TOLERANCE)).toBe(0);
+  it('is an exact no-op at slider 0 and a gentle denoise at the default', () => {
+    // Slider 0 stays an exact algebraic identity — every pixel spec below relies
+    // on it — but the app now OPENS at a small non-zero default so faint specks
+    // are pre-suppressed.
+    expect(floorForTolerance(0)).toBe(0);
+    expect(DEFAULT_TOLERANCE).toBeGreaterThan(0);
+    const dflt = floorForTolerance(DEFAULT_TOLERANCE);
+    expect(dflt).toBeGreaterThan(0);
+    expect(dflt).toBeLessThan(0.1); // gentle, not aggressive
   });
 
   it('is monotonically increasing across the slider', () => {
@@ -31,18 +37,21 @@ describe('floorForTolerance — the Tolerance slider → shader black point', ()
     }
   });
 
-  it('reaches exactly the cap at 100 and never exceeds it', () => {
+  it('reaches exactly the (raised) cap at 100 and never exceeds it', () => {
+    expect(TOLERANCE_MAX_FLOOR).toBeGreaterThan(0.5); // stronger reach than before
+    expect(TOLERANCE_MAX_FLOOR).toBeLessThan(1); // but never degenerate
     expect(floorForTolerance(100)).toBeCloseTo(TOLERANCE_MAX_FLOOR, 12);
     expect(floorForTolerance(1e9)).toBeCloseTo(TOLERANCE_MAX_FLOOR, 12);
   });
 
-  it('is QUADRATIC, so the low end of the slider has fine control', () => {
-    // Density is heavy-tailed and gamma lifts the mids hard, so the useful
-    // floors are tiny; a linear map would waste most of the travel.
-    expect(floorForTolerance(50)).toBeCloseTo(TOLERANCE_MAX_FLOOR * 0.25, 12);
-    expect(floorForTolerance(10)).toBeCloseTo(TOLERANCE_MAX_FLOOR * 0.01, 12);
-    // Half the slider buys a quarter of the floor — the defining property.
-    expect(floorForTolerance(50)).toBeLessThan(floorForTolerance(100) / 2);
+  it('is eased (between linear and square) for mid-slider bite + low-end control', () => {
+    // Mid-slider sits between pure-quadratic (0.25 of the cap) and linear (0.5),
+    // so the middle of the travel actually cleans the field up — the old square
+    // wasted it. The low end still stays fine-grained.
+    const midFrac = floorForTolerance(50) / TOLERANCE_MAX_FLOOR;
+    expect(midFrac).toBeGreaterThan(0.25);
+    expect(midFrac).toBeLessThan(0.5);
+    expect(floorForTolerance(10)).toBeLessThan(floorForTolerance(50) / 3);
   });
 
   it('clamps negatives and refuses NaN (a NaN floor blanks the heatmap)', () => {

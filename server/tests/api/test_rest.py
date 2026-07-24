@@ -49,8 +49,15 @@ async def test_symbols_crypto_shortlist(client):
     r = await client.get("/api/symbols", params={"q": "btc"})
     entry = next(s for s in r.json()["symbols"] if s["symbol"] == "BTCUSDT")
     assert entry["market"] == "binance-spot"
-    assert entry["capability"] == {"depth": "L2", "tape": "tick"}
-    assert entry["note"] == "live in T9"
+    # GOAL 3: crypto capability now advertises exchange-true side + CVD.
+    assert entry["capability"] == {
+        "depth": "L2",
+        "tape": "tick",
+        "trade_side": "exchange",
+        "cvd": "exchange",
+    }
+    # Live enumeration is unavailable offline in the pinned deps -> curated note.
+    assert "curated shortlist" in entry["note"]
 
 
 async def test_symbols_equity_shortlist(client):
@@ -65,21 +72,28 @@ async def test_symbols_equity_shortlist(client):
 
 
 async def test_symbols_empty_q_returns_all(client):
+    from flowmap_server.data.universe import CRYPTO_SYMBOLS, EQUITY_TICKERS
+
     r = await client.get("/api/symbols")
     syms = r.json()["symbols"]
     names = {s["symbol"] for s in syms}
+    # The legacy shortlist symbols are all still present (backward compatible).
     assert {
         "SIM-DEMO",
         "BTCUSDT", "ETHUSDT", "SOLUSDT",
         "AAPL", "MSFT", "NVDA", "TSLA", "SPY",
     } <= names
-    assert len(syms) == 9  # 1 sim + 3 crypto + 5 equity at M1
+    # GOAL 2: the directory is now the FULL bundled universe.
+    assert len(syms) == 1 + len(CRYPTO_SYMBOLS) + len(EQUITY_TICKERS)
+    assert len(syms) > 100
 
 
 async def test_symbols_filter_case_insensitive_substring(client):
     r = await client.get("/api/symbols", params={"q": "Usdt"})
     names = {s["symbol"] for s in r.json()["symbols"]}
-    assert names == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    # Every USDT pair in the curated crypto list matches; the majors are in it.
+    assert {"BTCUSDT", "ETHUSDT", "SOLUSDT"} <= names
+    assert all(n.endswith("USDT") for n in names)
     r = await client.get("/api/symbols", params={"q": "zzz-no-match"})
     assert r.json()["symbols"] == []
 

@@ -7,7 +7,9 @@ import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
+import { CvdPane } from './ui/CvdPane';
 import { DomLadder } from './ui/DomLadder';
+import { LiveControls } from './ui/LiveControls';
 import { HeatLegend } from './ui/HeatLegend';
 import { PriceAxis } from './ui/PriceAxis';
 import { SettingsDrawer } from './ui/SettingsDrawer';
@@ -17,6 +19,7 @@ import { Timeline } from './ui/Timeline';
 import { TopBar } from './ui/TopBar';
 import type { SymbolSearchHandle } from './ui/SymbolSearch';
 import {
+  historyDepthCols,
   loadSettings,
   saveSettings,
   type FlowMapSettings,
@@ -148,6 +151,11 @@ export function App() {
     // Follow policy is remembered by the renderer (`want*`) so the lazy ring
     // creation on the first column cannot discard it.
     renderer.setFollowTime(settingsRef.current.follow);
+    // BOOT uses 'fit' on purpose: there is no user zoom to preserve yet, and
+    // auto-fit is the only thing that frames the book instead of showing the whole
+    // multi-thousand-row grid as a hairline. The "keeps your zoom" contract kicks
+    // in AFTER the user has a scale — the settings toggle and the axis chip enable
+    // 'track' (below / PriceAxis.tsx), and a price zoom promotes 'fit'→'track'.
     renderer.setPriceFollow(settingsRef.current.followPrice ? 'fit' : 'off');
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
@@ -217,8 +225,17 @@ export function App() {
       }
       if (settings.followPrice !== prevSettingsRef.current.followPrice) {
         const wantOn = settings.followPrice;
-        if (wantOn && r.priceFollow === 'off') r.setPriceFollow('fit');
+        // 'track' keeps the user's zoom (recentre-on-drift); never 'fit', which
+        // re-frames to the book extent and discards the chosen scale.
+        if (wantOn && r.priceFollow === 'off') r.setPriceFollow('track');
         else if (!wantOn && r.priceFollow !== 'off') r.setPriceFollow('off');
+      }
+      // A mid-session history-depth change applies LIVE (every other drawer knob
+      // does): pull the newly-chosen span now, bounded to the ring by the prefetch
+      // guard. A decrease is a no-op — already-loaded history stays resident.
+      if (settings.historyDepth !== prevSettingsRef.current.historyDepth && settings.historyDepth !== 'off') {
+        const tl = r.timeline();
+        if (tl?.timeBase) r.prefetchHistory(historyDepthCols(settings.historyDepth, tl.timeBase.dtNs));
       }
     }
     prevSettingsRef.current = settings;
@@ -245,6 +262,31 @@ export function App() {
     if (prev === null || prev === subKey) return;
     rendererRef.current?.resetForSession();
     bookStore.resetForSession();
+  }, [subKey]);
+
+  // --- first-launch history prefetch (once per session) ------------------------
+  // When the chosen depth is not 'off', wait for the first column (so we know the
+  // epoch's dt), translate the wall-clock depth to columns, and eagerly pull that
+  // much history into the ring so scroll-back is instant. Runs once per session.
+  useEffect(() => {
+    // Skip inside the e2e test harnesses (?scrollback / ?perf / …): those drive
+    // history + residency deterministically, and an eager auto-prefetch would
+    // pollute their request-count / LRU assertions.
+    const p = new URLSearchParams(window.location.search);
+    if (['scrollback', 'perf', 'normalize', 'overlays', 'panels'].some((m) => p.get(m) === '1')) return;
+    let done = false;
+    const id = window.setInterval(() => {
+      if (done) return;
+      const tl = rendererRef.current?.timeline();
+      if (!tl || !tl.timeBase) return; // wait for the first data
+      // Read the depth LIVE (not captured at setup) so a choice made during the
+      // boot window before the first column takes effect.
+      const depth = settingsRef.current.historyDepth;
+      if (depth !== 'off') rendererRef.current?.prefetchHistory(historyDepthCols(depth, tl.timeBase.dtNs));
+      done = true;
+      window.clearInterval(id);
+    }, 400);
+    return () => window.clearInterval(id);
   }, [subKey]);
 
   // --- stream clock (≤1 Hz) -----------------------------------------------------
@@ -315,6 +357,13 @@ export function App() {
     );
   }, []);
 
+  // Re-enable price tracking WITHOUT re-fitting: 'track' keeps the user's zoom
+  // and only recentres on drift (the non-destructive counterpart to GO LIVE).
+  const onTrackPrice = useCallback(() => {
+    rendererRef.current?.setPriceFollow('track');
+    setSettings((prev) => (prev.followPrice ? prev : { ...prev, followPrice: true }));
+  }, []);
+
   const toggleRail = useCallback(
     () => setSettings((prev) => ({ ...prev, railVisible: !prev.railVisible })),
     [],
@@ -333,14 +382,25 @@ export function App() {
       />
 
       <div className="workspace">
-        <div className="stage">
+        <div className={`stage${settings.overlays.cvd ? ' stage--cvd' : ''}`}>
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
             <HeatLegend colormap={settings.colormap} />
             <ClosedBanner />
+            <LiveControls
+              rendererRef={rendererRef}
+              onGoLive={onGoLive}
+              onTrackPrice={onTrackPrice}
+            />
           </div>
           <PriceAxis canvasRef={priceAxisRef} rendererRef={rendererRef} />
+          {settings.overlays.cvd && (
+            <>
+              <CvdPane rendererRef={rendererRef} />
+              <div className="cvd-corner" aria-hidden="true" />
+            </>
+          )}
           <TimeAxis canvasRef={timeAxisRef} />
           <div className="stage__corner" aria-hidden="true" />
         </div>

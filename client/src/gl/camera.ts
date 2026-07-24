@@ -101,14 +101,35 @@ export interface CameraLimits {
   rows: number;
   /** Smallest time span — "can't zoom past 1 col". */
   minColSpan: number;
-  /** Largest time span — "can't zoom out beyond a max span". */
+  /**
+   * FRAMING cap — the widest span auto-fit / go-live / reset will FRAME to. Kept
+   * at the ring's full-res capacity so a programmatic reframe never asks for more
+   * columns than are GPU-resident.
+   */
   maxColSpan: number;
+  /**
+   * USER ZOOM-OUT cap — how far a manual time-zoom gesture may widen the span.
+   * Deliberately MUCH larger than {@link maxColSpan} (and the ring), so scrolling
+   * the wheel out never hits an artificial wall: past the resident window the
+   * shader simply paints background / SUM-mips, and the history backfill fills it
+   * in. Decoupling this from the ring capacity costs no GPU memory (it is only a
+   * clamp bound, not an allocation).
+   */
+  maxColSpanZoom: number;
 }
 
 /** Smallest time span in columns (one column fills the whole viewport). */
 export const MIN_COL_SPAN = 1;
 /** Smallest price span in rows (one price level fills the whole viewport). */
 export const MIN_ROW_SPAN = 1;
+/**
+ * Absolute ceiling on the USER time zoom-out (columns across the viewport).
+ * ~1.05M columns is effectively "infinite" for an order-flow chart (days-to-
+ * months of history in one view depending on the epoch cadence) while staying
+ * well inside f32's exact-integer range (2^24), so column indices and the
+ * colScale uniform never lose precision.
+ */
+export const MAX_COL_SPAN = 1_048_576;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -116,11 +137,14 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /** Build limits from the ring geometry: rows tall, up to `capacityCols` wide. */
 export function limitsFor(rows: number, capacityCols: number): CameraLimits {
+  const framing = Math.max(MIN_COL_SPAN, capacityCols);
   return {
     rows,
     minColSpan: MIN_COL_SPAN,
-    // Allow zooming out to (a little past) the whole ring; never below 1.
-    maxColSpan: Math.max(MIN_COL_SPAN, capacityCols),
+    // Framing (auto-fit / reset) never exceeds the full-res ring.
+    maxColSpan: framing,
+    // Manual zoom-out may go far past the ring — no wall.
+    maxColSpanZoom: Math.max(framing, MAX_COL_SPAN),
   };
 }
 
@@ -153,7 +177,9 @@ export function clampCamera(s: CameraState, limits: CameraLimits): CameraState {
   const bounds = rowCenterBounds(rowSpan, limits);
   return {
     colCenter: s.colCenter,
-    colSpan: clamp(s.colSpan, limits.minColSpan, limits.maxColSpan),
+    // Zoom-out bound, not the framing bound: a state produced by fit/reset is
+    // already ≤ maxColSpan ≤ maxColSpanZoom, so this never shrinks a framed span.
+    colSpan: clamp(s.colSpan, limits.minColSpan, limits.maxColSpanZoom),
     rowCenter: clamp(s.rowCenter, bounds.lo, bounds.hi),
     rowSpan,
     followTime: s.followTime,
@@ -228,7 +254,7 @@ export function zoomTime(
   factor: number,
   anchorCol: number,
 ): CameraState {
-  const newSpan = clamp(s.colSpan * factor, limits.minColSpan, limits.maxColSpan);
+  const newSpan = clamp(s.colSpan * factor, limits.minColSpan, limits.maxColSpanZoom);
   const eff = newSpan / s.colSpan;
   const colCenter = anchorCol + eff * (s.colCenter - anchorCol);
   return clampCamera(applyKill({ ...s, colSpan: newSpan, colCenter }, KILL_TIME), limits);

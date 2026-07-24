@@ -48,6 +48,37 @@ export type PriceBand = 'native' | 'wide' | 'full' | 'deep';
 
 export const PRICE_BANDS: readonly PriceBand[] = ['native', 'wide', 'full', 'deep'] as const;
 
+/**
+ * First-launch history depth — how much past data to eagerly pull into the chart
+ * on connect (the server seeds a deep tail; this chooses how much of it to load
+ * up front for instant scroll-back). A small, plain enum, not a free number.
+ *   - `off` — none; history streams in lazily only as you scroll back.
+ *   - `1h` / `4h` / `1d` — that much wall-clock time, converted to columns via the
+ *     epoch's tick cadence.
+ *   - `max` — as far back as the server retains.
+ */
+export type HistoryDepth = 'off' | '1h' | '4h' | '1d' | 'max';
+
+export const HISTORY_DEPTHS: readonly HistoryDepth[] = ['off', '1h', '4h', '1d', 'max'] as const;
+
+const HISTORY_DEPTH_NS: Record<Exclude<HistoryDepth, 'off' | 'max'>, number> = {
+  '1h': 3_600e9,
+  '4h': 14_400e9,
+  '1d': 86_400e9,
+};
+
+/**
+ * Target column count for a history depth given the epoch's `dtNs` (ns per
+ * column). `off` → 0 (no prefetch); `max` → a large cap the prefetch clamps to
+ * available history + the ring budget; durations → wall-clock / dtNs.
+ */
+export function historyDepthCols(depth: HistoryDepth, dtNs: number): number {
+  if (depth === 'off') return 0;
+  if (depth === 'max') return 1_000_000;
+  const dt = dtNs > 0 ? dtNs : 250e6;
+  return Math.max(1, Math.round(HISTORY_DEPTH_NS[depth] / dt));
+}
+
 export interface FlowMapSettings {
   /** Heatmap display contrast 0–100 (drives the perceptual gamma, §8.3). */
   contrast: number;
@@ -67,6 +98,8 @@ export interface FlowMapSettings {
   followPrice: boolean;
   /** Server price-grid coverage. Changing it re-subscribes. */
   priceBand: PriceBand;
+  /** How much history to eagerly load into the chart on first launch. */
+  historyDepth: HistoryDepth;
   /** Right rail (DOM ladder + tape) visibility. */
   railVisible: boolean;
   /** Which heatmap overlays are on. */
@@ -84,7 +117,12 @@ export const DEFAULT_SETTINGS: FlowMapSettings = {
   bubbleMinSize: 0,
   follow: true,
   followPrice: true,
-  priceBand: 'native',
+  // `deep` by default so price is NOT boxed into the ±~1% native linear grid:
+  // the hybrid scale keeps the native-tick ladder in the tradeable core AND
+  // reaches −99% / +1000%, so zooming price out actually reveals the whole range
+  // instead of hitting a wall. (Native stays selectable in the drawer.)
+  priceBand: 'deep',
+  historyDepth: '1h',
   railVisible: true,
   overlays: { ...DEFAULT_OVERLAY_VISIBILITY },
 };
@@ -125,6 +163,9 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
     priceBand: PRICE_BANDS.includes(o.priceBand as PriceBand)
       ? (o.priceBand as PriceBand)
       : DEFAULT_SETTINGS.priceBand,
+    historyDepth: HISTORY_DEPTHS.includes(o.historyDepth as HistoryDepth)
+      ? (o.historyDepth as HistoryDepth)
+      : DEFAULT_SETTINGS.historyDepth,
     railVisible: typeof o.railVisible === 'boolean' ? o.railVisible : DEFAULT_SETTINGS.railVisible,
     overlays,
   };

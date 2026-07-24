@@ -19,8 +19,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from flowmap_server import __version__
-from flowmap_server.api import rest, ws
+from flowmap_server.api import discovery, rest, ws
+from flowmap_server.api.market_cache import (
+    MarketDataCache,
+    default_movers_fn,
+    default_quote_fn,
+)
 from flowmap_server.config import Config
+from flowmap_server.core.backfill import default_backfill_fn
 from flowmap_server.core.record import Recorder
 from flowmap_server.core.session import SessionManager
 from flowmap_server.feeds.base import Feed
@@ -70,7 +76,11 @@ def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
     return factory
 
 
-def create_app(cfg: Config, manager: SessionManager | None = None) -> FastAPI:
+def create_app(
+    cfg: Config,
+    manager: SessionManager | None = None,
+    market_cache: MarketDataCache | None = None,
+) -> FastAPI:
     if manager is None:
         recorder = Recorder(
             # expanduser defensively: from_env already expands, but a Config
@@ -80,11 +90,25 @@ def create_app(cfg: Config, manager: SessionManager | None = None) -> FastAPI:
             enabled=cfg.recording_enabled,
         )
         manager = SessionManager(
-            cfg, feed_factory=_server_feed_factory(cfg), recorder=recorder
+            cfg,
+            feed_factory=_server_feed_factory(cfg),
+            recorder=recorder,
+            # First-launch history backfill (GOAL 1). The network seam dispatches
+            # crypto -> klines, equity -> Yahoo, sim -> no-op; tests inject their
+            # own manager (no backfill).
+            backfill_fn=default_backfill_fn,
+        )
+    # Discovery cache (GOAL 2): all movers/quote network lives behind this
+    # TTL-debounced cache. Tests inject a canned cache; the default wires the live
+    # provider seams (only called when /api/movers or /api/quote is hit).
+    if market_cache is None:
+        market_cache = MarketDataCache(
+            quote_fn=default_quote_fn, movers_fn=default_movers_fn
         )
     app = FastAPI(title="flowmap-server", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.cfg = cfg
     app.state.manager = manager
+    app.state.market_cache = market_cache
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(_ALLOWED_ORIGINS),
@@ -92,5 +116,6 @@ def create_app(cfg: Config, manager: SessionManager | None = None) -> FastAPI:
         allow_headers=[],
     )
     app.include_router(rest.router)
+    app.include_router(discovery.router)
     app.include_router(ws.router)
     return app

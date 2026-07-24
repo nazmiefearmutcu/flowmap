@@ -316,6 +316,8 @@ class CryptoFeed:
             "depth": "L2",
             "tape": "tick",
             "trade_side": "exchange",
+            # Exchange-true aggressor side -> honest per-bar CVD (spec §7 parity).
+            "cvd": "exchange",
             "markers": markers,
         }
 
