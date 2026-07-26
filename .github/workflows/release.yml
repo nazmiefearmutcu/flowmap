@@ -176,22 +176,35 @@ jobs:
         working-directory: app/src-tauri
         run: cargo tauri icon ../icons/icon-1024.png
 
-      - name: Build Windows/Linux installers (cargo tauri build)
-        if: matrix.kind != 'macos'
+      - name: Build Windows installers (cargo tauri build)
+        if: matrix.kind == 'windows'
+        working-directory: app/src-tauri
+        run: cargo tauri build
+
+      # The .deb is the SUPPORTED Linux installer and must succeed.
+      - name: Build Linux .deb
+        if: matrix.kind == 'linux'
+        working-directory: app/src-tauri
+        run: cargo tauri build --bundles deb
+
+      # The AppImage is a best-effort portable EXTRA. linuxdeploy has to pack the
+      # embedded ~500 MB CPython runtime into a squashfs image and fails on it
+      # with an opaque "failed to run linuxdeploy" (Tauri swallows its stderr),
+      # while the .deb from the same build is fine. Keeping this non-blocking
+      # means a linuxdeploy problem can never hold back the whole release; the
+      # upload step ships the AppImage only if it was actually produced.
+      #   APPIMAGE_EXTRACT_AND_RUN — linuxdeploy and its plugins ARE AppImages
+      #     and mount themselves via FUSE, which the runner cannot provide.
+      #   NO_STRIP — linuxdeploy strips every bundled shared object; the CPython
+      #     runtime has thousands and one unstrippable file aborts the bundle.
+      - name: Build Linux AppImage (best-effort)
+        if: matrix.kind == 'linux'
+        continue-on-error: true
         working-directory: app/src-tauri
         env:
-          # AppImage packaging notes (Linux only; both are no-ops on Windows):
-          #   APPIMAGE_EXTRACT_AND_RUN — linuxdeploy and its plugins ship AS
-          #     AppImages, which mount themselves via FUSE. GitHub's Ubuntu
-          #     runners have no usable FUSE mount for them, so linuxdeploy dies
-          #     with a bare "failed to run linuxdeploy". This makes them
-          #     self-extract and run instead of mounting.
-          #   NO_STRIP — linuxdeploy strips every shared object it bundles. Our
-          #     payload embeds a full ~500 MB CPython runtime with thousands of
-          #     .so files, and a single unstrippable one aborts the bundle.
           APPIMAGE_EXTRACT_AND_RUN: 1
           NO_STRIP: true
-        run: cargo tauri build
+        run: cargo tauri build --bundles appimage
 
       # --- Per-OS smoke test: import every server dep from the BUNDLED
       #     interpreter, then boot the server and poll /api/health (mirrors the
@@ -232,7 +245,9 @@ jobs:
           case "$KIND" in
             macos)   FILES=$(ls "$B"/dmg/*.dmg) ;;
             windows) FILES=$(ls "$B"/msi/*.msi "$B"/nsis/*-setup.exe) ;;
-            linux)   FILES=$(ls "$B"/deb/*.deb "$B"/appimage/*.AppImage) ;;
+            # The .deb is required; the AppImage is best-effort (see the build
+            # step above), so glob it separately and tolerate its absence.
+            linux)   FILES=$(ls "$B"/deb/*.deb; ls "$B"/appimage/*.AppImage 2>/dev/null || true) ;;
           esac
           echo "uploading:"; echo "$FILES"
           # shellcheck disable=SC2086
