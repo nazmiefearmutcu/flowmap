@@ -37,7 +37,8 @@ describe('OverlayToggles', () => {
       <OverlayToggles visibility={DEFAULT_OVERLAY_VISIBILITY} onToggle={() => {}} />,
     );
     const buttons = container.querySelectorAll('button.overlay-toggle');
-    expect(buttons.length).toBe(6);
+    // One chip per toggleable overlay (kept in lockstep with the visibility set).
+    expect(buttons.length).toBe(Object.keys(DEFAULT_OVERLAY_VISIBILITY).length);
     for (const btn of buttons) {
       expect(btn.getAttribute('aria-pressed')).toBe(String(DEFAULT_OVERLAY_VISIBILITY[
         (btn.textContent === 'BBO'

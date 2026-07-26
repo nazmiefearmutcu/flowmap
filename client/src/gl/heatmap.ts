@@ -64,33 +64,46 @@ export function gammaForContrast(contrast: number): number {
 export const DEFAULT_CONTRAST = 40;
 
 /**
- * Largest black point the Tolerance slider can reach. Capped well below 1: at
- * `floor → 1` the `1/(1-floor)` re-expansion degenerates and even the p99 white
- * point maps to LUT entry 0, i.e. the whole heatmap goes black — which breaks
- * the "both endpoints stay fixed" promise rather than implementing it.
+ * Largest black point the Tolerance slider can reach. Raised from 0.5 to 0.85 so
+ * the control has real reach — at the top of the slider it hides sub-threshold
+ * density up to 85% of the white point, cutting a genuinely noisy field down to
+ * just the walls. Still capped well below 1: at `floor → 1` the `1/(1-floor)`
+ * re-expansion (scale = 6.67× here) degenerates and even the p99 white point
+ * maps to LUT entry 0 — a black screen — which would break the "both endpoints
+ * stay fixed" promise rather than implement it.
  */
-export const TOLERANCE_MAX_FLOOR = 0.5;
+export const TOLERANCE_MAX_FLOOR = 0.85;
 
-/** Default Tolerance slider position. 0 = off, an exact algebraic no-op. */
-export const DEFAULT_TOLERANCE = 0;
+/** Curve exponent for the slider → floor map. Between linear (1) and the old
+ *  square (2): eased enough to keep fine control at the low end, but with real
+ *  bite through the mid-slider where the field actually gets cleaned up. */
+export const TOLERANCE_CURVE = 1.4;
+
+/**
+ * Default Tolerance slider position. A gentle non-zero denoise (not the old
+ * hard 0) so the app opens with the faintest sub-threshold specks already
+ * suppressed and the tradeable liquidity reads cleaner out of the box. Slider 0
+ * remains an exact algebraic no-op for anyone who wants every speck back.
+ */
+export const DEFAULT_TOLERANCE = 15;
 
 /**
  * Map a 0–100 "Tolerance" slider to the shader's black point.
  *
- * QUADRATIC, not linear, because the useful floors are tiny: order-flow density
- * is heavy-tailed and the default gamma ≈0.46 lifts the mid-field hard, so a
- * normalized density of just 0.01 already renders as visible dark indigo
- * (0.01^0.46 ≈ 0.11 → LUT index ~29). A linear 0→0.5 map would spend most of the
- * slider in "everything is already gone" territory; the square gives fine
- * control where it matters and still reaches the cap.
+ * Eased (exponent {@link TOLERANCE_CURVE}), not linear, because the useful floors
+ * are small: order-flow density is heavy-tailed and the default gamma ≈0.46 lifts
+ * the mid-field hard, so a normalized density of just 0.01 already renders as
+ * visible dark indigo. The eased curve gives fine control at the low end and
+ * meaningful bite through the middle, reaching the cap at 100.
  *
  * Non-finite input yields 0 rather than NaN — a NaN floor would blank the entire
  * heatmap, and this is reachable from `window.__flowmapLive` in dev/e2e builds.
+ * Slider 0 → floor 0 exactly (an algebraic no-op), preserved by construction.
  */
 export function floorForTolerance(tolerance: number): number {
   if (!Number.isFinite(tolerance)) return 0;
   const t = Math.min(100, Math.max(0, tolerance)) / 100;
-  return TOLERANCE_MAX_FLOOR * t * t;
+  return TOLERANCE_MAX_FLOOR * Math.pow(t, TOLERANCE_CURVE);
 }
 
 /** The mip level + tap geometry to sample this frame (see {@link selectLevel}). */

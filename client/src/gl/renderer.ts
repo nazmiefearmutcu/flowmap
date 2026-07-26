@@ -581,6 +581,32 @@ export class Renderer {
     };
   }
 
+  /**
+   * The CVD (cumulative volume delta) points inside the given absolute-column
+   * span, in ascending column order — for the lower CVD pane, which maps them
+   * through the SAME `timeline()` transform as the heatmap so it stays locked
+   * horizontally under pan/zoom/scroll-back. Empty before any bar arrives.
+   */
+  cvdSeries(loCol: number, hiCol: number): Array<{ col: number; cvd: number }> {
+    return this.overlays.cvdSeries(loCol, hiCol);
+  }
+
+  /** Cumulative CVD at one column (O(1)) — the CVD pane folds the newest column's
+   *  value into its repaint signature so the live tip tracks a forming bar. */
+  cvdValueAt(colSeq: number): number {
+    return this.overlays.cvdValueAt(colSeq);
+  }
+
+  /**
+   * First-launch history depth: eagerly pull up to `targetCols` columns of
+   * history into the ring so the chosen span is instantly available on scroll-back
+   * (the server seeds the deep tail; this loads it). One-shot and bounded — safe
+   * because the ring is nearly empty at launch. No-op when history isn't ready.
+   */
+  prefetchHistory(targetCols: number): void {
+    void this.history?.prefetch(targetCols);
+  }
+
   /** `Space` (live mode) / `F`: toggle auto-follow of the live right edge. */
   toggleFollow(): void {
     this.controller.toggleFollow();
@@ -1000,7 +1026,16 @@ export class Renderer {
       residentRange: () => this.ring?.residentRange() ?? null,
       budgetCols: () => this.ring?.budgetCols ?? 0,
       dtNs: () => this.currentDtNs(),
-      onSpliced: () => {
+      onSpliced: (resp) => {
+        // Backfilled bars carry the CLOSE (price line) and cumulative CVD for the
+        // scrolled-back region. Without routing them through the same sink as live
+        // bars, the price line and CVD pane go BLANK over backfilled history while
+        // the heatmap shows liquidity — the exact left-truncation the price line
+        // was added to cure. The depth-splice loop already ran (so overlays.prune
+        // to [oldest, newest] has happened); these bars fall inside that window and
+        // survive. Markers likewise, for parity with the live stream.
+        for (const bar of resp.bar_cols) this.overlays.onBar(bar);
+        for (const marker of resp.markers) this.overlays.onMarker(marker);
         this.dirty = true;
         // Re-arm the per-frame guard: if the visible range still isn't fully
         // resident (a wide pan needs several pages), the next frame fetches the

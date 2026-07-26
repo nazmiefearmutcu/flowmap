@@ -211,6 +211,44 @@ export class HistoryLoader {
     }
   }
 
+  /**
+   * One-time eager backfill (the first-launch "history depth" setting): page
+   * history in until `targetCols` columns are resident or history is exhausted.
+   *
+   * The requested depth is CLAMPED to the ring budget minus a headroom reserve
+   * (the same protection {@link ensureVisible} gives itself): the tile ring only
+   * holds `budgetCols` columns, so pulling more would slide the window backward
+   * and physically overwrite the live edge. With the clamp the loop terminates
+   * before the ring fills, leaving the newest/live columns resident. Paged and
+   * sequential (respects the single-in-flight rule); a hard page cap stops it from
+   * ever spinning. Yields immediately if a scroll-back fetch is already active.
+   */
+  async prefetch(targetCols: number): Promise<void> {
+    if (!(targetCols > 0)) return;
+    // Never ask for more than the ring can hold alongside a resident live window.
+    const budget = this.deps.budgetCols();
+    const effTarget = Math.min(targetCols, Math.max(1, budget - RESIDENT_HEADROOM_COLS));
+    for (let page = 0; page < 64; page++) {
+      if (this.startOfHistoryFlag) return;
+      if (this.inFlightBeforeT !== null) return; // a scroll-back fetch owns the channel
+      const range = this.deps.residentRange();
+      if (!range) return;
+      if (range.count >= effTarget) return; // enough loaded (and ring-safe)
+      if (range.oldest <= 0) {
+        this.startOfHistoryFlag = true;
+        return;
+      }
+      const beforeT = this.beforeTFor(range.oldest);
+      if (beforeT === null) return;
+      if (this.oldestAvailableT0 > 0n && beforeT <= this.oldestAvailableT0) {
+        this.startOfHistoryFlag = true;
+        return;
+      }
+      const n = Math.max(1, Math.min(HISTORY_PAGE_COLS, Math.ceil(effTarget - range.count)));
+      await this.fetch(beforeT, n);
+    }
+  }
+
   /** Clear scroll-back state (e.g. on go-live / re-subscribe / context restore). */
   reset(): void {
     this.inFlightBeforeT = null;

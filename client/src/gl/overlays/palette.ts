@@ -18,17 +18,24 @@ function css(r: number, g: number, b: number, a = 1): string {
 
 export const OVERLAY = {
   /** Aggressive buy (hits the ask). App accent teal. */
-  buy: { gl: rgba(31, 182, 166, 0.85), css: css(31, 182, 166) },
+  buy: { gl: rgba(31, 182, 166, 0.95), css: css(31, 182, 166) },
   /** Aggressive sell (hits the bid). */
-  sell: { gl: rgba(224, 84, 84, 0.85), css: css(224, 84, 84) },
+  sell: { gl: rgba(224, 84, 84, 0.95), css: css(224, 84, 84) },
   /** Unknown-aggressor trade (equity keyless / N/A side). Neutral grey. */
-  unknown: { gl: rgba(150, 160, 176, 0.7), css: css(150, 160, 176) },
+  unknown: { gl: rgba(150, 160, 176, 0.8), css: css(150, 160, 176) },
   /** Best-bid line + badge. */
-  bid: { gl: rgba(31, 182, 166, 0.9), css: css(31, 182, 166) },
+  bid: { gl: rgba(31, 182, 166, 0.95), css: css(31, 182, 166) },
   /** Best-ask line + badge. */
-  ask: { gl: rgba(224, 84, 84, 0.9), css: css(224, 84, 84) },
+  ask: { gl: rgba(224, 84, 84, 0.95), css: css(224, 84, 84) },
+  /** Last-price line over the heatmap — bright near-white so it reads as THE
+   *  price, clearly apart from the colored density, VWAP (violet) and BBO. */
+  price: { gl: rgba(245, 248, 252, 0.98), css: css(245, 248, 252) },
+  /** Soft glow drawn under the price line to fatten it without hard edges. */
+  priceGlow: { gl: rgba(245, 248, 252, 0.22), css: css(245, 248, 252, 0.22) },
   /** Session VWAP polyline — distinct violet so it reads apart from buy/sell. */
   vwap: { gl: rgba(196, 142, 255, 0.95), css: css(196, 142, 255) },
+  /** CVD (cumulative volume delta) line in the lower pane. Amber-gold. */
+  cvd: { gl: rgba(232, 176, 74, 0.98), css: css(232, 176, 74) },
   /** Volume profile bars. */
   profile: { gl: rgba(120, 150, 200, 0.35), css: css(120, 150, 200) },
   /** Point-of-control (max) profile row. */

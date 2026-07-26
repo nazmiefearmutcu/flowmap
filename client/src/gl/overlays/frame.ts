@@ -36,12 +36,22 @@ export interface OverlayFrame {
 
 /** The overlays a user can toggle; default all on except the profile. */
 export interface OverlayVisibility {
+  /** Trade bubbles (volume prints). */
   bubbles: boolean;
+  /** Best bid/ask lines + badges. */
   bbo: boolean;
+  /** Session VWAP polyline. */
   vwap: boolean;
+  /** Volume-by-price profile. */
   profile: boolean;
+  /** Event markers (liquidations / halts / gaps). */
   markers: boolean;
+  /** Price/time axis ticks + gridlines. */
   axes: boolean;
+  /** Persistent last-price line over the heatmap. */
+  price: boolean;
+  /** CVD (cumulative volume delta) lower pane. */
+  cvd: boolean;
 }
 
 export const DEFAULT_OVERLAY_VISIBILITY: OverlayVisibility = {
@@ -51,4 +61,6 @@ export const DEFAULT_OVERLAY_VISIBILITY: OverlayVisibility = {
   profile: false,
   markers: true,
   axes: true,
+  price: true,
+  cvd: true,
 };

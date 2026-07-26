@@ -1,17 +1,37 @@
 #!/usr/bin/env bash
 #
 # bundle-python.sh — build a relocatable, self-contained Python runtime that runs
-# the FlowMap server, for embedding in FlowMap.app as a Tauri resource.
+# the FlowMap server, for embedding in the FlowMap desktop app as a Tauri
+# resource. Cross-platform: macOS (arm64/intel), Windows (x86_64) and Linux
+# (x86_64/arm64).
 #
-# Strategy: download astral's `python-build-standalone` CPython 3.13
-# (aarch64-apple-darwin, the `install_only` tarball — already relocatable) into
-# app/src-tauri/resources/pyruntime, then install the flowmap-server + its deps
-# INTO that runtime's own site-packages so the whole tree is self-contained.
-# Dependencies (incl. the git-pinned crypcodile/stockodile) come from the
-# server's uv.lock so the bundle matches the tested resolution exactly.
+# Strategy: download astral's `python-build-standalone` CPython 3.13 for the
+# requested target triple (the `install_only` tarball — already relocatable)
+# into app/src-tauri/resources/pyruntime, then install the flowmap-server + its
+# deps INTO that runtime's own site-packages so the whole tree is
+# self-contained. Dependencies (incl. the git-pinned crypcodile/stockodile) come
+# from the server's uv.lock so the bundle matches the tested resolution exactly.
 #
-# Idempotent: re-running rebuilds the runtime from a cached tarball. Pass
-# --clean to also drop the cached tarball.
+# Because native wheels (numpy/polars/msgspec/curl-cffi …) are platform-specific,
+# each OS's runtime MUST be built on that OS — this is why the release workflow
+# runs this script once per matrix runner rather than cross-building.
+#
+# Usage:
+#   bundle-python.sh [TARGET_TRIPLE] [--clean]
+#
+#   TARGET_TRIPLE (default: aarch64-apple-darwin — keeps the historic macOS
+#   arm64 behavior when invoked with no arguments). Supported:
+#     aarch64-apple-darwin      x86_64-apple-darwin
+#     x86_64-pc-windows-msvc
+#     x86_64-unknown-linux-gnu  aarch64-unknown-linux-gnu
+#
+#   --clean   also drop the cached tarball before rebuilding.
+#
+# On Windows this script is designed to run under Git-Bash (the shell that ships
+# with GitHub's windows runners); paths handed to the native `uv`/`python.exe`
+# executables are converted to native form via `cygpath`.
+#
+# Idempotent: re-running rebuilds the runtime from a cached tarball.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,24 +43,61 @@ CACHE_DIR="$RES_DIR/.cache"
 PBS_TAG="20260623"          # python-build-standalone release tag
 PY_SERIES="3.13"           # CPython series to bundle
 
+# --- Parse args (triple and/or --clean, order-independent) --------------------
+TRIPLE=""
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    --clean) CLEAN=1 ;;
+    -*)      echo "ERROR: unknown flag '$arg'" >&2; exit 2 ;;
+    *)
+      if [[ -n "$TRIPLE" ]]; then
+        echo "ERROR: multiple target triples given ('$TRIPLE', '$arg')" >&2; exit 2
+      fi
+      TRIPLE="$arg"
+      ;;
+  esac
+done
+TRIPLE="${TRIPLE:-aarch64-apple-darwin}"
+
+case "$TRIPLE" in
+  *windows*) OS_KIND="windows" ;;
+  *apple*)   OS_KIND="macos" ;;
+  *linux*)   OS_KIND="linux" ;;
+  *) echo "ERROR: unrecognized/unsupported target triple '$TRIPLE'" >&2; exit 2 ;;
+esac
+
+# Convert a path to the native form the platform's tools expect. On Windows +
+# Git-Bash the native `uv`/`python.exe` need Windows paths (C:\…), not the MSYS
+# `/c/…` form; everywhere else this is the identity function.
+native_path() {
+  if [[ "$OS_KIND" == "windows" ]] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 echo "==> FlowMap Python runtime bundler"
+echo "    triple:    $TRIPLE ($OS_KIND)"
 echo "    repo:      $REPO_ROOT"
 echo "    pyruntime: $PYRUNTIME"
 
-if [[ "${1:-}" == "--clean" ]]; then
+if [[ "$CLEAN" == "1" ]]; then
   rm -rf "$CACHE_DIR"
 fi
 mkdir -p "$CACHE_DIR"
 
 # --- 1. Resolve + download the install_only tarball ---------------------------
 # Match the GitHub download URL for the plain (non-freethreaded, non-stripped)
-# install_only tarball. The `+` in the version is URL-encoded as `%2B`.
-ASSET_RE="cpython-${PY_SERIES}\.[0-9]+(%2B|\+)${PBS_TAG}-aarch64-apple-darwin-install_only\.tar\.gz"
+# install_only tarball for the requested triple. The `+` in the version is
+# URL-encoded as `%2B`.
+ASSET_RE="cpython-${PY_SERIES}\.[0-9]+(%2B|\+)${PBS_TAG}-${TRIPLE}-install_only\.tar\.gz"
 echo "==> Resolving python-build-standalone asset (tag $PBS_TAG)"
 ASSET_URL="$(curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/${PBS_TAG}" \
   | grep -oE "https://github.com/[^\"]*${ASSET_RE}" | grep -v freethreaded | grep -v stripped | head -1)"
 if [[ -z "$ASSET_URL" ]]; then
-  echo "ERROR: could not resolve a ${PY_SERIES} aarch64 install_only asset for tag ${PBS_TAG}" >&2
+  echo "ERROR: could not resolve a ${PY_SERIES} ${TRIPLE} install_only asset for tag ${PBS_TAG}" >&2
   exit 1
 fi
 TARBALL="$CACHE_DIR/$(basename "$ASSET_URL")"
@@ -56,14 +113,23 @@ fi
 echo "==> Extracting runtime"
 rm -rf "$PYRUNTIME"
 mkdir -p "$PYRUNTIME"
-# The tarball extracts to a top-level `python/` dir; flatten it into pyruntime.
+# The tarball extracts to a top-level `python/` dir (all platforms); flatten it
+# into pyruntime.
 TMP_EXTRACT="$(mktemp -d)"
 tar -xzf "$TARBALL" -C "$TMP_EXTRACT"
 mv "$TMP_EXTRACT/python/"* "$PYRUNTIME/"
 rm -rf "$TMP_EXTRACT"
 
-PY="$PYRUNTIME/bin/python3.13"
-[[ -x "$PY" ]] || PY="$PYRUNTIME/bin/python3"
+# Interpreter location differs per platform: Windows PBS puts `python.exe` at the
+# runtime root (no bin/); macOS/Linux put it under bin/.
+if [[ "$OS_KIND" == "windows" ]]; then
+  PY="$PYRUNTIME/python.exe"
+  [[ -e "$PY" ]] || PY="$PYRUNTIME/python3.13.exe"
+else
+  PY="$PYRUNTIME/bin/python3.13"
+  [[ -x "$PY" ]] || PY="$PYRUNTIME/bin/python3"
+fi
+[[ -e "$PY" ]] || { echo "ERROR: interpreter not found in $PYRUNTIME" >&2; exit 1; }
 echo "    interpreter: $PY"
 "$PY" -c "import sys; print('    python', sys.version.split()[0])"
 
@@ -76,22 +142,36 @@ fi
 # --- 3. Install the server + its deps into the runtime ------------------------
 echo "==> Exporting locked requirements from server/uv.lock"
 REQS="$CACHE_DIR/flowmap-reqs.txt"
-( cd "$SERVER_DIR" && uv export --frozen --no-dev --no-emit-project --no-hashes -o "$REQS" )
+( cd "$SERVER_DIR" && uv export --frozen --no-dev --no-emit-project --no-hashes -o "$(native_path "$REQS")" )
 echo "    $(grep -cvE '^\s*(#|$)' "$REQS") requirement lines"
 
 echo "==> Installing dependencies into the runtime (this fetches native wheels)"
-"$PY" -m pip install --no-warn-script-location --disable-pip-version-check -r "$REQS"
+"$PY" -m pip install --no-warn-script-location --disable-pip-version-check -r "$(native_path "$REQS")"
 
 echo "==> Building + installing flowmap-server wheel"
 WHEEL_DIR="$CACHE_DIR/wheel"
 rm -rf "$WHEEL_DIR"
-( cd "$SERVER_DIR" && uv build --wheel -o "$WHEEL_DIR" )
-"$PY" -m pip install --no-warn-script-location --disable-pip-version-check --no-deps "$WHEEL_DIR"/flowmap_server-*.whl
+( cd "$SERVER_DIR" && uv build --wheel -o "$(native_path "$WHEEL_DIR")" )
+WHEEL_FILE="$(ls "$WHEEL_DIR"/flowmap_server-*.whl | head -1)"
+[[ -n "$WHEEL_FILE" ]] || { echo "ERROR: flowmap-server wheel not built" >&2; exit 1; }
+"$PY" -m pip install --no-warn-script-location --disable-pip-version-check --no-deps "$(native_path "$WHEEL_FILE")"
 
 # --- 4. Slim the runtime (optional, safe removals) ----------------------------
-echo "==> Slimming runtime (pyc caches, pip/test cruft)"
+echo "==> Slimming runtime (pyc caches, test cruft)"
 find "$PYRUNTIME" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 find "$PYRUNTIME" -type d -name "tests" -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Windows installers (MSI/NSIS) cannot carry symlinks. PBS install_only for
+# Windows is already symlink-free, but dereference any straggler defensively.
+if [[ "$OS_KIND" == "windows" ]]; then
+  while IFS= read -r link; do
+    [[ -n "$link" ]] || continue
+    real="$(readlink -f "$link" 2>/dev/null || true)"
+    if [[ -n "$real" && -f "$real" ]]; then
+      rm -f "$link"; cp -f "$real" "$link"
+    fi
+  done < <(find "$PYRUNTIME" -type l 2>/dev/null || true)
+fi
 
 # --- 5. Verify the bundled runtime boots the server ---------------------------
 echo "==> Verifying bundled runtime"
@@ -113,4 +193,4 @@ PYEOF
 
 SIZE="$(du -sh "$PYRUNTIME" | cut -f1)"
 echo "==> Done. Bundled runtime size: $SIZE"
-echo "    symlinks in tree: $(find "$PYRUNTIME" -type l | wc -l | tr -d ' ')"
+echo "    symlinks in tree: $(find "$PYRUNTIME" -type l 2>/dev/null | wc -l | tr -d ' ')"

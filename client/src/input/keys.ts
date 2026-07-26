@@ -21,12 +21,25 @@ export interface KeyTargetContext {
   button: boolean;
 }
 
+/** Modifier state relevant to chord shortcuts (⌘K / Ctrl-K). */
+export interface KeyModifiers {
+  meta: boolean;
+  ctrl: boolean;
+}
+
 /**
  * Decide the app action for a key press, or null to let the event proceed
  * normally (typing, canvas gestures, button activation, unhandled keys).
  */
-export function routeGlobalKey(key: string, ctx: KeyTargetContext): GlobalKeyAction | null {
-  if (ctx.editable) return null; // never hijack typing
+export function routeGlobalKey(
+  key: string,
+  ctx: KeyTargetContext,
+  mods: KeyModifiers = { meta: false, ctrl: false },
+): GlobalKeyAction | null {
+  // ⌘K / Ctrl-K opens the symbol palette from ANYWHERE — an explicit chord, so it
+  // is safe even inside a text field (unlike the bare `/`).
+  if ((mods.meta || mods.ctrl) && (key === 'k' || key === 'K')) return { type: 'focus-search' };
+  if (ctx.editable) return null; // never hijack plain typing
   if (key === '/') return { type: 'focus-search' };
   if (key === ' ' || key === 'Spacebar') {
     if (ctx.button) return null; // let a focused button take its own Space
@@ -65,7 +78,10 @@ export function attachGlobalKeys(
 ): () => void {
   const onKeyDown = (ev: Event): void => {
     const e = ev as KeyboardEvent;
-    const action = routeGlobalKey(e.key, classifyTarget(e.target));
+    const action = routeGlobalKey(e.key, classifyTarget(e.target), {
+      meta: e.metaKey,
+      ctrl: e.ctrlKey,
+    });
     if (!action) return;
     e.preventDefault();
     if (action.type === 'space') handlers.onSpace();

@@ -1,0 +1,238 @@
+name: release
+
+# Builds the self-contained FlowMap desktop installers for macOS (Apple Silicon
+# + Intel), Windows and Linux, and attaches them to a GitHub Release.
+#
+# Native Python wheels (numpy / polars / msgspec / curl-cffi …) must be built on
+# their own OS+arch, so each installer is produced on its matching runner — the
+# bundled pyruntime cannot be cross-built. Triggered by pushing a `vX.Y.Z` tag;
+# `workflow_dispatch` can dry-run the build (no upload) or (re)release an
+# existing tag.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build & release (e.g. v1.2.0). Leave blank to build without releasing."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the target tag and whether we are releasing (vs. a dry-run build).
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      do_release: ${{ steps.resolve.outputs.do_release }}
+    steps:
+      - id: resolve
+        # Untrusted github-context values are passed via env and only ever read
+        # as quoted shell variables (never interpolated into the script body),
+        # so a crafted tag/input cannot inject commands.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "do_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Ensure a (draft) Release exists for the tag before the matrix uploads to it.
+  # ---------------------------------------------------------------------------
+  release-draft:
+    needs: prepare
+    if: needs.prepare.outputs.do_release == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Ensure a draft release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — reusing it."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "FlowMap $TAG" --generate-notes --draft
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build one installer per OS/arch and upload it to the draft release.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [prepare, release-draft]
+    # Run when releasing (release-draft succeeded) OR on a dry-run build
+    # (release-draft skipped). Never run if prepare failed or the run cancelled.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.release-draft.result == 'success' || needs.release-draft.result == 'skipped') }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            kind: macos
+          - os: macos-13
+            triple: x86_64-apple-darwin
+            kind: macos
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            kind: windows
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            kind: linux
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Uniform shell across all runners; on Windows this is Git-Bash, which
+        # is what bundle-python.sh is written for.
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (host target ${{ matrix.triple }})
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: Install Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install Linux WebView + bundling deps
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            file \
+            build-essential
+
+      - name: Install Tauri CLI (cargo-tauri)
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # --- macOS: the existing all-in-one script (client → pyruntime → tauri →
+      #     ditto → ad-hoc codesign → dmg). Arch-aware, so it drives both the
+      #     Apple-Silicon and Intel runners. ------------------------------------
+      - name: Build macOS installer (build-dmg.sh)
+        if: matrix.kind == 'macos'
+        run: bash app/scripts/build-dmg.sh
+
+      # --- Windows/Linux: client + pyruntime + `cargo tauri build`. The
+      #     pyruntime is embedded by Tauri via bundle.resources declared in
+      #     tauri.<platform>.conf.json. ------------------------------------------
+      - name: Build client (client/dist)
+        if: matrix.kind != 'macos'
+        working-directory: client
+        run: |
+          npm ci
+          npm run build
+
+      - name: Bundle Python runtime (${{ matrix.triple }})
+        if: matrix.kind != 'macos'
+        run: bash app/scripts/bundle-python.sh "${{ matrix.triple }}"
+
+      - name: Generate Tauri icon set
+        if: matrix.kind != 'macos'
+        working-directory: app/src-tauri
+        run: cargo tauri icon ../icons/icon-1024.png
+
+      - name: Build Windows/Linux installers (cargo tauri build)
+        if: matrix.kind != 'macos'
+        working-directory: app/src-tauri
+        run: cargo tauri build
+
+      # --- Per-OS smoke test: import every server dep from the BUNDLED
+      #     interpreter, then boot the server and poll /api/health (mirrors the
+      #     import check in bundle-python.sh and the health poll in main.rs). ----
+      - name: Smoke test the bundled server
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.kind }}" = "windows" ]; then
+            PY="app/src-tauri/resources/pyruntime/python.exe"
+          else
+            PY="app/src-tauri/resources/pyruntime/bin/python3.13"
+          fi
+          echo "interpreter: $PY"
+          "$PY" -c "import importlib; [importlib.import_module(m) for m in ['flowmap_server','numpy','polars','fastapi','uvicorn','msgspec','crypcodile','stockodile']]; print('imports OK')"
+          PORT=8799
+          DATA_DIR="$(mktemp -d)"
+          FLOWMAP_HOST=127.0.0.1 FLOWMAP_PORT="$PORT" FLOWMAP_RECORDING_ENABLED=0 FLOWMAP_DATA_DIR="$DATA_DIR" "$PY" -m flowmap_server &
+          SRV=$!
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
+              echo "health OK"; ok=1; break
+            fi
+            sleep 1
+          done
+          kill "$SRV" 2>/dev/null || true
+          if [ "$ok" != "1" ]; then echo "server health check FAILED"; exit 1; fi
+
+      - name: Upload installers to the release
+        if: needs.prepare.outputs.do_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          B="app/src-tauri/target/release/bundle"
+          case "$KIND" in
+            macos)   FILES=$(ls "$B"/dmg/*.dmg) ;;
+            windows) FILES=$(ls "$B"/msi/*.msi "$B"/nsis/*-setup.exe) ;;
+            linux)   FILES=$(ls "$B"/deb/*.deb "$B"/appimage/*.AppImage) ;;
+          esac
+          echo "uploading:"; echo "$FILES"
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ---------------------------------------------------------------------------
+  # Flip the release out of draft once every installer uploaded successfully.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.do_release == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --draft=false --latest

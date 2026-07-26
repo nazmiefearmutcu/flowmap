@@ -100,8 +100,11 @@ test('§8.3 T10: overlays render over the heatmap, locked to the camera', async 
       for (let c = sc.view.colOffset; c <= sc.newest; c += 4) {
         const k = c - sc.view.colOffset + 1;
         r.ingestForTest({
+          // Close is DISTINCT from the VWAP price (101 vs 96): the last-price line
+          // draws at the close and sits above VWAP by draw order, so an identical
+          // value would (correctly) hide the VWAP probe. Real feeds rarely coincide.
           type: tags.BAR, epoch: sc.epoch, col_seq: c, t0_ns: tsOf(c),
-          o: 96, h: 97, l: 95, c: 96, vol_buy: 1, vol_sell: 1, cvd_cum: 0,
+          o: 96, h: 102, l: 95, c: 101, vol_buy: 1, vol_sell: 1, cvd_cum: 0,
           vwap_num_cum: vwapPrice * k, vwap_den_cum: k,
         });
       }
@@ -125,9 +128,12 @@ test('§8.3 T10: overlays render over the heatmap, locked to the camera', async 
       return [
         { name: 'buy', x: buyPos.x, y: buyPos.y, kind: 'teal' },
         { name: 'sell', x: sellPos.x, y: sellPos.y, kind: 'red' },
-        { name: 'bbo-bid', x: cssW * 0.5, y: bidY, kind: 'teal' },
-        { name: 'bbo-ask', x: cssW * 0.5, y: askY, kind: 'red' },
-        { name: 'vwap', x: cssW * 0.5, y: vwapY, kind: 'violet' },
+        // Sample the full-width BBO lines near the left edge, where the (now much
+        // larger, deliberately prominent) trade bubbles — which cluster mid-chart —
+        // don't occlude them. Occlusion by a big print is expected in normal use.
+        { name: 'bbo-bid', x: cssW * 0.12, y: bidY, kind: 'teal' },
+        { name: 'bbo-ask', x: cssW * 0.12, y: askY, kind: 'red' },
+        { name: 'vwap', x: cssW * 0.12, y: vwapY, kind: 'violet' },
         { name: 'liquidation', x: liqPos.x, y: liqPos.y, kind: 'orange' },
       ] as Probe[];
     },

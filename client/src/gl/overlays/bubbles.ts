@@ -32,12 +32,18 @@ export interface BubbleOptions {
 }
 
 const DEFAULTS: Required<BubbleOptions> = {
-  capacity: 6000,
+  // Large ring so the trade trail persists as far back as the heatmap does — the
+  // old 6k cap evicted bubbles on the left while the depth history stayed, which
+  // read as "the price trail gets deleted". The draw loop below breaks as soon as
+  // it scans past the left edge, so this is still O(visible), not O(capacity).
+  capacity: 120_000,
   minSize: 0,
-  refSize: 4,
-  baseRadiusPx: 5,
-  minRadiusPx: 2,
-  maxRadiusPx: 26,
+  // A smaller reference size + bigger base/max radius makes prints far more
+  // legible: a median trade is a solid dot, whales are unmistakable.
+  refSize: 2,
+  baseRadiusPx: 9,
+  minRadiusPx: 3,
+  maxRadiusPx: 44,
 };
 
 /** Bubble radius in CSS px for a trade size (√-area scaling, clamped). Pure. */
@@ -95,13 +101,18 @@ export class Bubbles {
     const n = this.opts.capacity;
     const minSize = this.opts.minSize;
     points.begin();
+    // Scan newest → oldest. Timestamps are monotonic in insertion order, so the
+    // horizontal position decreases monotonically as we walk back: once a bubble
+    // sits left of the viewport, every remaining (older) one does too → break.
+    // That keeps the pass O(visible) no matter how large the ring is.
     for (let i = 0; i < this.count; i++) {
       const idx = (this.head - 1 - i + n) % n;
-      const size = this.size[idx];
-      if (size < minSize) continue;
       const colf = gm.tsToCol(this.ts[idx]) + 0.5; // center within the column
       const cx = gm.clipX(colf);
-      if (cx < -1.04 || cx > 1.04) continue; // off-screen-left/right: skip
+      if (cx > 1.04) continue; // newer than the right edge (scrolled back): keep scanning
+      if (cx < -1.04) break; // older than the left edge: all remaining are older too
+      const size = this.size[idx];
+      if (size < minSize) continue;
       const rowf = gm.priceToRow(this.price[idx]) + 0.5;
       const cy = gm.clipY(rowf);
       if (cy < -1.04 || cy > 1.04) continue;

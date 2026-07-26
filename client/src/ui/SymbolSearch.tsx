@@ -1,15 +1,24 @@
 /**
- * Dual-market symbol search (§9 top bar, T12).
+ * Dual-market symbol palette (§9 top bar) — a big, centre-screen search modal in
+ * the shape traders expect from TradingView / an exchange search box.
  *
- * Debounced query against `GET /api/symbols?q=` (the M1 REST directory: sim +
- * crypto shortlist + equity shortlist), a keyboard-navigable dropdown grouped
- * crypto / equity / sim with each row's honest capability chips. Selecting a row
- * reports `(market, symbol)` up to the App, which re-subscribes the session in the
- * current live/replay mode — the heatmap then switches symbols.
+ * - A compact TRIGGER lives in the top bar (current symbol + a ⌘K hint). Clicking
+ *   it — or the `/` and ⌘K / Ctrl-K global shortcuts (see input/keys.ts + App) —
+ *   opens the modal, which is portalled to <body> and centred over a backdrop.
+ * - On open (empty query) it shows THE DAY'S TOP MOVERS across crypto + equity,
+ *   each with live price, % change and a mini sparkline (GET /api/movers).
+ * - Typing fuzzy-ranks the FULL curated universe (GET /api/universe, fetched once
+ *   and matched locally, so it is instant and not a per-keystroke server round
+ *   trip) — the substring-only server filter is no longer the ranking.
+ * - The active row drives a live preview panel (price / % change / sparkline /
+ *   honest capability chips) via GET /api/quote.
+ * - Clicking the backdrop, pressing Escape, or selecting a row closes it;
+ *   selecting reports `(market, symbol)` up so the App re-subscribes.
  *
- * Exposes an imperative `focus()` (via ref) so the `/` global shortcut can jump
- * here. High-frequency data never touches this component — it only ever holds the
- * (low-frequency) directory list and its own input state.
+ * Symmetry / honesty (§7, §14): capability chips are shown verbatim off the
+ * feed's descriptor, so an equity symbol that cannot reach L2 depth or a true CVD
+ * reads `SYNTH` / `SIDE NA` rather than pretending parity with crypto. A symbol
+ * whose quote provider is unreachable shows an explicit "data unavailable" state.
  */
 
 import {
@@ -17,250 +26,383 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 
 import { apiBase } from '../net/serverBase';
-import {
-  capabilityChipClass,
-  capabilityChips,
-  filterSymbols,
-  flattenGroups,
-  groupSymbols,
-  type SymbolEntry,
-} from './symbols';
-
-/** Debounce for the /api/symbols query (ms). */
-const QUERY_DEBOUNCE_MS = 200;
+import { capabilityChipClass, capabilityChips, fuzzyRank, marketGroup, type SymbolEntry } from './symbols';
+import { fmtPct, fmtPrice, sparkDirection, sparkPath } from './spark';
 
 export interface SymbolSearchHandle {
+  /** Open the palette (bound to the `/` and ⌘K/Ctrl-K global shortcuts). */
+  open: () => void;
+  /** Back-compat alias used by the older `/`-focus wiring. */
   focus: () => void;
 }
 
 interface SymbolSearchProps {
-  /** The currently subscribed `market:symbol` (shown as the resting field value). */
+  /** The currently subscribed `market:symbol` (shown on the trigger). */
   current: string;
   onSelect: (market: string, symbol: string) => void;
 }
 
+interface Quote {
+  market: string;
+  symbol: string;
+  price: number | null;
+  changePct: number | null;
+  spark: number[];
+  stale?: boolean;
+  reachable?: boolean;
+}
+
+interface Mover extends Quote {
+  stale: boolean;
+}
+
+const GROUP_LABEL: Record<string, string> = { crypto: 'Crypto', equity: 'Equity', sim: 'Sim' };
+const QUOTE_DEBOUNCE_MS = 160;
+
+/** A single search result: a directory entry, optionally enriched with a quote. */
+interface Row {
+  entry: SymbolEntry;
+  quote?: Quote;
+}
+
+async function getJson<T>(path: string, signal: AbortSignal): Promise<T | null> {
+  try {
+    const r = await fetch(`${apiBase()}${path}`, { signal });
+    if (!r.ok) return null;
+    return (await r.json()) as T;
+  } catch (err) {
+    if ((err as { name?: string })?.name !== 'AbortError') {
+      console.warn('[flowmap] palette fetch failed', path, err);
+    }
+    return null;
+  }
+}
+
 export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
   function SymbolSearch({ current, onSelect }, ref) {
-    const [query, setQuery] = useState('');
-    const [entries, setEntries] = useState<SymbolEntry[]>([]);
     const [open, setOpen] = useState(false);
-    const [active, setActive] = useState(0);
+    const [query, setQuery] = useState('');
+    // Raw highlight index; the RENDER-time `active` below clamps it to the current
+    // row count so a shrinking result set can never reference an out-of-bounds row
+    // for a frame (a post-commit clamp effect would leave one bad frame committed).
+    const [activeState, setActive] = useState(0);
+    const [universe, setUniverse] = useState<SymbolEntry[]>([]);
+    const [movers, setMovers] = useState<Mover[]>([]);
+    const [preview, setPreview] = useState<Quote | null>(null);
     const inputRef = useRef<HTMLInputElement>(null);
-    const rootRef = useRef<HTMLDivElement>(null);
+    const triggerRef = useRef<HTMLButtonElement>(null);
+    const listRef = useRef<HTMLDivElement>(null);
 
-    useImperativeHandle(ref, () => ({
-      focus: () => {
-        inputRef.current?.focus();
-        inputRef.current?.select();
-        setOpen(true);
-      },
-    }));
+    const doOpen = useCallback(() => {
+      setOpen(true);
+      setQuery('');
+      setActive(0);
+    }, []);
 
-    // Debounced directory fetch. AbortController cancels the in-flight request so
-    // a fast typist never races a stale response into the list.
+    useImperativeHandle(ref, () => ({ open: doOpen, focus: doOpen }), [doOpen]);
+
+    // Fetch the universe ONCE (guarded, self-limiting) — kept separate from the
+    // movers effect so the universe response resolving doesn't re-trigger movers.
+    useEffect(() => {
+      if (!open || universe.length !== 0) return;
+      const ctrl = new AbortController();
+      void getJson<{ symbols: SymbolEntry[] }>('/api/universe?market=all&limit=1000', ctrl.signal).then(
+        (b) => b && setUniverse(b.symbols ?? []),
+      );
+      return () => ctrl.abort();
+    }, [open, universe.length]);
+
+    // Fetch today's movers + focus the input exactly once per open.
     useEffect(() => {
       if (!open) return;
       const ctrl = new AbortController();
-      const timer = window.setTimeout(() => {
-        fetch(`${apiBase()}/api/symbols?q=${encodeURIComponent(query.trim())}`, { signal: ctrl.signal })
-          .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`symbols ${r.status}`))))
-          .then((body: { symbols?: SymbolEntry[] }) => setEntries(body.symbols ?? []))
-          .catch((err) => {
-            if (err?.name !== 'AbortError') console.warn('[flowmap] symbol query failed', err);
-          });
-      }, QUERY_DEBOUNCE_MS);
+      void Promise.all([
+        getJson<{ movers: Mover[] }>('/api/movers?market=crypto&limit=14', ctrl.signal),
+        getJson<{ movers: Mover[] }>('/api/movers?market=equity&limit=14', ctrl.signal),
+      ]).then(([c, e]) => {
+        const merged = [...(c?.movers ?? []), ...(e?.movers ?? [])].sort(
+          (a, b) => Math.abs(b.changePct ?? 0) - Math.abs(a.changePct ?? 0),
+        );
+        setMovers(merged);
+      });
+      const t = window.setTimeout(() => inputRef.current?.focus(), 0);
       return () => {
         ctrl.abort();
-        window.clearTimeout(timer);
+        window.clearTimeout(t);
       };
-    }, [query, open]);
-
-    // Close on outside click.
-    useEffect(() => {
-      if (!open) return;
-      const onDown = (e: MouseEvent): void => {
-        if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
-      };
-      window.addEventListener('mousedown', onDown);
-      return () => window.removeEventListener('mousedown', onDown);
     }, [open]);
 
-    const groups = groupSymbols(filterSymbols(entries, query));
-    const flat = flattenGroups(groups);
+    // The visible rows: movers on an empty query, fuzzy universe hits otherwise.
+    const rows = useMemo<Row[]>(() => {
+      if (query.trim() === '') {
+        return movers.map((m) => ({ entry: { market: m.market, symbol: m.symbol, capability: {} }, quote: m }));
+      }
+      const byKey = new Map(movers.map((m) => [`${m.market}:${m.symbol}`, m] as const));
+      return fuzzyRank(universe, query, 60).map((entry) => ({
+        entry,
+        quote: byKey.get(`${entry.market}:${entry.symbol}`),
+      }));
+    }, [query, movers, universe]);
+
+    const active = rows.length ? Math.min(activeState, rows.length - 1) : 0;
+    const activeRow = rows[active];
+
+    // Live preview for the active row: reuse its mover quote if we have one, else
+    // fetch /api/quote (debounced) so scanning the list doesn't hammer the server.
+    useEffect(() => {
+      if (!open || !activeRow) {
+        setPreview(null);
+        return;
+      }
+      if (activeRow.quote) {
+        setPreview(activeRow.quote);
+        return;
+      }
+      const { market, symbol } = activeRow.entry;
+      // Drop the previous row's quote immediately so a symbol NAME never renders
+      // over another symbol's live-looking price/%/sparkline during the debounce.
+      setPreview(null);
+      const ctrl = new AbortController();
+      const t = window.setTimeout(() => {
+        void getJson<Quote>(
+          `/api/quote?market=${encodeURIComponent(market)}&symbol=${encodeURIComponent(symbol)}`,
+          ctrl.signal,
+        ).then((q) => {
+          if (ctrl.signal.aborted) return; // a newer row superseded this fetch
+          // On an unreachable/failed provider, resolve to an explicit
+          // reachable:false so the honest "data unavailable" state renders —
+          // never leave a stale quote standing (§7).
+          setPreview(q ?? { market, symbol, price: null, changePct: null, spark: [], reachable: false });
+        });
+      }, QUOTE_DEBOUNCE_MS);
+      return () => {
+        ctrl.abort();
+        window.clearTimeout(t);
+      };
+    }, [open, activeRow]);
+
+    const close = useCallback(() => {
+      setOpen(false);
+      triggerRef.current?.focus();
+    }, []);
 
     const commit = useCallback(
-      (entry: SymbolEntry | undefined) => {
-        if (!entry) return;
-        onSelect(entry.market, entry.symbol);
-        setQuery('');
-        setOpen(false);
-        inputRef.current?.blur();
+      (row: Row | undefined) => {
+        if (!row) return;
+        onSelect(row.entry.market, row.entry.symbol);
+        // Route through close() so selecting restores focus to the trigger too —
+        // otherwise the portal unmounts the focused input and focus drops to
+        // <body>, losing a keyboard/screen-reader user's place.
+        close();
       },
-      [onSelect],
+      [onSelect, close],
     );
 
     const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>): void => {
-      const last = flat.length - 1;
+      const last = rows.length - 1;
+      // Base navigation on the CLAMPED `active`, not a stale raw index.
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setOpen(true);
-        if (flat.length > 0) setActive((i) => (i >= last ? 0 : i + 1));
+        if (rows.length) setActive(active >= last ? 0 : active + 1);
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setOpen(true);
-        if (flat.length > 0) setActive((i) => (i <= 0 ? last : i - 1));
-      } else if (e.key === 'Home') {
-        e.preventDefault();
-        setActive(0);
-      } else if (e.key === 'End') {
-        e.preventDefault();
-        if (flat.length > 0) setActive(last);
+        if (rows.length) setActive(active <= 0 ? last : active - 1);
       } else if (e.key === 'Enter') {
         e.preventDefault();
-        commit(flat[active]);
+        commit(rows[active]);
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        // First press closes/clears while keeping focus; blur only once the menu
-        // is already closed and the query is empty.
-        if (open || query !== '') {
-          setOpen(false);
-          setQuery('');
-        } else {
-          inputRef.current?.blur();
-        }
+        close();
       }
     };
 
-    // Keep the active index inside the (re-filtered) list.
-    useEffect(() => {
-      setActive((i) => (i >= flat.length ? Math.max(0, flat.length - 1) : i));
-    }, [flat.length]);
-
-    // Reset to the top match whenever the query changes, so Enter commits the
-    // first result (the hover path still clamps via the effect above).
-    useEffect(() => {
-      setActive(0);
-    }, [query]);
-
-    // Scroll the keyboard-highlighted option into view so arrowing past the fold
-    // never hides the highlight (and never commits an off-screen row).
+    // Reset the highlight to the top whenever the query changes. Shrinking result
+    // sets are handled by the render-time clamp on `active`, not a post-commit
+    // effect, so no out-of-bounds frame can commit.
+    useEffect(() => setActive(0), [query]);
+    // Keep the highlighted row scrolled into view.
     useEffect(() => {
       if (!open) return;
-      const el = rootRef.current?.querySelector(`#symopt-${active}`);
-      el?.scrollIntoView({ block: 'nearest' });
+      listRef.current?.querySelector(`#sympal-opt-${active}`)?.scrollIntoView({ block: 'nearest' });
     }, [active, open]);
 
-    let flatIndex = -1; // running index across groups → maps rows to `active`
+    const previewDir = preview ? sparkDirection(preview.spark) : 0;
 
     return (
-      <div className="symsearch" ref={rootRef}>
-        <div className="symsearch__field">
+      <>
+        <button
+          type="button"
+          ref={triggerRef}
+          className="symsearch__trigger"
+          data-testid="symbol-search-trigger"
+          onClick={doOpen}
+          aria-label="Search symbols"
+          title="Search symbols ( / or ⌘K )"
+        >
           <span className="symsearch__icon" aria-hidden="true">
             ⌕
           </span>
-          <input
-            ref={inputRef}
-            className="symsearch__input"
-            type="text"
-            spellCheck={false}
-            autoComplete="off"
-            data-testid="symbol-search-input"
-            placeholder={current}
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setOpen(true);
-            }}
-            onFocus={() => setOpen(true)}
-            onKeyDown={onKeyDown}
-            aria-label="symbol search"
-            role="combobox"
-            aria-autocomplete="list"
-            aria-expanded={open}
-            aria-controls="symsearch-listbox"
-            aria-activedescendant={open && flat.length > 0 ? `symopt-${active}` : undefined}
-          />
-          {query !== '' ? (
-            <button
-              type="button"
-              className="symsearch__kbd symsearch__clear"
-              aria-label="clear symbol search"
-              data-testid="symbol-search-clear"
+          <span className="symsearch__current">{current}</span>
+          <span className="symsearch__kbd" aria-hidden="true">
+            ⌘K
+          </span>
+        </button>
+
+        {open &&
+          createPortal(
+            <div
+              className="sympal__backdrop"
+              data-testid="symbol-search-backdrop"
               onMouseDown={(e) => {
-                // mousedown + preventDefault so the input keeps focus.
-                e.preventDefault();
-                setQuery('');
-                inputRef.current?.focus();
+                if (e.target === e.currentTarget) close();
               }}
             >
-              ×
-            </button>
-          ) : (
-            <span className="symsearch__kbd" aria-hidden="true">
-              /
-            </span>
-          )}
-        </div>
+              <div className="sympal" role="dialog" aria-modal="true" aria-label="Symbol search">
+                <div className="sympal__head">
+                  <span className="sympal__icon" aria-hidden="true">
+                    ⌕
+                  </span>
+                  <input
+                    ref={inputRef}
+                    className="sympal__input"
+                    type="text"
+                    spellCheck={false}
+                    autoComplete="off"
+                    data-testid="symbol-search-input"
+                    placeholder="Search all markets — symbol or venue…"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={onKeyDown}
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded
+                    aria-controls="sympal-listbox"
+                    aria-activedescendant={rows.length ? `sympal-opt-${active}` : undefined}
+                    aria-label="symbol search"
+                  />
+                  <button type="button" className="sympal__esc" onClick={close} aria-label="close search">
+                    esc
+                  </button>
+                </div>
 
-        {open && (
-          <div
-            className="symsearch__pop"
-            data-testid="symbol-search-pop"
-            id="symsearch-listbox"
-            role="listbox"
-            aria-label="symbol results"
-          >
-            {flat.length === 0 ? (
-              <div className="symsearch__empty">no symbols match “{query}”</div>
-            ) : (
-              groups.map((g) => (
-                <div className="symgroup" key={g.key}>
-                  <div className="symgroup__label">{g.label}</div>
-                  {g.entries.map((entry) => {
-                    flatIndex += 1;
-                    const idx = flatIndex;
-                    return (
-                      <div
-                        key={`${entry.market}:${entry.symbol}`}
-                        id={`symopt-${idx}`}
-                        className={`symrow${idx === active ? ' is-active' : ''}`}
-                        role="option"
-                        aria-selected={idx === active}
-                        data-testid="symbol-row"
-                        data-market={entry.market}
-                        data-symbol={entry.symbol}
-                        onMouseEnter={() => setActive(idx)}
-                        onMouseDown={(e) => {
-                          // mousedown (not click) so the outside-click closer + input
-                          // blur don't race the selection away.
-                          e.preventDefault();
-                          commit(entry);
-                        }}
-                      >
-                        <span className="symrow__sym">{entry.symbol}</span>
-                        <span className="symrow__caps">
-                          {capabilityChips(entry.capability).map((c) => (
+                <div className="sympal__body">
+                  <div className="sympal__list" ref={listRef} id="sympal-listbox" role="listbox" aria-label="symbols">
+                    {query.trim() === '' && rows.length > 0 && (
+                      <div className="sympal__section">Top movers today</div>
+                    )}
+                    {rows.length === 0 ? (
+                      <div className="sympal__empty">
+                        {universe.length === 0
+                          ? 'loading…'
+                          : query.trim() === ''
+                            ? 'Top movers unavailable — type to search all crypto + equity symbols.'
+                            : `no symbols match “${query}”`}
+                      </div>
+                    ) : (
+                      rows.map((row, idx) => {
+                        const g = marketGroup(row.entry.market);
+                        const chg = row.quote?.changePct ?? null;
+                        const dir = sparkDirection(row.quote?.spark ?? []);
+                        return (
+                          <div
+                            key={`${row.entry.market}:${row.entry.symbol}`}
+                            id={`sympal-opt-${idx}`}
+                            className={`sympal__row${idx === active ? ' is-active' : ''}`}
+                            role="option"
+                            aria-selected={idx === active}
+                            data-testid="symbol-row"
+                            data-market={row.entry.market}
+                            data-symbol={row.entry.symbol}
+                            onMouseEnter={() => setActive(idx)}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              commit(row);
+                            }}
+                          >
+                            <span className={`sympal__grp sympal__grp--${g}`}>{GROUP_LABEL[g] ?? g}</span>
+                            <span className="sympal__sym">{row.entry.symbol}</span>
+                            {row.quote?.spark?.length ? (
+                              <svg className="sympal__spark" viewBox="0 0 56 18" preserveAspectRatio="none" aria-hidden="true">
+                                <path
+                                  d={sparkPath(row.quote.spark, 56, 18)}
+                                  className={dir >= 0 ? 'spark-up' : 'spark-down'}
+                                  fill="none"
+                                />
+                              </svg>
+                            ) : (
+                              <span className="sympal__caps">
+                                {capabilityChips(row.entry.capability).map((c) => (
+                                  <span key={c} className={capabilityChipClass(c)}>
+                                    {c}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
+                            <span className="sympal__px">{fmtPrice(row.quote?.price)}</span>
+                            <span
+                              className={`sympal__chg${chg == null ? '' : chg >= 0 ? ' is-up' : ' is-down'}`}
+                            >
+                              {fmtPct(chg)}
+                            </span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <aside className="sympal__preview" aria-label="preview">
+                    {activeRow ? (
+                      <>
+                        <div className="sympal__pv-sym">{activeRow.entry.symbol}</div>
+                        <div className="sympal__pv-mkt">{activeRow.entry.market}</div>
+                        <div className={`sympal__pv-px ${previewDir >= 0 ? 'is-up' : 'is-down'}`}>
+                          {fmtPrice(preview?.price)}
+                        </div>
+                        <div className={`sympal__pv-chg ${(preview?.changePct ?? 0) >= 0 ? 'is-up' : 'is-down'}`}>
+                          {fmtPct(preview?.changePct)}
+                        </div>
+                        {preview?.spark?.length ? (
+                          <svg className="sympal__pv-spark" viewBox="0 0 220 60" preserveAspectRatio="none" aria-hidden="true">
+                            <path d={sparkPath(preview.spark, 220, 60, 3)} className={previewDir >= 0 ? 'spark-up' : 'spark-down'} fill="none" />
+                          </svg>
+                        ) : (
+                          <div className="sympal__pv-note">
+                            {preview?.reachable === false ? 'data unavailable' : 'no preview'}
+                          </div>
+                        )}
+                        <div className="sympal__pv-caps">
+                          {capabilityChips(activeRow.entry.capability).map((c) => (
                             <span key={c} className={capabilityChipClass(c)}>
                               {c}
                             </span>
                           ))}
-                        </span>
-                        {entry.note && <span className="symrow__note">{entry.note}</span>}
-                      </div>
-                    );
-                  })}
+                        </div>
+                        {preview?.stale && <div className="sympal__pv-stale">stale — market closed or last known</div>}
+                      </>
+                    ) : (
+                      <div className="sympal__pv-note">type to search all crypto + equity symbols</div>
+                    )}
+                  </aside>
                 </div>
-              ))
-            )}
-          </div>
-        )}
-      </div>
+
+                <div className="sympal__foot">
+                  <span><kbd>↑↓</kbd> navigate</span>
+                  <span><kbd>↵</kbd> select</span>
+                  <span><kbd>esc</kbd> close</span>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )}
+      </>
     );
   },
 );

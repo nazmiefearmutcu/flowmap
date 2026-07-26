@@ -22,10 +22,19 @@ TAURI_DIR="$REPO_ROOT/app/src-tauri"
 PYRUNTIME="$TAURI_DIR/resources/pyruntime"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-VERSION="1.2.0"
+VERSION="1.3.0"
+
+# Arch-aware so the same script drives both the Apple-Silicon (macos-14) and
+# Intel (macos-13) release runners as well as a local machine of either arch.
+case "$(uname -m)" in
+  arm64)  TARGET_TRIPLE="aarch64-apple-darwin"; DMG_ARCH="aarch64" ;;
+  x86_64) TARGET_TRIPLE="x86_64-apple-darwin";  DMG_ARCH="x86_64"  ;;
+  *) echo "ERROR: unsupported macOS arch $(uname -m)" >&2; exit 1 ;;
+esac
+
 APP_PATH="$TAURI_DIR/target/release/bundle/macos/FlowMap.app"
 DMG_DIR="$TAURI_DIR/target/release/bundle/dmg"
-DMG_PATH="$DMG_DIR/FlowMap_${VERSION}_aarch64.dmg"
+DMG_PATH="$DMG_DIR/FlowMap_${VERSION}_${DMG_ARCH}.dmg"
 
 echo "==> [1/7] Building the client (client/dist)"
 cd "$CLIENT_DIR"
@@ -36,11 +45,11 @@ else
 fi
 npm run build
 
-echo "==> [2/7] Bundling the Python runtime"
+echo "==> [2/7] Bundling the Python runtime ($TARGET_TRIPLE)"
 if [[ "${SKIP_PYRUNTIME:-}" == "1" && -x "$PYRUNTIME/bin/python3.13" ]]; then
   echo "    SKIP_PYRUNTIME=1 → reusing $PYRUNTIME"
 else
-  bash "$REPO_ROOT/app/scripts/bundle-python.sh"
+  bash "$REPO_ROOT/app/scripts/bundle-python.sh" "$TARGET_TRIPLE"
 fi
 
 echo "==> [3/7] Generating the Tauri icon set"
@@ -53,6 +62,12 @@ cargo tauri build --bundles app
 [[ -d "$APP_PATH" ]] || { echo "ERROR: $APP_PATH not produced" >&2; exit 1; }
 
 echo "==> [5/7] Injecting the pyruntime into the .app"
+# macOS deliberately injects the pyruntime via `ditto` (symlink- and
+# metadata-preserving) rather than Tauri's `bundle.resources`: the base
+# tauri.conf.json carries NO resources key, so `cargo tauri build` above does
+# not copy the ~529 MB tree — no double-copy. (Windows/Linux DO use
+# bundle.resources, declared in tauri.windows.conf.json / tauri.linux.conf.json,
+# because those runners have no ditto step.) The rm -rf makes this idempotent.
 rm -rf "$APP_PATH/Contents/Resources/pyruntime"
 ditto "$PYRUNTIME" "$APP_PATH/Contents/Resources/pyruntime"
 

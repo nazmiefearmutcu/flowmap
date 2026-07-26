@@ -29,6 +29,16 @@ describe('routeGlobalKey', () => {
       expect(routeGlobalKey(k, PLAIN)).toBeNull();
     }
   });
+
+  it('opens search on ⌘K / Ctrl-K, even while typing (an explicit chord)', () => {
+    expect(routeGlobalKey('k', PLAIN, { meta: true, ctrl: false })).toEqual({ type: 'focus-search' });
+    expect(routeGlobalKey('K', PLAIN, { meta: false, ctrl: true })).toEqual({ type: 'focus-search' });
+    expect(routeGlobalKey('k', { editable: true, button: false }, { meta: true, ctrl: false })).toEqual({
+      type: 'focus-search',
+    });
+    // plain k (no modifier) is not a shortcut
+    expect(routeGlobalKey('k', PLAIN)).toBeNull();
+  });
 });
 
 describe('classifyTarget', () => {

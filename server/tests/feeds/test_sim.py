@@ -241,3 +241,11 @@ def test_simfeed_satisfies_feed_protocol():
     assert feed.market == "sim"
     assert feed.symbol == "SIM-DEMO"
     assert isinstance(feed.capability, dict)
+
+
+def test_simfeed_capability_advertises_exchange_cvd():
+    # GOAL 3 symmetry: sim has exchange-true aggressor side, so its per-bar CVD
+    # is honest -> cvd == "exchange" (like crypto, unlike keyless equity's "na").
+    feed = SimFeed(seed=0)
+    assert feed.capability["trade_side"] == "exchange"
+    assert feed.capability["cvd"] == "exchange"

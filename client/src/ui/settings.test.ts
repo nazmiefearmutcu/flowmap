@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
+  historyDepthCols,
   loadSettings,
   normalizeSettings,
   saveSettings,
@@ -102,10 +103,28 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({ followPrice: 'yes' }).followPrice).toBe(
       DEFAULT_SETTINGS.followPrice,
     );
-    for (const b of ['native', 'wide', 'full'] as const) {
+    for (const b of ['native', 'wide', 'full', 'deep'] as const) {
       expect(normalizeSettings({ priceBand: b }).priceBand).toBe(b);
     }
-    expect(normalizeSettings({ priceBand: 'galaxy' }).priceBand).toBe('native');
+    expect(normalizeSettings({ priceBand: 'galaxy' }).priceBand).toBe(DEFAULT_SETTINGS.priceBand);
+  });
+
+  it('coerces the history-depth field', () => {
+    for (const d of ['off', '1h', '4h', '1d', 'max'] as const) {
+      expect(normalizeSettings({ historyDepth: d }).historyDepth).toBe(d);
+    }
+    expect(normalizeSettings({ historyDepth: 'forever' }).historyDepth).toBe(DEFAULT_SETTINGS.historyDepth);
+    expect(normalizeSettings({}).historyDepth).toBe(DEFAULT_SETTINGS.historyDepth);
+  });
+
+  it('maps history depth to a column target from the epoch cadence', () => {
+    expect(historyDepthCols('off', 250e6)).toBe(0);
+    expect(historyDepthCols('max', 250e6)).toBeGreaterThan(100000);
+    // 1h at 250ms/col = 3600s / 0.25s = 14400 columns
+    expect(historyDepthCols('1h', 250e6)).toBe(14400);
+    // longer window ⇒ more columns; coarser dt ⇒ fewer
+    expect(historyDepthCols('1d', 250e6)).toBeGreaterThan(historyDepthCols('4h', 250e6));
+    expect(historyDepthCols('1h', 1e9)).toBeLessThan(historyDepthCols('1h', 250e6));
   });
 
   it('round-trips a pre-upgrade v1 payload without disturbing unrelated fields', () => {
@@ -128,7 +147,14 @@ describe('normalizeSettings', () => {
     expect(n.bubbleMinSize).toBe(25);
     expect(n.follow).toBe(false);
     expect(n.railVisible).toBe(false);
-    expect(n.overlays).toEqual(legacy.overlays);
+    // Legacy overlay keys are preserved verbatim; overlay keys added in this
+    // release (price, cvd) adopt their defaults — the generic key-iteration in
+    // normalizeSettings is exactly what makes new overlays migration-free.
+    expect(n.overlays).toEqual({
+      ...legacy.overlays,
+      price: DEFAULT_SETTINGS.overlays.price,
+      cvd: DEFAULT_SETTINGS.overlays.cvd,
+    });
     // New fields adopt defaults (colormap deliberately does NOT keep 'thermal').
     expect(n.tolerance).toBe(DEFAULT_SETTINGS.tolerance);
     expect(n.followPrice).toBe(DEFAULT_SETTINGS.followPrice);

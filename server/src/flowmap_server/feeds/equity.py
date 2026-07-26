@@ -713,11 +713,19 @@ class EquityFeed:
 
 
 # Per-tier capability descriptors (spec §7 dual-market parity table).
+#
+# ``cvd`` is stated EXPLICITLY per tier so the client can badge it honestly
+# (GOAL 3 symmetry): keyless has NO aggressor side (SIDE_UNKNOWN is never counted
+# in grid.on_trade), so its cvd_cum is meaningless -> ``na``; the keyed tiers
+# infer side (quote/tick rule) so their CVD is honestly ``inferred`` — never the
+# exchange-true ``exchange`` that crypto/sim get. Unavailable capabilities use an
+# explicit value (finnhub ``depth: 'N/A'``) rather than omission.
 _CAPABILITY: dict[str, dict[str, object]] = {
     "keyless": {
         "depth": "SYNTH",
         "tape": "poll",
         "trade_side": "na",
+        "cvd": "na",
         "vwap": "approx",
         "markers": ["gap", "session_break"],
     },
@@ -725,6 +733,7 @@ _CAPABILITY: dict[str, dict[str, object]] = {
         "depth": "L1",
         "tape": "tick",
         "trade_side": "inferred",
+        "cvd": "inferred",
         "vwap": "from_tape",
         "markers": ["halt", "gap", "session_break"],
     },
@@ -732,6 +741,7 @@ _CAPABILITY: dict[str, dict[str, object]] = {
         "depth": "N/A",
         "tape": "tick",
         "trade_side": "inferred",
+        "cvd": "inferred",
         "vwap": "from_tape",
         "markers": ["gap", "session_break"],
     },
