@@ -90,7 +90,11 @@ jobs:
           - os: macos-14
             triple: aarch64-apple-darwin
             kind: macos
-          - os: macos-13
+          # Intel macOS. NOT `macos-13`: that image was retired on 2025-12-04, so
+          # jobs targeting it queue forever without ever being assigned a runner.
+          # `macos-15-intel` is the x86_64 replacement (available until Aug 2027,
+          # after which Actions drops Intel macOS entirely).
+          - os: macos-15-intel
             triple: x86_64-apple-darwin
             kind: macos
           - os: windows-latest
@@ -139,7 +143,9 @@ jobs:
             librsvg2-dev \
             patchelf \
             file \
-            build-essential
+            build-essential \
+            fuse \
+            libfuse2
 
       - name: Install Tauri CLI (cargo-tauri)
         run: cargo install tauri-cli --version "^2.0" --locked
@@ -173,6 +179,18 @@ jobs:
       - name: Build Windows/Linux installers (cargo tauri build)
         if: matrix.kind != 'macos'
         working-directory: app/src-tauri
+        env:
+          # AppImage packaging notes (Linux only; both are no-ops on Windows):
+          #   APPIMAGE_EXTRACT_AND_RUN — linuxdeploy and its plugins ship AS
+          #     AppImages, which mount themselves via FUSE. GitHub's Ubuntu
+          #     runners have no usable FUSE mount for them, so linuxdeploy dies
+          #     with a bare "failed to run linuxdeploy". This makes them
+          #     self-extract and run instead of mounting.
+          #   NO_STRIP — linuxdeploy strips every shared object it bundles. Our
+          #     payload embeds a full ~500 MB CPython runtime with thousands of
+          #     .so files, and a single unstrippable one aborts the bundle.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          NO_STRIP: true
         run: cargo tauri build
 
       # --- Per-OS smoke test: import every server dep from the BUNDLED
