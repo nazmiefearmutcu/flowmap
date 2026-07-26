@@ -83,25 +83,29 @@ Every installer on the [latest release](https://github.com/nazmiefearmutcu/flowm
 is **fully self-contained** — it bundles the WebGL2 client *and* a relocatable Python 3.13 running
 the server, so there is nothing else to install (no Python, no Node, no `uv`). Pick your platform:
 
+**Click your platform — the download starts immediately** (v1.3.0):
+
 | Platform | Download | Install |
 |---|---|---|
-| **macOS — Apple Silicon** | `FlowMap_1.3.0_aarch64.dmg` | open the dmg, drag **FlowMap.app** to Applications |
-| **macOS — Intel** | `FlowMap_1.3.0_x86_64.dmg` | same as above |
-| **Windows x64** | `FlowMap_1.3.0_x64-setup.exe` (NSIS) or `FlowMap_1.3.0_x64_en-US.msi` (MSI) | run the installer |
-| **Linux x64** | `FlowMap_1.3.0_amd64.AppImage` (portable) or `flowmap_1.3.0_amd64.deb` (Debian/Ubuntu) | `chmod +x` the AppImage, or `sudo apt install ./flowmap_1.3.0_amd64.deb` |
+| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.0_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_aarch64.dmg)** · 168 MB | open the dmg, drag **FlowMap** into **Applications** |
+| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.0_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x86_64.dmg)** · 183 MB | same as above |
+| 🪟 **Windows 10/11 x64** *(recommended)* | **[⬇️ FlowMap_1.3.0_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64-setup.exe)** · 103 MB | run it — installs per-user, no admin needed |
+| 🪟 **Windows 10/11 x64** *(MSI / managed)* | **[⬇️ FlowMap_1.3.0_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64_en-US.msi)** · 167 MB | standard MSI installer |
+| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.0_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.deb)** · 434 MB | `sudo apt install ./FlowMap_1.3.0_amd64.deb` |
+
+*Which Mac do I have?* → Apple menu → **About This Mac**: "Chip: Apple M…" = Apple Silicon, "Processor: Intel…" = Intel.
 
 > **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
 > (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for
 > this project), so the OS will warn on first open:
 > - **macOS:** **right-click → Open** (confirm once), or run `xattr -cr /Applications/FlowMap.app`.
 > - **Windows:** SmartScreen → **More info → Run anyway**.
-> - **Linux:** the AppImage needs `libwebkit2gtk-4.1`, `libgtk-3` and `libayatana-appindicator3`
->   present (the `.deb` declares these as dependencies and pulls them in automatically).
 >
 > After the first confirmation the app launches normally.
 
-Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Any platform
-without a prebuilt installer — including Linux on arm — can **run from source** (below).
+Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Platforms
+without a prebuilt installer — **non-Debian Linux** (no AppImage in 1.3.0), Linux on arm, and 32-bit
+systems — can **run from source** (below).
 
 ## Run it
 
