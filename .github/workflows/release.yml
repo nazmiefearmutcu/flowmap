@@ -145,7 +145,12 @@ jobs:
             file \
             build-essential \
             fuse \
-            libfuse2
+            libfuse2 \
+            libgdk-pixbuf2.0-dev \
+            gir1.2-gtk-3.0 \
+            desktop-file-utils \
+            squashfs-tools \
+            zsync
 
       - name: Install Tauri CLI (cargo-tauri)
         run: cargo install tauri-cli --version "^2.0" --locked
