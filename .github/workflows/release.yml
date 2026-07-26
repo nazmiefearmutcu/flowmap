@@ -209,15 +209,7 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
           NO_STRIP: true
-          # linuxdeploy hides the actual reason behind "failed to run linuxdeploy"
-          # unless it is asked to talk; 2 = debug.
-          VERBOSE: 1
-          DEBUG: 1
-        run: |
-          set -x
-          df -h /
-          cargo tauri build --bundles appimage --verbose 2>&1 | tail -n 200
-          df -h /
+        run: cargo tauri build --bundles appimage
 
       # --- Per-OS smoke test: import every server dep from the BUNDLED
       #     interpreter, then boot the server and poll /api/health (mirrors the

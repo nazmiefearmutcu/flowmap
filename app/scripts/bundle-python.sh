@@ -161,6 +161,28 @@ echo "==> Slimming runtime (pyc caches, test cruft)"
 find "$PYRUNTIME" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 find "$PYRUNTIME" -type d -name "tests" -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
 
+# Drop Tk/tkinter. FlowMap's server is headless — the UI is the Tauri webview —
+# so nothing in the dependency set imports it (see the import check below).
+#
+# This is not merely a size saving: `_tkinter*.so` links against libtcl9.0 /
+# libtk9.0, which python-build-standalone does NOT ship in the install_only
+# tarball. On Linux that makes the AppImage bundle fail outright — linuxdeploy
+# walks every ELF in the AppDir, cannot resolve libtcl9.0.so, and aborts the
+# whole build with "Failed to deploy dependencies for existing files". Removing
+# the module removes the dangling dependency at its source, on every platform.
+echo "==> Removing unused Tk/tkinter (headless server; breaks AppImage deps)"
+find "$PYRUNTIME" -name "_tkinter*.so" -o -name "_tkinter*.pyd" | while IFS= read -r f; do
+  [[ -n "$f" ]] && rm -f "$f"
+done
+find "$PYRUNTIME" -type d \( -name "tkinter" -o -name "idlelib" -o -name "turtledemo" \) \
+  -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PYRUNTIME" -name "turtle.py" -delete 2>/dev/null || true
+# The Tcl/Tk runtime data + shared libraries the removed module was the only
+# consumer of (PBS ships these under lib/ and lib/tcl8.6 etc. when present).
+find "$PYRUNTIME" -maxdepth 3 -type d \( -name "tcl*" -o -name "tk*" \) \
+  -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PYRUNTIME" \( -name "libtcl*" -o -name "libtk*" \) -delete 2>/dev/null || true
+
 # Windows installers (MSI/NSIS) cannot carry symlinks. PBS install_only for
 # Windows is already symlink-free, but dereference any straggler defensively.
 if [[ "$OS_KIND" == "windows" ]]; then
