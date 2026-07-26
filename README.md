@@ -85,10 +85,10 @@ the server, so there is nothing else to install (no Python, no Node, no `uv`). P
 
 | Platform | Download | Install |
 |---|---|---|
-| **macOS — Apple Silicon** | `FlowMap_1.2.0_aarch64.dmg` | open the dmg, drag **FlowMap.app** to Applications |
-| **macOS — Intel** | `FlowMap_1.2.0_x86_64.dmg` | same as above |
-| **Windows x64** | `FlowMap_1.2.0_x64-setup.exe` (NSIS) or `FlowMap_1.2.0_x64_en-US.msi` (MSI) | run the installer |
-| **Linux x64** | `FlowMap_1.2.0_amd64.AppImage` (portable) or `flowmap_1.2.0_amd64.deb` (Debian/Ubuntu) | `chmod +x` the AppImage, or `sudo apt install ./flowmap_1.2.0_amd64.deb` |
+| **macOS — Apple Silicon** | `FlowMap_1.3.0_aarch64.dmg` | open the dmg, drag **FlowMap.app** to Applications |
+| **macOS — Intel** | `FlowMap_1.3.0_x86_64.dmg` | same as above |
+| **Windows x64** | `FlowMap_1.3.0_x64-setup.exe` (NSIS) or `FlowMap_1.3.0_x64_en-US.msi` (MSI) | run the installer |
+| **Linux x64** | `FlowMap_1.3.0_amd64.AppImage` (portable) or `flowmap_1.3.0_amd64.deb` (Debian/Ubuntu) | `chmod +x` the AppImage, or `sudo apt install ./flowmap_1.3.0_amd64.deb` |
 
 > **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
 > (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for

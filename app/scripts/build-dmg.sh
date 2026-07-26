@@ -22,7 +22,7 @@ TAURI_DIR="$REPO_ROOT/app/src-tauri"
 PYRUNTIME="$TAURI_DIR/resources/pyruntime"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Arch-aware so the same script drives both the Apple-Silicon (macos-14) and
 # Intel (macos-13) release runners as well as a local machine of either arch.

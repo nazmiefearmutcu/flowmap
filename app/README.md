@@ -53,11 +53,11 @@ GitHub Release, not git.
 bash app/scripts/build-dmg.sh
 ```
 
-It is **arch-aware** (`uname -m`): produces `FlowMap_1.2.0_aarch64.dmg` on Apple
-Silicon and `FlowMap_1.2.0_x86_64.dmg` on Intel. Outputs:
+It is **arch-aware** (`uname -m`): produces `FlowMap_1.3.0_aarch64.dmg` on Apple
+Silicon and `FlowMap_1.3.0_x86_64.dmg` on Intel. Outputs:
 
 - `app/src-tauri/target/release/bundle/macos/FlowMap.app` (~536 MB)
-- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.2.0_<arch>.dmg` (~169 MB)
+- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.3.0_<arch>.dmg` (~169 MB)
 
 Requires: `cargo`/`rustc`, `cargo-tauri` (`cargo install tauri-cli --version '^2'
 --locked`), Node/npm, `uv`, and the macOS `codesign`/`hdiutil`/`sips`/`iconutil`
