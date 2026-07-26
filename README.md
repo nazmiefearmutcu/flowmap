@@ -1,5 +1,7 @@
 # FlowMap
 
+[![tests](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/test.yml/badge.svg)](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/test.yml)
+
 **An institutional-grade, dual-market order-flow visualizer — real-time liquidity heatmap, DOM
 ladder, time & sales, and order-flow overlays for crypto and US equities, in one renderer.**
 
