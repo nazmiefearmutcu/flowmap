@@ -82,7 +82,7 @@ make the code publicly installable, and publish (push + GitHub release).
 
 ### 4. Publicly installable + publish
 - **Dependency de-localization (the public-install blocker):** `server/pyproject.toml`
-  `[tool.uv.sources]` currently points crypcodile/stockodile at `/Users/nazmi/...` local paths.
+  `[tool.uv.sources]` currently points crypcodile/stockodile at local checkout paths.
   Both repos are already public on GitHub. Change to **pinned git dependencies**:
   `crypcodile = { git = "https://github.com/nazmiefearmutcu/Crypcodile.git", rev = "<sha>" }` and
   the same for stockodile (the `core` extra). Pin to the exact commits with the M1 dependency

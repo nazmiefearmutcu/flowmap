@@ -340,7 +340,7 @@ pre-loaded 10 k-column history; runs headed on this Mac; results written to `per
 ## 13. Dependencies & repository layout
 
 Neither `crypcodile` nor `stockodile` is on PyPI. Both are consumed as **uv path dependencies to
-the local checkouts** (`/Users/nazmi/Crypcodile`, `/Users/nazmi/stockodile`) via
+the local checkouts** (sibling `Crypcodile` and `stockodile` clones) via
 `tool.uv.sources` for dev, with pinned git SHAs recorded for reproducibility (local checkouts are
 authoritative during this build).
 
