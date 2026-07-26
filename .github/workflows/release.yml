@@ -132,6 +132,21 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
+      # The AppImage payload is heavy: a Rust LTO build tree, the ~500 MB embedded
+      # CPython runtime, the .deb produced just before it, an AppDir copy of the
+      # whole lot and finally the squashfs image — all on the same volume. The
+      # stock runner image ships ~25 GB of toolchains we never touch, so reclaim
+      # them first; "no space left" is otherwise reported as an opaque
+      # linuxdeploy failure.
+      - name: Free disk space
+        if: matrix.kind == 'linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
       - name: Install Linux WebView + bundling deps
         if: matrix.kind == 'linux'
         run: |
@@ -209,7 +224,15 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
           NO_STRIP: true
-        run: cargo tauri build --bundles appimage
+          # linuxdeploy hides the actual reason behind "failed to run linuxdeploy"
+          # unless it is asked to talk; 2 = debug.
+          VERBOSE: 1
+          DEBUG: 1
+        run: |
+          set -x
+          df -h /
+          cargo tauri build --bundles appimage --verbose 2>&1 | tail -n 200
+          df -h /
 
       # --- Per-OS smoke test: import every server dep from the BUNDLED
       #     interpreter, then boot the server and poll /api/health (mirrors the
