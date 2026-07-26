@@ -91,7 +91,8 @@ the server, so there is nothing else to install (no Python, no Node, no `uv`). P
 | 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.0_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x86_64.dmg)** · 183 MB | same as above |
 | 🪟 **Windows 10/11 x64** *(recommended)* | **[⬇️ FlowMap_1.3.0_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64-setup.exe)** · 103 MB | run it — installs per-user, no admin needed |
 | 🪟 **Windows 10/11 x64** *(MSI / managed)* | **[⬇️ FlowMap_1.3.0_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64_en-US.msi)** · 167 MB | standard MSI installer |
-| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.0_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.deb)** · 434 MB | `sudo apt install ./FlowMap_1.3.0_amd64.deb` |
+| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.0_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.deb)** · 430 MB | `sudo apt install ./FlowMap_1.3.0_amd64.deb` |
+| 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.0_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.AppImage)** · 313 MB | `chmod +x` it, then run it |
 
 *Which Mac do I have?* → Apple menu → **About This Mac**: "Chip: Apple M…" = Apple Silicon, "Processor: Intel…" = Intel.
 
@@ -104,8 +105,7 @@ the server, so there is nothing else to install (no Python, no Node, no `uv`). P
 > After the first confirmation the app launches normally.
 
 Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Platforms
-without a prebuilt installer — **non-Debian Linux** (no AppImage in 1.3.0), Linux on arm, and 32-bit
-systems — can **run from source** (below).
+without a prebuilt installer — Linux on arm and 32-bit systems — can **run from source** (below).
 
 ## Run it
 
