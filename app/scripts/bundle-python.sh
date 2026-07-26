@@ -94,7 +94,17 @@ mkdir -p "$CACHE_DIR"
 # URL-encoded as `%2B`.
 ASSET_RE="cpython-${PY_SERIES}\.[0-9]+(%2B|\+)${PBS_TAG}-${TRIPLE}-install_only\.tar\.gz"
 echo "==> Resolving python-build-standalone asset (tag $PBS_TAG)"
-ASSET_URL="$(curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/${PBS_TAG}" \
+# Authenticate the API lookup when a token is available. Unauthenticated GitHub
+# API calls are capped at 60/hour PER IP, and CI runners share egress IPs, so
+# this request intermittently comes back 403 and fails the whole build. A token
+# raises the cap to 5000/hour. --retry-all-errors also covers 403/429, which
+# plain --retry ignores.
+API_AUTH=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  API_AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+ASSET_URL="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 "${API_AUTH[@]}" \
+  "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/${PBS_TAG}" \
   | grep -oE "https://github.com/[^\"]*${ASSET_RE}" | grep -v freethreaded | grep -v stripped | head -1)"
 if [[ -z "$ASSET_URL" ]]; then
   echo "ERROR: could not resolve a ${PY_SERIES} ${TRIPLE} install_only asset for tag ${PBS_TAG}" >&2
@@ -104,7 +114,7 @@ TARBALL="$CACHE_DIR/$(basename "$ASSET_URL")"
 echo "    asset: $ASSET_URL"
 if [[ ! -f "$TARBALL" ]]; then
   echo "==> Downloading $(basename "$TARBALL")"
-  curl -fSL --retry 3 -o "$TARBALL" "$ASSET_URL"
+  curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -o "$TARBALL" "$ASSET_URL"
 else
   echo "    (cached)"
 fi

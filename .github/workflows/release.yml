@@ -160,6 +160,11 @@ jobs:
       #     Apple-Silicon and Intel runners. ------------------------------------
       - name: Build macOS installer (build-dmg.sh)
         if: matrix.kind == 'macos'
+        env:
+          # Lets bundle-python.sh authenticate its python-build-standalone
+          # release lookup; the unauthenticated GitHub API cap is 60/hour per IP
+          # and shared runner IPs blow through it, returning a 403.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash app/scripts/build-dmg.sh
 
       # --- Windows/Linux: client + pyruntime + `cargo tauri build`. The
@@ -174,6 +179,8 @@ jobs:
 
       - name: Bundle Python runtime (${{ matrix.triple }})
         if: matrix.kind != 'macos'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash app/scripts/bundle-python.sh "${{ matrix.triple }}"
 
       - name: Generate Tauri icon set
