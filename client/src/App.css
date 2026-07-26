@@ -60,13 +60,14 @@ body,
   pointer-events: none;
 }
 
+/* The script logotype (ui/Wordmark.tsx). It is an outlined SVG filled with
+   currentColor, so the colour is set here and the mark scales cleanly. The
+   glyphs carry swashes that overshoot the type box, hence the small horizontal
+   padding — without it the F's flourish clips against the window edge. */
 .topbar__brand {
   display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  font-size: var(--fs-lg);
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  align-items: center;
+  padding: 0 6px;
   color: var(--text);
   white-space: nowrap;
 }

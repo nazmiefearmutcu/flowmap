@@ -15,6 +15,7 @@ import { forwardRef, useEffect, useState } from 'react';
 import type { StreamMode } from '../proto/types';
 import { useFlowMapStore } from '../state/store';
 import { SymbolSearch, type SymbolSearchHandle } from './SymbolSearch';
+import { Wordmark } from './Wordmark';
 import { capabilityChips, marketGroup, type SymbolGroupKey } from './symbols';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -104,7 +105,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
   return (
     <header className="topbar">
       <span className="topbar__brand">
-        FlowMap
+        <Wordmark height={24} />
       </span>
 
       <SymbolSearch ref={searchRef} current={`${market}:${symbol}`} onSelect={onSelectSymbol} />
