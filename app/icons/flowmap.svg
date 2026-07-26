@@ -1,64 +1,78 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!--
-  FlowMap app icon — hand-authored.
-  Mark: a VOLUME PROFILE / order-flow liquidity histogram. Fifteen price rows share
-  a common price-axis baseline at the left; each bar's LENGTH is proportional to
-  resting liquidity at that price, so the bars form the characteristic profile
-  silhouette — longest at the Point of Control (the bright teal->cyan focal
-  "liquidity wall" dead-centre) and tapering, irregularly, above and below. Two
-  secondary bright cyan walls mark other high-volume nodes; one amber row is the
-  caution/replay channel; a single short red tick near the top marks the sell/ask
-  side; a faint vertical hairline is the current-price cursor crossing the profile.
-  Palette from the product theme (theme.css): bg #050709, teal #1fb6a6,
-  cyan #37d0c0, amber #d6a13a, red #d3524f. macOS squircle tile (circular-corner
-  approximation of the Apple superellipse, r = 18% of side). Geometry only — no
-  glows, no orbs, no clip-art.
--->
+<?xml version="1.0"?>
+
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0b0f16"/>
-      <stop offset="0.55" stop-color="#070a10"/>
-      <stop offset="1" stop-color="#050709"/>
-    </linearGradient>
-    <!-- focal POC wall: teal -> cyan along its length -->
-    <linearGradient id="focalWall" x1="184" y1="0" x2="856" y2="0" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1fb6a6"/>
-      <stop offset="1" stop-color="#37d0c0"/>
-    </linearGradient>
-    <clipPath id="tileClip">
-      <rect x="0" y="0" width="1024" height="1024" rx="185" ry="185"/>
-    </clipPath>
+    <linearGradient id="mTileE" x1="512" y1="90" x2="512" y2="914" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0e1a0f"></stop><stop offset=".5" stop-color="#0a1109"></stop><stop offset="1" stop-color="#0d0208"></stop></linearGradient>
+    <clipPath id="mClipE"><rect x="100" y="90" width="824" height="824" rx="185"></rect></clipPath>
+    <filter id="mShadowE" x="-25%" y="-25%" width="150%" height="150%"><feDropShadow dx="0" dy="26" stdDeviation="30" flood-color="#000" flood-opacity=".6"></feDropShadow></filter>
+    <radialGradient id="mScrimE" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#04120a" stop-opacity=".72"></stop><stop offset=".62" stop-color="#04120a" stop-opacity=".34"></stop><stop offset="1" stop-color="#04120a" stop-opacity="0"></stop></radialGradient>
   </defs>
-
-  <!-- tile -->
-  <rect x="0" y="0" width="1024" height="1024" rx="185" ry="185" fill="url(#bgGrad)"/>
-
-  <!-- volume-profile motif: baseline x=184, bar length = liquidity at that price -->
-  <g clip-path="url(#tileClip)">
-    <!-- current-price cursor, faint, crosses the profile -->
-    <rect x="595" y="150" width="2.5" height="724" fill="#37d0c0" opacity="0.13"/>
-
-    <!-- rows top -> bottom; POC (row 8) is longest & dead-centre -->
-    <rect x="184" y="155" width="148" height="26" rx="4" fill="#1fb6a6" opacity="0.40"/>
-    <rect x="184" y="207" width="108" height="20" rx="3" fill="#d3524f" opacity="0.92"/><!-- red ask tick (short) -->
-    <rect x="184" y="253" width="282" height="26" rx="4" fill="#1fb6a6" opacity="0.52"/>
-    <rect x="184" y="302" width="242" height="26" rx="4" fill="#1fb6a6" opacity="0.48"/>
-    <rect x="184" y="352" width="376" height="26" rx="4" fill="#d6a13a" opacity="0.66"/><!-- amber channel -->
-    <rect x="184" y="402" width="497" height="24" rx="3" fill="#37d0c0" opacity="0.90"/><!-- bright node -->
-    <rect x="184" y="450" width="430" height="26" rx="4" fill="#1fb6a6" opacity="0.62"/>
-    <rect x="184" y="498" width="672" height="28" rx="4" fill="url(#focalWall)"/><!-- POC (focal) -->
-    <rect x="184" y="509" width="672" height="6" rx="3" fill="#8ceede" opacity="0.85"/><!-- POC bright core -->
-    <rect x="184" y="548" width="564" height="26" rx="4" fill="#1fb6a6" opacity="0.74"/>
-    <rect x="184" y="597" width="390" height="26" rx="4" fill="#1fb6a6" opacity="0.58"/>
-    <rect x="184" y="647" width="484" height="24" rx="3" fill="#37d0c0" opacity="0.82"/><!-- bright node -->
-    <rect x="184" y="696" width="322" height="26" rx="4" fill="#1fb6a6" opacity="0.54"/>
-    <rect x="184" y="745" width="242" height="26" rx="4" fill="#1fb6a6" opacity="0.48"/>
-    <rect x="184" y="794" width="296" height="26" rx="4" fill="#1fb6a6" opacity="0.52"/>
-    <rect x="184" y="843" width="175" height="26" rx="4" fill="#1fb6a6" opacity="0.42"/>
-  </g>
-
-  <!-- faint inner border for definition on light desktops -->
-  <rect x="6" y="6" width="1012" height="1012" rx="179" ry="179"
-        fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+      <g filter="url(#mShadowE)"><rect x="100" y="90" width="824" height="824" rx="185" fill="url(#mTileE)"></rect></g>
+      <g clip-path="url(#mClipE)">
+        <rect x="169" y="176" width="4" height="648" fill="#008f11" opacity=".3"></rect>
+        <rect x="164" y="210" width="14" height="580" rx="3" fill="#008f11" opacity=".55"></rect>
+        <rect x="192.5" y="116" width="4" height="778" fill="#003b00" opacity=".45"></rect>
+        <rect x="187.5" y="150" width="14" height="710" rx="3" fill="#003b00" opacity=".85"></rect>
+        <rect x="216" y="231" width="4" height="523" fill="#00ff41" opacity=".14"></rect>
+        <rect x="211" y="265" width="14" height="455" rx="3" fill="#00ff41" opacity=".28"></rect>
+        <rect x="239.5" y="151" width="4" height="723" fill="#6e1414" opacity=".4"></rect>
+        <rect x="234.5" y="185" width="14" height="655" rx="3" fill="#6e1414" opacity=".75"></rect>
+        <rect x="263" y="96" width="4" height="733" fill="#008f11" opacity=".35"></rect>
+        <rect x="258" y="130" width="14" height="665" rx="3" fill="#008f11" opacity=".7"></rect>
+        <rect x="286.5" y="206" width="4" height="703" fill="#003b00" opacity=".5"></rect>
+        <rect x="281.5" y="240" width="14" height="635" rx="3" fill="#003b00" opacity=".9"></rect>
+        <rect x="310" y="141" width="4" height="628" fill="#4a0f0f" opacity=".5"></rect>
+        <rect x="305" y="175" width="14" height="560" rx="3" fill="#4a0f0f" opacity=".95"></rect>
+        <rect x="333.5" y="90" width="4" height="764" fill="#00ff41" opacity=".25"></rect>
+        <rect x="328.5" y="120" width="14" height="700" rx="3" fill="#00ff41" opacity=".5"></rect>
+        <rect x="357" y="251" width="4" height="563" fill="#003b00" opacity=".45"></rect>
+        <rect x="352" y="285" width="14" height="495" rx="3" fill="#003b00" opacity=".8"></rect>
+        <rect x="380.5" y="126" width="4" height="773" fill="#008f11" opacity=".32"></rect>
+        <rect x="375.5" y="160" width="14" height="705" rx="3" fill="#008f11" opacity=".6"></rect>
+        <rect x="404" y="191" width="4" height="548" fill="#003b00" opacity=".4"></rect>
+        <rect x="399" y="225" width="14" height="480" rx="3" fill="#003b00" opacity=".75"></rect>
+        <rect x="427.5" y="106" width="4" height="758" fill="#8f1a1a" opacity=".32"></rect>
+        <rect x="422.5" y="140" width="14" height="690" rx="3" fill="#8f1a1a" opacity=".6"></rect>
+        <rect x="451" y="161" width="4" height="758" fill="#008f11" opacity=".4"></rect>
+        <rect x="446" y="195" width="14" height="690" rx="3" fill="#008f11" opacity=".8"></rect>
+        <rect x="474.5" y="221" width="4" height="573" fill="#003b00" opacity=".48"></rect>
+        <rect x="469.5" y="255" width="14" height="505" rx="3" fill="#003b00" opacity=".9"></rect>
+        <rect x="498" y="90" width="4" height="789" fill="#00ff41" opacity=".38"></rect>
+        <rect x="493" y="110" width="14" height="735" rx="3" fill="#00ff41" opacity=".75"></rect>
+        <rect x="521.5" y="196" width="4" height="638" fill="#008f11" opacity=".26"></rect>
+        <rect x="516.5" y="230" width="14" height="570" rx="3" fill="#008f11" opacity=".5"></rect>
+        <rect x="545" y="131" width="4" height="628" fill="#6e1414" opacity=".42"></rect>
+        <rect x="540" y="165" width="14" height="560" rx="3" fill="#6e1414" opacity=".8"></rect>
+        <rect x="568.5" y="171" width="4" height="733" fill="#00ff41" opacity=".2"></rect>
+        <rect x="563.5" y="205" width="14" height="665" rx="3" fill="#00ff41" opacity=".38"></rect>
+        <rect x="592" y="241" width="4" height="583" fill="#008f11" opacity=".35"></rect>
+        <rect x="587" y="275" width="14" height="515" rx="3" fill="#008f11" opacity=".68"></rect>
+        <rect x="615.5" y="101" width="4" height="748" fill="#4a0f0f" opacity=".5"></rect>
+        <rect x="610.5" y="135" width="14" height="680" rx="3" fill="#4a0f0f" opacity=".95"></rect>
+        <rect x="639" y="216" width="4" height="563" fill="#008f11" opacity=".3"></rect>
+        <rect x="634" y="250" width="14" height="495" rx="3" fill="#008f11" opacity=".55"></rect>
+        <rect x="662.5" y="146" width="4" height="768" fill="#00ff41" opacity=".3"></rect>
+        <rect x="657.5" y="180" width="14" height="700" rx="3" fill="#00ff41" opacity=".58"></rect>
+        <rect x="686" y="181" width="4" height="623" fill="#003b00" opacity=".48"></rect>
+        <rect x="681" y="215" width="14" height="555" rx="3" fill="#003b00" opacity=".9"></rect>
+        <rect x="709.5" y="121" width="4" height="748" fill="#6e1414" opacity=".38"></rect>
+        <rect x="704.5" y="155" width="14" height="680" rx="3" fill="#6e1414" opacity=".7"></rect>
+        <rect x="733" y="256" width="4" height="493" fill="#003b00" opacity=".42"></rect>
+        <rect x="728" y="290" width="14" height="425" rx="3" fill="#003b00" opacity=".8"></rect>
+        <rect x="756.5" y="166" width="4" height="718" fill="#00ff41" opacity=".16"></rect>
+        <rect x="751.5" y="200" width="14" height="650" rx="3" fill="#00ff41" opacity=".3"></rect>
+        <rect x="780" y="111" width="4" height="703" fill="#008f11" opacity=".4"></rect>
+        <rect x="775" y="145" width="14" height="635" rx="3" fill="#008f11" opacity=".78"></rect>
+        <rect x="803.5" y="201" width="4" height="658" fill="#8f1a1a" opacity=".3"></rect>
+        <rect x="798.5" y="235" width="14" height="590" rx="3" fill="#8f1a1a" opacity=".55"></rect>
+        <rect x="827" y="136" width="4" height="648" fill="#008f11" opacity=".26"></rect>
+        <rect x="822" y="170" width="14" height="580" rx="3" fill="#008f11" opacity=".5"></rect>
+        <rect x="850.5" y="226" width="4" height="668" fill="#003b00" opacity=".38"></rect>
+        <rect x="845.5" y="260" width="14" height="600" rx="3" fill="#003b00" opacity=".72"></rect>
+        <ellipse cx="512" cy="502" rx="400" ry="370" fill="url(#mScrimE)"></ellipse>
+        <text x="191.8" y="603.5" font-family="&#39;Great Vibes&#39;, cursive" font-size="452" fill="none" stroke="#04120a" stroke-width="18" stroke-linejoin="round" opacity=".9">F</text>
+        <text x="191.8" y="603.5" font-family="&#39;Great Vibes&#39;, cursive" font-size="452" fill="#eafff0">F</text>
+      </g>
+      <rect x="100.75" y="90.75" width="822.5" height="822.5" rx="184.25" fill="none" stroke="#eafff0" stroke-opacity=".1" stroke-width="1.5"></rect>
+    
 </svg>
