@@ -1,17 +1,21 @@
 """Bundled symbol universe + directory builder (GOAL 2, no network).
 
-Why bundled lists? There is no free, offline enumerator for either market in the
-pinned deps:
+These lists are the OFFLINE FALLBACK and the first-paint default — not the
+reachable universe. Live per-venue enumeration lives in
+:mod:`flowmap_server.data.venues`, which the merged engine made possible
+(``crypto.instruments.universe`` and the native connectors' ``list_instruments``
+did not exist in the fork this file was written against).
 
-- **Equity:** no free full-market ticker enumerator exists, so a CURATED list of
-  large-cap US tickers is shipped in-tree. It is intentionally static reference
-  data, refreshed by editing this file — never fetched at runtime.
-- **Crypto:** the pinned crypcodile has no ``instruments.universe`` /
-  ``exchanges.coingecko`` module (the design map referenced a newer revision), so
-  live market-wide enumeration is not available offline either. A curated
-  shortlist of high-volume Binance USDT spot pairs is shipped the same way. Live
-  price/mover data for these symbols still comes through the network cache
-  (``api/market_cache.py``); only the ENUMERATION is bundled.
+They are still worth shipping:
+
+- **First paint.** ``/api/universe?market=all`` stays pure, so the picker opens
+  instantly instead of waiting on a venue round-trip.
+- **Offline.** A venue outage degrades discovery to this shortlist rather than
+  to an empty picker.
+- **Equity.** The engine can enumerate the full US listing set through SEC +
+  Tiingo, but that is a multi-megabyte pull; the curated large-caps remain the
+  default surface, and any ticker outside them is still subscribable by typing
+  it — the directory bounds what is BROWSABLE, never what is reachable.
 
 The directory builder is pure: callers pass in the honest, feed-derived
 capability dicts (so a directory entry can never claim more than a real subscribe
@@ -104,7 +108,7 @@ def build_directory(
             "market": CRYPTO_MARKET,
             "symbol": s,
             "capability": crypto_capability,
-            "note": "curated shortlist (live enumeration unavailable offline)",
+            "note": "curated shortlist — pick a venue to enumerate it live",
         }
         for s in CRYPTO_SYMBOLS
     ]
@@ -142,7 +146,10 @@ def _market_matches(entry_market: str, want: str) -> bool:
     if want in ("", "all"):
         return True
     if want == "crypto":
-        return entry_market == CRYPTO_MARKET or entry_market.startswith("binance") or entry_market == "okx"
+        # Any venue the engine can reach, not the three this file used to know.
+        from flowmap_server.feeds.crypto import is_crypto_market
+
+        return is_crypto_market(entry_market)
     if want == "equity":
         return entry_market == "equity"
     if want == "sim":

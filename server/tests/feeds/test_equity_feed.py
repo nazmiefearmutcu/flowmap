@@ -5,7 +5,7 @@ All bars/prices/clocks are hand-built and injected (``bars_fn`` / ``price_fn``
 google_finance. The frozen contract:
 
 1. SYNTH volume-at-price builder: bars -> **two-sided** BookState split at a
-   reference price (bid ``price <= ref`` / ask ``price > ref``, stockodile
+   reference price (bid ``price <= ref`` / ask ``price > ref``, engine
    ``split_ladder`` semantics), the profile SHAPE rescaled to a combined peak,
    the point-of-control preserved.
 2. That profile lands as two-sided density in a real L1_BAND Grid.
@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import datetime
 
+import msgspec
 import numpy as np
 
-from stockodile.scheduler.calendar import MARKET_TZ
-from stockodile.schema.records import Bar as StkBar
-from stockodile.schema.records import Quote as StkQuote
-from stockodile.schema.records import Trade as StkTrade
+from crocodile.core.schema.enums import AssetClass, Side
+from crocodile.core.schema.records import OHLCV as StkBar
+from crocodile.core.schema.records import Quote as StkQuote
+from crocodile.core.schema.records import Trade as StkTrade
+from crocodile.core.scheduler.calendar import MARKET_TZ
 
 from flowmap_server.config import Config
 from flowmap_server.core.grid import Grid, GridCfg
@@ -37,6 +39,7 @@ from flowmap_server.feeds.equity import (
     EQUITY_MARKET,
     PROFILE_PEAK_TARGET,
     EquityFeed,
+    _bar_ts,
     _EquitySink,
 )
 from flowmap_server.proto.events import (
@@ -64,9 +67,10 @@ def _et_ns(y: int, mo: int, d: int, h: int, mi: int = 0, s: int = 0) -> int:
 
 def _bar(ts_ns: int, o: float, h: float, low: float, c: float, v: float) -> StkBar:
     return StkBar(
-        provider="yahoo",
+        source="yahoo",
         symbol="AAPL",
         symbol_raw="AAPL",
+        asset_class=AssetClass.EQUITY,
         local_ts=ts_ns,
         source_ts=ts_ns,
         interval="1m",
@@ -482,14 +486,17 @@ def test_symbol_uppercased():
 
 def _stk_trade(ts: int, price: float) -> StkTrade:
     return StkTrade(
-        provider="finnhub",
+        source="finnhub",
         symbol="AAPL",
         symbol_raw="AAPL",
+        asset_class=AssetClass.EQUITY,
         local_ts=ts,
         source_ts=ts,
         id="",
         price=price,
-        size=10.0,
+        amount=10.0,
+        # US equity providers do not publish the aggressor; the feed infers it.
+        side=Side.UNKNOWN,
     )
 
 
@@ -512,9 +519,10 @@ async def test_keyed_sink_quote_rule_alpaca_emits_bbo_and_infers_side():
     # streamed L1 quote sets the midpoint (100.5) and surfaces as a BBO.
     await sink.put(
         StkQuote(
-            provider="alpaca",
+            source="alpaca",
             symbol="AAPL",
             symbol_raw="AAPL",
+            asset_class=AssetClass.EQUITY,
             local_ts=1,
             source_ts=1,
             bid_px=100.0,
@@ -548,9 +556,10 @@ async def test_keyed_sink_alpaca_skips_zero_price_quote_for_depth():
     sink = _EquitySink(out.append, use_quote_rule=True)
     await sink.put(
         StkQuote(
-            provider="alpaca",
+            source="alpaca",
             symbol="AAPL",
             symbol_raw="AAPL",
+            asset_class=AssetClass.EQUITY,
             local_ts=1,
             source_ts=1,
             bid_px=0.0,  # "no bid" sentinel
@@ -563,7 +572,8 @@ async def test_keyed_sink_alpaca_skips_zero_price_quote_for_depth():
     # a healthy two-sided quote afterwards DOES produce a depth column.
     await sink.put(
         StkQuote(
-            provider="alpaca", symbol="AAPL", symbol_raw="AAPL", local_ts=2, source_ts=2,
+            source="alpaca", symbol="AAPL", symbol_raw="AAPL",
+            asset_class=AssetClass.EQUITY, local_ts=2, source_ts=2,
             bid_px=100.0, bid_sz=5.0, ask_px=101.0, ask_sz=7.0,
         )
     )
@@ -610,3 +620,61 @@ def _const_price(px: float):
         return px
 
     return price_fn
+
+
+# --- the merged header's clock + field renames, pinned --------------------------
+# A referee proved these were unpinned: replacing `record.source_ts` with
+# `record.local_ts` in `_rec_ts`/`_bar_ts` left the ENTIRE 389-test suite green,
+# because every equity fixture above sets `local_ts == source_ts`. The equity
+# half of the Crocodile migration renamed `provider`->`source`, `size`->`amount`
+# and `Bar`->`OHLCV`; those renames get assertions that can actually fail.
+
+_EQ_VENUE_NS = 1_700_000_000_000_000_000
+_EQ_LOCAL_NS = _EQ_VENUE_NS + 555_000_000  # receive clock, 555 ms later
+
+
+def _skewed_trade() -> StkTrade:
+    return StkTrade(
+        source="finnhub",
+        symbol="AAPL",
+        symbol_raw="AAPL",
+        asset_class=AssetClass.EQUITY,
+        local_ts=_EQ_LOCAL_NS,
+        source_ts=_EQ_VENUE_NS,
+        id="",
+        price=100.0,
+        amount=42.0,
+        side=Side.UNKNOWN,
+    )
+
+
+async def test_keyed_trade_carries_the_provider_clock_and_the_merged_fields() -> None:
+    out: list[FeedEvent] = []
+    sink = _EquitySink(out.append, use_quote_rule=False)
+    await sink.put(_skewed_trade())
+    (trade,) = out
+    assert isinstance(trade, Trade)
+    assert trade.ts_ns == _EQ_VENUE_NS  # source_ts, NOT local_ts
+    assert trade.ts_ns != _EQ_LOCAL_NS
+    assert trade.size == 42.0  # merged `amount`, not the old `size`
+    assert trade.venue == "finnhub"  # merged `source`, not the old `provider`
+    # No US equity provider publishes the aggressor, so the side is inferred and
+    # says so — never laundered into an exchange-true claim.
+    assert trade.side_src == SIDE_SRC_INFERRED
+
+
+async def test_keyed_trade_falls_back_to_the_receive_clock_only_when_unstamped() -> None:
+    out: list[FeedEvent] = []
+    sink = _EquitySink(out.append, use_quote_rule=False)
+    await sink.put(msgspec.structs.replace(_skewed_trade(), source_ts=None))
+    (trade,) = out
+    assert trade.ts_ns == _EQ_LOCAL_NS
+
+
+async def test_synth_profile_bars_use_the_provider_clock() -> None:
+    """The SYNTH ladder's column timestamps come from the bar's own clock."""
+    bar = msgspec.structs.replace(
+        _bar(_EQ_LOCAL_NS, 10.0, 10.0, 10.0, 10.0, 5.0), source_ts=_EQ_VENUE_NS
+    )
+    assert _bar_ts(bar) == _EQ_VENUE_NS
+    assert _bar_ts(msgspec.structs.replace(bar, source_ts=None)) == _EQ_LOCAL_NS

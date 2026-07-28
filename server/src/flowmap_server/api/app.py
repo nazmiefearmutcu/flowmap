@@ -30,9 +30,7 @@ from flowmap_server.core.backfill import default_backfill_fn
 from flowmap_server.core.record import Recorder
 from flowmap_server.core.session import SessionManager
 from flowmap_server.feeds.base import Feed
-from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
-from flowmap_server.feeds.equity import EQUITY_MARKETS, EquityFeed
-from flowmap_server.feeds.sim import SimFeed
+from flowmap_server.feeds.router import feed_factory
 from flowmap_server.proto import events
 
 __all__ = ["create_app"]
@@ -51,29 +49,14 @@ _ALLOWED_ORIGINS = (
 
 
 def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
-    """Server-path feed factory: realtime sim + live crypto (M1).
+    """Server-path feed factory: realtime sim + live crypto/equity.
 
-    Mirrors ``SessionManager._default_feed_factory`` except the sim feed is
-    ``realtime=True`` — one interval per ``dt_ns`` of wall time keeps the
-    event loop live and the demo stream watchable (4 columns/s at dt=250 ms).
+    Same routing as the test path (both go through ``feeds.router``); only the
+    sim feed differs — ``realtime=True`` paces one interval per ``dt_ns`` of
+    wall time, which keeps the event loop live and the demo stream watchable
+    (4 columns/s at dt=250 ms).
     """
-
-    def factory(sub: events.Subscribe) -> Feed:
-        if sub.market == "sim":
-            return SimFeed(seed=42, dt_ns=cfg.dt_crypto_ns, start_ns=0, realtime=True)
-        if sub.market in CRYPTO_MARKETS:
-            # "<exchange>-<market>" ("binance-usdm") or bare "<exchange>".
-            exchange, _, market = sub.market.partition("-")
-            return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=market, cfg=cfg)
-        if sub.market in EQUITY_MARKETS:
-            # Tier (keyless SYNTH / Alpaca / Finnhub) auto-selected from cfg keys.
-            return EquityFeed(sub.symbol, cfg)
-        raise NotImplementedError(
-            f"market {sub.market!r} has no feed "
-            f"(sim + crypto {sorted(CRYPTO_MARKETS)} + equity {sorted(EQUITY_MARKETS)})"
-        )
-
-    return factory
+    return feed_factory(cfg, realtime_sim=True)
 
 
 def create_app(

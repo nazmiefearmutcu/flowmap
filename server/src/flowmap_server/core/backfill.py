@@ -18,9 +18,10 @@ to Parquet (only genuine live columns persist for a future rehydration).
 The network fetch is fully behind the injectable ``BackfillFn`` seam
 (``async (market, symbol, *, max_cols, now_ns) -> Sequence[Candle]``): pytest
 feeds canned candles and never hits the network; the default production seam
-(:func:`default_backfill_fn`) dispatches crypto -> crypcodile ``iter_backfill``
-klines and equity -> stockodile Yahoo 1 m bars, and is imported lazily so the
-heavy provider deps never load in tests.
+(:func:`default_backfill_fn`) dispatches crypto -> Crocodile ``iter_backfill``
+klines where a venue has a native REST backfill and ccxt ``fetchOHLCV`` for the
+rest, equity -> Crocodile's Yahoo 1 m bars; all imported lazily so the heavy
+provider deps never load in tests.
 
 Conversion rules (mirrors :meth:`Grid.preload`'s contract):
 
@@ -245,11 +246,11 @@ async def default_backfill_fn(
     try:
         if market == "sim":
             return []
-        from flowmap_server.feeds.crypto import CRYPTO_MARKETS
+        from flowmap_server.feeds.crypto import is_crypto_market
         from flowmap_server.feeds.equity import EQUITY_MARKETS
 
-        if market in CRYPTO_MARKETS:
-            return await _crypto_candles(market, symbol, max_cols=max_cols, now_ns=now_ns)
+        if is_crypto_market(market):
+            return await crypto_klines(market, symbol, max_bars=max_cols, now_ns=now_ns)
         if market in EQUITY_MARKETS:
             return await _equity_candles(symbol, max_cols=max_cols)
     except Exception:  # noqa: BLE001 — backfill is best-effort; cold start on any error
@@ -257,39 +258,209 @@ async def default_backfill_fn(
     return []
 
 
-async def _crypto_candles(
-    market: str, symbol: str, *, max_cols: int, now_ns: int
+# Market segments that mean "derivatives" to ccxt's defaultType option. Used
+# only to disambiguate a bare symbol (BTCUSDT) when a venue lists both a spot
+# and a perp pair under near-identical names.
+_SWAP_SEGMENTS = frozenset({"usdm", "coinm", "linear", "inverse", "swap", "perp", "futures"})
+
+
+# Interval label -> its span in ns. The two the app asks for: 1 m grid columns
+# and 1 h quote sparks.
+_INTERVAL_NS: dict[str, int] = {"1m": 60 * 10**9, "1h": 3600 * 10**9}
+
+
+async def crypto_klines(
+    market: str, symbol: str, *, interval: str = "1m", max_bars: int, now_ns: int
 ) -> list[Candle]:
-    from crypcodile.client.backfill import iter_backfill
+    """Crypto klines, from whichever path the venue actually has.
+
+    The engine's hand-written REST backfill covers ``ohlcv`` for Binance only
+    (``SUPPORTED_CHANNELS``). Every other venue is reachable through ccxt's
+    ``fetchOHLCV``, so falling back there is the difference between a chart with
+    history and a cold start on all but one of the venues.
+    """
+    from crocodile.crypto.client.backfill import SUPPORTED_CHANNELS
+
+    from flowmap_server.data.venues import resolve_symbol
 
     exchange, _, seg = market.partition("-")
     seg = seg or "spot"
-    minute = 60 * 10**9
-    start = now_ns - max_cols * minute
+    # Same translation the live feed does: a symbol in the other venue's
+    # spelling must not silently cost us the native path (and with it the taker
+    # split) by failing the venue's REST call.
+    symbol = await resolve_symbol(market, symbol)
+    kw = {"interval": interval, "max_bars": max_bars, "now_ns": now_ns}
+    if "ohlcv" in SUPPORTED_CHANNELS.get(exchange, frozenset()):
+        # Native first: only the venue's own klines carry the taker buy/sell
+        # split, which is what makes the reconstructed CVD real rather than
+        # flat. ccxt's unified OHLCV has no such column.
+        try:
+            native = await _native_candles(exchange, symbol, seg, **kw)
+        except Exception:  # noqa: BLE001 — fall through to ccxt below
+            logger.warning("native klines failed for %s; trying ccxt", market, exc_info=True)
+        else:
+            if native:
+                return native
+    return await _ccxt_candles(exchange, symbol, seg, **kw)
+
+
+async def _native_candles(
+    exchange: str, symbol: str, seg: str, *, interval: str, max_bars: int, now_ns: int
+) -> list[Candle]:
+    from crocodile.crypto.client.backfill import iter_backfill
+
+    span = _INTERVAL_NS.get(interval, 60 * 10**9)
+    start = now_ns - max_bars * span
     out: list[Candle] = []
-    async for rec in iter_backfill(
-        exchange, "ohlcv", symbol, start, now_ns, market=seg, interval="1m"
-    ):
-        ts = rec.exchange_ts if rec.exchange_ts is not None else rec.local_ts
+    backfill_obj, session = _hardened_backfill(exchange, seg)
+    try:
+        async for rec in iter_backfill(
+            exchange,
+            "ohlcv",
+            symbol,
+            start,
+            now_ns,
+            market=seg,
+            interval=interval,
+            backfill_obj=backfill_obj,
+        ):
+            ts = rec.source_ts if rec.source_ts is not None else rec.local_ts
+            # The merged OHLCV makes the taker split optional: a venue that does
+            # not report it now says None instead of a fabricated 0.0. Pass the
+            # absence through — Candle already treats None as "no split", which
+            # keeps CVD flat instead of drawing a fake all-sell bar.
+            buy, sell = rec.buy_volume, rec.sell_volume
+            out.append(
+                Candle(
+                    t0_ns=int(ts),
+                    o=float(rec.open),
+                    h=float(rec.high),
+                    l=float(rec.low),
+                    c=float(rec.close),
+                    volume=float(rec.volume),
+                    buy_volume=None if buy is None else float(buy),
+                    sell_volume=None if sell is None else float(sell),
+                )
+            )
+            if len(out) >= max_bars:
+                break
+    finally:
+        if session is not None:
+            await session.close()
+    return out
+
+
+# Binance REST bases per market segment. The engine's `make_live_backfill`
+# wires klines to the SPOT base for every segment, so a usdm/coinm backfill
+# would silently read spot candles; naming the base here fixes that as a
+# side-effect of hardening the session.
+_BINANCE_KLINE_BASE = {
+    "spot": "https://api.binance.com/api/v3",
+    "usdm": "https://fapi.binance.com/fapi/v1",
+    "coinm": "https://dapi.binance.com/dapi/v1",
+}
+
+
+def _hardened_backfill(exchange: str, seg: str) -> tuple[object | None, object | None]:
+    """A backfill object whose REST session trusts the certifi CA bundle.
+
+    Same problem `_harden_rest_ssl` solves for the live feed: on a stock macOS
+    framework Python the default OpenSSL trust store cannot verify these hosts,
+    and the engine's own backfill builds its session internally where that
+    wrapper cannot reach. Returns ``(None, None)`` — plain engine defaults —
+    for venues we have no hardening recipe for, or if certifi is unavailable.
+    """
+    if exchange != "binance":
+        return None, None
+    try:
+        import functools
+        import ssl
+
+        import aiohttp
+        import certifi
+
+        from crocodile.crypto.exchanges.binance.backfill import (
+            BinanceBackfill,
+            _live_fetch_klines,
+        )
+    except Exception:  # noqa: BLE001 — keep engine defaults if anything is absent
+        return None, None
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
+    try:
+        base = _BINANCE_KLINE_BASE.get(seg, _BINANCE_KLINE_BASE["spot"])
+        bf = BinanceBackfill(
+            fetch_aggtrades=None,
+            fetch_klines=functools.partial(_live_fetch_klines, rest_base=base, session=session),
+            fetch_open_interest=None,
+            fetch_open_interest_hist=None,
+        )
+    except Exception:  # noqa: BLE001 — never leak the session we just opened
+        session._connector.close()  # sync close; we are not in an await context
+        raise
+    return bf, session
+
+
+async def _ccxt_candles(
+    exchange: str, symbol: str, seg: str, *, interval: str, max_bars: int, now_ns: int
+) -> list[Candle]:
+    """1-minute klines for any ccxt venue, via ``fetchOHLCV``.
+
+    Returns ``[]`` rather than raising when the venue is not a ccxt id (the
+    on-chain and CoinGecko readers), does not serve OHLCV, or does not list the
+    symbol — the caller treats an empty result as a clean cold start.
+
+    No taker split: ccxt's unified OHLCV has no buy/sell breakdown, so the
+    candles carry ``None`` and the reconstructed CVD stays flat instead of
+    inventing a direction.
+    """
+    from crocodile.crypto.exchanges.ccxt_universal.connector import CCXTConnector
+    from flowmap_server.data.venues import ccxt_knows
+
+    # `ccxt_knows`, not `factory.is_ccxt_exchange` — the latter is False for the
+    # five venues that also have a native connector, and those are precisely the
+    # ones whose klines we need from ccxt (the engine's own REST backfill serves
+    # ohlcv for Binance alone).
+    if not ccxt_knows(exchange):
+        return []
+    import ccxt.async_support as ccxt_async
+
+    default_type = "swap" if seg in _SWAP_SEGMENTS else "spot"
+    ex = getattr(ccxt_async, exchange)(
+        {"enableRateLimit": True, "options": {"defaultType": default_type}}
+    )
+    try:
+        if not ex.has.get("fetchOHLCV"):
+            return []
+        markets = await ex.load_markets()
+        unified = CCXTConnector._resolve_symbol(symbol, markets, ex.markets_by_id)
+        if unified is None:
+            logger.warning("ccxt backfill: %s does not list %r", exchange, symbol)
+            return []
+        span = _INTERVAL_NS.get(interval, 60 * 10**9)
+        since_ms = (now_ns - max_bars * span) // 10**6
+        rows = await ex.fetch_ohlcv(unified, interval, since=int(since_ms), limit=max_bars)
+    finally:
+        await ex.close()
+    out: list[Candle] = []
+    for ts_ms, o, h, l, c, vol in rows[-max_bars:]:
+        if None in (ts_ms, o, h, l, c):
+            continue
         out.append(
             Candle(
-                t0_ns=int(ts),
-                o=float(rec.open),
-                h=float(rec.high),
-                l=float(rec.low),
-                c=float(rec.close),
-                volume=float(rec.volume),
-                buy_volume=float(rec.buy_volume),
-                sell_volume=float(rec.sell_volume),
+                t0_ns=int(ts_ms) * 10**6,
+                o=float(o),
+                h=float(h),
+                l=float(l),
+                c=float(c),
+                volume=float(vol or 0.0),
             )
         )
-        if len(out) >= max_cols:
-            break
     return out
 
 
 async def _equity_candles(symbol: str, *, max_cols: int) -> list[Candle]:
-    from stockodile.providers.yahoo.client import YahooClient
+    from crocodile.equity.providers.yahoo.client import YahooClient
 
     bars = await YahooClient().fetch_intraday_bars(symbol.upper(), "1m")
     out: list[Candle] = []

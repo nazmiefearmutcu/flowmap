@@ -1,4 +1,4 @@
-"""CryptoFeed (Crypcodile -> canonical) bridge tests (M1 plan Task 9).
+"""CryptoFeed (Crocodile -> canonical) bridge tests (M1 plan Task 9).
 
 NO live network. The fixture ``fixtures/binance_btcusdt_sample.jsonl`` holds
 raw Binance USD-M ws frames plus two REST-style depth snapshots (wrapper
@@ -17,21 +17,24 @@ import pathlib
 
 import numpy as np
 
-from crypcodile.exchanges.binance.book import parse_rest_depth_snapshot
-from crypcodile.exchanges.binance.connector import BinanceConnector
-from crypcodile.ingest.transport import FakeTransport
-from crypcodile.instruments.registry import InstrumentRegistry
-from crypcodile.schema.enums import Side
-from crypcodile.schema.records import BookSnapshot
-from crypcodile.schema.records import Trade as CTrade
+from crocodile.core.ingest.transport import FakeTransport
+from crocodile.core.schema.enums import AssetClass, Side
+from crocodile.core.schema.records import BookSnapshot
+from crocodile.core.schema.records import Trade as CTrade
+from crocodile.crypto.exchanges.binance.book import parse_rest_depth_snapshot
+from crocodile.crypto.exchanges.binance.connector import BinanceConnector
+from crocodile.crypto.instruments.registry import InstrumentRegistry
 
 from flowmap_server.config import Config
 from flowmap_server.feeds.base import BookState, Feed, FeedEvent
 from flowmap_server.feeds.crypto import (
     BOOK_TOP_N,
-    CRYPTO_MARKETS,
+    CRYPTO_EXCHANGES,
+    NATIVE_EXCHANGES,
     CryptoFeed,
     _BridgeSink,
+    is_crypto_market,
+    split_market,
 )
 from flowmap_server.proto.events import (
     BBO,
@@ -266,10 +269,11 @@ async def test_events_recall_builds_fresh_connector() -> None:
         async def run(self, max_reconnects: int = -1) -> None:
             await self._sink.put(
                 CTrade(
-                    exchange="binance-usdm",
+                    source="binance-usdm",
                     symbol="binance-usdm:BTCUSDT",
                     symbol_raw="BTCUSDT",
-                    exchange_ts=1_700_000_000_000_000_000,
+                    asset_class=AssetClass.CRYPTO,
+                    source_ts=1_700_000_000_000_000_000,
                     local_ts=1_700_000_000_000_000_001,
                     id=str(len(calls)),
                     price=50000.0,
@@ -309,10 +313,11 @@ async def test_bookstate_top_n_cap_and_order() -> None:
     n = BOOK_TOP_N + 500
     await sink.put(
         BookSnapshot(
-            exchange="binance-usdm",
+            source="binance-usdm",
             symbol="binance-usdm:BTCUSDT",
             symbol_raw="BTCUSDT",
-            exchange_ts=None,
+            asset_class=AssetClass.CRYPTO,
+            source_ts=None,
             local_ts=123,
             bids=[(50000.0 - 0.1 * i, 1.0) for i in range(n)],
             asks=[(50000.1 + 0.1 * i, 1.0) for i in range(n)],
@@ -322,7 +327,7 @@ async def test_bookstate_top_n_cap_and_order() -> None:
     )
     (book,) = out
     assert isinstance(book, BookState)
-    assert book.ts_ns == 123  # exchange_ts None -> local_ts
+    assert book.ts_ns == 123  # source_ts None -> local_ts
     assert len(book.bid_px) == BOOK_TOP_N
     assert len(book.ask_px) == BOOK_TOP_N
     # best-first: bids descending from best bid, asks ascending from best ask
@@ -348,19 +353,44 @@ def test_session_factory_routing() -> None:
     from flowmap_server.proto import events as pe
 
     mgr = SessionManager(Config())
-    assert CRYPTO_MARKETS == {"binance-spot", "binance-usdm", "okx"}
+    # The venue set is the engine's, not a shortlist kept here: the ten native
+    # connectors plus every ccxt id, and no id contains "-" so the
+    # "<exchange>-<segment>" grammar stays unambiguous.
+    assert NATIVE_EXCHANGES <= CRYPTO_EXCHANGES
+    assert {"binance", "okx", "bybit", "coinbase", "deribit"} <= NATIVE_EXCHANGES
+    assert len(CRYPTO_EXCHANGES) > 50, "ccxt venues missing — is the `market` extra installed?"
+    assert not [e for e in CRYPTO_EXCHANGES if "-" in e]
 
     sim = mgr._default_feed_factory(pe.Subscribe(market="sim", symbol="X", mode="live"))
     assert isinstance(sim, SimFeed)
 
-    for market in sorted(CRYPTO_MARKETS):
+    # A native venue with a segment, a native venue without one, and a
+    # ccxt-only venue all route to CryptoFeed and keep their market string.
+    for market in ("binance-spot", "binance-usdm", "okx", "kraken", "bybit-linear"):
+        assert is_crypto_market(market)
         feed = mgr._default_feed_factory(
             pe.Subscribe(market=market, symbol="BTCUSDT", mode="live")
         )
         assert isinstance(feed, CryptoFeed)
         assert feed.market == market
         assert feed.symbol == "BTCUSDT"
+        assert feed.exchange == split_market(market)[0]
 
+    # Capability is honest about which venues stream true book diffs.
+    native = mgr._default_feed_factory(
+        pe.Subscribe(market="binance-spot", symbol="BTCUSDT", mode="live")
+    )
+    ccxt_only = mgr._default_feed_factory(
+        pe.Subscribe(market="kraken", symbol="BTCUSDT", mode="live")
+    )
+    assert native.native and native.capability["depth"] == "L2"
+    assert not ccxt_only.native and ccxt_only.capability["depth"] == "L2-snapshot"
+    # A snapshot-driven venue has no sequence to lose, so it claims no gap marker.
+    assert "gap" in native.capability["markers"]
+    assert "gap" not in ccxt_only.capability["markers"]
+
+    # Not a venue this build can reach.
+    assert not is_crypto_market("nasdaq")
     with pytest.raises(NotImplementedError):
         mgr._default_feed_factory(
             pe.Subscribe(market="nasdaq", symbol="AAPL", mode="live")

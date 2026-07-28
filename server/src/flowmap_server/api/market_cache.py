@@ -201,10 +201,10 @@ class MarketDataCache:
 
 async def default_quote_fn(market: str, symbol: str) -> QuoteData:
     """Production single-symbol quote seam (crypto klines / equity Yahoo)."""
-    from flowmap_server.feeds.crypto import CRYPTO_MARKETS
+    from flowmap_server.feeds.crypto import is_crypto_market
     from flowmap_server.feeds.equity import EQUITY_MARKETS
 
-    if market in CRYPTO_MARKETS or market == "crypto":
+    if market == "crypto" or is_crypto_market(market):
         return await _crypto_quote(market if market != "crypto" else "binance-spot", symbol)
     if market in EQUITY_MARKETS or market == "equity":
         return await _equity_quote(symbol)
@@ -245,17 +245,15 @@ async def _safe_quote(fetch: Callable[[str], Awaitable[QuoteData]], symbol: str)
 
 
 async def _crypto_quote(market: str, symbol: str) -> QuoteData:
-    from crypcodile.client.backfill import iter_backfill
+    # Shared with the grid backfill so every venue quotes through the same
+    # path: native REST klines where the engine has them, ccxt fetchOHLCV
+    # otherwise. Previously this was Binance-only in practice.
+    from flowmap_server.core.backfill import crypto_klines
 
-    exchange, _, seg = market.partition("-")
-    seg = seg or "spot"
     now = time.time_ns()
-    start = now - 25 * 60 * 60 * 10**9  # ~25 h for a 24 h change + spark
-    closes: list[float] = []
-    last_ts = now
-    async for rec in iter_backfill(exchange, "ohlcv", symbol, start, now, market=seg, interval="1h"):
-        closes.append(float(rec.close))
-        last_ts = int(rec.exchange_ts if rec.exchange_ts is not None else rec.local_ts)
+    candles = await crypto_klines(market, symbol, interval="1h", max_bars=25, now_ns=now)
+    closes = [float(c.c) for c in candles]
+    last_ts = int(candles[-1].t0_ns) if candles else now
     if not closes:
         return QuoteData(market=market, symbol=symbol, reachable=True, stale=True, as_of_ns=now)
     price = closes[-1]
@@ -276,8 +274,8 @@ async def _crypto_quote(market: str, symbol: str) -> QuoteData:
 async def _equity_quote(symbol: str) -> QuoteData:
     import datetime
 
-    from stockodile.providers.yahoo.client import YahooClient
-    from stockodile.scheduler.calendar import USMarketCalendar
+    from crocodile.core.scheduler.calendar import USMarketCalendar
+    from crocodile.equity.providers.yahoo.client import YahooClient
 
     bars = await YahooClient().fetch_intraday_bars(symbol.upper(), "1m")
     closes = [float(b.close) for b in bars if b.close is not None]

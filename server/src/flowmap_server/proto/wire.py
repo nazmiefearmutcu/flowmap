@@ -431,6 +431,12 @@ def golden_fixture_events() -> dict:
         capability={"depth": "L2", "trades": "full", "bbo": "native"},
         norm_seed=42.5,
     )
+    # FROZEN. `source="crypcodile"` names an engine that no longer exists (it
+    # merged into `crocodile`), and `market="crypto"` is not a subscribable
+    # market string. Both are deliberate: this vector exists to catch wire-format
+    # drift, and its value comes from the bytes never changing. Renaming a
+    # payload string here would rewrite client/tests/golden/cold_subscribe.bin
+    # and prove nothing. Treat the contents as opaque bytes, not documentation.
     subscribe = events.Subscribe(market="crypto", symbol="BTCUSDT", mode="live",
                                  source="crypcodile", start_t=None)
 

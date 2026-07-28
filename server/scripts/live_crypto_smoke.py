@@ -1,10 +1,15 @@
 #!/usr/bin/env python
 """Manual LIVE smoke test for CryptoFeed — real network, NOT a pytest test.
 
-Connects the real CryptoFeed (crypcodile connector + AiohttpWsTransport) to
+Connects the real CryptoFeed (Crocodile connector + AiohttpWsTransport) to
 an exchange, consumes events for ``--duration`` seconds, and reports counts
 per event type, event rate, book shape, best bid/ask samples, and trade
 count.
+
+``--exchange`` accepts any of the ~109 venues the engine reaches, not just the
+five with hand-written connectors; a venue without one is served by the
+universal ccxt connector and reports ``depth: L2-snapshot``. ``--symbol`` may
+be in either the venue's own spelling or ccxt's unified one.
 
 Exit status 0 iff at least one two-sided BookState AND at least one Trade
 were observed.
