@@ -111,7 +111,7 @@ async function injectCrypto(page: Page): Promise<Captured> {
       epochs: new Map([[epoch, params]]),
       gridEpoch: epoch,
       normSeed: 4,
-      // The real Crypcodile descriptor (futures adds 'liquidation'); no vwap key
+      // The real crypto descriptor (futures adds 'liquidation'); no vwap key
       // → VWAP is real (from tape), never the 'approx' badge.
       capability: {
         depth: 'L2',

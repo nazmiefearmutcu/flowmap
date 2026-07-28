@@ -66,6 +66,7 @@ import {
 } from './follow';
 import { ViewportNormalizer } from './normalize';
 import { ColumnCache } from './columnCache';
+import { planDepthColumn, sessionGateOpen } from './sessionGate';
 import {
   attachAxisGestures,
   attachGestures,
@@ -247,6 +248,17 @@ export class Renderer {
   private overlayIngestWarned = false;
   /** norm_seed applied once, the first time the server sends it. */
   private normSeeded = false;
+  /**
+   * Per-session column gate (gl/sessionGate.ts). True from `resetForSession()`
+   * until the NEW session identifies itself — the window in which the OLD
+   * session's still-in-flight columns would otherwise size the ring to the
+   * previous symbol's row count. See sessionGate.ts for why this cannot latch.
+   */
+  private awaitingSession = false;
+  /** `sessionId` as of the last `resetForSession()`; the gate opens off this. */
+  private gateSessionId: string | null = null;
+  /** One-shot guard so a burst of gated columns warns at most once per switch. */
+  private gateWarned = false;
   /** Fixed per-instrument decode scale (capability-driven; 1 for the sim). */
   private decodeScale = 1;
   /** Current colormap row (inferno / synth / classic), from mode + user choice. */
@@ -645,6 +657,14 @@ export class Renderer {
    * sessionId. Safe to call before the first column too (a no-op teardown).
    */
   resetForSession(): void {
+    // Close the per-session column gate FIRST, ahead of the lost-context bail:
+    // the old session's columns keep arriving whether or not the GL context is
+    // healthy, and the restore path rebuilds at the remembered `ringRows`, which
+    // is the OLD geometry. See gl/sessionGate.ts.
+    this.awaitingSession = true;
+    this.gateSessionId = this.store.getState().sessionId;
+    this.gateWarned = false;
+
     // A lost context is mid-rebuild; its own `restored` path re-empties the ring.
     if (this.glLost()) return;
 
@@ -850,20 +870,46 @@ export class Renderer {
     // A lost context has no valid textures; drop until restore re-fetches.
     if (this.glLost()) return;
 
-    const params = this.store.getState().epochs.get(col.epoch);
-    const rows = params?.rows ?? col.bid.length;
+    const state = this.store.getState();
+    const epochRows = state.epochs.get(col.epoch)?.rows;
 
-    if (this.ring === null) this.createRing(rows);
-    const ring = this.ring!;
+    // Session gate (gl/sessionGate.ts): after resetForSession() the OLD session's
+    // columns are still arriving, and the store's epoch table is empty, so their
+    // bid.length would size the new ring to the PREVIOUS symbol's geometry. Hold
+    // them until the new session identifies itself — by its Hello, or by simply
+    // being able to size this column's epoch authoritatively.
+    if (this.awaitingSession && sessionGateOpen(this.gateSessionId, state.sessionId, epochRows)) {
+      this.awaitingSession = false;
+    }
 
-    if (rows !== ring.rows || col.bid.length !== rows) {
-      // A per-epoch row-count change needs a fresh ring; until then a mismatched
-      // column is dropped rather than corrupting the upload.
-      console.warn(
-        `[flowmap] depth column rows ${rows} (bid ${col.bid.length}) ≠ ring rows ${ring.rows}; skipping`,
-      );
+    const plan = planDepthColumn({
+      awaitingSession: this.awaitingSession,
+      epochRows,
+      colRows: col.bid.length,
+      ringRows: this.ring?.rows ?? null,
+    });
+
+    if (plan.action === 'drop') {
+      if (plan.reason === 'row-mismatch') {
+        console.warn(
+          `[flowmap] depth column bid ${col.bid.length} ≠ its epoch's rows ${epochRows}; skipping`,
+        );
+      } else if (!this.gateWarned) {
+        this.gateWarned = true;
+        console.warn(
+          '[flowmap] dropping pre-Hello depth column(s) from the previous session (suppressed after the first)',
+        );
+      }
       return;
     }
+    if (plan.action === 'create') this.createRing(plan.rows);
+    // A genuine grid-geometry change (crypto 2048 → equity 4096, or the `deep`
+    // band's 4096). REBUILD rather than skip: the old code warned and returned,
+    // leaving a ring nothing would ever resize — a blank heatmap for good.
+    else if (plan.action === 'rebuild') this.recreateRingForRows(plan.rows);
+
+    const rows = plan.rows;
+    const ring = this.ring!;
 
     // Epoch change: the server moved p0, so a USER-OWNED price window (track /
     // off) is now pointing at different prices. Remap the camera + tracked row
@@ -918,6 +964,11 @@ export class Renderer {
    */
   private spliceColumn = (col: DepthColumn): void => {
     if (this.glLost()) return;
+    // Same session gate as the live path: `resetForSession()` nulls the
+    // HistoryLoader, but a request the OLD loader already had in flight still
+    // resolves through this bound sink. Never create or rebuild here — a stale
+    // history response must not touch the live ring's geometry.
+    if (this.awaitingSession) return;
     const ring = this.ring;
     if (ring === null) return;
     const params = this.store.getState().epochs.get(col.epoch);
@@ -1005,6 +1056,47 @@ export class Renderer {
     this.camera.setLimits(limitsFor(rows, cap));
     this.camera.reset(this.ring.residentRange(), rows);
     this.applyWantedFollow();
+  }
+
+  /**
+   * Rebuild the ring at a DIFFERENT row count — a grid-geometry change (crypto's
+   * 2048-row grid → equity's 4096, or the `deep` band's 4096 on the same symbol).
+   *
+   * This exists because the alternative is worse than losing the resident
+   * columns: the previous code warned and skipped every mismatched column, and
+   * since nothing else ever recreates the ring, the heatmap stayed blank for the
+   * rest of the session. Row INDICES are meaningless across the change too, so
+   * the row-addressed CPU caches and the price-follow cursors go with the ring;
+   * everything here is re-derived from the next few columns.
+   *
+   * Narrower than {@link resetForSession}: overlays, the col_seq cursors and the
+   * user's follow/zoom intent are untouched, because this may be a mid-session
+   * epoch change rather than a new instrument.
+   */
+  private recreateRingForRows(rows: number): void {
+    this.mips?.dispose();
+    this.heatmap?.dispose();
+    this.ring?.dispose();
+    this.mips = null;
+    this.heatmap = null;
+    this.ring = null;
+    this.history = null;
+    this.extentLo = null;
+    this.extentHi = null;
+    this.extentSeq = null;
+    this.ringRows = 0;
+    this.ringLayers = 0;
+
+    // Row-addressed CPU state from the old geometry cannot be reinterpreted.
+    this.normalizer.reset();
+    this.columnCache.reset();
+    this.trackedRowN = null;
+    this.priceEpoch = null;
+    this.priceTarget = null;
+    this.priceStalled = false;
+    this.priceFitMemo = null;
+
+    this.createRing(rows);
   }
 
   /**

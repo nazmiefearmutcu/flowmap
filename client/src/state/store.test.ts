@@ -8,7 +8,7 @@ import type { SocketLike } from '../net/connection';
 import type { StreamMsg } from '../net/connection';
 import { decodeFrame } from '../proto/decode';
 import { MsgType, type Msg } from '../proto/types';
-import { setFlowMapTransport, useFlowMapStore } from './store';
+import { sessionResetKey, setFlowMapTransport, useFlowMapStore } from './store';
 
 /** Decode a single-message control frame the FakeWebSocket captured. */
 function sentMsg(bytes: Uint8Array): Msg {
@@ -182,6 +182,64 @@ describe('FlowMap store', () => {
     expect(store.getState().nextOpenTs).toBeNull();
   });
 
+  it('drops the previous session’s state when subscribing to a different stream', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('equity', 'AAPL');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    sockets[0].deliver(
+      coldFrameBytes(MsgType.STATUS, {
+        feed_state: 'closed',
+        capability: { depth: 'SYNTH_PROFILE', tape: 'poll', vwap: 'approx' },
+        latency_ms: 0.0,
+        clock_skew_ms: 0.0,
+        next_open_ts: 1_752_710_400_000_000_000n,
+      }),
+    );
+    expect(store.getState().feedState).toBe('closed');
+    expect(store.getState().epochs.size).toBeGreaterThan(0);
+
+    // Switch to a 24/7 crypto symbol. The new session is healthy, so it starts
+    // in `live` and — Status being broadcast only on a TRANSITION — sends no
+    // Status at all: nothing would ever clear the stale 'closed' and the banner
+    // would sit over the crypto chart forever.
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    expect(store.getState().feedState).toBeNull();
+    expect(store.getState().nextOpenTs).toBeNull();
+    // The equity grid's epoch params must not stay resolvable either: the new
+    // session's grid restarts at epoch 0 and would otherwise decode against the
+    // old symbol's price frame.
+    expect(store.getState().epochs.size).toBe(0);
+    expect(store.getState().gridEpoch).toBeNull();
+
+    // The new session's Hello re-seeds the session facts; no banner reappears.
+    sockets[0].deliver(goldenU8('cold_hello'));
+    expect(store.getState().feedState).toBeNull();
+    expect(store.getState().gridEpoch).toBe(3);
+    expect(store.getState().capability).not.toBeNull();
+  });
+
+  it('keeps session state when re-subscribing to the SAME stream', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    const sentBefore = sockets[0].sent.length;
+
+    // The Connection recognises the identical stream and sends nothing, so the
+    // server never re-attaches and never re-asserts Hello. Wiping the session
+    // facts here would blank the capability chips / price axis permanently.
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    expect(sockets[0].sent).toHaveLength(sentBefore);
+    expect(store.getState().capability).not.toBeNull();
+    expect(store.getState().epochs.get(3)).toMatchObject({ epoch: 3 });
+    expect(store.getState().gridEpoch).toBe(3);
+  });
+
   it('advances gridEpoch on a re-anchor EpochStart but never regresses it', () => {
     installFakeTransport();
     const store = useFlowMapStore;
@@ -250,6 +308,30 @@ describe('FlowMap store — replay transport', () => {
     expect(store.getState().paused).toBe(false); // pause() then resume()
   });
 
+  it('clears EVERY Hello-asserted field on a fresh subscription — normSeed included', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    expect(store.getState().normSeed).toBe(42.5);
+    expect(store.getState().sessionId).toBe('golden-session-0001');
+
+    store.getState().connectAndSubscribe('equity', 'AAPL');
+
+    const s = store.getState();
+    expect(s.sessionId).toBeNull();
+    expect(s.capability).toBeNull();
+    expect(s.gridEpoch).toBeNull();
+    expect(s.epochs.size).toBe(0);
+    // normSeed is asserted by that SAME Hello and was missed. It matters more
+    // than the rest: gl/renderer.ts latches it once behind a one-shot flag, so a
+    // survivor makes the new session normalise its whole life against the
+    // previous symbol's density scale (a $60k book's p99 vs a $180 stock's).
+    expect(s.normSeed).toBeNull();
+  });
+
   it('resets speed/paused on a fresh subscription', () => {
     installFakeTransport();
     const store = useFlowMapStore;
@@ -264,5 +346,38 @@ describe('FlowMap store — replay transport', () => {
     store.getState().connectAndSubscribe('sim', 'SIM-DEMO', 'live');
     expect(store.getState().speed).toBe(1);
     expect(store.getState().paused).toBe(false);
+  });
+});
+
+// The key App.tsx uses to decide whether a subscription change must tear the GL
+// ring down and clear the shared book buffer. It is NOT the whole subscription:
+// a mode toggle re-subscribes the same grid and must keep scrolled-back history.
+describe('sessionResetKey', () => {
+  const sub = { market: 'crypto', symbol: 'BTCUSDT', mode: 'live' as const, band: 'native' };
+
+  it('is null with no subscription', () => {
+    expect(sessionResetKey(null)).toBeNull();
+  });
+
+  it('changes on a market or symbol switch', () => {
+    expect(sessionResetKey({ ...sub, symbol: 'ETHUSDT' })).not.toBe(sessionResetKey(sub));
+    expect(sessionResetKey({ ...sub, market: 'equity' })).not.toBe(sessionResetKey(sub));
+  });
+
+  it('changes on a BAND switch — a new server grid, with its own row count', () => {
+    // `band` is part of the subscription identity in both store.ts and
+    // net/connection.ts, so changing it really does start a new server session;
+    // `deep` is a 4096-row grid against the default 2048. Leaving it out of the
+    // key meant the renderer kept a ring sized for the OLD grid.
+    expect(sessionResetKey({ ...sub, band: 'deep' })).not.toBe(sessionResetKey(sub));
+    expect(sessionResetKey({ ...sub, band: 'wide' })).not.toBe(sessionResetKey(sub));
+  });
+
+  it('does NOT change on a mode toggle — same grid, keep the scroll-back', () => {
+    expect(sessionResetKey({ ...sub, mode: 'replay' })).toBe(sessionResetKey(sub));
+  });
+
+  it('is stable for an identical subscription', () => {
+    expect(sessionResetKey({ ...sub })).toBe(sessionResetKey(sub));
   });
 });

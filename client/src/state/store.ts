@@ -30,8 +30,27 @@ export interface Subscription {
   market: string;
   symbol: string;
   mode: StreamMode;
-  /** Server price-grid coverage preset ('native' | 'wide' | 'full'). */
+  /** Server price-grid coverage preset ('native' | 'wide' | 'full' | 'deep'). */
   band: string;
+}
+
+/**
+ * The identity of the GRID a subscription renders — the key App.tsx watches to
+ * decide when the GL ring and the shared book buffer must be torn down.
+ *
+ * Deliberately NOT the whole subscription. `mode` is excluded: a live⇄replay
+ * toggle re-subscribes the same instrument on the same grid, and resetting there
+ * would throw away the user's scrolled-back history for nothing.
+ *
+ * `band` IS included, and that is the fix: it is part of the subscription
+ * identity in `connectAndSubscribe` below and in net/connection.ts, so changing
+ * it genuinely starts a new server session — one whose grid may be a different
+ * HEIGHT (`deep` is 4096 rows against the default 2048). Keying only on
+ * market:symbol left the renderer holding a ring sized for the old grid, which
+ * is exactly the geometry mismatch gl/sessionGate.ts then has to survive.
+ */
+export function sessionResetKey(sub: Subscription | null): string | null {
+  return sub === null ? null : `${sub.market}:${sub.symbol}:${sub.band}`;
 }
 
 export interface FlowMapState {
@@ -42,6 +61,14 @@ export interface FlowMapState {
   nextOpenTs: bigint | null;
   capability: Record<string, unknown> | null;
   sessionId: string | null;
+  /**
+   * Wire protocol version from Hello. Deliberately NOT cleared on a
+   * re-subscribe, unlike the rest of the Hello-asserted fields: it describes the
+   * SERVER (one build, one version, identical across every session on the same
+   * socket), not the session, and nothing in the client reads it — no component,
+   * no renderer path, only the store test. Clearing it would add a state
+   * transition with no observer.
+   */
   protocolVersion: number | null;
   gridEpoch: number | null;
   normSeed: number | null;
@@ -155,9 +182,45 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         onConnStatus: (status) => set({ status }),
       });
     }
-    // A fresh subscription resets the transport (a new replay clock starts at 1×,
-    // playing; live mode ignores these but they must not carry over stale state).
-    set({ subscription: { market, symbol, mode, band }, speed: 1, paused: false });
+    // A DIFFERENT stream is a different server session, so nothing the previous
+    // one asserted may survive into it. Critical for the Status-derived fields:
+    // a healthy session starts in `live` and the server broadcasts Status only on
+    // a TRANSITION, so a fresh crypto session sends none at all and a stale
+    // `closed` would keep the market-closed banner up forever. The epoch geometry
+    // goes with it (the new grid restarts at epoch 0 — the old params must not
+    // stay resolvable), as does the transport (a new replay clock starts at 1×,
+    // playing; live mode ignores these but they must not carry over either).
+    // Gated on the identity actually changing: an idempotent re-subscribe never
+    // reaches the server, so nothing would ever re-assert what we cleared.
+    const prev = get().subscription;
+    if (
+      prev === null ||
+      prev.market !== market ||
+      prev.symbol !== symbol ||
+      prev.mode !== mode ||
+      prev.band !== band
+    ) {
+      set({
+        subscription: { market, symbol, mode, band },
+        speed: 1,
+        paused: false,
+        feedState: null,
+        nextOpenTs: null,
+        latencyMs: null,
+        clockSkewMs: null,
+        // Re-asserted by the new session's Hello on attach.
+        sessionId: null,
+        capability: null,
+        epochs: new Map(),
+        gridEpoch: null,
+        // normSeed belongs to this list for the same reason and matters more
+        // than most of it: gl/renderer.ts latches the seed ONCE behind a
+        // one-shot flag, so a survivor is not a stale frame — the new session
+        // normalises its entire life against the previous symbol's density
+        // scale (a $60k book's p99 against a $180 stock's).
+        normSeed: null,
+      });
+    }
     conn.subscribe(market, symbol, mode, band);
   },
 

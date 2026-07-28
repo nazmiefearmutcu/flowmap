@@ -25,7 +25,7 @@ import {
   type FlowMapSettings,
 } from './ui/settings';
 import { bookStore } from './state/bookStore';
-import { setFlowMapTransport, useFlowMapStore } from './state/store';
+import { sessionResetKey, setFlowMapTransport, useFlowMapStore } from './state/store';
 import type { SocketLike } from './net/connection';
 
 /**
@@ -211,7 +211,11 @@ export function App() {
         r.setFollowTime(settings.follow);
       }
       // The band is a SERVER grid property, so changing it must re-subscribe.
-      // Edge-triggered: a re-subscribe tears down the ring and refetches.
+      // Edge-triggered. The re-subscribe changes `sessionResetKey` (band is part
+      // of it), and the effect below tears the ring down and refetches — which is
+      // the point: `deep` is a 4096-row grid where the default is 2048, so a ring
+      // kept from the old band would be the wrong height for every column that
+      // follows.
       if (settings.priceBand !== prevSettingsRef.current.priceBand) {
         const sub = useFlowMapStore.getState().subscription;
         useFlowMapStore
@@ -241,18 +245,20 @@ export function App() {
     prevSettingsRef.current = settings;
   }, [settings]);
 
-  // --- reset the heatmap on an actual symbol / market switch -------------------
+  // --- reset the heatmap on an actual grid switch ------------------------------
   // The DOM ladder + tape read the live book and switch on their own, but the GL
   // heatmap holds the old symbol's ring + a camera fit to the old price frame, so
   // on a real switch we tear the renderer's GL state back down to empty (the next
   // column of the new session rebuilds it, fit to the new price range) and clear
   // the shared book buffer (so the ladder/tape don't flash the old symbol). Keyed
-  // on market:symbol — NOT sessionId — so a bare reconnect of the SAME symbol
-  // (e.g. a mode toggle or a transport reconnect) keeps any scrolled-back
-  // history. The FIRST subscription (the initial mount connect) is skipped: the
-  // renderer already starts empty.
+  // on `sessionResetKey` (market:symbol:BAND) — NOT sessionId — so a bare
+  // reconnect of the SAME grid (a mode toggle, a transport reconnect) keeps any
+  // scrolled-back history, while a band change, which really does start a new
+  // server session at a possibly different row count, does reset. The FIRST
+  // subscription (the initial mount connect) is skipped: the renderer already
+  // starts empty.
   const subscription = useFlowMapStore((s) => s.subscription);
-  const subKey = subscription ? `${subscription.market}:${subscription.symbol}` : null;
+  const subKey = sessionResetKey(subscription);
   const prevSubKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (subKey === null) return;
@@ -263,6 +269,21 @@ export function App() {
     rendererRef.current?.resetForSession();
     bookStore.resetForSession();
   }, [subKey]);
+
+  // The reset above fires when we ASK for a new symbol; frames for the old one
+  // are still in flight and land in the freshly-cleared buffers. On a liquid
+  // name the new prints push them out within a second and nobody notices — on a
+  // thin venue (most of the ~104 ccxt venues have quiet pairs) they simply stay,
+  // and the tape shows another instrument's trades at another instrument's
+  // prices indefinitely. `sessionId` changes only when the server's Hello lands
+  // on attach, which IS the moment the stream provably swapped, so clear again
+  // there. Cheap and self-healing: the attach snapshot re-sends the book and the
+  // tape warm-up, so a reconnect refills what this drops.
+  const sessionId = useFlowMapStore((s) => s.sessionId);
+  useEffect(() => {
+    if (sessionId === null) return;
+    bookStore.resetForSession();
+  }, [sessionId]);
 
   // --- first-launch history prefetch (once per session) ------------------------
   // When the chosen depth is not 'off', wait for the first column (so we know the
