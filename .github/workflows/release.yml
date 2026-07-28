@@ -230,7 +230,12 @@ jobs:
             PY="app/src-tauri/resources/pyruntime/bin/python3.13"
           fi
           echo "interpreter: $PY"
-          "$PY" -c "import importlib; [importlib.import_module(m) for m in ['flowmap_server','numpy','polars','fastapi','uvicorn','msgspec','crypcodile','stockodile']]; print('imports OK')"
+          # The health poll below already proves everything the server imports
+          # EAGERLY, so an eager-only list adds no coverage. What it cannot see
+          # is the lazily-imported closure — above all the equity providers,
+          # which are only reached on a real `equity:` subscribe. A bundle that
+          # lost pandas or pyarrow would boot green and die on the first one.
+          "$PY" -c "import importlib; [importlib.import_module(m) for m in ['flowmap_server','numpy','polars','fastapi','uvicorn','msgspec','crocodile','ccxt','aiohttp','certifi','crocodile.core.connector','crocodile.core.ingest.transport','crocodile.core.schema.records','crocodile.core.scheduler.calendar','crocodile.core.sink.memory','crocodile.crypto.exchanges.factory','crocodile.crypto.client.backfill','crocodile.crypto.exchanges.ccxt_universal.connector','crocodile.crypto.exchanges.binance.backfill','crocodile.equity.providers.factory','crocodile.equity.providers.yahoo.client','crocodile.equity.client.collect','crocodile.equity.depth.vap','pandas','pyarrow','yfinance','bs4']]; print('imports OK')"
           PORT=8799
           DATA_DIR="$(mktemp -d)"
           FLOWMAP_HOST=127.0.0.1 FLOWMAP_PORT="$PORT" FLOWMAP_RECORDING_ENABLED=0 FLOWMAP_DATA_DIR="$DATA_DIR" "$PY" -m flowmap_server &

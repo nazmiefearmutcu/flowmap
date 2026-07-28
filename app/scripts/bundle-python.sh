@@ -9,7 +9,7 @@
 # requested target triple (the `install_only` tarball — already relocatable)
 # into app/src-tauri/resources/pyruntime, then install the flowmap-server + its
 # deps INTO that runtime's own site-packages so the whole tree is
-# self-contained. Dependencies (incl. the git-pinned crypcodile/stockodile) come
+# self-contained. Dependencies (incl. the git-pinned crocodile engine) come
 # from the server's uv.lock so the bundle matches the tested resolution exactly.
 #
 # Because native wheels (numpy/polars/msgspec/curl-cffi …) are platform-specific,
@@ -155,6 +155,12 @@ REQS="$CACHE_DIR/flowmap-reqs.txt"
 ( cd "$SERVER_DIR" && uv export --frozen --no-dev --no-emit-project --no-hashes -o "$(native_path "$REQS")" )
 echo "    $(grep -cvE '^\s*(#|$)' "$REQS") requirement lines"
 
+# NOTE for the macOS Intel leg: ccxt pins `cryptography==49.0.0` exactly, and
+# that release publishes only a `macosx_11_0_arm64` macOS wheel — no x86_64, no
+# universal2 (48.0.1 was the last with one). So on x86_64-apple-darwin pip
+# BUILDS cryptography from sdist, which needs a Rust toolchain. The release
+# workflow installs Rust before this step for Tauri's sake, so the toolchain is
+# there; expect this leg to take a few minutes longer than the others.
 echo "==> Installing dependencies into the runtime (this fetches native wheels)"
 "$PY" -m pip install --no-warn-script-location --disable-pip-version-check -r "$(native_path "$REQS")"
 
@@ -169,7 +175,7 @@ WHEEL_FILE="$(ls "$WHEEL_DIR"/flowmap_server-*.whl | head -1)"
 # --- 4. Slim the runtime (optional, safe removals) ----------------------------
 echo "==> Slimming runtime (pyc caches, test cruft)"
 find "$PYRUNTIME" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
-find "$PYRUNTIME" -type d -name "tests" -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PYRUNTIME" -type d \( -name "tests" -o -name "test" \) -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
 
 # Drop Tk/tkinter. FlowMap's server is headless — the UI is the Tauri webview —
 # so nothing in the dependency set imports it (see the import check below).
@@ -210,7 +216,23 @@ echo "==> Verifying bundled runtime"
 "$PY" -c "import flowmap_server; print('    flowmap_server', flowmap_server.__version__)"
 "$PY" -c "import flowmap_server.__main__; print('    flowmap_server.__main__ imports OK')"
 "$PY" - <<'PYEOF'
-mods = ["numpy", "polars", "fastapi", "uvicorn", "msgspec", "crypcodile", "stockodile"]
+mods = [
+    # Eager: loaded the moment the server boots.
+    "flowmap_server", "numpy", "polars", "fastapi", "uvicorn", "msgspec",
+    "crocodile", "ccxt", "aiohttp", "certifi",
+    # Lazy: imported only on a real subscribe, so booting the server proves
+    # nothing about them. A bundle that lost pyarrow or pandas would pass every
+    # other gate and die on the first `equity:AAPL`.
+    "crocodile.core.connector", "crocodile.core.ingest.transport",
+    "crocodile.core.schema.records", "crocodile.core.scheduler.calendar",
+    "crocodile.core.sink.memory", "crocodile.crypto.exchanges.factory",
+    "crocodile.crypto.client.backfill",
+    "crocodile.crypto.exchanges.ccxt_universal.connector",
+    "crocodile.crypto.exchanges.binance.backfill",
+    "crocodile.equity.providers.factory", "crocodile.equity.providers.yahoo.client",
+    "crocodile.equity.client.collect", "crocodile.equity.depth.vap",
+    "pandas", "pyarrow", "yfinance", "bs4",
+]
 import importlib
 ok = []
 for m in mods:
