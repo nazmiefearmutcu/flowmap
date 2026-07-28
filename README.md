@@ -10,9 +10,9 @@ into a session. Columns are rasterized once on the GPU, so pan/zoom cost never g
 FlowMap is a ground-up rebuild of an earlier PyQt6 desktop app that re-rasterized the entire visible
 history on the CPU every pan/zoom frame, so scrolling back through history collapsed to ~1 fps.
 FlowMap puts history in a WebGL2 texture and makes pan/zoom a pure view transform — **interaction cost
-is independent of history depth**. It unifies two market-data engines
-([Crypcodile](https://github.com/nazmiefearmutcu/Crypcodile) for crypto,
-stockodile for US equities) behind one market-agnostic renderer.
+is independent of history depth**. It renders one market-data engine —
+[Crocodile](https://github.com/nazmiefearmutcu/Crocodile), which covers crypto and US equities —
+behind one market-agnostic view.
 
 ## Highlights
 
@@ -35,8 +35,15 @@ stockodile for US equities) behind one market-agnostic renderer.
   Price** pill appears the moment you scroll off the live edge. Price and time both zoom out far
   past the grid, so nothing hits an artificial wall. A **Tolerance** black point (calibrated with a
   sensible non-zero default) hides sub-threshold density so only liquidity worth reading paints.
+- **The whole crypto market, not a shortlist.** **104 crypto venues** are subscribable (plus
+  equities and the sim feed — 106 rows from `/api/venues`). Five have hand-written connectors
+  that stream true incremental book diffs (`L2`) — binance, bybit, coinbase, deribit, okx — and
+  every other ccxt venue id is served by the universal connector, which re-reads the book whole
+  each tick (`L2-snapshot`). That difference is a badge in the UI, never a silent downgrade. Symbols are
+  enumerated live from the venue itself, in the venue's own spelling, and a symbol typed in the
+  other spelling (`ETH/BTC` vs `ETHBTC`) is translated rather than rejected.
 - **A command palette for the whole market.** Press **⌘K / Ctrl-K** (or `/`) for a centre-screen
-  search over every crypto + equity symbol both engines reach — fuzzy-ranked, with the day's top
+  search over every crypto + equity symbol the engine reaches — fuzzy-ranked, with the day's top
   movers, live price, % change and a mini sparkline, and honest capability chips per row. On first
   launch you choose from the settings how much history to pull straight onto the chart.
 - **Configurable price coverage, including one that does not compromise.** On a linear grid range
@@ -69,7 +76,7 @@ client/   TypeScript + React + WebGL2 renderer (Vite)
           heatmap tile-array + SUM-mips + camera + overlays + DOM/tape + UI shell
 server/   Python 3.13 asyncio gateway (FastAPI, binary WebSocket, loopback-only)
           time-weighted density grid + sessions + parquet recording/replay
-          feeds/  crypto (Crypcodile) · equity (stockodile) · deterministic sim
+          feeds/  crypto (104 venues) · equity · deterministic sim — one router
 ```
 
 The client is a pure renderer of a canonical binary stream (`docs/superpowers/specs/`); the server
