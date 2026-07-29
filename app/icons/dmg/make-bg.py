@@ -113,6 +113,15 @@ def main() -> None:
             render(args.version, arch, scale).save(out)
             print(f"wrote {out.name}")
 
+    # The version is *pixels* once rendered, so nothing downstream can read it
+    # back off the PNG. Stamp it beside the art instead: build-dmg.sh compares
+    # this against tauri.conf.json and refuses to ship a disk image whose window
+    # advertises a different version than the app it contains.
+    if args.all:
+        stamp = HERE / "RENDERED_VERSION"
+        stamp.write_text(args.version + "\n")
+        print(f"wrote {stamp.name} ({args.version})")
+
 
 if __name__ == "__main__":
     main()
