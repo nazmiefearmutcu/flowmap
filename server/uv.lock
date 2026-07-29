@@ -364,7 +364,7 @@ wheels = [
 [[package]]
 name = "crocodile"
 version = "0.3.0"
-source = { git = "https://github.com/nazmiefearmutcu/Crocodile.git?rev=8ff6a75dcd61b673ccfc39465c746359c8444bce#8ff6a75dcd61b673ccfc39465c746359c8444bce" }
+source = { git = "https://github.com/nazmiefearmutcu/Crocodile.git?rev=2e22c901dff7f0b4ec98ef7e66b8a10de4464d9c#2e22c901dff7f0b4ec98ef7e66b8a10de4464d9c" }
 dependencies = [
     { name = "aiohttp" },
     { name = "beautifulsoup4" },
@@ -537,7 +537,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "certifi" },
-    { name = "crocodile", extras = ["market"], git = "https://github.com/nazmiefearmutcu/Crocodile.git?rev=8ff6a75dcd61b673ccfc39465c746359c8444bce" },
+    { name = "crocodile", extras = ["market"], git = "https://github.com/nazmiefearmutcu/Crocodile.git?rev=2e22c901dff7f0b4ec98ef7e66b8a10de4464d9c" },
     { name = "fastapi", specifier = ">=0.111" },
     { name = "msgspec", specifier = ">=0.18" },
     { name = "numpy", specifier = ">=1.26" },
