@@ -88,6 +88,14 @@ verification record (live Binance + live equity evidence, perf gates, parity mat
 
 ## Install
 
+Two supported paths, and the first one asks you to trust nothing:
+
+- **Run from source** — [below](#run-it). Python 3.13 + `uv`, Node 22 + npm, one script. No
+  binary involved.
+- **Download an installer** — self-contained, and **verifiable**: every installer is signed with
+  a build-provenance attestation that ties it to this repo and the commit it was built from.
+  [Check it in one command](#verify-your-download) before you run it.
+
 Every installer on the [latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest)
 is **fully self-contained** — it bundles the WebGL2 client *and* a relocatable Python 3.13 running
 the server, so there is nothing else to install (no Python, no Node, no `uv`). Pick your platform:
@@ -105,13 +113,34 @@ the server, so there is nothing else to install (no Python, no Node, no `uv`). P
 
 *Which Mac do I have?* → Apple menu → **About This Mac**: "Chip: Apple M…" = Apple Silicon, "Processor: Intel…" = Intel.
 
+### Verify your download
+
+An installer from a stranger's GitHub deserves suspicion, and "the source is open" does not answer
+it — the source is not what you downloaded. So every installer is signed at build time with a
+**SLSA build-provenance attestation**: a public, Sigstore-backed statement binding that exact file's
+digest to this repository, this workflow, and the commit it was built from.
+
+```bash
+gh attestation verify ~/Downloads/<the-file-you-downloaded> -R nazmiefearmutcu/flowmap
+```
+
+A pass prints the workflow run and commit that produced it. **A failure means the file did not come
+from this repository — don't run it.** Each release also ships a `SHA256SUMS` asset, for a check
+that needs no tooling: `shasum -a 256 -c SHA256SUMS`.
+
+Attestations start with the next tagged release; v1.3.0's assets predate them. What the app does on
+your machine — loopback-only server, no telemetry, no wallet or trading keys, no auto-updater, and
+the full list of endpoints it talks to — is written down in [SECURITY.md](SECURITY.md).
+
 > **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
 > (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for
 > this project), so the OS will warn on first open:
 > - **macOS:** **right-click → Open** (confirm once), or run `xattr -cr /Applications/FlowMap.app`.
 > - **Windows:** SmartScreen → **More info → Run anyway**.
 >
-> After the first confirmation the app launches normally.
+> After the first confirmation the app launches normally. Do this *after* the attestation check
+> above — the warning is about a missing certificate, and the attestation is what replaces the
+> assurance that certificate would have given you.
 
 Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Platforms
 without a prebuilt installer — Linux on arm and 32-bit systems — can **run from source** (below).
@@ -151,6 +180,13 @@ cd client && npm test && npm run e2e   # renderer units + Playwright (heatmap, p
 
 The Playwright suite includes the §10 performance gate (history-independent frame cost) and the
 two-market parity matrix.
+
+## Security
+
+What FlowMap connects to, what it writes, what it never asks for, and how to verify a download —
+[SECURITY.md](SECURITY.md). Vulnerabilities go to a
+[private advisory](https://github.com/nazmiefearmutcu/flowmap/security/advisories/new), not a public
+issue.
 
 ## License
 
