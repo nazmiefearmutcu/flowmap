@@ -6,6 +6,9 @@ src-tauri/gen/
 # scripts/bundle-python.sh, shipped in the DMG via the GitHub Release — not git)
 src-tauri/resources/pyruntime/
 src-tauri/resources/.cache/
+# What the last bundle-python.sh run excluded, handed to the import gate in a
+# later step (see app/scripts/import-gate.py). Build output, not source.
+src-tauri/resources/.import-skip
 
 # Tauri-generated icon set (regenerated from ../icons/icon-1024.png by
 # `cargo tauri icon` in scripts/build-dmg.sh)
