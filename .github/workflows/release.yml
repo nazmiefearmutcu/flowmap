@@ -9,6 +9,10 @@ name: release
 # bundled pyruntime cannot be cross-built. Triggered by pushing a `vX.Y.Z` tag;
 # `workflow_dispatch` can dry-run the build (no upload) or (re)release an
 # existing tag.
+#
+# Every released installer is signed with a SLSA build-provenance attestation
+# and listed in a single `SHA256SUMS` asset, so a download can be tied back to
+# this repo and this commit without trusting the release page — see SECURITY.md.
 on:
   push:
     tags:
@@ -84,6 +88,15 @@ jobs:
     if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.release-draft.result == 'success' || needs.release-draft.result == 'skipped') }}
     permissions:
       contents: write
+      # An unsigned installer downloaded from a stranger's GitHub is, on its
+      # face, indistinguishable from malware — "the source is open" says nothing
+      # about the 168 MB binary, which nobody compiled themselves. These two
+      # scopes let the run sign a provenance statement binding each installer's
+      # digest to this repository, this workflow file and this commit, so the
+      # link from readable source to downloaded binary stops being a promise:
+      #   gh attestation verify FlowMap_<version>_aarch64.dmg -R nazmiefearmutcu/flowmap
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -283,11 +296,13 @@ jobs:
                 done
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload installers to the release
+      # One list, resolved once and reused by the attestation, the checksums and
+      # the upload — so what gets signed, what gets hashed and what gets shipped
+      # are the same files by construction, not by three globs agreeing.
+      - name: Collect the produced installers
+        id: installers
         if: needs.prepare.outputs.do_release == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare.outputs.tag }}
           KIND: ${{ matrix.kind }}
         run: |
           set -euo pipefail
@@ -299,6 +314,69 @@ jobs:
             # step above), so glob it separately and tolerate its absence.
             linux)   FILES=$(ls "$B"/deb/*.deb; ls "$B"/appimage/*.AppImage 2>/dev/null || true) ;;
           esac
+          echo "$FILES"
+          # Multi-line step output: the delimiter must not occur in the payload,
+          # and these are build-dir paths, so a literal marker is safe.
+          { echo "files<<__FLOWMAP_EOF__"; echo "$FILES"; echo "__FLOWMAP_EOF__"; } >> "$GITHUB_OUTPUT"
+
+      # Signs a SLSA provenance statement for every installer BEFORE it is
+      # uploaded, so the digest in the attestation is the digest of the file the
+      # next step ships. Sigstore-backed and public — anyone can check a download
+      # against it without trusting the release page:
+      #   gh attestation verify <file> -R nazmiefearmutcu/flowmap
+      - name: Attest build provenance
+        if: needs.prepare.outputs.do_release == 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-path: ${{ steps.installers.outputs.files }}
+
+      # Per-leg checksum lines. They are collected into a single SHA256SUMS asset
+      # by the publish job — one file the whole release can be checked against,
+      # which the parallel matrix cannot produce on its own.
+      #   shasum first, not sha256sum: the macOS runners have no sha256sum. The
+      #   fallback is not decoration — it keeps the leg alive if a runner image
+      #   ever ships without perl, which is what shasum is.
+      - name: Checksum the installers
+        if: needs.prepare.outputs.do_release == 'true'
+        env:
+          FILES: ${{ steps.installers.outputs.files }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          sha256_of() {
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$1" | cut -d' ' -f1
+            else
+              sha256sum "$1" | cut -d' ' -f1
+            fi
+          }
+          mkdir -p checksums
+          OUT="checksums/$TRIPLE.txt"
+          : > "$OUT"
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            # `hash  basename` — the format `shasum -c` expects when it is run
+            # next to the downloaded files, not next to this build tree.
+            printf '%s  %s\n' "$(sha256_of "$f")" "$(basename "$f")" >> "$OUT"
+          done <<< "$FILES"
+          cat "$OUT"
+
+      - name: Upload the checksum lines
+        if: needs.prepare.outputs.do_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: checksums-${{ matrix.triple }}
+          path: checksums/${{ matrix.triple }}.txt
+          if-no-files-found: error
+
+      - name: Upload installers to the release
+        if: needs.prepare.outputs.do_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          FILES: ${{ steps.installers.outputs.files }}
+        run: |
+          set -euo pipefail
           echo "uploading:"; echo "$FILES"
           # shellcheck disable=SC2086
           gh release upload "$TAG" $FILES --repo "$GITHUB_REPOSITORY" --clobber
@@ -310,8 +388,35 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.do_release == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      # download-artifact reads this run's own artifacts.
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fetch the per-leg checksum lines
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: checksums-*
+          path: checksums
+
+      # One SHA256SUMS for the whole release. The attestation is the strong
+      # check (it proves *where* a file came from); this is the cheap one that
+      # needs no tooling — `shasum -c SHA256SUMS` next to the downloads.
+      # `find`, not a fixed glob: download-artifact's layout depends on whether
+      # the artifacts were merged, and both shapes have to work.
+      - name: Assemble and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          find checksums -name '*.txt' -exec cat {} + | sort -k2 > SHA256SUMS
+          if [ ! -s SHA256SUMS ]; then echo "no checksum lines collected"; exit 1; fi
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
