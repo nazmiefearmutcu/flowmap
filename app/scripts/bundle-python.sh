@@ -163,10 +163,14 @@ echo "    $(grep -cvE '^\s*(#|$)' "$REQS") requirement lines"
 # (cryptography). Each is handled by removing exactly as much as the ARM64 bundle
 # can live without — and nothing more:
 #
-#   pyarrow            Only reachable through crocodile's Arrow-IPC export
-#                      helpers (crypto/client/export.py, equity/client/export.py).
-#                      FlowMap never imports them: its recording layer is polars,
-#                      whose parquet reader/writer is native Rust. Dropped.
+#   pyarrow            Needed by exactly one thing: crocodile's `fmt="arrow"`
+#                      export. FlowMap never asks for it — its recording layer is
+#                      polars, whose parquet codec is native Rust. Dropped.
+#                      Note this only became safe with crocodile 2e22c90: before
+#                      it, `crocodile/equity/client/__init__.py` imported the
+#                      Arrow writer eagerly, so dropping pyarrow took live equity
+#                      collection down with it and this gate caught it. The
+#                      writer now loads pyarrow at the point of use.
 #   zlib-ng            A ccxt speed-up: aiohttp_fast_zlib swaps aiohttp's gzip
 #   aiohttp-fast-zlib  codec for zlib-ng (~2x faster decompression). ccxt imports
 #                      it inside `try: … except ImportError: pass`, so its
@@ -183,6 +187,7 @@ echo "    $(grep -cvE '^\s*(#|$)' "$REQS") requirement lines"
 # in the lock — or cryptography's locked version moves — the build stops instead
 # of quietly shipping a different dependency set than the one described here.
 # Re-check PyPI for win_arm64 wheels before touching it.
+#
 # Seeded with the flags every target uses, so the array is never empty — an
 # empty array expansion is an "unbound variable" under `set -u` on bash 3.2,
 # which is what /bin/bash still is on the macOS runners.
@@ -298,44 +303,13 @@ fi
 echo "==> Verifying bundled runtime"
 "$PY" -c "import flowmap_server; print('    flowmap_server', flowmap_server.__version__)"
 "$PY" -c "import flowmap_server.__main__; print('    flowmap_server.__main__ imports OK')"
-"$PY" - <<'PYEOF'
-mods = [
-    # Eager: loaded the moment the server boots.
-    "flowmap_server", "numpy", "polars", "fastapi", "uvicorn", "msgspec",
-    "crocodile", "ccxt", "aiohttp", "certifi",
-    # Lazy: imported only on a real subscribe, so booting the server proves
-    # nothing about them. A bundle that lost pyarrow or pandas would pass every
-    # other gate and die on the first `equity:AAPL`.
-    "crocodile.core.connector", "crocodile.core.ingest.transport",
-    "crocodile.core.schema.records", "crocodile.core.scheduler.calendar",
-    "crocodile.core.sink.memory", "crocodile.crypto.exchanges.factory",
-    "crocodile.crypto.client.backfill",
-    "crocodile.crypto.exchanges.ccxt_universal.connector",
-    "crocodile.crypto.exchanges.binance.backfill",
-    "crocodile.equity.providers.factory", "crocodile.equity.providers.yahoo.client",
-    "crocodile.equity.client.collect", "crocodile.equity.depth.vap",
-    "pandas", "pyarrow", "yfinance", "bs4",
-]
-import importlib
-import os
-
-# Targets whose wheel availability forces an exception (see step 3b) declare it
-# here rather than by weakening the list — everything not named still has to
-# import.
-skip = {m for m in os.environ.get("FLOWMAP_SKIP_IMPORTS", "").split(",") if m}
-ok = []
-for m in mods:
-    if m in skip:
-        print(f"    skipped (excluded on this target): {m}")
-        continue
-    try:
-        importlib.import_module(m)
-        ok.append(m)
-    except Exception as e:  # noqa: BLE001
-        print(f"    MISSING: {m}: {e}")
-        raise
-print("    imports OK:", ", ".join(ok))
-PYEOF
+# The module list lives in app/scripts/import-gate.py, not here: the release
+# workflow's smoke test gates on the same closure, and when the list was written
+# out twice the copies drifted the first time a target needed an exception.
+# Always (re)write the sidecar, so a skip left over from a previous target in the
+# same checkout cannot leak into this one.
+printf '%s' "${FLOWMAP_SKIP_IMPORTS:-}" > "$RES_DIR/.import-skip"
+"$PY" "$REPO_ROOT/app/scripts/import-gate.py"
 
 SIZE="$(du -sh "$PYRUNTIME" | cut -f1)"
 echo "==> Done. Bundled runtime size: $SIZE"
