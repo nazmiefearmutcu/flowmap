@@ -276,12 +276,16 @@ jobs:
           {
             echo "### $TRIPLE"
             echo ""
-            echo "| installer | size |"
-            echo "|---|---|"
+            echo "| installer | size | bytes |"
+            echo "|---|---|---|"
             find "$B" -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \
                                  -o -name '*.deb' -o -name '*.AppImage' \) -print0 \
               | while IFS= read -r -d '' f; do
-                  printf '| `%s` | %s |\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+                  # Both: `du -h` for a human reading the summary, and the exact
+                  # byte count, because the download table quotes MB and a
+                  # rounded MiB cannot be converted back into one.
+                  printf '| `%s` | %s | %s |\n' "$(basename "$f")" \
+                    "$(du -h "$f" | cut -f1)" "$(wc -c < "$f" | tr -d ' ')"
                 done
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # `tee`, not `>>`: the step summary is not readable through the API, so

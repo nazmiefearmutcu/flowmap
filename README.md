@@ -90,20 +90,24 @@ verification record (live Binance + live equity evidence, perf gates, parity mat
 
 Every installer on the [latest release](https://github.com/nazmiefearmutcu/flowmap/releases/latest)
 is **fully self-contained** — it bundles the WebGL2 client *and* a relocatable Python 3.13 running
-the server, so there is nothing else to install (no Python, no Node, no `uv`). Pick your platform:
+the server, so there is nothing else to install (no Python, no Node, no `uv`). Every one of them is
+built on its own CPU — there is no emulated build in the list, Windows on ARM included.
 
-**Click your platform — the download starts immediately** (v1.3.0):
+**Click your platform — the download starts immediately** (v1.3.1):
 
 | Platform | Download | Install |
 |---|---|---|
-| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.0_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_aarch64.dmg)** · 168 MB | open the dmg, drag **FlowMap** into **Applications** |
-| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.0_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x86_64.dmg)** · 183 MB | same as above |
-| 🪟 **Windows 10/11 x64** *(recommended)* | **[⬇️ FlowMap_1.3.0_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64-setup.exe)** · 103 MB | run it — installs per-user, no admin needed |
-| 🪟 **Windows 10/11 x64** *(MSI / managed)* | **[⬇️ FlowMap_1.3.0_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_x64_en-US.msi)** · 167 MB | standard MSI installer |
-| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.0_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.deb)** · 430 MB | `sudo apt install ./FlowMap_1.3.0_amd64.deb` |
-| 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.0_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.0/FlowMap_1.3.0_amd64.AppImage)** · 313 MB | `chmod +x` it, then run it |
+| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_aarch64.dmg)** · ~184 MB | open the dmg, drag **FlowMap** into **Applications** |
+| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.1_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_x86_64.dmg)** · ~184 MB | same as above |
+| 🪟 **Windows 10/11 — Intel / AMD (x64)** | **[⬇️ FlowMap_1.3.1_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_x64-setup.exe)** · ~121 MB | run it — installs per-user, no admin needed |
+| 🪟 **Windows 11 — ARM** (Snapdragon X, ARM Surface) | **[⬇️ FlowMap_1.3.1_arm64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_arm64-setup.exe)** · ~90 MB | run it — **native ARM64**, not emulated |
+| 🪟 Windows x64 — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_x64_en-US.msi)** · ~197 MB | standard MSI installer |
+| 🪟 Windows ARM — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_arm64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_arm64_en-US.msi)** · ~158 MB | standard MSI installer |
+| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.1_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_amd64.deb)** · ~479 MB | `sudo apt install ./FlowMap_1.3.1_amd64.deb` |
+| 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.1_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1/FlowMap_1.3.1_amd64.AppImage)** · ~354 MB | `chmod +x` it, then run it |
 
 *Which Mac do I have?* → Apple menu → **About This Mac**: "Chip: Apple M…" = Apple Silicon, "Processor: Intel…" = Intel.
+*Which Windows do I have?* → **Settings → System → About → System type**: "ARM-based processor" = ARM, anything else = x64.
 
 > **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
 > (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for
@@ -113,8 +117,17 @@ the server, so there is nothing else to install (no Python, no Node, no `uv`). P
 >
 > After the first confirmation the app launches normally.
 
-Installers are produced per OS+arch on CI (native Python wheels can't be cross-built). Platforms
-without a prebuilt installer — Linux on arm and 32-bit systems — can **run from source** (below).
+Installers are produced per OS+arch on CI (native Python wheels can't be cross-built), and each one
+boots its bundled server and answers `/api/health` on that OS before the release accepts it.
+Platforms without a prebuilt installer — Linux on ARM and 32-bit systems — can **run from source**
+(below).
+
+On Windows ARM the ARM64 build ships one deliberate difference, for a reason outside this project's
+control: `pyarrow` publishes no `win_arm64` wheel in any release, so that build omits it and
+`cryptography` is pinned to the last version that has one. Neither is on a path FlowMap uses —
+recording is polars, and the omitted pyarrow only serves an Arrow export FlowMap never calls — and
+the release gate imports the full lazy closure on the machine that built it, so the difference is
+measured rather than assumed. `app/README.md` has the table.
 
 ## Run it
 
