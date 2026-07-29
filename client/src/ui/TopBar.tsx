@@ -16,7 +16,13 @@ import type { StreamMode } from '../proto/types';
 import { useFlowMapStore } from '../state/store';
 import { SymbolSearch, type SymbolSearchHandle } from './SymbolSearch';
 import { Wordmark } from './Wordmark';
-import { capabilityChips, marketGroup, type SymbolGroupKey } from './symbols';
+import {
+  capabilityChipClass,
+  capabilityChipTitle,
+  capabilityChips,
+  marketGroup,
+  venueLabel,
+} from './symbols';
 
 const STATUS_LABEL: Record<string, string> = {
   idle: 'idle',
@@ -26,29 +32,11 @@ const STATUS_LABEL: Record<string, string> = {
   closed: 'closed',
 };
 
-const GROUP_VENUE: Record<SymbolGroupKey, string> = {
-  crypto: 'Crypto',
-  equity: 'Equity',
-  sim: 'Sim',
-};
-
-/**
- * Class suffix for a capability chip so its FIDELITY (not just its channel) reads
- * in the right hue (§7 honesty): synthetic depth gets the amber `cap--synth` ramp,
- * and lower-fidelity tape (POLL) / inferred-or-absent side get a `cap--caution`
- * modifier, while the real tiers (L2/L1/TICK/EXCHANGE) keep the plain accent.
- */
-export function chipClass(chip: string): string {
-  if (chip.startsWith('TAPE')) {
-    return chip.includes('POLL') ? 'cap cap--tape cap--caution' : 'cap cap--tape';
-  }
-  if (chip.startsWith('SIDE')) {
-    return chip.includes('INFERRED') || chip.includes('NA') ? 'cap cap--caution' : 'cap';
-  }
-  // Depth chip: SYNTH / SYNTH_PROFILE render fabricated depth → amber ramp.
-  if (chip.startsWith('SYNTH')) return 'cap cap--synth';
-  return 'cap cap--depth';
-}
+// Capability chips are classified by the ONE shared `capabilityChipClass`
+// (ui/symbols.ts), the same function the symbol palette uses. This file used to
+// carry its own copy, and the two drifted: the same `SYNTH_PROFILE` string read
+// as fabricated depth here and as real depth in the palette. One string, one
+// fidelity claim, every surface.
 
 /** The viewer's local time-zone abbreviation (e.g. `GMT+3`, `EST`) for labeling the wall clock. */
 function localZoneAbbrev(d: Date): string {
@@ -110,9 +98,17 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
 
       <SymbolSearch ref={searchRef} current={`${market}:${symbol}`} onSelect={onSelectSymbol} />
 
-      <span className={`venue venue--${group}`} data-testid="venue" title={`${market} · ${symbol}`}>
+      {/* The venue, not just its asset class: with ~106 reachable venues "Crypto"
+          no longer says WHERE the book is coming from, so a crypto session names
+          the market string (`kraken`, `binance-usdm`) it is actually subscribed
+          to. Equity / sim keep their group word — there the group IS the venue. */}
+      <span
+        className={`venue venue--${group}`}
+        data-testid="venue"
+        title={`${market} · ${symbol} · ${group}`}
+      >
         <span className="venue__dot" aria-hidden="true" />
-        {GROUP_VENUE[group]}
+        {venueLabel(market)}
         <strong style={{ color: 'var(--text)', fontWeight: 600 }}>{symbol}</strong>
       </span>
 
@@ -125,7 +121,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
           <span className="cap cap--na">NO CAPS</span>
         ) : (
           chips.map((c) => (
-            <span key={c} className={chipClass(c)}>
+            <span key={c} className={capabilityChipClass(c)} title={capabilityChipTitle(c)}>
               {c}
             </span>
           ))

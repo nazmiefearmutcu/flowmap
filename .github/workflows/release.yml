@@ -1,7 +1,8 @@
 name: release
 
 # Builds the self-contained FlowMap desktop installers for macOS (Apple Silicon
-# + Intel), Windows and Linux, and attaches them to a GitHub Release.
+# + Intel), Windows (x64 + ARM64) and Linux, and attaches them to a GitHub
+# Release.
 #
 # Native Python wheels (numpy / polars / msgspec / curl-cffi …) must be built on
 # their own OS+arch, so each installer is produced on its matching runner — the
@@ -99,6 +100,16 @@ jobs:
             kind: macos
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
+            kind: windows
+          # Windows on ARM (Snapdragon X laptops, Surface, and Windows 11 in a
+          # VM on Apple Silicon). `windows-11-arm` is a GA GitHub-hosted ARM64
+          # image, so this leg is a NATIVE build — no `--target` flag, and the
+          # bundle lands in the same target/release/bundle path as every other
+          # runner. An emulated x64 install works on these machines too, but it
+          # runs an emulated CPython over an emulated webview; native is the
+          # build we actually want people to download.
+          - os: windows-11-arm
+            triple: aarch64-pc-windows-msvc
             kind: windows
           - os: ubuntu-22.04
             triple: x86_64-unknown-linux-gnu
@@ -230,7 +241,12 @@ jobs:
             PY="app/src-tauri/resources/pyruntime/bin/python3.13"
           fi
           echo "interpreter: $PY"
-          "$PY" -c "import importlib; [importlib.import_module(m) for m in ['flowmap_server','numpy','polars','fastapi','uvicorn','msgspec','crypcodile','stockodile']]; print('imports OK')"
+          # The health poll below already proves everything the server imports
+          # EAGERLY, so an eager-only list adds no coverage. What it cannot see
+          # is the lazily-imported closure — above all the equity providers,
+          # which are only reached on a real `equity:` subscribe. A bundle that
+          # lost pandas or pyarrow would boot green and die on the first one.
+          "$PY" -c "import importlib; [importlib.import_module(m) for m in ['flowmap_server','numpy','polars','fastapi','uvicorn','msgspec','crocodile','ccxt','aiohttp','certifi','crocodile.core.connector','crocodile.core.ingest.transport','crocodile.core.schema.records','crocodile.core.scheduler.calendar','crocodile.core.sink.memory','crocodile.crypto.exchanges.factory','crocodile.crypto.client.backfill','crocodile.crypto.exchanges.ccxt_universal.connector','crocodile.crypto.exchanges.binance.backfill','crocodile.equity.providers.factory','crocodile.equity.providers.yahoo.client','crocodile.equity.client.collect','crocodile.equity.depth.vap','pandas','pyarrow','yfinance','bs4']]; print('imports OK')"
           PORT=8799
           DATA_DIR="$(mktemp -d)"
           FLOWMAP_HOST=127.0.0.1 FLOWMAP_PORT="$PORT" FLOWMAP_RECORDING_ENABLED=0 FLOWMAP_DATA_DIR="$DATA_DIR" "$PY" -m flowmap_server &
@@ -244,6 +260,28 @@ jobs:
           done
           kill "$SRV" 2>/dev/null || true
           if [ "$ok" != "1" ]; then echo "server health check FAILED"; exit 1; fi
+
+      # The README's download table names every installer and its size, so those
+      # numbers need a source that is not a guess. This prints what the leg
+      # actually produced into the job summary — and because it runs on dry-run
+      # builds too, the table can be refreshed BEFORE the tag is cut.
+      - name: Report produced installers
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          B="app/src-tauri/target/release/bundle"
+          {
+            echo "### $TRIPLE"
+            echo ""
+            echo "| installer | size |"
+            echo "|---|---|"
+            find "$B" -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \
+                                 -o -name '*.deb' -o -name '*.AppImage' \) -print0 \
+              | while IFS= read -r -d '' f; do
+                  printf '| `%s` | %s |\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+                done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload installers to the release
         if: needs.prepare.outputs.do_release == 'true'

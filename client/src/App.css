@@ -150,6 +150,20 @@ body,
   border-color: var(--warn-line);
   background: var(--warn-dim);
 }
+/* One step down from a real tier, but NOT fabricated: polled tape, inferred side,
+   and snapshot depth (a ccxt book re-read whole each tick). Amber ink on the bare
+   surface — visibly not the accent, visibly not the filled SYNTH badge. Declared
+   after .cap--depth / .cap--tape so the modifier wins when both classes apply. */
+.cap--caution {
+  color: var(--warn);
+  border-color: var(--warn-line);
+}
+/* Pre-Hello placeholder: present but inert, so the bar does not jump when the
+   real chips arrive. */
+.cap--pending {
+  color: var(--text-4);
+  border-color: var(--line);
+}
 
 /* --- connection status --- */
 .status {
@@ -410,6 +424,56 @@ body,
   background: none;
   cursor: pointer;
 }
+/* --- venue scope bar (the ~106-venue selector lives behind this button) --- */
+.sympal__scope {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-inset);
+}
+.sympal__venuebtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 8px;
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  cursor: pointer;
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+.sympal__venuebtn:hover,
+.sympal__venuebtn.is-on {
+  border-color: var(--accent-line);
+  color: var(--text);
+}
+.sympal__venuebtn-k {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.sympal__venuebtn-v {
+  font-size: var(--fs-md);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-money);
+}
+.sympal__venuebtn-c {
+  font-size: 8px;
+  color: var(--text-3);
+}
+.sympal__scopenote {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+}
+
 .sympal__body {
   display: grid;
   grid-template-columns: 1fr 230px;
@@ -428,9 +492,11 @@ body,
   text-transform: uppercase;
   color: var(--text-3);
 }
+/* Column 3 holds either the sparkline (56px) or the depth chip; it is sized for
+   the widest honest tier, `L2-SNAPSHOT`, so a ccxt venue's rows stay one line. */
 .sympal__row {
   display: grid;
-  grid-template-columns: 52px 1fr 60px 74px 62px;
+  grid-template-columns: 52px 1fr 78px 74px 62px;
   align-items: center;
   gap: 10px;
   padding: 8px;
@@ -457,6 +523,66 @@ body,
 .sympal__grp--crypto { color: #6fd0c4; border-color: rgba(31, 182, 166, 0.4); }
 .sympal__grp--equity { color: #a9b4ff; border-color: rgba(120, 130, 255, 0.4); }
 .sympal__grp--sim { color: #d6a13a; border-color: rgba(214, 161, 58, 0.4); }
+.sympal__grp--all { color: var(--text-2); border-color: var(--line-2); }
+
+/* --- venue rows (same rhythm as a symbol row, minus the price columns) --- */
+.sympal__vrow {
+  display: grid;
+  grid-template-columns: 52px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.sympal__vrow:hover,
+.sympal__vrow.is-active {
+  background: var(--bg-3);
+}
+.sympal__vrow.is-active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.sympal__vrow .sympal__sym {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.sympal__vmeta {
+  display: inline-flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+/* --- venue listing in flight (the opt-in slow path, seconds not ms) --- */
+.sympal__loading {
+  padding: 22px 10px;
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  text-align: center;
+}
+.sympal__loadbar {
+  display: block;
+  width: 148px;
+  height: 2px;
+  margin: 0 auto 12px;
+  background: var(--line-2);
+  overflow: hidden;
+  position: relative;
+}
+.sympal__loadbar::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 42%;
+  background: var(--accent);
+  animation: sympal-scan 1.05s ease-in-out infinite;
+}
+@keyframes sympal-scan {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(238%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sympal__loadbar::after { animation: none; width: 100%; opacity: 0.45; }
+}
 .sympal__sym {
   font-size: var(--fs-md);
   font-weight: 600;
@@ -466,7 +592,7 @@ body,
   white-space: nowrap;
 }
 .sympal__spark { width: 56px; height: 18px; }
-.sympal__caps { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.sympal__caps { display: inline-flex; gap: 4px; }
 .sympal__px {
   font-size: var(--fs-sm);
   text-align: right;
@@ -486,6 +612,49 @@ body,
   font-size: var(--fs-sm);
   color: var(--text-3);
   text-align: center;
+}
+/* A FAILED listing, deliberately NOT styled like .sympal__empty: an empty venue
+   is an answer (muted, unremarkable), a failed request is a fault we are asking
+   the user to retry. Amber ink + a rule, matching the .cap--caution language. */
+.sympal__failed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 8px;
+  padding: 18px 16px;
+  text-align: center;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-1);
+  background: var(--warn-dim);
+}
+.sympal__failed-h {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--warn);
+}
+.sympal__failed-s {
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  color: var(--text-3);
+  max-width: 42ch;
+}
+.sympal__retry {
+  margin-top: 2px;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--warn);
+  padding: 4px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-1);
+  background: none;
+  cursor: pointer;
+}
+.sympal__retry:hover {
+  color: var(--text);
+  border-color: var(--warn);
 }
 .spark-up { stroke: #1fb6a6; stroke-width: 1.4; }
 .spark-down { stroke: #e05454; stroke-width: 1.4; }

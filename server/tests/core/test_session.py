@@ -15,8 +15,9 @@ import logging
 import numpy as np
 import pytest
 
-from stockodile.scheduler.calendar import MARKET_TZ
-from stockodile.schema.records import Bar as StkBar
+from crocodile.core.schema.enums import AssetClass
+from crocodile.core.schema.records import OHLCV as StkBar
+from crocodile.core.scheduler.calendar import MARKET_TZ
 
 from flowmap_server.config import Config
 from flowmap_server.core.grid import Grid, GridCfg
@@ -841,9 +842,10 @@ def _eq_et_ns(y: int, mo: int, d: int, h: int, mi: int = 0) -> int:
 def _eq_bar(ts_ns: int, price: float, vol: float) -> StkBar:
     """A 1 m bar whose whole OHLC sits at ``price`` (typical price == price)."""
     return StkBar(
-        provider="yahoo",
+        source="yahoo",
         symbol="AAPL",
         symbol_raw="AAPL",
+        asset_class=AssetClass.EQUITY,
         local_ts=ts_ns,
         source_ts=ts_ns,
         interval="1m",

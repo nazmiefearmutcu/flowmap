@@ -192,6 +192,10 @@ describe('golden vectors — cold (JSON) messages decode byte-exact', () => {
     expect(msg.market).toBe('crypto');
     expect(msg.symbol).toBe('BTCUSDT');
     expect(msg.mode).toBe('live');
+    // 'crypcodile' names an engine that no longer exists. It is FROZEN payload
+    // inside a byte-identity fixture — see the rationale at
+    // server/src/flowmap_server/proto/wire.py (build_golden_vectors). Renaming it
+    // rewrites the .bin and proves nothing.
     expect(msg.source).toBe('crypcodile');
     expect(msg.start_t).toBeNull();
   });

@@ -17,6 +17,7 @@ webview: WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux) that:
 ```
 app/
   icons/                     hand-authored source icon (flowmap.svg, .icns, PNGs)
+    dmg/                     DMG install-window art + make-bg.py (+ RENDERED_VERSION)
   scripts/
     bundle-python.sh         builds the relocatable pyruntime for a target triple
                              (astral python-build-standalone) — macOS/Windows/Linux
@@ -44,6 +45,18 @@ The bundled `pyruntime/`, the Rust `target/`, the generated `icons/`, and the
 built installers are **gitignored** (large binaries). Installers ship via the
 GitHub Release, not git.
 
+## Versioning
+
+`tauri.conf.json`'s `version` is the **single source**. `build-dmg.sh` reads it
+rather than carrying a copy (it once carried a stale one, and named a disk image
+for the wrong release). The DMG install window is the one place the version
+becomes *pixels*, so `app/icons/dmg/make-bg.py <version> --all` regenerates the
+plate and stamps `RENDERED_VERSION` beside it; `build-dmg.sh` refuses to build
+when that stamp and the config disagree. Bumping a release means editing
+`tauri.conf.json`, `Cargo.toml`(+`.lock`), `server/pyproject.toml`(+`uv.lock`),
+`flowmap_server/__init__.py`, `client/package.json`(+`.lock`), then rerunning
+`make-bg.py`.
+
 ## Build
 
 ### macOS (local, one command)
@@ -53,11 +66,11 @@ GitHub Release, not git.
 bash app/scripts/build-dmg.sh
 ```
 
-It is **arch-aware** (`uname -m`): produces `FlowMap_1.3.0_aarch64.dmg` on Apple
-Silicon and `FlowMap_1.3.0_x86_64.dmg` on Intel. Outputs:
+It is **arch-aware** (`uname -m`): produces `FlowMap_1.3.1_aarch64.dmg` on Apple
+Silicon and `FlowMap_1.3.1_x86_64.dmg` on Intel. Outputs:
 
-- `app/src-tauri/target/release/bundle/macos/FlowMap.app` (~536 MB)
-- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.3.0_<arch>.dmg` (~169 MB)
+- `app/src-tauri/target/release/bundle/macos/FlowMap.app`
+- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.3.1_<arch>.dmg`
 
 Requires: `cargo`/`rustc`, `cargo-tauri` (`cargo install tauri-cli --version '^2'
 --locked`), Node/npm, `uv`, and the macOS `codesign`/`hdiutil`/`sips`/`iconutil`
@@ -75,15 +88,40 @@ cd app/src-tauri && cargo tauri icon ../icons/icon-1024.png  # 3. icons
 cargo tauri build                                            # 4. installers
 ```
 
-`<target-triple>` ∈ `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`
-(default). On Windows run `bundle-python.sh` under **Git-Bash**. Outputs land in
-`target/release/bundle/{msi,nsis,deb,appimage}/`.
+`<target-triple>` ∈ `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+`aarch64-apple-darwin` (default). On Windows run `bundle-python.sh` under
+**Git-Bash**. Outputs land in `target/release/bundle/{msi,nsis,deb,appimage}/`,
+named for the arch — `FlowMap_<version>_x64-setup.exe` on Intel/AMD,
+`FlowMap_<version>_arm64-setup.exe` on ARM.
 
 `.github/workflows/release.yml` does exactly this across a `macos-14` (arm),
-`macos-13` (Intel), `windows-latest` and `ubuntu-22.04` matrix on every `vX.Y.Z`
-tag, smoke-tests each bundle's server (`/api/health`), and attaches the
-installers to the GitHub Release.
+`macos-15-intel`, `windows-latest` (x64), `windows-11-arm` (ARM64) and
+`ubuntu-22.04` matrix on every `vX.Y.Z` tag, smoke-tests each bundle's server
+(`/api/health`), reports each installer's size to the job summary, and attaches
+the installers to the GitHub Release. Every leg is a **native** build — the
+Python wheels are platform-specific and cannot be cross-built.
+
+### Windows on ARM: the dependency exceptions
+
+71 of the 75 locked distributions publish a `win_arm64` wheel. The four that do
+not are handled in `bundle-python.sh` by a fail-loud exception list applied only
+to `aarch64-pc-windows-msvc`:
+
+| package | why it has no ARM64 wheel path | what the ARM64 bundle does |
+|---|---|---|
+| `pyarrow` | no `win_arm64` wheel in any release; from-sdist means building Arrow C++ | dropped — reachable only via crocodile's Arrow-IPC export helpers, which FlowMap never imports (recording is polars, whose parquet codec is native Rust) |
+| `zlib-ng`, `aiohttp-fast-zlib` | no `win_arm64` wheel | dropped — a ccxt decompression speed-up imported inside `try/except ImportError`; ARM64 uses stdlib zlib |
+| `cryptography` | 47.0.0 onward ship `win_amd64`/`win32` only | pinned back to **46.0.3**, the last release with a `win_arm64` wheel — not droppable, ccxt imports it eagerly, and only long-stable hazmat primitives are used |
+| `uvloop` | n/a | already excluded by its own marker on Windows |
+
+Because the exported lock is a complete closure, this leg installs with
+`--no-deps` (otherwise pip would re-resolve and undo the exceptions). The
+import gate in step 5 of `bundle-python.sh` is what proves the resulting tree is
+sound; it is told which module to skip rather than being weakened. If a dropped
+name leaves the lock, or `cryptography`'s locked version moves off 49.0.0, the
+build **fails** rather than silently shipping something the table above no
+longer describes.
 
 ## First run (unsigned / unnotarized)
 

@@ -68,9 +68,8 @@ from flowmap_server.core.backfill import BackfillFn, columns_from_candles
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.feeds.base import BookState, Feed
-from flowmap_server.feeds.crypto import CRYPTO_MARKETS, CryptoFeed
-from flowmap_server.feeds.equity import EQUITY_MARKETS, EquityFeed
-from flowmap_server.feeds.sim import SimFeed
+from flowmap_server.feeds.equity import EQUITY_MARKETS
+from flowmap_server.feeds.router import build_feed
 from flowmap_server.proto import events, wire
 
 __all__ = ["ClientTx", "Session", "SessionLimitError", "SessionManager"]
@@ -1079,19 +1078,10 @@ class SessionManager:
         self._sessions: dict[tuple[str, str, str, str | None, str], Session] = {}
 
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
-        if sub.market == "sim":
-            return SimFeed(seed=42, dt_ns=self._cfg.dt_crypto_ns, start_ns=0)
-        if sub.market in CRYPTO_MARKETS:
-            # "<exchange>-<market>" ("binance-usdm") or bare "<exchange>" ("okx").
-            exchange, _, market = sub.market.partition("-")
-            return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=market, cfg=self._cfg)
-        if sub.market in EQUITY_MARKETS:
-            # Tier (keyless SYNTH / Alpaca / Finnhub) auto-selected from cfg keys.
-            return EquityFeed(sub.symbol, self._cfg)
-        raise NotImplementedError(
-            f"market {sub.market!r} has no feed "
-            f"(sim + crypto {sorted(CRYPTO_MARKETS)} + equity {sorted(EQUITY_MARKETS)})"
-        )
+        # Test path: the sim feed is unpaced so tests own the clock. Routing
+        # itself lives in feeds.router — see the note there about the copy this
+        # replaced.
+        return build_feed(sub, self._cfg, realtime_sim=False)
 
     def _grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         if feed.market in EQUITY_MARKETS:

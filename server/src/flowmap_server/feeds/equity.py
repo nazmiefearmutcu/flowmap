@@ -1,4 +1,4 @@
-"""US-equity feed: stockodile providers -> canonical FeedEvents (M3 T1).
+"""US-equity feed: Crocodile equity providers -> canonical FeedEvents (M3 T1).
 
 Equities have **no free L2 depth**. This feed therefore auto-selects a tier
 from the credentials in :class:`~flowmap_server.config.Config` and expresses
@@ -26,7 +26,7 @@ its typical price ``(H+L+C)/3`` snapped to a cent bucket, accumulated into a
 rescaled so the **combined** peak == ``PROFILE_PEAK_TARGET`` and then split at a
 **reference price** (that bar's close during warmup, the live last price when
 running) into a bid channel (``price <= ref``) and an ask channel (``price >
-ref``) — stockodile ``split_ladder`` semantics. The grid, which time-weights the
+ref``) — engine ``split_ladder`` semantics. The grid, which time-weights the
 previous book over each interval, thus renders a **two-sided** depth-over-time
 whose bid/ask boundary walks with price (grid ``mode=L1_BAND``, two channels on
 the wire; the badge stays honestly ``SYNTH``). The emitted sizes are a bounded
@@ -54,7 +54,7 @@ can schedule a restart at ``next_open_ts`` (``events()`` is re-callable per the
 Feed restart contract and re-fetches on the next call).
 
 The session model authority is
-:class:`stockodile.scheduler.calendar.USMarketCalendar` (America/New_York,
+:class:`crocodile.core.scheduler.calendar.USMarketCalendar` (America/New_York,
 holiday-aware); live polling is gated on its RTH window. All time is UTC ns;
 ``now_ns_fn`` is injected so tests can pin "closed" (a Saturday) vs "open" (a
 weekday RTH minute) with no wall-clock dependency, and ``bars_fn`` / ``price_fn``
@@ -72,11 +72,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 import numpy as np
 
-from stockodile.depth.vap import reference_price as stk_reference_price
-from stockodile.scheduler.calendar import MARKET_TZ, USMarketCalendar
-from stockodile.schema.records import Bar as StkBar
-from stockodile.schema.records import Quote as StkQuote
-from stockodile.schema.records import Trade as StkTrade
+from crocodile.core.schema.records import OHLCV as EqBar
+from crocodile.core.schema.records import Quote as EqQuote
+from crocodile.core.schema.records import Trade as EqTrade
+from crocodile.core.scheduler.calendar import MARKET_TZ, USMarketCalendar
+from crocodile.equity.depth.vap import reference_price as eq_reference_price
 
 from flowmap_server.config import Config
 from flowmap_server.feeds.base import BookState, FeedEvent
@@ -121,18 +121,18 @@ _ALPACA_CAP = 30
 _FINNHUB_CAP = 50
 
 
-BarsFn = Callable[[], Awaitable[Sequence[StkBar]]]
+BarsFn = Callable[[], Awaitable[Sequence[EqBar]]]
 PriceFn = Callable[[], Awaitable[float | None]]
 SleepFn = Callable[[float], Awaitable[None]]
 NowFn = Callable[[], int]
 
 
-def _bar_ts(bar: StkBar) -> int:
+def _bar_ts(bar: EqBar) -> int:
     """A bar's canonical UTC-ns timestamp (source over local)."""
     return int(bar.source_ts if bar.source_ts is not None else bar.local_ts)
 
 
-def _bar_finite(bar: StkBar) -> bool:
+def _bar_finite(bar: EqBar) -> bool:
     """True iff the bar's OHLCV are all finite and volume is non-negative.
 
     Yahoo bars can carry gaps (already dropped in the client), but NaN/inf can
@@ -142,7 +142,7 @@ def _bar_finite(bar: StkBar) -> bool:
     return all(v is not None and math.isfinite(v) for v in vals) and bar.volume >= 0.0
 
 
-def _typical_price(bar: StkBar) -> float:
+def _typical_price(bar: EqBar) -> float:
     """Bar typical price ``(H+L+C)/3`` — the volume-at-price anchor and the
     same convention spec §7 uses for the approx VWAP."""
     return (bar.high + bar.low + bar.close) / 3.0
@@ -166,7 +166,7 @@ class _ProfileBuilder:
         self._tick = tick
         self._buckets: dict[int, float] = {}
 
-    def add_bar(self, bar: StkBar) -> bool:
+    def add_bar(self, bar: EqBar) -> bool:
         """Add one bar's volume at its typical price. Returns False (skipped)
         for non-finite/negative-volume bars or a non-positive typical price."""
         if not _bar_finite(bar):
@@ -183,7 +183,7 @@ class _ProfileBuilder:
 
     def book_state(self, ts_ns: int, ref: float | None = None) -> BookState:
         """The cumulative volume-at-price profile as a **two-sided** normalized
-        :class:`BookState`, split at ``ref`` (stockodile ``split_ladder``
+        :class:`BookState`, split at ``ref`` (engine ``split_ladder``
         semantics): buckets with ``price <= ref`` are the bid channel, ``price >
         ref`` the ask channel. The occupied buckets carry the profile's SHAPE
         rescaled so its **combined** (bid+ask) peak == ``PROFILE_PEAK_TARGET``.
@@ -237,7 +237,7 @@ class _FeedEnd:
 
 
 class _EquitySink:
-    """Translate stockodile records -> canonical events (keyed tiers).
+    """Translate Crocodile equity records -> canonical events (keyed tiers).
 
     US tapes carry no aggressor side, so it is inferred and stamped
     ``side_src=inferred`` (spec §7):
@@ -249,7 +249,7 @@ class _EquitySink:
       previous side; the first print defaults to buy (any fixed default is
       equally arbitrary — documented in the reference feed).
 
-    Implements just enough of :class:`stockodile.sink.base.Sink` (``put`` /
+    Implements just enough of :class:`crocodile.core.sink.base.Sink` (``put`` /
     ``flush``) to run inside ``collect``'s TaskGroup; not a real Parquet sink.
     """
 
@@ -263,18 +263,28 @@ class _EquitySink:
         self._bbo: tuple[float, float] | None = None  # (bid_px, ask_px)
 
     async def put(self, record: object) -> None:
-        if isinstance(record, StkTrade):
+        if isinstance(record, EqTrade):
+            # The merged record now carries a `side` field, but every US equity
+            # provider fills it with Side.UNKNOWN — the consolidated tape does
+            # not publish the aggressor. An earlier revision here promoted a
+            # non-UNKNOWN side to `SIDE_SRC_EXCHANGE`; that was wrong twice
+            # over: it read the field instead of the record's `prov` block, so
+            # a provider-side inference would have been laundered into
+            # "exchange-true", and it contradicted this tier's own
+            # `trade_side: "inferred"` badge. Inference is the honest answer
+            # here, and it must run on EVERY print or the tick rule's
+            # `_last_px`/`_last_side` go stale.
             self._emit(
                 Trade(
                     ts_ns=_rec_ts(record),
                     price=float(record.price),
-                    size=float(record.size),
+                    size=float(record.amount),
                     side=self._infer_side(float(record.price)),
                     side_src=SIDE_SRC_INFERRED,
-                    venue=record.provider,
+                    venue=record.source,
                 )
             )
-        elif isinstance(record, StkQuote) and self._use_quote_rule:
+        elif isinstance(record, EqQuote) and self._use_quote_rule:
             bid_px, ask_px = float(record.bid_px), float(record.ask_px)
             bid_sz, ask_sz = float(record.bid_sz), float(record.ask_sz)
             self._bbo = (bid_px, ask_px)
@@ -337,7 +347,7 @@ class _EquitySink:
         return self._last_side
 
 
-def _rec_ts(record: StkTrade | StkQuote) -> int:
+def _rec_ts(record: EqTrade | EqQuote) -> int:
     return int(record.source_ts if record.source_ts is not None else record.local_ts)
 
 
@@ -357,9 +367,9 @@ class _GooglePricePoller:
     async def poll(self) -> float | None:
         import aiohttp
 
-        from stockodile.providers.google_finance.connector import GoogleFinanceProvider
-        from stockodile.reference.registry import InstrumentRegistry
-        from stockodile.sink.base import MemorySink
+        from crocodile.equity.providers.google_finance.connector import GoogleFinanceProvider
+        from crocodile.equity.reference.registry import InstrumentRegistry
+        from crocodile.core.sink.memory import MemorySink
 
         if self._provider is None:
             self._provider = GoogleFinanceProvider(
@@ -372,7 +382,7 @@ class _GooglePricePoller:
         self._provider.session = session  # type: ignore[attr-defined]
         recs = await self._provider._scrape_symbol(self._symbol)  # type: ignore[attr-defined]
         for rec in recs:
-            if isinstance(rec, StkTrade) and math.isfinite(rec.price):
+            if isinstance(rec, EqTrade) and math.isfinite(rec.price):
                 return float(rec.price)
         return None
 
@@ -447,7 +457,7 @@ class EquityFeed:
 
     @staticmethod
     def synth_profile(
-        bars: Sequence[StkBar],
+        bars: Sequence[EqBar],
         *,
         tick: float = DEFAULT_PROFILE_TICK,
         ref: float | None = None,
@@ -458,21 +468,21 @@ class EquityFeed:
         ``PROFILE_PEAK_TARGET`` (a bounded relative intensity, not a share count —
         see :meth:`_ProfileBuilder.book_state`) then split at ``ref`` into bid
         (``price <= ref``) and ask (``price > ref``) channels. ``ref`` defaults to
-        the last finite bar's close (``stockodile.depth.vap.reference_price``); a
+        the last finite bar's close (``crocodile.equity.depth.vap.reference_price``); a
         ``None`` result of that (no finite bars) yields an empty book. ``ts_ns``
         is the newest bar's timestamp (0 if none)."""
         builder = _ProfileBuilder(tick)
         last_ts = 0
-        finite: list[StkBar] = []
+        finite: list[EqBar] = []
         for bar in bars:
             if builder.add_bar(bar):
                 last_ts = max(last_ts, _bar_ts(bar))
                 finite.append(bar)
         if ref is None and finite:
-            ref = stk_reference_price(finite)
+            ref = eq_reference_price(finite)
         return builder.book_state(last_ts, ref)
 
-    def _select_warmup_bars(self, bars: Sequence[StkBar]) -> list[StkBar]:
+    def _select_warmup_bars(self, bars: Sequence[EqBar]) -> list[EqBar]:
         """The most recent session's finite bars (grouped by ET date), sorted
         by time. Restricting to one session keeps warmup timestamps ~1 m apart
         so the grid never bridges an overnight/weekend gap into empty columns
@@ -621,13 +631,13 @@ class EquityFeed:
             yield builder.book_state(now, ref)
             await self._sleep(poll_s)
 
-    async def _fetch_bars(self) -> Sequence[StkBar]:
+    async def _fetch_bars(self) -> Sequence[EqBar]:
         if self._bars_fn is not None:
             return await self._bars_fn()
         return await self._default_fetch_bars()
 
-    async def _default_fetch_bars(self) -> Sequence[StkBar]:
-        from stockodile.providers.yahoo.client import YahooClient
+    async def _default_fetch_bars(self) -> Sequence[EqBar]:
+        from crocodile.equity.providers.yahoo.client import YahooClient
 
         client = YahooClient()
         return await client.fetch_intraday_bars(self.symbol, "1m")
@@ -674,8 +684,8 @@ class EquityFeed:
     def _make_provider(self, sink: _EquitySink) -> object:
         if self._provider_factory is not None:
             return self._provider_factory(sink)
-        from stockodile.providers.factory import make_provider
-        from stockodile.reference.registry import InstrumentRegistry
+        from crocodile.equity.providers.factory import make_provider
+        from crocodile.equity.reference.registry import InstrumentRegistry
 
         if self._tier == "alpaca":
             return make_provider(
@@ -700,7 +710,7 @@ class EquityFeed:
     async def _drive_keyed(
         provider: object, sink: _EquitySink, queue: asyncio.Queue[FeedEvent | _FeedEnd]
     ) -> None:
-        from stockodile.client.collect import collect
+        from crocodile.equity.client.collect import collect
 
         try:
             await collect([provider], sink, max_reconnects=-1)  # type: ignore[list-item]

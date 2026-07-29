@@ -245,6 +245,80 @@ describe('Connection — subscription lifecycle', () => {
     assertType(frames[2], MsgType.SUBSCRIBE);
     expect(frames[2].symbol).toBe('AAPL');
   });
+
+  it('rewinds the per-session cursors when the stream changes', () => {
+    const { sockets, clock, factory } = harness();
+    const onStream = vi.fn();
+    const conn = new Connection({
+      url: URL, wsFactory: factory,
+      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
+    });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].deliver(buildEpochStart(0));
+    sockets[0].deliver(buildDepthCol(0, 900, true)); // deep into the old session
+    expect(onStream).toHaveBeenCalledTimes(1);
+
+    // Swapping symbols detaches the server session; the replacement's grid
+    // restarts at epoch 0 with low col_seqs and its attach snapshot arrives
+    // final=true. Without a rewind the whole snapshot/backfill would be dropped
+    // as "already finalized" and only the forming right edge would render.
+    conn.subscribe('equity', 'AAPL', 'live');
+    expect(conn.epochs.size).toBe(0); // the old grid geometry is gone too
+    sockets[0].deliver(buildDepthCol(0, 1, true));
+    sockets[0].deliver(buildDepthCol(0, 2, true));
+    expect(onStream).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the dedup cursor across a reconnect of the SAME stream', () => {
+    const { sockets, clock, factory } = harness();
+    const onStream = vi.fn();
+    const conn = new Connection({
+      url: URL, wsFactory: factory,
+      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
+    });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].deliver(buildDepthCol(3, 42, true));
+    expect(onStream).toHaveBeenCalledTimes(1);
+
+    sockets[0].drop(); // server-side close
+    clock.advance(500);
+    sockets[1].open();
+
+    // Same stream, same server session: the reconnect snapshot re-sends what we
+    // already finalized, which is exactly what the cursor exists to swallow.
+    sockets[1].deliver(buildDepthCol(3, 42, true));
+    expect(onStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an in-flight history request when the stream changes', async () => {
+    const { sockets, clock, factory } = harness();
+    const conn = new Connection({
+      url: URL,
+      wsFactory: factory,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+
+    // A page of the OLD symbol's history is still in flight when the user
+    // switches: its columns must never resolve into the new symbol's ring.
+    const pending = conn.requestHistory(1n, 10);
+    const sent = decodeFrame(sockets[0].lastSent);
+    assertType(sent[0], MsgType.HISTORY_REQ);
+    const reqId = sent[0].req_id;
+    const assertion = expect(pending).rejects.toThrow(/subscription changed/);
+    conn.subscribe('equity', 'AAPL', 'live');
+    await assertion;
+
+    // A late response for the abandoned req_id is now unmatched — dropped.
+    expect(() => sockets[0].deliver(buildHistoryResp(reqId))).not.toThrow();
+  });
 });
 
 describe('Connection — message routing', () => {

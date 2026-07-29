@@ -2,14 +2,14 @@
 #
 # bundle-python.sh — build a relocatable, self-contained Python runtime that runs
 # the FlowMap server, for embedding in the FlowMap desktop app as a Tauri
-# resource. Cross-platform: macOS (arm64/intel), Windows (x86_64) and Linux
+# resource. Cross-platform: macOS (arm64/intel), Windows (x86_64/arm64) and Linux
 # (x86_64/arm64).
 #
 # Strategy: download astral's `python-build-standalone` CPython 3.13 for the
 # requested target triple (the `install_only` tarball — already relocatable)
 # into app/src-tauri/resources/pyruntime, then install the flowmap-server + its
 # deps INTO that runtime's own site-packages so the whole tree is
-# self-contained. Dependencies (incl. the git-pinned crypcodile/stockodile) come
+# self-contained. Dependencies (incl. the git-pinned crocodile engine) come
 # from the server's uv.lock so the bundle matches the tested resolution exactly.
 #
 # Because native wheels (numpy/polars/msgspec/curl-cffi …) are platform-specific,
@@ -22,7 +22,7 @@
 #   TARGET_TRIPLE (default: aarch64-apple-darwin — keeps the historic macOS
 #   arm64 behavior when invoked with no arguments). Supported:
 #     aarch64-apple-darwin      x86_64-apple-darwin
-#     x86_64-pc-windows-msvc
+#     x86_64-pc-windows-msvc    aarch64-pc-windows-msvc
 #     x86_64-unknown-linux-gnu  aarch64-unknown-linux-gnu
 #
 #   --clean   also drop the cached tarball before rebuilding.
@@ -155,8 +155,97 @@ REQS="$CACHE_DIR/flowmap-reqs.txt"
 ( cd "$SERVER_DIR" && uv export --frozen --no-dev --no-emit-project --no-hashes -o "$(native_path "$REQS")" )
 echo "    $(grep -cvE '^\s*(#|$)' "$REQS") requirement lines"
 
+# --- 3b. Per-target dependency exceptions -------------------------------------
+# Windows-on-ARM is the one target where the locked resolution is not installable
+# as-is: three of the locked distributions publish no `win_arm64` wheel, and
+# building them from sdist on an ARM64 runner is either impossible in practice
+# (pyarrow = the entire Arrow C++ tree) or needs a from-source OpenSSL
+# (cryptography). Each is handled by removing exactly as much as the ARM64 bundle
+# can live without — and nothing more:
+#
+#   pyarrow            Only reachable through crocodile's Arrow-IPC export
+#                      helpers (crypto/client/export.py, equity/client/export.py).
+#                      FlowMap never imports them: its recording layer is polars,
+#                      whose parquet reader/writer is native Rust. Dropped.
+#   zlib-ng            A ccxt speed-up: aiohttp_fast_zlib swaps aiohttp's gzip
+#   aiohttp-fast-zlib  codec for zlib-ng (~2x faster decompression). ccxt imports
+#                      it inside `try: … except ImportError: pass`, so its
+#                      absence is a documented, supported configuration — the
+#                      ARM64 build simply decompresses with stdlib zlib.
+#   cryptography       NOT droppable: ccxt imports it eagerly at the top of
+#                      base/exchange.py. 46.0.3 is the newest release that still
+#                      ships a win_arm64 wheel (47.0.0 onward are win_amd64/win32
+#                      only), and ccxt only touches long-stable hazmat primitives
+#                      (hashes, ec, ed25519, padding, PEM loading), so it is
+#                      pinned back for this target alone.
+#
+# The exception list is fail-loud: if a name it removes or re-pins is no longer
+# in the lock — or cryptography's locked version moves — the build stops instead
+# of quietly shipping a different dependency set than the one described here.
+# Re-check PyPI for win_arm64 wheels before touching it.
+# Seeded with the flags every target uses, so the array is never empty — an
+# empty array expansion is an "unbound variable" under `set -u` on bash 3.2,
+# which is what /bin/bash still is on the macOS runners.
+PIP_INSTALL_ARGS=(--no-warn-script-location --disable-pip-version-check)
+if [[ "$TRIPLE" == "aarch64-pc-windows-msvc" ]]; then
+  echo "==> Applying the win-arm64 dependency exceptions"
+  "$PY" - "$(native_path "$REQS")" <<'PYEOF'
+import pathlib, re, sys
+
+DROP = ("pyarrow", "zlib-ng", "aiohttp-fast-zlib")
+REPIN = {"cryptography": ("49.0.0", "46.0.3")}
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+out, dropped, repinned, i = [], set(), set(), 0
+while i < len(lines):
+    line = lines[i]
+    m = re.match(r"^([A-Za-z0-9._-]+)\s*(==|@)", line)
+    name = m.group(1).lower().replace("_", "-") if m else None
+    if name in DROP:
+        dropped.add(name)
+        i += 1
+        # swallow the indented "# via ..." block that belongs to this pin
+        while i < len(lines) and lines[i][:1].isspace() and lines[i].lstrip().startswith("#"):
+            i += 1
+        continue
+    if name in REPIN:
+        old, new = REPIN[name]
+        if f"=={old}" not in line:
+            sys.exit(f"ERROR: win-arm64 exception list expects {name}=={old}, lock has: {line!r}\n"
+                     f"       Re-check PyPI for a win_arm64 wheel before adjusting the pin.")
+        line = line.replace(f"=={old}", f"=={new}")
+        repinned.add(name)
+    out.append(line)
+    i += 1
+
+stale = (set(DROP) - dropped) | (set(REPIN) - repinned)
+if stale:
+    sys.exit(f"ERROR: win-arm64 exception list names packages the lock no longer contains: "
+             f"{sorted(stale)}\n       The exception is obsolete — remove it from bundle-python.sh.")
+
+path.write_text("\n".join(out) + "\n")
+print("    dropped:  " + ", ".join(sorted(dropped)))
+print("    re-pinned: " + ", ".join(f"{k}=={v[0]}->{v[1]}" for k, v in sorted(REPIN.items())))
+PYEOF
+  # The export is already a complete, pinned closure, so resolution adds nothing
+  # — and here it would actively undo the exceptions above (pip would re-pull
+  # pyarrow and cryptography==49.0.0 to satisfy crocodile's and ccxt's metadata).
+  # The import check in step 5 is what proves the resulting tree is sound.
+  PIP_INSTALL_ARGS+=(--no-deps)
+  # Keep the import gate honest: it must stop asserting what this target
+  # deliberately does not ship, and assert everything else exactly as before.
+  export FLOWMAP_SKIP_IMPORTS="pyarrow"
+fi
+
+# NOTE for the macOS Intel leg: ccxt pins `cryptography==49.0.0` exactly, and
+# that release publishes only a `macosx_11_0_arm64` macOS wheel — no x86_64, no
+# universal2 (48.0.1 was the last with one). So on x86_64-apple-darwin pip
+# BUILDS cryptography from sdist, which needs a Rust toolchain. The release
+# workflow installs Rust before this step for Tauri's sake, so the toolchain is
+# there; expect this leg to take a few minutes longer than the others.
 echo "==> Installing dependencies into the runtime (this fetches native wheels)"
-"$PY" -m pip install --no-warn-script-location --disable-pip-version-check -r "$(native_path "$REQS")"
+"$PY" -m pip install "${PIP_INSTALL_ARGS[@]}" -r "$(native_path "$REQS")"
 
 echo "==> Building + installing flowmap-server wheel"
 WHEEL_DIR="$CACHE_DIR/wheel"
@@ -169,7 +258,7 @@ WHEEL_FILE="$(ls "$WHEEL_DIR"/flowmap_server-*.whl | head -1)"
 # --- 4. Slim the runtime (optional, safe removals) ----------------------------
 echo "==> Slimming runtime (pyc caches, test cruft)"
 find "$PYRUNTIME" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
-find "$PYRUNTIME" -type d -name "tests" -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PYRUNTIME" -type d \( -name "tests" -o -name "test" \) -path "*/site-packages/*" -prune -exec rm -rf {} + 2>/dev/null || true
 
 # Drop Tk/tkinter. FlowMap's server is headless — the UI is the Tauri webview —
 # so nothing in the dependency set imports it (see the import check below).
@@ -210,10 +299,35 @@ echo "==> Verifying bundled runtime"
 "$PY" -c "import flowmap_server; print('    flowmap_server', flowmap_server.__version__)"
 "$PY" -c "import flowmap_server.__main__; print('    flowmap_server.__main__ imports OK')"
 "$PY" - <<'PYEOF'
-mods = ["numpy", "polars", "fastapi", "uvicorn", "msgspec", "crypcodile", "stockodile"]
+mods = [
+    # Eager: loaded the moment the server boots.
+    "flowmap_server", "numpy", "polars", "fastapi", "uvicorn", "msgspec",
+    "crocodile", "ccxt", "aiohttp", "certifi",
+    # Lazy: imported only on a real subscribe, so booting the server proves
+    # nothing about them. A bundle that lost pyarrow or pandas would pass every
+    # other gate and die on the first `equity:AAPL`.
+    "crocodile.core.connector", "crocodile.core.ingest.transport",
+    "crocodile.core.schema.records", "crocodile.core.scheduler.calendar",
+    "crocodile.core.sink.memory", "crocodile.crypto.exchanges.factory",
+    "crocodile.crypto.client.backfill",
+    "crocodile.crypto.exchanges.ccxt_universal.connector",
+    "crocodile.crypto.exchanges.binance.backfill",
+    "crocodile.equity.providers.factory", "crocodile.equity.providers.yahoo.client",
+    "crocodile.equity.client.collect", "crocodile.equity.depth.vap",
+    "pandas", "pyarrow", "yfinance", "bs4",
+]
 import importlib
+import os
+
+# Targets whose wheel availability forces an exception (see step 3b) declare it
+# here rather than by weakening the list — everything not named still has to
+# import.
+skip = {m for m in os.environ.get("FLOWMAP_SKIP_IMPORTS", "").split(",") if m}
 ok = []
 for m in mods:
+    if m in skip:
+        print(f"    skipped (excluded on this target): {m}")
+        continue
     try:
         importlib.import_module(m)
         ok.append(m)

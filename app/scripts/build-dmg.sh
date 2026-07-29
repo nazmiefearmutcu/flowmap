@@ -23,10 +23,16 @@ PYRUNTIME="$TAURI_DIR/resources/pyruntime"
 DMG_ART="$REPO_ROOT/app/icons/dmg"          # bg-<arch>.png (660x440) + @2x (1320x880)
 export PATH="$HOME/.cargo/bin:$PATH"
 
-VERSION="1.3.0"
+# The version is read from tauri.conf.json — the same field the Tauri bundler
+# stamps into the .app — so the DMG's filename can never disagree with the app
+# inside it. (It did: a hardcoded copy here stayed at 1.3.0 while the config had
+# moved on, which silently mislabels a download.)
+VERSION="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$TAURI_DIR/tauri.conf.json" | head -1)"
+[[ -n "$VERSION" ]] || { echo "ERROR: no version in $TAURI_DIR/tauri.conf.json" >&2; exit 1; }
 
 # Arch-aware so the same script drives both the Apple-Silicon (macos-14) and
-# Intel (macos-13) release runners as well as a local machine of either arch.
+# Intel (macos-15-intel) release runners as well as a local machine of either arch.
 case "$(uname -m)" in
   arm64)  TARGET_TRIPLE="aarch64-apple-darwin"; DMG_ARCH="aarch64" ;;
   x86_64) TARGET_TRIPLE="x86_64-apple-darwin";  DMG_ARCH="x86_64"  ;;
@@ -91,6 +97,14 @@ BG_1X="$DMG_ART/bg-${DMG_ARCH}.png"
 BG_2X="$DMG_ART/bg-${DMG_ARCH}@2x.png"
 [[ -f "$BG_1X" && -f "$BG_2X" ]] || {
   echo "ERROR: missing $BG_1X or $BG_2X (run app/icons/dmg/make-bg.py)" >&2; exit 1; }
+# The version is rendered *into* those pixels, so a stale plate would put the
+# previous release's number on this release's install window. make-bg.py leaves
+# a sidecar naming what it drew; it has to agree with the config.
+ART_VERSION="$(cat "$DMG_ART/RENDERED_VERSION" 2>/dev/null || true)"
+[[ "$ART_VERSION" == "$VERSION" ]] || {
+  echo "ERROR: DMG artwork was rendered for '${ART_VERSION:-<unstamped>}' but this build is $VERSION." >&2
+  echo "       Regenerate + commit it:  python3 app/icons/dmg/make-bg.py $VERSION --all" >&2
+  exit 1; }
 
 mkdir -p "$DMG_DIR"
 STAGING="$(mktemp -d)"

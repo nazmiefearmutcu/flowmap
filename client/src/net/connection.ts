@@ -218,12 +218,41 @@ export class Connection {
     mode: StreamMode = 'live',
     band = 'native',
   ): void {
-    this.desiredSub = { market, symbol, mode, band };
+    const next: Subscription = { market, symbol, mode, band };
+    // A different stream is a different SERVER session, and this is the only
+    // place that knows it: reconnects re-enter through sendSubscribe(), where a
+    // rewind would be WRONG (same session, and the cursor is exactly what
+    // swallows the reconnect snapshot's re-sends). Gated on the identity so an
+    // idempotent re-subscribe — which sends nothing — changes nothing either.
+    if (this.desiredSub === null || !sameSub(this.desiredSub, next)) {
+      this.resetSessionState();
+    }
+    this.desiredSub = next;
     if (this.socket !== null && this.socketOpen) {
       this.sendSubscribe();
     } else {
       this.connect();
     }
+  }
+
+  /**
+   * Drop everything scoped to the session we are leaving. The replacement's grid
+   * restarts at `epoch = 0` with a low `col_seq` and its attach snapshot arrives
+   * `final=true`, so a surviving dedup cursor would discard the new symbol's
+   * whole history and leave only the forming right edge on screen; surviving
+   * epoch params would let the new grid decode against the old symbol's price
+   * frame; and an in-flight history page would splice the OLD symbol's columns
+   * into the new symbol's ring.
+   */
+  private resetSessionState(): void {
+    this.lastColSeq.clear();
+    this.epochMap.clear();
+    this.sessionId = null;
+    for (const waiter of this.historyWaiters.values()) {
+      this.clearTimeoutFn(waiter.timer);
+      waiter.reject(new Error('flowmap: history request abandoned — subscription changed'));
+    }
+    this.historyWaiters.clear();
   }
 
   /**
