@@ -72,6 +72,8 @@ Silicon and `FlowMap_1.3.1_x86_64.dmg` on Intel. Outputs:
 - `app/src-tauri/target/release/bundle/macos/FlowMap.app`
 - `app/src-tauri/target/release/bundle/dmg/FlowMap_1.3.1_<arch>.dmg`
 
+Note: local builds keep the bundle-version name (`FlowMap_1.3.1_<arch>.dmg`); CI renames installers to match the release tag (e.g. `FlowMap_1.3.1.1_<suffix>`) before uploading.
+
 Requires: `cargo`/`rustc`, `cargo-tauri` (`cargo install tauri-cli --version '^2'
 --locked`), Node/npm, `uv`, and the macOS `codesign`/`hdiutil`/`sips`/`iconutil`
 tools.

@@ -111,16 +111,14 @@ between feed bursts.
 
 | Platform | Download | Install |
 |---|---|---|
-| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_aarch64.dmg)** · ~175 MB | open the dmg, drag **FlowMap** into **Applications** |
-| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.1_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x86_64.dmg)** · ~183 MB | same as above |
-| 🪟 **Windows 10/11 — Intel / AMD (x64)** | **[⬇️ FlowMap_1.3.1_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x64-setup.exe)** · ~121 MB | run it — installs per-user, no admin needed |
-| 🪟 **Windows 11 — ARM** (Snapdragon X, ARM Surface) | **[⬇️ FlowMap_1.3.1_arm64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_arm64-setup.exe)** · ~90 MB | run it — **native ARM64**, not emulated |
-| 🪟 Windows x64 — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x64_en-US.msi)** · ~196 MB | standard MSI installer |
-| 🪟 Windows ARM — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_arm64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_arm64_en-US.msi)** · ~158 MB | standard MSI installer |
-| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.1_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_amd64.deb)** · ~479 MB | `sudo apt install ./FlowMap_1.3.1_amd64.deb` |
-| 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.1_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_amd64.AppImage)** · ~354 MB | `chmod +x` it, then run it |
-
-*Installer files keep the 1.3.1 name because the app bundle version must stay semver-valid; this release is v1.3.1.1.*
+| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_aarch64.dmg)** · ~175 MB | open the dmg, drag **FlowMap** into **Applications** |
+| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.1.1_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_x86_64.dmg)** · ~183 MB | same as above |
+| 🪟 **Windows 10/11 — Intel / AMD (x64)** | **[⬇️ FlowMap_1.3.1.1_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_x64-setup.exe)** · ~121 MB | run it — installs per-user, no admin needed |
+| 🪟 **Windows 11 — ARM** (Snapdragon X, ARM Surface) | **[⬇️ FlowMap_1.3.1.1_arm64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_arm64-setup.exe)** · ~90 MB | run it — **native ARM64**, not emulated |
+| 🪟 Windows x64 — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1.1_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_x64_en-US.msi)** · ~196 MB | standard MSI installer |
+| 🪟 Windows ARM — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1.1_arm64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_arm64_en-US.msi)** · ~158 MB | standard MSI installer |
+| 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.1.1_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_amd64.deb)** · ~479 MB | `sudo apt install ./FlowMap_1.3.1.1_amd64.deb` |
+| 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.1.1_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1.1_amd64.AppImage)** · ~354 MB | `chmod +x` it, then run it |
 
 *Which Mac do I have?* → Apple menu → **About This Mac**: "Chip: Apple M…" = Apple Silicon, "Processor: Intel…" = Intel.
 *Which Windows do I have?* → **Settings → System → About → System type**: "ARM-based processor" = ARM, anything else = x64.
