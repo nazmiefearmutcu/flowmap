@@ -22,12 +22,13 @@ behind one market-agnostic view.
   re-rasterized; pan and both zoom axes only change a uniform. Measured: draw cost is ~0.2 ms
   whether 200 or 10 000 columns are resident (history-independent — the old 1-fps bug is
   structurally gone).
-- **Professional order flow:** liquidity heatmap (inferno ramp — indigo → red → gold → white, so
-  relative size reads by hue and not just brightness — with correct SUM-mip zoom-out so walls
-  don't dilute), DOM ladder, time & sales tape, prominent trade bubbles, a bright **last-price
-  line** that persists as far back as the book, BBO, VWAP, a **CVD** (cumulative volume delta)
-  lower pane locked to the chart's time axis, volume profile, event markers, crosshair with exact
-  liquidity readout, deep scroll-back, replay transport. Every overlay toggles individually.
+- **Professional order flow:** liquidity heatmap (inferno ramp — indigo → red → saturated gold,
+  never white, so a max-density wall stays distinct from the white price line and relative size
+  reads by hue and not just brightness — with correct SUM-mip zoom-out so walls don't dilute),
+  DOM ladder, time & sales tape, prominent trade bubbles, a bright **last-price line** that
+  persists as far back as the book, BBO, VWAP, a **CVD** (cumulative volume delta) lower pane
+  locked to the chart's time axis, volume profile, event markers, crosshair with exact liquidity
+  readout, deep scroll-back, replay transport. Every overlay toggles individually.
 - **Chart controls that behave like the tools you already use.** The price gutter is a control
   surface: wheel scales price at the cursor, a vertical drag scales the axis, double-click
   re-fits. The two axes follow independently — scroll back through time and price keeps
@@ -103,6 +104,11 @@ built on its own CPU — there is no emulated build in the list, Windows on ARM 
 
 **Click your platform — the download starts immediately** (v1.3.1.1):
 
+**What's new in v1.3.1.1** — the heatmap is visible out of the box (sane tolerance and white-point
+defaults), the price axis zooms out as far as the time axis, **Go Live** keeps your scale instead
+of resetting it, trade bubbles no longer hide the price line, and the live edge updates at 20 Hz
+between feed bursts.
+
 | Platform | Download | Install |
 |---|---|---|
 | 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_aarch64.dmg)** · ~175 MB | open the dmg, drag **FlowMap** into **Applications** |
@@ -134,9 +140,10 @@ A pass prints the workflow run and commit that produced it. **A failure means th
 from this repository — don't run it.** Each release also ships a `SHA256SUMS` asset, for a check
 that needs no tooling: `shasum -a 256 -c SHA256SUMS`.
 
-Attestations start with the next tagged release; v1.3.0's assets predate them. What the app does on
-your machine — loopback-only server, no telemetry, no wallet or trading keys, no auto-updater, and
-the full list of endpoints it talks to — is written down in [SECURITY.md](SECURITY.md).
+Every release from v1.3.1 onward carries attestations; v1.3.0's assets predate them. What the app
+does on your machine — loopback-only server, no telemetry, no wallet or trading keys, no
+auto-updater, and the full list of endpoints it talks to — is written down in
+[SECURITY.md](SECURITY.md).
 
 > **First launch — unsigned app warnings.** The apps are **ad-hoc / unsigned and not notarized**
 > (code-signing certificates for a paid Apple Developer ID / Windows publisher are not available for
