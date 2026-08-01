@@ -317,6 +317,7 @@ jobs:
         if: needs.prepare.outputs.do_release == 'true'
         env:
           KIND: ${{ matrix.kind }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           B="app/src-tauri/target/release/bundle"
@@ -327,10 +328,18 @@ jobs:
             # step above), so glob it separately and tolerate its absence.
             linux)   FILES=$(ls "$B"/deb/*.deb; ls "$B"/appimage/*.AppImage 2>/dev/null || true) ;;
           esac
-          echo "$FILES"
+          REL="${TAG#v}"
+          RENAMED=""
+          while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            new="$(printf '%s' "$n" | sed -E 's#^(.*/)?FlowMap_[^_]+#\1FlowMap_'"$REL"'#')"
+            mv "$n" "$new"
+            RENAMED="${RENAMED}${new}"$'\n'
+          done <<< "$FILES"
+          echo "$RENAMED"
           # Multi-line step output: the delimiter must not occur in the payload,
           # and these are build-dir paths, so a literal marker is safe.
-          { echo "files<<__FLOWMAP_EOF__"; echo "$FILES"; echo "__FLOWMAP_EOF__"; } >> "$GITHUB_OUTPUT"
+          { echo "files<<__FLOWMAP_EOF__"; printf '%s' "$RENAMED"; echo "__FLOWMAP_EOF__"; } >> "$GITHUB_OUTPUT"
 
       # Signs a SLSA provenance statement for every installer BEFORE it is
       # uploaded, so the digest in the attestation is the digest of the file the
@@ -429,6 +438,18 @@ jobs:
           if [ ! -s SHA256SUMS ]; then echo "no checksum lines collected"; exit 1; fi
           cat SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            case "$name" in
+              FlowMap_*)
+                if ! grep -Fxq "$name" <(awk '{print $2}' SHA256SUMS); then
+                  echo "removing stale asset: $name"
+                  gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+                fi
+                ;;
+            esac
+          done || true
 
       - name: Publish the release
         env:
