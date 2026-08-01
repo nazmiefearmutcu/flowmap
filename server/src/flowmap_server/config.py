@@ -34,7 +34,12 @@ class Config(msgspec.Struct, frozen=True):
     finnhub_key: str | None = None
     dt_crypto_ns: int = 250_000_000
     dt_equity_keyed_ns: int = 10**9
+    # Keyless (SYNTH) equity: last-price POLL cadence (10 s) vs the grid's
+    # COLUMN cadence (1 s). The grid re-asserts the resting profile every
+    # dt_equity_keyless_grid_ns so the heatmap's right edge keeps advancing
+    # (1 col/s) between the slow Yahoo-friendly price polls.
     dt_equity_keyless_ns: int = 10 * 10**9
+    dt_equity_keyless_grid_ns: int = 10**9
     max_rows: int = 4096
     # First-launch history backfill (spec: reconstructed candle history so the
     # client's eager requestHistory returns real data instead of a cold ring).
@@ -78,6 +83,12 @@ class Config(msgspec.Struct, frozen=True):
             # scroll-back e2e can drive the sim fast enough to overrun the
             # client's full-res budget in seconds. Default 250 ms (4 cols/s).
             dt_crypto_ns=int(env.get("FLOWMAP_DT_CRYPTO_NS", str(250_000_000))),
+            dt_equity_keyless_ns=int(
+                env.get("FLOWMAP_DT_EQUITY_KEYLESS_NS", str(10 * 10**9))
+            ),
+            dt_equity_keyless_grid_ns=int(
+                env.get("FLOWMAP_DT_EQUITY_KEYLESS_GRID_NS", str(10**9))
+            ),
             max_sessions=int(env.get("FLOWMAP_MAX_SESSIONS", "4")),
             recording_gb_cap=float(env.get("FLOWMAP_RECORDING_GB_CAP", "20.0")),
             recording_enabled=env.get("FLOWMAP_RECORDING_ENABLED", "1")

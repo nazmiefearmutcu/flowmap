@@ -38,12 +38,14 @@ const DEFAULTS: Required<BubbleOptions> = {
   // it scans past the left edge, so this is still O(visible), not O(capacity).
   capacity: 120_000,
   minSize: 0,
-  // A smaller reference size + bigger base/max radius makes prints far more
-  // legible: a median trade is a solid dot, whales are unmistakable.
-  refSize: 2,
-  baseRadiusPx: 9,
-  minRadiusPx: 3,
-  maxRadiusPx: 44,
+  // √-area scaling with deliberately restrained radii: bubbles mark the tape
+  // without burying the price line. A median trade is a small solid dot
+  // (refSize=4 → baseRadiusPx=4.5), and the biggest prints cap at a 40px
+  // diameter (was 88px), so far more of the heatmap stays readable.
+  refSize: 4,
+  baseRadiusPx: 4.5,
+  minRadiusPx: 2.5,
+  maxRadiusPx: 20,
 };
 
 /** Bubble radius in CSS px for a trade size (√-area scaling, clamped). Pure. */

@@ -539,7 +539,17 @@ class EquityFeed:
     # -- keyless (fully implemented) -------------------------------------------
 
     async def _keyless_events(self) -> AsyncIterator[FeedEvent]:
-        bars = await self._fetch_bars()
+        try:
+            bars = await self._fetch_bars()
+        except Exception:  # noqa: BLE001 — a 429 storm must degrade, not kill the feed
+            logger.warning(
+                "keyless bar fetch failed for %s; starting with an empty profile "
+                "(refresh retries every %ds)",
+                self.symbol,
+                self._bar_refresh_ns // 10**9,
+                exc_info=True,
+            )
+            bars = []
         warmup = self._select_warmup_bars(bars)
         builder = _ProfileBuilder(self._profile_tick)
         last_bar_ts = 0
@@ -580,12 +590,15 @@ class EquityFeed:
     ) -> AsyncIterator[FeedEvent]:
         """Live keyless loop: per ``dt_equity_keyless_ns`` poll the last price
         (display-only Trade + the two-sided split reference) and re-assert the
-        resting SYNTH profile split at that price (advances the grid one column);
-        refresh bars every ``bar_refresh_ns``. Stops with a session_break when the
-        RTH window closes. ``ref`` seeds from the last warmup bar's close and then
+        resting SYNTH profile split at that price every
+        ``dt_equity_keyless_grid_ns`` (the grid's column cadence — the heatmap
+        right edge advances 1 col/s between the slow 10 s price polls); refresh
+        bars every ``bar_refresh_ns``. Stops with a session_break when the RTH
+        window closes. ``ref`` seeds from the last warmup bar's close and then
         tracks each valid live price so the bid/ask boundary follows the market."""
-        poll_s = self._cfg.dt_equity_keyless_ns / 1e9
+        grid_s = self._cfg.dt_equity_keyless_grid_ns / 1e9
         next_refresh = self._now_ns() + self._bar_refresh_ns
+        next_poll = self._now_ns()
         while True:
             now = self._now_ns()
             state, next_open = self._session_state(now)
@@ -611,25 +624,30 @@ class EquityFeed:
                     )
                 next_refresh = now + self._bar_refresh_ns
 
-            price = await self._poll_price_safe()
-            if price is not None and math.isfinite(price) and price > 0.0:
-                # Display-only tape: google last-price is not a print/NBBO. The
-                # same price is the two-sided split reference so the bid/ask
-                # boundary follows the live market.
-                ref = float(price)
-                yield Trade(
-                    ts_ns=now,
-                    price=float(price),
-                    size=1.0,
-                    side=SIDE_UNKNOWN,
-                    side_src=SIDE_SRC_NA,
-                    venue=SYNTH_VENUE,
-                )
+            if now >= next_poll:
+                price = await self._poll_price_safe()
+                if price is not None and math.isfinite(price) and price > 0.0:
+                    # Display-only tape: google last-price is not a print/NBBO.
+                    # The same price is the two-sided split reference so the
+                    # bid/ask boundary follows the live market.
+                    ref = float(price)
+                    yield Trade(
+                        ts_ns=now,
+                        price=float(price),
+                        size=1.0,
+                        side=SIDE_UNKNOWN,
+                        side_src=SIDE_SRC_NA,
+                        venue=SYNTH_VENUE,
+                    )
+                # Integer-ns arithmetic ONLY: a float offset (now + 10.0) loses
+                # the whole poll interval to float64 rounding at ns magnitudes
+                # (~1.8e18, ulp 256 ns) and would poll every column instead.
+                next_poll = now + self._cfg.dt_equity_keyless_ns
             # Re-assert the resting profile so the grid advances a column and
             # the current column rolls with the (bar-refreshed) profile, split
             # two-sided at the latest reference price.
             yield builder.book_state(now, ref)
-            await self._sleep(poll_s)
+            await self._sleep(grid_s)
 
     async def _fetch_bars(self) -> Sequence[EqBar]:
         if self._bars_fn is not None:

@@ -19,13 +19,17 @@ function remap(t: number, floor: number): number {
 describe('floorForTolerance — the Tolerance slider → shader black point', () => {
   it('is an exact no-op at slider 0 and a gentle denoise at the default', () => {
     // Slider 0 stays an exact algebraic identity — every pixel spec below relies
-    // on it — but the app now OPENS at a small non-zero default so faint specks
-    // are pre-suppressed.
+    // on it — but the app OPENS at a small non-zero default so faint specks are
+    // pre-suppressed. The default sits in the 4–7 band: high enough to cut the
+    // bottom quartile of the heavy tail, low enough (floor ≈ 0.013, i.e. ~1.3%
+    // of the white point) that the median cell (~4% of norm) clears it — the
+    // old 15 (floor ≈ 0.060) drowned the whole ladder, see the visibility test.
     expect(floorForTolerance(0)).toBe(0);
-    expect(DEFAULT_TOLERANCE).toBeGreaterThan(0);
+    expect(DEFAULT_TOLERANCE).toBeGreaterThanOrEqual(4);
+    expect(DEFAULT_TOLERANCE).toBeLessThanOrEqual(7);
     const dflt = floorForTolerance(DEFAULT_TOLERANCE);
-    expect(dflt).toBeGreaterThan(0);
-    expect(dflt).toBeLessThan(0.1); // gentle, not aggressive
+    expect(dflt).toBeGreaterThan(0.005);
+    expect(dflt).toBeLessThan(0.02); // well below the old ~0.06 that hid the field
   });
 
   it('is monotonically increasing across the slider', () => {
@@ -122,6 +126,72 @@ describe('gammaForContrast', () => {
     expect(g).toBeGreaterThan(0.28);
     expect(g).toBeLessThan(0.72);
     expect(g).toBeCloseTo(0.456, 6);
+  });
+});
+
+describe('default visibility — the boxed heatmap must show the field, not just walls', () => {
+  // Heavy-tail model: log-normal with σ chosen so the MEDIAN active cell is 2% of
+  // the p99 white point (observed order-flow shape: a handful of walls dwarf the
+  // ladder). All quantiles below are derived from that one shape assumption.
+  const SIGMA = Math.log(50) / 2.3263; // p99/median = exp(2.3263·σ) = 50 → σ ≈ 1.68
+  const P99 = Math.exp(2.3263 * SIGMA);
+  const P97 = Math.exp(1.8808 * SIGMA); // standard-normal quantile for 97%
+
+  /** Standard-normal CDF (Abramowitz–Stegun 26.2.17, |err| < 7.5e-8). */
+  function phi(z: number): number {
+    const t = 1 / (1 + 0.2316419 * Math.abs(z));
+    const d = 0.3989422804014327 * Math.exp((-z * z) / 2);
+    const p =
+      d *
+      t *
+      (0.31938153 +
+        t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    return z >= 0 ? 1 - p : p;
+  }
+
+  /** Cell density at the standard-normal quantile z (median = 2% of p99). */
+  function cell(z: number): number {
+    return 0.02 * P99 * Math.exp(z * SIGMA);
+  }
+
+  /** The fragment shader chain: normalize → black point → gamma → LUT index. */
+  function lut(cellDensity: number, norm: number, floor: number, gamma: number): number {
+    const t = Math.min(1, Math.max(0, cellDensity / norm));
+    const remapped = Math.min(1, Math.max(0, (t - floor) / Math.max(1 - floor, 1e-6)));
+    return Math.round(Math.pow(remapped, gamma) * 255);
+  }
+
+  /** Share of active cells above the floor (visible) on the model distribution. */
+  function visibleFraction(floor: number, norm: number): number {
+    const z = (Math.log(floor * norm) - Math.log(0.02 * P99)) / SIGMA;
+    return 1 - phi(z);
+  }
+
+  it('keeps ~3× more of the field visible than the pre-fix defaults', () => {
+    const floor = floorForTolerance(DEFAULT_TOLERANCE);
+    const before = visibleFraction(floorForTolerance(15), P99); // pre-fix: tol 15 + p99
+    const after = visibleFraction(floor, P97); // now: tol 5 + p97
+    expect(after).toBeGreaterThan(0.6); // ≈76% of active cells paint
+    expect(before).toBeLessThan(0.35); // ≈26% before — walls only
+    expect(after).toBeGreaterThan(before * 2);
+  });
+
+  it('lifts the median cell off background while the bottom quartile stays suppressed', () => {
+    const floor = floorForTolerance(DEFAULT_TOLERANCE);
+    const gamma = gammaForContrast(DEFAULT_CONTRAST);
+    const medianLut = lut(cell(0), P97, floor, gamma);
+    const lowLut = lut(cell(-0.6745), P97, floor, gamma); // 25th percentile
+    expect(medianLut).toBeGreaterThanOrEqual(40); // ≈LUT 51 — visible dark indigo
+    expect(lowLut).toBeLessThanOrEqual(15); // ≈LUT 10 — still ~background
+    // Pre-fix regression pin: with floor ≈0.06 + p99 the median maps to LUT 0.
+    expect(lut(cell(0), P99, floorForTolerance(15), gamma)).toBe(0);
+  });
+
+  it('keeps the walls saturated at the default white point', () => {
+    const floor = floorForTolerance(DEFAULT_TOLERANCE);
+    const gamma = gammaForContrast(DEFAULT_CONTRAST);
+    expect(lut(P97, P97, floor, gamma)).toBeGreaterThanOrEqual(250); // p97 → white
+    expect(lut(P99, P97, floor, gamma)).toBe(255); // p99 clamps to full brightness
   });
 });
 

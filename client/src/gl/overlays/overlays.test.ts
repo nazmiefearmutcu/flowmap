@@ -8,22 +8,30 @@ import { sessionVwap } from './vwap';
 const BUBBLE_DEFAULTS: Required<BubbleOptions> = {
   capacity: 120_000,
   minSize: 0,
-  refSize: 2,
-  baseRadiusPx: 9,
-  minRadiusPx: 3,
-  maxRadiusPx: 44,
+  refSize: 4,
+  baseRadiusPx: 4.5,
+  minRadiusPx: 2.5,
+  maxRadiusPx: 20,
 };
 
 describe('bubbleRadiusPx (√-area scaling, clamped)', () => {
   it('maps the reference size to the base radius', () => {
-    expect(bubbleRadiusPx(2, BUBBLE_DEFAULTS)).toBeCloseTo(9);
+    expect(bubbleRadiusPx(4, BUBBLE_DEFAULTS)).toBeCloseTo(4.5);
   });
   it('scales with √size', () => {
-    expect(bubbleRadiusPx(8, BUBBLE_DEFAULTS)).toBeCloseTo(18); // 9·√(8/2)
+    expect(bubbleRadiusPx(16, BUBBLE_DEFAULTS)).toBeCloseTo(9); // 4.5·√(16/4)
   });
   it('clamps to the min/max radius', () => {
-    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(3);
-    expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(44);
+    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(2.5);
+    expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(20);
+  });
+  it('keeps small trades as dots and big prints under the cap', () => {
+    // size=1: raw 4.5·√(1/4)=2.25 → clamped to the 2.5px minimum (5px dot).
+    expect(bubbleRadiusPx(1, BUBBLE_DEFAULTS)).toBe(2.5);
+    // size=10: 4.5·√(10/4) ≈ 7.1px.
+    expect(bubbleRadiusPx(10, BUBBLE_DEFAULTS)).toBeCloseTo(4.5 * Math.sqrt(10 / 4));
+    // size=100: raw 4.5·√(100/4)=22.5 → capped at 20px (40px diameter, was 88px).
+    expect(bubbleRadiusPx(100, BUBBLE_DEFAULTS)).toBe(20);
   });
 });
 

@@ -84,17 +84,28 @@ export const TOLERANCE_CURVE = 1.4;
  * hard 0) so the app opens with the faintest sub-threshold specks already
  * suppressed and the tradeable liquidity reads cleaner out of the box. Slider 0
  * remains an exact algebraic no-op for anyone who wants every speck back.
+ *
+ * 15 (floor ≈ 0.060) was the "empty heatmap" default: order-flow density is
+ * heavy-tailed, and with the p99 white point the MEDIAN active cell sat at ~2%
+ * of norm — a third of the floor — so out of the box the whole ladder painted
+ * background and only the walls showed. 5 maps to a floor of ≈ 0.013, which on
+ * the same tail shape suppresses just the bottom quartile (the specks) while
+ * the median cell (~4% of the p97 norm) clears the floor and reads as dark
+ * indigo. The math is pinned by the "default visibility" test in
+ * heatmap.test.ts (≈76% of active cells visible vs ≈26% before).
  */
-export const DEFAULT_TOLERANCE = 15;
+export const DEFAULT_TOLERANCE = 5;
 
 /**
  * Map a 0–100 "Tolerance" slider to the shader's black point.
  *
  * Eased (exponent {@link TOLERANCE_CURVE}), not linear, because the useful floors
- * are small: order-flow density is heavy-tailed and the default gamma ≈0.46 lifts
- * the mid-field hard, so a normalized density of just 0.01 already renders as
- * visible dark indigo. The eased curve gives fine control at the low end and
- * meaningful bite through the middle, reaching the cap at 100.
+ * are small: order-flow density is heavy-tailed and with the p97 white point the
+ * median active cell lands near 4% of norm, so a floor around 1–2% separates the
+ * real ladder from the specks without hiding the field (at the default floor of
+ * ≈0.013 a cell needs ~1.3% of the white point to paint at all). The eased curve
+ * gives fine control at the low end and meaningful bite through the middle,
+ * reaching the cap at 100.
  *
  * Non-finite input yields 0 rather than NaN — a NaN floor would blank the entire
  * heatmap, and this is reachable from `window.__flowmapLive` in dev/e2e builds.

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_NORM_FLOOR,
+  DEFAULT_PERCENTILE,
   mipSumFactor,
   normMipScale,
   t7ShaderRescale,
@@ -46,7 +47,9 @@ describe('mip sum-factor coordination with T7', () => {
 
 describe('viewport percentile — histogram merge correctness', () => {
   it('reads a p99 near the true heavy-tail value', () => {
-    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    // Explicit p99 — the DEFAULT percentile is now 97 (pinned below); this test
+    // is about histogram correctness at a high percentile, not about defaults.
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, percentile: 99 });
     // 900 samples of 10 + 100 samples of 100 → p99 lands in the 100-block.
     addConst(n, 0, 10, 900);
     addConst(n, 1, 100, 100);
@@ -83,6 +86,85 @@ describe('viewport percentile — histogram merge correctness', () => {
     // If zeros were counted, p50 would be ~0; they aren't, so it is ~42.
     expect(p50).toBeGreaterThan(35);
     expect(p50).toBeLessThan(50);
+  });
+});
+
+describe('default percentile — p97, not p99 (the p99 white point drowned the field)', () => {
+  /** Standard-normal quantile (Acklam's rational approximation, |err| < 1.15e-9). */
+  function phiInv(p: number): number {
+    const a = [
+      -3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2,
+      1.38357751867269e2, -3.066479806614716e1, 2.506628277459239,
+    ];
+    const b = [
+      -5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2,
+      6.680131188771972e1, -1.328068155288572e1,
+    ];
+    const c = [
+      -7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838,
+      -2.549732539343734, 4.374664141464968, 2.938163982698783,
+    ];
+    const d = [
+      7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416,
+    ];
+    const plow = 0.02425;
+    const phigh = 1 - plow;
+    if (p < plow) {
+      const q = Math.sqrt(-2 * Math.log(p));
+      return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+        ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+    }
+    if (p <= phigh) {
+      const q = p - 0.5;
+      const r = q * q;
+      return (
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+      );
+    }
+    const q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(
+      ((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]
+    ) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+
+  it('is 97, and the default-constructed normalizer adopts it', () => {
+    expect(DEFAULT_PERCENTILE).toBe(97);
+    expect(new ViewportNormalizer({ colsPerTile: COLS_PER_TILE }).percentile).toBe(
+      DEFAULT_PERCENTILE,
+    );
+  });
+
+  it('p97 halves the white point on a heavy tail (≈2× the p99 headroom)', () => {
+    // Smooth log-normal fixture: median 1, σ such that median = 2% of p99
+    // (exp(2.3263σ) = 50 → σ ≈ 1.68). Quantile-sample the CDF into columns —
+    // equal-count quantile bins make the samples a faithful draw of the law.
+    const SIGMA = Math.log(50) / 2.3263;
+    const N = 2048;
+    const cols = Math.ceil(N / COLS_PER_TILE);
+    const addFixture = (n: ViewportNormalizer): void => {
+      for (let c = 0; c < cols; c++) {
+        const bid = new Float32Array(COLS_PER_TILE);
+        for (let r = 0; r < COLS_PER_TILE; r++) {
+          const i = c * COLS_PER_TILE + r;
+          if (i >= N) break;
+          bid[r] = Math.exp(phiInv((i + 0.5) / N) * SIGMA);
+        }
+        n.addColumn(c, bid, null);
+      }
+    };
+    const n97 = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, percentile: 97, floor: 0 });
+    const n99 = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, percentile: 99, floor: 0 });
+    addFixture(n97);
+    addFixture(n99);
+    const range = tilesRange(0, cols - 1);
+    const p97 = n97.viewportPercentile(range, ALL_ROWS, 0);
+    const p99 = n99.viewportPercentile(range, ALL_ROWS, 0);
+    // Analytic: p97/p99 = exp((1.8808 − 2.3263)·σ) ≈ 0.47. Bin interpolation
+    // widens the band, but the HEADROOM claim — p97 ≈ half of p99 — must hold.
+    expect(p97).toBeGreaterThan(0.35 * p99);
+    expect(p97).toBeLessThan(0.65 * p99);
+    expect(p99 / p97).toBeGreaterThan(1.5);
   });
 });
 

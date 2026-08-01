@@ -18,7 +18,8 @@
  *
  *   2. On pan/zoom (or every dirty frame) the tiles covering the visible column
  *      range have their histograms **summed** (a few × 256 adds, <1 ms) and the
- *      configured percentile (p99 by default) is read off the merged CDF with
+ *      configured percentile (p97 by default — see {@link DEFAULT_PERCENTILE}) is
+ *      read off the merged CDF with
  *      in-bin log interpolation. This is `O(tiles in view)`, not `O(columns)`:
  *      the merge touches ~`colSpan/colsPerTile` histograms regardless of how many
  *      columns those tiles hold.
@@ -47,7 +48,17 @@
  */
 
 export const DEFAULT_BINS = 256;
-export const DEFAULT_PERCENTILE = 99;
+/**
+ * Default viewport white point. p99 was the first-run "empty heatmap" culprit:
+ * order-flow density is so heavy-tailed (the median active cell sits at ~2% of
+ * the p99 white point) that p99 normalization put the whole ladder BELOW the
+ * default black point (~1.3% of norm, heatmap.ts DEFAULT_TOLERANCE) — only the
+ * walls painted. p97 cuts the white point to ≈0.47× the p99 value on that tail
+ * shape, lifting the median cell to ~4% of norm (above the floor) while cells
+ * ≥ p97 — the walls — still saturate to LUT entry 255. The exact ratio is pinned
+ * by the "p97 vs p99 headroom" test in normalize.test.ts.
+ */
+export const DEFAULT_PERCENTILE = 97;
 /** Log-bin range low edge (density below this clamps into bin 0). */
 export const DEFAULT_HIST_MIN = 1 / 64; // 0.015625
 /** Log-bin range high edge (density above this clamps into the top bin). */

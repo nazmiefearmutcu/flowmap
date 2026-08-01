@@ -131,11 +131,12 @@ test('heatmap renders resident columns with a bright wall and black voids', asyn
   expect(result.caps.maxTextureImageUnits).toBeGreaterThanOrEqual(8);
   expect(typeof result.caps.colorBufferFloat).toBe('boolean');
 
-  // (b) Wall row is bright (yellow/white, high LUT color).
+  // (b) Wall row is bright saturated gold — the top of the ramp is deliberately
+  // NOT white, so a max-density wall stays distinct from the white price line.
   expect(luma(result.wallPx)).toBeGreaterThan(200);
   expect(result.wallPx[0]).toBeGreaterThan(180);
   expect(result.wallPx[1]).toBeGreaterThan(180);
-  expect(result.wallPx[2]).toBeGreaterThan(180);
+  expect(result.wallPx[2]).toBeLessThan(150);
 
   // (c) Zero-density band is near-black.
   expect(luma(result.zeroPx)).toBeLessThan(30);

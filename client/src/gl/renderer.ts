@@ -624,7 +624,8 @@ export class Renderer {
     this.controller.toggleFollow();
   }
 
-  /** Reset the view + re-enable follow (the `R` / Go-Live control). */
+  /** Re-pin TIME to the live edge; the price axis (zoom + follow mode) is kept
+   *  exactly as the user left it (the `R` / Go-Live control). */
   goLive(): void {
     this.controller.goLive();
   }
@@ -780,9 +781,16 @@ export class Renderer {
         this.setFollowTime(on);
       },
       goLive: () => {
+        // TIME axis only: snap the right edge to the newest column and re-arm
+        // follow. The user's PRICE zoom (rowSpan) and price-follow mode
+        // ('track'/'off'/'fit') are PRESERVED — re-arming Go Live must never
+        // re-frame the book out from under the user's chosen scale. (This used
+        // to call camera.reset(), which re-fitted rowSpan to the grid; see the
+        // reset() docblock — Go Live now routes through follow() instead.)
         this.wantFollowTime = true;
-        this.wantPriceFollow = 'fit';
-        this.camera.reset(this.residentRange(), this.ring?.rows);
+        const range = this.residentRange();
+        if (range !== null) this.camera.followEdge(range);
+        else this.camera.setFollowTime(true);
         // Leaving scroll-back: allow live appends to re-anchor the ring at the
         // live edge and let the loader probe again on the next pan.
         this.history?.reset();

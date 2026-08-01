@@ -4,21 +4,28 @@
  * Three ramps live side by side in one 256×3 RGBA8 atlas texture so the fragment
  * shader can select a ramp with a single uniform and a single texture bind:
  *   - row 0 (RAMP_INFERNO): the DEFAULT density ramp — near-black → indigo →
- *     violet → magenta → RED → orange → gold → white as density rises.
+ *     violet → magenta → RED → orange → saturated gold as density rises.
  *   - row 1 (RAMP_SYNTH): a distinct single-hue amber ramp for SYNTHETIC equity
  *     depth, so fabricated density reads as visually different from real L2.
  *   - row 2 (RAMP_CLASSIC): the legacy thermal ramp (blue → cyan → yellow →
- *     white), kept as a user-selectable option.
+ *     saturated yellow-gold), kept as a user-selectable option.
  *
  * **Why the default changed.** The classic thermal ramp crosses half its
- * luminance range by LUT index 96 and is near-white from ~160 up, so its top two
- * thirds are all bright cyan/yellow/white: a wall and a mid-sized resting order
- * land in visually adjacent colours and the field reads as "blue with bright
- * stripes". The inferno family spreads the same range across FOUR distinct hue
- * families (indigo / magenta / red / orange-gold) before saturating to white, so
- * relative density is legible by hue, not just by brightness.
+ * luminance range by LUT index 96 and spent its top third in bright
+ * cyan/yellow/white (its old endpoint was literally white): a wall and a
+ * mid-sized resting order land in visually adjacent colours and the field
+ * reads as "blue with bright stripes". The inferno family spreads the same
+ * range across FOUR distinct hue families (indigo / magenta / red /
+ * orange-gold) and caps in saturated gold rather than white, so relative
+ * density is legible by hue, not just by brightness.
  *
- * **Why not yellow → red → white.** Every ramp here must be monotone in
+ * **Why the tops are gold, not white.** The price line overlay is white, so a
+ * white ramp top would make a max-density wall indistinguishable from the
+ * price line. Both real-depth ramps therefore end in saturated gold/yellow —
+ * still their brightest stops (luma stays monotone), but blue-starved, so the
+ * two never merge.
+ *
+ * **Why not yellow → red.** Every ramp here must be monotone in
  * luminance — the whole point is that hotter reads as brighter, and lut.test.ts
  * locks it. Pure red has a LOWER luma than yellow, so putting red above yellow
  * would make the ramp dip and a big order would read *darker* than a medium one.
@@ -76,11 +83,13 @@ interface Stop {
   rgb: [number, number, number];
 }
 
-// Inferno: near-black → indigo → violet → magenta → RED → orange → gold →
-// white. Rec.601 luma at the stops runs 2.7 → 22.1 → 44.8 → 66.7 → 89.9 →
-// 128.6 → 183.1 → 248.3: strictly increasing, so the rasterized ramp is
-// luminance-monotone (luma is linear in RGB, and linear interpolation between
-// monotone endpoints stays monotone). The red band lands at t ≈ 0.58.
+// Inferno: near-black → indigo → violet → magenta → RED → orange → gold. The
+// endpoint is SATURATED gold (blue-starved), never white — a max-density wall
+// must stay distinct from the white price line overlay. Rec.601 luma at the
+// stops runs 2.7 → 22.1 → 44.8 → 66.7 → 89.9 → 128.6 → 183.1 → 207.6: strictly
+// increasing, so the rasterized ramp is luminance-monotone (luma is linear in
+// RGB, and linear interpolation between monotone endpoints stays monotone).
+// The red band lands at t ≈ 0.58.
 const INFERNO_STOPS: Stop[] = [
   { t: 0.0, rgb: [2, 2, 8] },
   { t: 0.12, rgb: [26, 12, 64] },
@@ -89,18 +98,20 @@ const INFERNO_STOPS: Stop[] = [
   { t: 0.58, rgb: [196, 44, 48] },
   { t: 0.72, rgb: [234, 96, 20] },
   { t: 0.86, rgb: [250, 176, 44] },
-  { t: 1.0, rgb: [255, 248, 232] },
+  { t: 1.0, rgb: [255, 216, 40] },
 ];
 
 // Classic (the legacy thermal ramp): near-black → deep blue → cyan → yellow →
-// white. Control-point luminance is monotonically increasing.
+// saturated yellow-gold (was white — same reason as inferno: the white price
+// line must not blend into the top of the ramp). Control-point luminance is
+// monotonically increasing.
 const CLASSIC_STOPS: Stop[] = [
   { t: 0.0, rgb: [2, 4, 12] },
   { t: 0.15, rgb: [10, 22, 92] },
   { t: 0.4, rgb: [0, 130, 200] },
   { t: 0.62, rgb: [24, 208, 224] },
   { t: 0.8, rgb: [232, 232, 44] },
-  { t: 1.0, rgb: [255, 255, 255] },
+  { t: 1.0, rgb: [255, 228, 32] },
 ];
 
 // Synth: single-hue amber, near-black → deep amber → bright gold. Also

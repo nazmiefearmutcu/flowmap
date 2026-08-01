@@ -10,6 +10,7 @@ import {
   KILL_PRICE,
   KILL_TIME,
   limitsFor,
+  MAX_ROW_SPAN,
   MIN_COL_SPAN,
   MIN_ROW_SPAN,
   pan,
@@ -237,9 +238,60 @@ describe('zoomPrice — cursor anchored', () => {
     expect(zoomPrice(s, LIMITS, 0.001, s.rowCenter).rowSpan).toBe(MIN_ROW_SPAN);
   });
 
-  it('cannot zoom price out beyond the full grid height', () => {
+  it('lets the user zoom price out far past the grid height, up to the zoom cap', () => {
+    // The price twin of the time-axis decoupling: zoom-out is not capped by the
+    // framing/grid height (README: "price and time both zoom out far past the
+    // grid"). A 1e6x from near-grid height lands past ROWS, not on it...
+    const past = zoomPrice({ ...baseState(), rowSpan: 400 }, LIMITS, 1e6, 256);
+    expect(past.rowSpan).toBeGreaterThan(ROWS);
+    expect(past.rowSpan).toBe(LIMITS.maxRowSpanZoom);
+    // ...but there is still a hard ceiling (maxRowSpanZoom) for numeric safety.
+    const capped = zoomPrice({ ...baseState(), rowSpan: 400 }, LIMITS, 1e9, 256);
+    expect(capped.rowSpan).toBe(MAX_ROW_SPAN);
+  });
+
+  it('an in-between span past the grid height is legal and untouched', () => {
     const s = { ...baseState(), rowSpan: 400 };
-    expect(zoomPrice(s, LIMITS, 100, s.rowCenter).rowSpan).toBe(ROWS);
+    const out = zoomPrice(s, LIMITS, 2, s.rowCenter);
+    expect(out.rowSpan).toBe(800); // > ROWS, < MAX_ROW_SPAN — no wall, no jump
+  });
+});
+
+describe('maxRowSpanZoom — the user price zoom-out cap', () => {
+  it('limitsFor decouples it from the grid height (like maxColSpanZoom)', () => {
+    expect(LIMITS.maxRowSpanZoom).toBe(MAX_ROW_SPAN); // ROWS(512) < cap
+    // A grid that somehow outgrew the cap still gets its full height.
+    expect(limitsFor(MAX_ROW_SPAN * 2, CAP).maxRowSpanZoom).toBe(MAX_ROW_SPAN * 2);
+  });
+
+  it('clampCamera allows any span in [MIN_ROW_SPAN, maxRowSpanZoom]', () => {
+    expect(clampCamera({ ...baseState(), rowSpan: 500_000 }, LIMITS).rowSpan).toBe(500_000);
+    expect(clampCamera({ ...baseState(), rowSpan: 1e12 }, LIMITS).rowSpan).toBe(MAX_ROW_SPAN);
+  });
+
+  it('rowCenterBounds stays span-relative at the max user zoom-out', () => {
+    const b = rowCenterBounds(MAX_ROW_SPAN, LIMITS);
+    expect(b).toEqual({ lo: -MAX_ROW_SPAN, hi: ROWS + MAX_ROW_SPAN });
+    // A full overscroll at the widest span keeps the view finite and precise.
+    const p = pan({ ...baseState(), rowSpan: MAX_ROW_SPAN }, LIMITS, 0, -1e12);
+    expect(p.rowCenter).toBe(-MAX_ROW_SPAN);
+  });
+});
+
+describe('framing stays locked to the grid height (fit/reset/setPriceFrame)', () => {
+  it('fit frames the whole grid, never past it', () => {
+    expect(fit(LIMITS, range(200, 699), ROWS).rowSpan).toBe(ROWS);
+  });
+
+  it('reset frames the whole grid, never past it', () => {
+    expect(reset(LIMITS, range(500, 999), ROWS).rowSpan).toBe(ROWS);
+    expect(reset(LIMITS).rowSpan).toBe(ROWS);
+  });
+
+  it('setPriceFrame (the renderer auto-fit path) clamps to the grid', () => {
+    const cam = new Camera(LIMITS);
+    cam.setPriceFrame(0, 1_000_000);
+    expect(cam.toView().rowScale).toBe(ROWS);
   });
 });
 
@@ -264,7 +316,7 @@ describe('fit', () => {
   });
 });
 
-describe('reset / go-live', () => {
+describe('reset — session-boot framing (NOT the go-live action)', () => {
   it('pins the right edge to the newest column and turns follow ON', () => {
     const r = reset(LIMITS, range(500, 999), ROWS);
     expect(r.followTime).toBe(true);
@@ -298,14 +350,70 @@ describe('follow — snap right edge', () => {
   });
 });
 
+describe('go-live via follow — re-arms TIME only, preserves the price axis', () => {
+  it('keeps the user price zoom AND follow mode when re-arming live', () => {
+    // A scrolled-back user with a custom price zoom ('track'): R / GO LIVE
+    // snaps the right edge to newest+1 but must not touch rowSpan or the mode.
+    const s: CameraState = {
+      colCenter: 500,
+      colSpan: 300,
+      rowCenter: 100,
+      rowSpan: 25,
+      followTime: false,
+      followPrice: 'track',
+    };
+    const out = follow(s, range(0, 4999));
+    expect(out.followTime).toBe(true);
+    expect(out.colSpan).toBe(300); // time span preserved too
+    const v = toView(out);
+    expect(v.colOffset + v.colScale).toBe(5000); // right edge = newest+1
+    expect(out.rowSpan).toBe(25); // the user's price zoom survives
+    expect(out.rowCenter).toBe(100);
+    expect(out.followPrice).toBe('track');
+  });
+
+  it('preserves an OFF price axis (the user locked it)', () => {
+    const s: CameraState = { ...baseState(), followTime: false, followPrice: 'off' };
+    const out = follow(s, range(0, 4999));
+    expect(out.followTime).toBe(true);
+    expect(out.followPrice).toBe('off');
+    expect(out.rowSpan).toBe(s.rowSpan);
+  });
+
+  it('keeps a FIT price axis fitted — the renderer auto-fit owns it from here', () => {
+    const s: CameraState = { ...baseState(), rowSpan: 300, followTime: false, followPrice: 'fit' };
+    const out = follow(s, range(0, 4999));
+    expect(out.followTime).toBe(true);
+    expect(out.followPrice).toBe('fit'); // unchanged; updateView applies the fit frame
+    expect(out.rowSpan).toBe(300); // follow() never re-frames the book manually
+  });
+
+  it('setFollowTime(true) re-arms follow without touching price state', () => {
+    // A scrolled-back user with a custom price zoom: both follows off.
+    const cam = new Camera(LIMITS, {
+      colCenter: 500,
+      colSpan: 300,
+      rowCenter: 100,
+      rowSpan: 25,
+      followTime: false,
+      followPrice: 'off',
+    });
+    cam.setPriceFollow('track');
+    cam.setFollowTime(true);
+    expect(cam.followTime).toBe(true);
+    expect(cam.followPrice).toBe('track');
+    expect(cam.state.rowSpan).toBe(25); // the user's span is intact
+  });
+});
+
 describe('clampCamera', () => {
   it('clamps every axis independently', () => {
     const c = clampCamera(
       {
         colCenter: -50,
         colSpan: 0.1,
-        rowCenter: 9999,
-        rowSpan: 99999,
+        rowCenter: 1e12,
+        rowSpan: 1e12,
         followTime: false,
         followPrice: 'off',
       },
@@ -313,27 +421,28 @@ describe('clampCamera', () => {
     );
     expect(c.colCenter).toBe(-50); // time center free
     expect(c.colSpan).toBe(MIN_COL_SPAN);
-    expect(c.rowSpan).toBe(ROWS); // span still tops out at the grid height
-    // rowCenter is bounded by the POST-clamp span, not the 99999 it came in with.
-    expect(c.rowCenter).toBe(ROWS + ROWS);
+    expect(c.rowSpan).toBe(MAX_ROW_SPAN); // span tops out at the USER zoom cap
+    // rowCenter is bounded by the POST-clamp span, not the 1e12 it came in with.
+    expect(c.rowCenter).toBe(ROWS + MAX_ROW_SPAN);
   });
 
   it('clamps rowSpan BEFORE deriving the rowCenter band (order matters)', () => {
-    // If the band were derived from the pre-clamp span (500), rowCenter would be
-    // allowed out to 1012; it must use the clamped span (ROWS) → 1024.
+    // If the band were derived from the pre-clamp span (1e12), rowCenter (1e9)
+    // would pass unclamped; it must use the clamped span (MAX_ROW_SPAN) →
+    // ROWS + MAX_ROW_SPAN.
     const c = clampCamera(
       {
         colCenter: 0,
         colSpan: 100,
         rowCenter: 1e9,
-        rowSpan: 5000,
+        rowSpan: 1e12,
         followTime: false,
         followPrice: 'off',
       },
       LIMITS,
     );
-    expect(c.rowSpan).toBe(ROWS);
-    expect(c.rowCenter).toBe(rowCenterBounds(ROWS, LIMITS).hi);
+    expect(c.rowSpan).toBe(MAX_ROW_SPAN);
+    expect(c.rowCenter).toBe(rowCenterBounds(MAX_ROW_SPAN, LIMITS).hi);
   });
 });
 
@@ -387,7 +496,15 @@ describe('Camera (imperative wrapper)', () => {
     const cam = new Camera(LIMITS);
     cam.setFollowFrame(0, 100, 0, 500); // rowSpan 500 within 512
     cam.setLimits(limitsFor(256, CAP)); // grid shrinks to 256 rows
-    expect(cam.toView().rowScale).toBe(256);
+    // A 500-row span is a legal USER zoom-out on the shrunk grid (past the
+    // grid the shader paints background), so it survives; only the centre
+    // re-bounds to the new span-relative band.
+    expect(cam.toView().rowScale).toBe(500);
+    expect(cam.state.rowCenter).toBe(250); // band for span 500 is [-500, 756]
+    // What the shrink still forces back: a span past the USER cap.
+    cam.state = { ...cam.state, rowSpan: 2_000_000 };
+    cam.setLimits(limitsFor(256, CAP));
+    expect(cam.toView().rowScale).toBe(cam.limits.maxRowSpanZoom);
   });
 });
 
