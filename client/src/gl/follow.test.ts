@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { KILL_BOTH, KILL_NONE, KILL_PRICE, KILL_TIME } from './camera';
+import { follow, KILL_BOTH, KILL_NONE, KILL_PRICE, KILL_TIME, toView } from './camera';
 import {
   approach,
   colsBehind,
@@ -137,5 +137,28 @@ describe('isColVisible / colsBehind', () => {
   it('reports the gap when scrolled back', () => {
     // right edge = 1100; newest 1600 → 1601 - 1100 = 501 columns behind.
     expect(colsBehind(VIEW, 1600)).toBe(501);
+  });
+});
+
+describe('go-live re-arm (camera.follow) — the contract the Go Live chip relies on', () => {
+  // The renderer's goLive action is exactly `follow(state, range)`: re-pin the
+  // right edge to newest+1 and turn TIME follow on. The PRICE axis — the user's
+  // zoom (rowSpan) and follow mode — must come through untouched, or re-arming
+  // live would destroy the scale the user set (the bug this pins).
+  it('leaves price zoom and mode alone while making the view live again', () => {
+    const scrolledBack: Parameters<typeof follow>[0] = {
+      colCenter: 400,
+      colSpan: 200,
+      rowCenter: 80,
+      rowSpan: 30, // the user's chosen price zoom
+      followTime: false,
+      followPrice: 'track',
+    };
+    const out = follow(scrolledBack, { oldest: 0, newest: 1599, count: 1600 });
+    expect(out.followTime).toBe(true);
+    const v = toView(out);
+    expect(v.colOffset + v.colScale).toBe(1600); // right edge = newest + 1
+    expect(out.rowSpan).toBe(30); // user's price zoom preserved
+    expect(out.followPrice).toBe('track'); // price follow mode preserved
   });
 });

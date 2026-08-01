@@ -184,8 +184,11 @@ test('§9 a horizontal canvas drag detaches TIME but keeps price tracking', asyn
   // not cost you price tracking, and the fitted span is kept rather than lost.
   expect(f.priceFollow, 'price keeps tracking after a horizontal drag').toBe('track');
 
-  // GO LIVE is the visible way back, and it restores BOTH axes.
+  // GO LIVE is the visible way back: it re-pins TIME to the live edge but
+  // PRESERVES the user's price zoom + follow mode — re-arming must never
+  // re-frame the book out from under the chosen scale (goLive() now routes
+  // through follow(), not camera.reset()).
   await page.locator('[data-testid="go-live"]').click();
   await expect.poll(async () => (await follow(page)).following).toBe(true);
-  expect((await follow(page)).priceFollow).toBe('fit');
+  expect((await follow(page)).priceFollow).toBe('track');
 });

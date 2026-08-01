@@ -28,10 +28,13 @@
  * the user can push the grid entirely off screen in either direction — the
  * "look infinitely far up/down" gesture. That is visually safe with no shader
  * change: the fragment shader already paints the LUT floor (`background()`) for
- * any row outside `[0, rows)`. `rowSpan` still tops out at the grid height:
- * beyond that there is nothing but background to reveal, and letting it grow
- * further would push `Renderer.currentLevel()` to SUM-mip level 2, which
- * silently suppresses scroll-back backfill (see net/history.ts).
+ * any row outside `[0, rows)`. `rowSpan` tops out at the USER zoom-out cap
+ * `maxRowSpanZoom` (≈ MAX_ROW_SPAN), deliberately far past the grid height — the
+ * same decoupling the time axis has — so zooming price out to "the whole market
+ * in one view" hits no artificial wall. The one trade-off, identical to the time
+ * axis's deep zoom-out: past ~16 rows-per-pixel `Renderer.currentLevel()`
+ * saturates at SUM-mip level 2, which renders from the mips and suppresses
+ * scroll-back backfill (see net/history.ts).
  *
  * All operations are PURE — they take a state (+ limits) and return a new state,
  * so the math is unit-testable with no GL context (see camera.test.ts). The
@@ -72,7 +75,11 @@ export interface CameraState {
   colSpan: number;
   /** Absolute row at the viewport's vertical center (fractional). */
   rowCenter: number;
-  /** Rows across the viewport (price zoom). Clamped to [MIN_ROW_SPAN, rows]. */
+  /**
+   * Rows across the viewport (price zoom). Clamped to
+   * [MIN_ROW_SPAN, maxRowSpanZoom] for USER zoom; programmatic frames
+   * (fit/reset/setPriceFrame) are deliberately locked to the grid height.
+   */
   rowSpan: number;
   /** Auto-track the newest column at the right edge (TIME axis only). */
   followTime: boolean;
@@ -97,7 +104,9 @@ export const KILL_NONE: FollowKill = { killTime: false, killPrice: false };
 
 /** Bounds the clamps enforce (from the tile ring geometry). */
 export interface CameraLimits {
-  /** Price grid height — caps rowSpan (zoom-out) and bounds rowCenter. */
+  /** Price grid height — caps the FRAMING span (fit/reset) and bounds
+   *  rowCenter. Deliberately NOT the user zoom-out cap: see
+   *  {@link maxRowSpanZoom}. */
   rows: number;
   /** Smallest time span — "can't zoom past 1 col". */
   minColSpan: number;
@@ -116,6 +125,15 @@ export interface CameraLimits {
    * clamp bound, not an allocation).
    */
   maxColSpanZoom: number;
+  /**
+   * USER ZOOM-OUT cap — how far a manual PRICE zoom gesture may widen the span.
+   * The price-axis twin of {@link maxColSpanZoom}, so README's "price and time
+   * both zoom out far past the grid" is true: past the grid the shader paints
+   * background, so the only thing a larger span reveals is more background.
+   * Also only a clamp bound, never an allocation. Framing stays locked to
+   * {@link rows} — see {@link fit} / {@link reset}.
+   */
+  maxRowSpanZoom: number;
 }
 
 /** Smallest time span in columns (one column fills the whole viewport). */
@@ -130,6 +148,16 @@ export const MIN_ROW_SPAN = 1;
  * colScale uniform never lose precision.
  */
 export const MAX_COL_SPAN = 1_048_576;
+/**
+ * Absolute ceiling on the USER price zoom-out (rows across the viewport) — the
+ * price-axis twin of {@link MAX_COL_SPAN}. ~1.05M rows is effectively
+ * "infinite" for a 2048/4096-row order-flow grid (the whole book, both wings
+ * and everything past them, in one view) while staying well inside f32's
+ * exact-integer range (2^24), so row indices and the rowScale uniform never
+ * lose precision. `maxRowSpanZoom` is `Math.max(rows, MAX_ROW_SPAN)` so a grid
+ * that somehow outgrew the cap still gets its full height.
+ */
+export const MAX_ROW_SPAN = 1_048_576;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -145,6 +173,8 @@ export function limitsFor(rows: number, capacityCols: number): CameraLimits {
     maxColSpan: framing,
     // Manual zoom-out may go far past the ring — no wall.
     maxColSpanZoom: Math.max(framing, MAX_COL_SPAN),
+    // Manual price zoom-out may go far past the grid — no wall.
+    maxRowSpanZoom: Math.max(rows, MAX_ROW_SPAN),
   };
 }
 
@@ -163,8 +193,8 @@ export function rowCenterBounds(rowSpan: number, limits: CameraLimits): { lo: nu
 
 /**
  * Enforce the clamps on a candidate state:
- *   - colSpan  ∈ [minColSpan, maxColSpan]          (time zoom limits)
- *   - rowSpan  ∈ [MIN_ROW_SPAN, rows]              (price zoom limits)
+ *   - colSpan  ∈ [minColSpan, maxColSpanZoom]       (time zoom limits)
+ *   - rowSpan  ∈ [MIN_ROW_SPAN, maxRowSpanZoom]     (price zoom limits)
  *   - rowCenter ∈ rowCenterBounds(rowSpan)         (price overscroll band)
  * `rowSpan` is clamped FIRST so the two price clamps compose deterministically
  * (the centre band is derived from the FINAL span, never a pre-clamp one).
@@ -173,7 +203,10 @@ export function rowCenterBounds(rowSpan: number, limits: CameraLimits): { lo: nu
  * is the whole point, and it stays O(1).
  */
 export function clampCamera(s: CameraState, limits: CameraLimits): CameraState {
-  const rowSpan = clamp(s.rowSpan, MIN_ROW_SPAN, limits.rows);
+  // USER zoom-out bound, not the framing bound: a state produced by fit/reset/
+  // setPriceFrame is already ≤ rows ≤ maxRowSpanZoom, so this never shrinks a
+  // framed span. (The colSpan branch below is the same decoupling for time.)
+  const rowSpan = clamp(s.rowSpan, MIN_ROW_SPAN, limits.maxRowSpanZoom);
   const bounds = rowCenterBounds(rowSpan, limits);
   return {
     colCenter: s.colCenter,
@@ -266,6 +299,8 @@ export function zoomTime(
  * overscroll bounds where rowCenter clamps). Does NOT touch time follow, and
  * does not switch price follow off — it promotes `'fit'` to `'track'` so the
  * span the user just chose is kept and only the centre keeps tracking.
+ * Zoom-out runs to `maxRowSpanZoom` (far past the grid — the price twin of
+ * {@link zoomTime}'s maxColSpanZoom), not to the framing cap `rows`.
  */
 export function zoomPrice(
   s: CameraState,
@@ -273,7 +308,7 @@ export function zoomPrice(
   factor: number,
   anchorRow: number,
 ): CameraState {
-  const newSpan = clamp(s.rowSpan * factor, MIN_ROW_SPAN, limits.rows);
+  const newSpan = clamp(s.rowSpan * factor, MIN_ROW_SPAN, limits.maxRowSpanZoom);
   const eff = newSpan / s.rowSpan;
   const rowCenter = anchorRow + eff * (s.rowCenter - anchorRow);
   return clampCamera(adoptPriceSpan({ ...s, rowSpan: newSpan, rowCenter }), limits);
@@ -304,6 +339,8 @@ export function fit(limits: CameraLimits, range: ResidentRange, rows: number): C
   const colSpan = clamp(count, limits.minColSpan, limits.maxColSpan);
   // Center of the half-open column interval [oldest, newest+1).
   const colCenter = (range.oldest + range.newest + 1) / 2;
+  // FRAMING lock: fit shows the whole grid (never more), regardless of how far
+  // the user zoomed out before — maxRowSpanZoom is a USER gesture cap only.
   const rowSpan = clamp(rows, MIN_ROW_SPAN, limits.rows);
   return {
     colCenter,
@@ -318,9 +355,12 @@ export function fit(limits: CameraLimits, range: ResidentRange, rows: number): C
 /**
  * Reset to a live default: frame the resident columns (or the max span if none),
  * pin the right edge to the newest column, center the price grid, BOTH follows
- * on. This is the `R` / Go-Live action. When a range is given the view is
- * immediately correct; the renderer's per-column follow reframes the span to the
- * canvas next.
+ * on. This is the session-boot / ring-recreation frame: the renderer calls it
+ * whenever a new grid is created (createRing / resetForSession). The Go-Live
+ * (`R`) ACTION does NOT route here — it uses {@link follow}, so re-arming the
+ * live edge keeps the user's price zoom and price-follow mode. When a range is
+ * given the view is immediately correct; the renderer's per-column follow
+ * reframes the span to the canvas next.
  */
 export function reset(
   limits: CameraLimits,
@@ -464,10 +504,14 @@ export class Camera {
   }
 
   /** Price half of the auto-fit frame: bottom row + span. Leaves the follow
-   *  mode alone (the caller only reaches here while it is 'fit'). */
+   *  mode alone (the caller only reaches here while it is 'fit'). FRAMING
+   *  lock: the renderer's auto-fit path frames to the GRID, never past it —
+   *  maxRowSpanZoom is a user-gesture cap only, so it is not applied here
+   *  (fit/reset share the same rows lock). */
   setPriceFrame(rowBottom: number, rowSpan: number): void {
+    const span = clamp(rowSpan, MIN_ROW_SPAN, this.limits.rows);
     this.state = clampCamera(
-      { ...this.state, rowCenter: rowBottom + rowSpan / 2, rowSpan },
+      { ...this.state, rowCenter: rowBottom + span / 2, rowSpan: span },
       this.limits,
     );
   }
