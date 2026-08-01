@@ -547,6 +547,33 @@ async def test_live_loop_end_to_end_sim():
     assert any(isinstance(m, Trade) for m in msgs)
 
 
+async def test_periodic_partial_flush_animates_quiet_feed():
+    """Regression: partial re-emissions are CLOCK-driven, not feed-driven. A
+    quiet feed (equity keyless polls every 10 s; sim/crypto burst then sleep)
+    must still animate the forming column at FLUSH_INTERVAL_NS (20 Hz) so the
+    heatmap right edge never freezes between feed events."""
+    grid = _mk_grid(rows=64, ring_columns=128)
+    _drive_synthetic(grid, 2)  # anchor the grid so a partial is in flight
+    assert grid.current_partial() is not None
+    sess = Session("tick", feed=IdleFeed(), grid=grid)
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+    try:
+        # ClientTx coalesces partials latest-wins per t0, so drain per tick:
+        # every ~50 ms window must deliver a fresh right-edge re-emission
+        # with zero feed events.
+        seen = 0
+        for _ in range(3):
+            await asyncio.sleep(0.06)
+            msgs = _drain_all(client)
+            seen += sum(1 for m in msgs if isinstance(m, DepthColumn) and not m.final)
+        assert seen >= 3, "quiet feed froze the forming column"
+    finally:
+        sess.run_task.cancel()
+        await asyncio.gather(sess.run_task, return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 # 8. handle_history
 
@@ -893,10 +920,13 @@ async def test_equity_subscribe_synth_grid_and_closed_status():
     client = ClientTx()
     sess = await mgr.subscribe(sub, client)
 
-    # (c) grid is equity-appropriate: two-sided L1_BAND mode, cent tick, keyless dt.
+    # (c) grid is equity-appropriate: two-sided L1_BAND mode, cent tick, and
+    # the keyless GRID dt (1 s columns) — the 10 s poll cadence stays a feed
+    # concern, the heatmap right edge must advance every second.
     assert sess._grid.cfg.mode == MODE_L1_BAND
     assert sess._grid.cfg.tick == 0.01
-    assert sess._grid.cfg.dt_ns == cfg.dt_equity_keyless_ns
+    assert sess._grid.cfg.dt_ns == cfg.dt_equity_keyless_grid_ns
+    assert cfg.dt_equity_keyless_grid_ns < cfg.dt_equity_keyless_ns
     assert 0 < sess._grid.cfg.rows <= cfg.max_rows
 
     await asyncio.wait_for(sess.run_task, timeout=5)  # warms up, then closes

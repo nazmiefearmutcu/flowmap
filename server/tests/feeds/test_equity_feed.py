@@ -57,7 +57,8 @@ from flowmap_server.proto.events import (
 
 # --- fixtures / helpers --------------------------------------------------------
 
-DT_KEYLESS_NS = 10 * 10**9  # matches Config.dt_equity_keyless_ns
+DT_KEYLESS_NS = 10 * 10**9  # matches Config.dt_equity_keyless_ns (price poll)
+DT_KEYLESS_GRID_NS = 10**9  # matches Config.dt_equity_keyless_grid_ns (column)
 
 
 def _et_ns(y: int, mo: int, d: int, h: int, mi: int = 0, s: int = 0) -> int:
@@ -440,6 +441,89 @@ async def test_market_open_polls_and_emits_trades():
     assert trades, "open market must emit live display trades"
     assert all(t.price == 150.25 and t.side_src == SIDE_SRC_NA for t in trades)
     assert feed.feed_state == "live"
+
+
+async def test_keyless_bar_fetch_failure_closed_still_marks_session_break():
+    """A Yahoo 429 storm must degrade, not kill the feed: when the initial bar
+    fetch raises, a CLOSED market still emits the session_break marker + closed
+    state (no crash -> no session restart/backoff loop)."""
+    sat = _et_ns(2026, 7, 18, 12, 0)  # Saturday
+
+    async def broken_bars_fn():
+        raise RuntimeError("Yahoo Finance provider request failed after 5 attempts.")
+
+    feed = EquityFeed(
+        "AAPL",
+        Config(),
+        now_ns_fn=lambda: sat,
+        bars_fn=broken_bars_fn,
+        sleep_fn=_nosleep,
+    )
+    events = await _collect(feed, 10_000)  # generator ends on its own
+    markers = [e for e in events if isinstance(e, Marker)]
+    trades = [e for e in events if isinstance(e, Trade)]
+    assert len(markers) == 1 and markers[0].kind == "session_break"
+    assert not trades
+    assert feed.feed_state == "closed"
+
+
+async def test_keyless_bar_fetch_failure_open_still_lives():
+    """Same 429 storm, but during RTH: the feed must fall back to an empty
+    profile live loop (display trades + empty-book re-asserts) instead of
+    crashing into the session's restart/degraded cycle."""
+    async def broken_bars_fn():
+        raise RuntimeError("Yahoo Finance provider request failed after 5 attempts.")
+
+    feed = EquityFeed(
+        "AAPL",
+        Config(),
+        now_ns_fn=_StepClock(_et_ns(2026, 7, 15, 11, 0), DT_KEYLESS_NS),  # Wed RTH
+        bars_fn=broken_bars_fn,
+        price_fn=_const_price(150.25),
+        sleep_fn=_nosleep,
+        bar_refresh_ns=10**18,  # never re-fetch during the test
+    )
+    events = await _collect(feed, 12)
+    trades = [e for e in events if isinstance(e, Trade)]
+    books = [e for e in events if isinstance(e, BookState)]
+    assert trades, "open market must keep emitting display trades"
+    assert all(t.price == 150.25 for t in trades)
+    assert books, "live loop must keep re-asserting the (empty) profile"
+    assert feed.feed_state == "live"
+
+
+async def test_keyless_live_column_cadence_splits_from_poll():
+    """Regression: the SYNTH grid must advance a column at the 1 s GRID cadence
+    while the slow 10 s price POLL cadence only refreshes the split reference —
+    the heatmap right edge moves 1 col/s between polls instead of freezing for
+    10 s."""
+    calls = {"n": 0}
+
+    async def price_fn() -> float:
+        calls["n"] += 1
+        return 100.0
+
+    feed = EquityFeed(
+        "AAPL",
+        Config(),
+        now_ns_fn=_StepClock(_et_ns(2026, 7, 15, 11, 0), 10**9),  # 1 s steps
+        bars_fn=_make_bars_fn([]),  # no warmup -> straight to live
+        price_fn=price_fn,
+        sleep_fn=_nosleep,
+        bar_refresh_ns=10**18,
+    )
+    # 25 live cycles at 1 s: polls at t0, t0+10s, t0+20s -> 3 trades + 25 books.
+    events = await _collect(feed, 28)
+    trades = [e for e in events if isinstance(e, Trade)]
+    books = [e for e in events if isinstance(e, BookState)]
+    assert calls["n"] == 3, "price polled once per 10 s, not per column"
+    assert len(trades) == 3
+    assert len(books) == 25
+    ts = [b.ts_ns for b in books]
+    assert all(b - a == 10**9 for a, b in zip(ts, ts[1:])), "column cadence != 1 s"
+    assert trades[0].ts_ns == ts[0]
+    assert trades[1].ts_ns == ts[10]
+    assert trades[2].ts_ns == ts[20]
 
 
 # --- 6a. tier auto-select + capability -----------------------------------------

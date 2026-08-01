@@ -678,6 +678,9 @@ class Session:
         buffered recording rows are flushed so the on-disk tail stays fresh
         for the next §8.1 rehydration. The flush is synchronous; it only
         runs when the loop is stopping anyway."""
+        flush_task = asyncio.create_task(
+            self._partial_flusher(), name=f"session-{self.session_id}-partial-flush"
+        )
         try:
             while True:
                 try:
@@ -696,10 +699,39 @@ class Session:
                     await asyncio.sleep(self._backoff_s)
                     self._backoff_s = min(self._backoff_s * 2.0, _BACKOFF_CAP_S)
         finally:
+            flush_task.cancel()
+            try:
+                await flush_task
+            except asyncio.CancelledError:
+                pass
             if self._closed:
                 self._close_recording()
             else:
                 self._flush_recording()
+
+    async def _partial_flusher(self) -> None:
+        """Clock-driven right-edge flush (FLUSH_INTERVAL_NS, 20 Hz default).
+
+        ``_consume`` only flushed partials while it was draining feed events,
+        so a quiet or bursty feed (equity keyless polls every 10 s; sim/crypto
+        burst every 250 ms and then sleep) froze the forming column between
+        events — the heatmap right edge looked stalled even though the DOM
+        board updated instantly. This task re-emits the in-progress column on a
+        fixed cadence so the right edge animates continuously; it is a no-op
+        while no client is attached and when the grid has no in-flight column.
+        Cancelled by :meth:`run` on every exit (crash/restart keeps one task
+        alive across feed restarts)."""
+        interval_s = self._flush_interval_ns / 1e9
+        while True:
+            await asyncio.sleep(interval_s)
+            if not self._clients:
+                continue
+            try:
+                self._flush_partial()
+            except Exception:  # noqa: BLE001 — a flush must never kill the session
+                logger.exception(
+                    "periodic partial flush failed for session %s", self.session_id
+                )
 
     async def _consume(self) -> None:
         async for ev in self._feed.events():
@@ -1111,15 +1143,16 @@ class SessionManager:
 
     def _equity_grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         """Equity-appropriate grid (spec §7): mode and column cadence honestly
-        derived from the feed's capability. Keyless SYNTH_PROFILE runs a
-        single-channel (bid-only) density at the 10 s keyless cadence; keyed
+        derived from the feed's capability. Keyless SYNTH_PROFILE runs at the
+        1 s keyless grid cadence (the feed re-asserts the resting profile every
+        ``dt_equity_keyless_grid_ns`` while polling price every 10 s); keyed
         tiers (L1_BAND) run at the 1 s equity cadence. Cent tick; a nominal
         $100 p0 that the grid re-anchors to the symbol's real price on the
         first book (a >=$1 stock's profile near $180 pulls p0 up)."""
         depth = feed.capability.get("depth")
         mode = _EQUITY_DEPTH_MODE.get(depth, events.MODE_L1_BAND)
         dt = (
-            self._cfg.dt_equity_keyless_ns
+            self._cfg.dt_equity_keyless_grid_ns
             if depth in _EQUITY_SYNTH_DEPTHS
             else self._cfg.dt_equity_keyed_ns
         )
