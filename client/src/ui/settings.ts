@@ -22,6 +22,7 @@
 
 import { DEFAULT_CONTRAST, DEFAULT_TOLERANCE } from '../gl/heatmap';
 import { DEFAULT_COLORMAP, type Colormap } from '../gl/lut';
+import { DEFAULT_PERCENTILE } from '../gl/normalize';
 import {
   DEFAULT_OVERLAY_VISIBILITY,
   type OverlayVisibility,
@@ -112,7 +113,11 @@ export const DEFAULT_SETTINGS: FlowMapSettings = {
   contrast: DEFAULT_CONTRAST,
   tolerance: DEFAULT_TOLERANCE,
   colormap: DEFAULT_COLORMAP,
-  normPercentile: 99,
+  // p97, not p99: on the heavy-tailed density the p99 white point leaves the
+  // median cell at ~2% of norm — below the default black point — so the ladder
+  // vanishes on first launch. p97 halves the white point and the field shows.
+  // Pinned to normalize.ts DEFAULT_PERCENTILE so the two can never drift.
+  normPercentile: DEFAULT_PERCENTILE,
   tickGrouping: 1,
   bubbleMinSize: 0,
   follow: true,

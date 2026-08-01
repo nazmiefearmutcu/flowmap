@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { DEFAULT_PERCENTILE } from '../gl/normalize';
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -62,6 +63,14 @@ describe('saveSettings → loadSettings round-trip', () => {
 });
 
 describe('normalizeSettings', () => {
+  it('pins the default normalization percentile to the normalizer default (p97)', () => {
+    // p99 was the first-run "empty heatmap" culprit (heavy tail → the median
+    // cell sits below the default black point). The persisted default must stay
+    // in lockstep with the normalizer's DEFAULT_PERCENTILE.
+    expect(DEFAULT_PERCENTILE).toBe(97);
+    expect(DEFAULT_SETTINGS.normPercentile).toBe(DEFAULT_PERCENTILE);
+  });
+
   it('merges a partial object over defaults', () => {
     const n = normalizeSettings({ colormap: 'classic', overlays: { profile: true } });
     expect(n.colormap).toBe('classic');
