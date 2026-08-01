@@ -97,10 +97,11 @@ named for the arch — `FlowMap_<version>_x64-setup.exe` on Intel/AMD,
 
 `.github/workflows/release.yml` does exactly this across a `macos-14` (arm),
 `macos-15-intel`, `windows-latest` (x64), `windows-11-arm` (ARM64) and
-`ubuntu-22.04` matrix on every `vX.Y.Z` tag, smoke-tests each bundle's server
-(`/api/health`), reports each installer's size to the job summary, and attaches
-the installers to the GitHub Release. Every leg is a **native** build — the
-Python wheels are platform-specific and cannot be cross-built.
+`ubuntu-22.04` matrix on every `vX.Y.Z` (or hotfix `vX.Y.Z.W`) tag, smoke-tests
+each bundle's server (`/api/health`), reports each installer's size to the job
+summary, and attaches the installers to the GitHub Release. Every leg is a
+**native** build — the Python wheels are platform-specific and cannot be
+cross-built.
 
 ### Windows on ARM: the dependency exceptions
 
