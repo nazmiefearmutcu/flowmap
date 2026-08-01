@@ -105,11 +105,11 @@ built on its own CPU — there is no emulated build in the list, Windows on ARM 
 
 | Platform | Download | Install |
 |---|---|---|
-| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_aarch64.dmg)** · ~184 MB | open the dmg, drag **FlowMap** into **Applications** |
-| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.1_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x86_64.dmg)** · ~184 MB | same as above |
+| 🍎 **macOS — Apple Silicon** (M1/M2/M3/M4) | **[⬇️ FlowMap_1.3.1_aarch64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_aarch64.dmg)** · ~175 MB | open the dmg, drag **FlowMap** into **Applications** |
+| 🍎 **macOS — Intel** | **[⬇️ FlowMap_1.3.1_x86_64.dmg](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x86_64.dmg)** · ~183 MB | same as above |
 | 🪟 **Windows 10/11 — Intel / AMD (x64)** | **[⬇️ FlowMap_1.3.1_x64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x64-setup.exe)** · ~121 MB | run it — installs per-user, no admin needed |
 | 🪟 **Windows 11 — ARM** (Snapdragon X, ARM Surface) | **[⬇️ FlowMap_1.3.1_arm64-setup.exe](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_arm64-setup.exe)** · ~90 MB | run it — **native ARM64**, not emulated |
-| 🪟 Windows x64 — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x64_en-US.msi)** · ~197 MB | standard MSI installer |
+| 🪟 Windows x64 — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_x64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_x64_en-US.msi)** · ~196 MB | standard MSI installer |
 | 🪟 Windows ARM — *MSI, managed deployment* | **[⬇️ FlowMap_1.3.1_arm64_en-US.msi](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_arm64_en-US.msi)** · ~158 MB | standard MSI installer |
 | 🐧 **Linux x64 — Debian/Ubuntu/Mint** | **[⬇️ FlowMap_1.3.1_amd64.deb](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_amd64.deb)** · ~479 MB | `sudo apt install ./FlowMap_1.3.1_amd64.deb` |
 | 🐧 **Linux x64 — any distro, portable** | **[⬇️ FlowMap_1.3.1_amd64.AppImage](https://github.com/nazmiefearmutcu/flowmap/releases/download/v1.3.1.1/FlowMap_1.3.1_amd64.AppImage)** · ~354 MB | `chmod +x` it, then run it |
