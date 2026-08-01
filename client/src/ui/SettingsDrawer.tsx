@@ -180,8 +180,8 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               ))}
             </div>
             <span className="setting__hint">
-              Inferno separates size by hue (indigo → red → gold → white); Classic is the
-              legacy blue→cyan→white ramp. Synthetic depth always stays amber.
+              Inferno separates size by hue (indigo → red → gold); Classic is the
+              legacy blue→cyan→yellow ramp. Synthetic depth always stays amber.
             </span>
           </div>
 

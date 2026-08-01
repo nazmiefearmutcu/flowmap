@@ -1821,27 +1821,8 @@ body,
   width: 8px;
   height: 92px;
   border-radius: 2px;
-  /* thermal ramp bottom(low)→top(high), matching gl/lut.ts THERMAL_STOPS */
-  background: linear-gradient(
-    to top,
-    #02040c 0%,
-    #0a165c 15%,
-    #0082c8 40%,
-    #18d0e0 62%,
-    #e8e82c 80%,
-    #ffffff 100%
-  );
-}
-.heat-legend--synth .heat-legend__bar {
-  /* amber ramp, matching SYNTH_STOPS — synthetic liquidity reads amber */
-  background: linear-gradient(
-    to top,
-    #060300 0%,
-    #501e00 25%,
-    #b45a00 55%,
-    #f0aa1e 80%,
-    #fff0c8 100%
-  );
+  /* The gradient is painted inline by HeatLegend.tsx from the same stop list
+     gl/lut.ts rasterizes, so the legend always matches the heatmap ramp. */
 }
 .heat-legend__cap {
   font-size: var(--fs-2xs);

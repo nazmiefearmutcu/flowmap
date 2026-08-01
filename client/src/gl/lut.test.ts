@@ -51,9 +51,16 @@ describe('inferno LUT (the default ramp)', () => {
     }
   });
 
-  it('starts near-black and ends near-white', () => {
+  it('starts near-black and ends in saturated gold (never white)', () => {
     expect(luma(lut, 0)).toBeLessThan(10);
-    expect(luma(lut, LUT_SIZE - 1)).toBeGreaterThan(245);
+    expect(luma(lut, LUT_SIZE - 1)).toBeGreaterThan(200);
+    // Gold endpoint: red-dominant, blue-starved — a max-density wall must not
+    // merge into the white price line overlay.
+    const [r, g, b] = rgb(lut, LUT_SIZE - 1);
+    expect(r).toBeGreaterThan(200);
+    expect(g).toBeGreaterThan(150);
+    expect(b).toBeLessThan(100);
+    expect(b).toBeLessThan(g);
   });
 
   it('brightens monotonically', () => {
@@ -142,13 +149,15 @@ describe('classic LUT (the legacy thermal ramp)', () => {
     }
   });
 
-  it('starts near-black and ends bright white', () => {
+  it('starts near-black and ends in saturated yellow (never white)', () => {
     expect(luma(lut, 0)).toBeLessThan(10);
-    expect(luma(lut, LUT_SIZE - 1)).toBeGreaterThan(245);
-    // White endpoint: all channels maxed.
-    expect(lut[(LUT_SIZE - 1) * 4 + 0]).toBe(255);
-    expect(lut[(LUT_SIZE - 1) * 4 + 1]).toBe(255);
-    expect(lut[(LUT_SIZE - 1) * 4 + 2]).toBe(255);
+    expect(luma(lut, LUT_SIZE - 1)).toBeGreaterThan(200);
+    // Saturated yellow endpoint: red-dominant, blue-starved — never white, so
+    // the classic ramp top stays distinct from the white price line too.
+    const [r, g, b] = rgb(lut, LUT_SIZE - 1);
+    expect(r).toBeGreaterThan(200);
+    expect(g).toBeGreaterThan(150);
+    expect(b).toBeLessThan(100);
   });
 
   it('is cold (blue-dominant) at the low end', () => {
@@ -261,7 +270,7 @@ describe('rampCssGradient (the legend must not drift from the texture)', () => {
   it('emits ordered sRGB stops spanning 0→100%', () => {
     const g = rampCssGradient(RAMP_INFERNO);
     expect(g.startsWith('rgb(2, 2, 8) 0.0%')).toBe(true);
-    expect(g.endsWith('rgb(255, 248, 232) 100.0%')).toBe(true);
+    expect(g.endsWith('rgb(255, 216, 40) 100.0%')).toBe(true);
   });
 
   it('gives each row its own gradient', () => {

@@ -151,6 +151,13 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
   // 0..SYNTH_HUE_SAFE_MAX-1 — i.e. across the low/mid density that fills most of
   // the profile. So: amber pixels must be present AND cool pixels must be
   // absent. gl/lut.test.ts pins both halves of that claim.
+  //
+  // Since the p97 white point change, the POC saturates to the SYNTH ramp's top
+  // stop (255,240,200) — the white point now sits below the peak, so the
+  // highest-density row lands at LUT 255. The top stop is gold-CREAM (rr−bb is
+  // exactly 55, not > 55), so the amber predicate below counts it as amber via
+  // the blue-starved bound rr > bb + 40; the cool probe still does the real
+  // discrimination.
   const probe = await page.evaluate((p) => {
     const c = document.querySelector('canvas#gl') as HTMLCanvasElement;
     const dpr = c.width / Math.max(1, c.clientWidth);
@@ -174,8 +181,10 @@ test('§7 M3 T3: SYNTH-profile equity renders honestly (amber ramp, SYNTH ladder
         const rr = img[i];
         const gg = img[i + 1];
         const bb = img[i + 2];
-        // Amber: red-dominant, blue-starved, green below red (never cyan/white).
-        if (rr > 110 && rr > bb + 55 && gg < rr) n++;
+        // Amber: red-dominant, blue-starved (rr−bb > 40 admits the saturated
+        // gold-cream top stop 255,240,200; rr−bb > 55 missed it by exactly 1),
+        // green below red (never cyan/white).
+        if (rr > 110 && rr > bb + 40 && gg < rr) n++;
         // Cool: blue over green. IMPOSSIBLE anywhere on the synth ramp; the
         // signature of inferno's indigo/violet/magenta low-and-mid field.
         if (bb > gg + 10) cool++;
