@@ -376,7 +376,7 @@ class Session:
 
     # -- lifecycle -------------------------------------------------------------
 
-    async def start(self) -> asyncio.Task:
+    async def start(self) -> asyncio.Task | None:
         """Boot (open recorder + rehydrate, once) and start the feed task.
 
         Idempotent and restart-safe. The boot phase runs BEFORE the run task
@@ -385,6 +385,14 @@ class Session:
         concurrent second subscriber wait for the same boot instead of racing
         it. ``load_tail`` executes in the default executor — the event loop
         (other sessions, other clients) never blocks on Parquet IO.
+
+        Returns ``None`` when the session was torn down while booting (a
+        grace-timer or band-replacement teardown fires during the seconds-long
+        boot await — boot holds no clients, so it is teardown-eligible). In
+        that case ``_teardown`` has already run and can NEVER run again
+        (``_closed`` is a one-way latch), so starting ``run()`` here would leak
+        a live feed task plus a full ring, broadcasting to zero clients
+        forever; the caller re-subscribes instead.
         """
         async with self._start_lock:
             if self.run_task is None or self.run_task.done():
@@ -396,6 +404,8 @@ class Session:
                     # instead of running with recording/rehydration silently off.
                     await self._boot()
                     self._boot_done = True
+                if self._closed:
+                    return None
                 self.run_task = asyncio.create_task(
                     self.run(), name=f"session-{self.session_id}"
                 )
@@ -422,8 +432,12 @@ class Session:
             else:
                 self._rec = rec
                 if tail is not None:
-                    self._apply_tail(tail)
-                    tail_applied = True
+                    # _apply_tail reports success: a tail that failed preload
+                    # (grid shape changed, corrupt arrays) leaves the ring
+                    # genuinely virgin, so the candle backfill below must run
+                    # — otherwise the session gets NO history at all even
+                    # though both sources were available (M2).
+                    tail_applied = self._apply_tail(tail)
 
         # Backfill only a genuinely cold ring — never on top of a rehydrated tail
         # (the grid is no longer virgin; preload would raise).
@@ -525,8 +539,12 @@ class Session:
         )
         return rec, tail
 
-    def _apply_tail(self, tail: TailData) -> None:
-        """Seed grid/tape/markers from a recorded tail + emit the gap Marker."""
+    def _apply_tail(self, tail: TailData) -> bool:
+        """Seed grid/tape/markers from a recorded tail + emit the gap Marker.
+
+        Returns True only when the grid actually took the tail; a False return
+        (unusable recording) leaves the grid virgin so the caller still runs
+        the candle backfill."""
         try:
             self._grid.preload(tail.columns, tail.epochs)
         except Exception:
@@ -536,7 +554,7 @@ class Session:
                 "rehydration preload failed; cold start for session %s",
                 self.session_id,
             )
-            return
+            return False
         self._tape.extend(tail.trades)
         self._markers.extend(tail.markers)
         dt = self._grid.cfg.dt_ns
@@ -558,6 +576,7 @@ class Session:
             tail.columns[0].t0_ns,
             tail.newest_t0_ns,
         )
+        return True
 
     # -- recording (all wrapped: failures disable recording, never the feed) ---
 
@@ -1176,11 +1195,15 @@ class SessionManager:
             )
         )
 
-    async def subscribe(self, sub: events.Subscribe, client: ClientTx) -> Session:
+    async def subscribe(
+        self, sub: events.Subscribe, client: ClientTx, _retry: bool = True
+    ) -> Session:
         """Attach ``client`` to the session for ``sub``'s key, creating and
         starting the session if needed (≤ ``cfg.max_sessions`` distinct keys).
         The snapshot frames are enqueued into ``client`` before returning, so
-        they precede every live broadcast."""
+        they precede every live broadcast. ``_retry`` is internal: it bounds
+        the single teardown-during-boot re-subscribe so a pathological teardown
+        that keeps winning surfaces as an error instead of recursing forever."""
         band = canonical_band(sub.band)
         key = (sub.market, sub.symbol, sub.mode, sub.source, band)
         # The band is part of the key (two clients on the same symbol with
@@ -1222,8 +1245,31 @@ class SessionManager:
         # feed ended normally must not be handed out as a zombie — a new
         # subscriber restarts the run task. First start boots (rehydrates)
         # BEFORE attach below, so the snapshot includes the recorded tail.
-        await session.start()
-        frames = session.attach(client)
+        # A boot can take seconds (executor Parquet load, backfill seam) and
+        # holds zero clients, so a grace teardown (or `_evict_other_bands` from
+        # a rival band) may fire mid-boot; `_teardown` then runs to completion
+        # and can never run again. start() now declines to spawn the run task
+        # on that dead session, and attach() raises — retry ONCE on the fresh
+        # session the remover already installed under the key (L2).
+        started = await session.start()
+        if started is not None:
+            try:
+                frames = session.attach(client)
+            except RuntimeError:
+                if self._sessions.get(key) is session:
+                    self._sessions.pop(key, None)
+                if not _retry:
+                    raise
+                return await self.subscribe(sub, client, _retry=False)
+        else:
+            if self._sessions.get(key) is session:
+                self._sessions.pop(key, None)
+            if not _retry:
+                raise RuntimeError(
+                    f"session for {key!r} was torn down during boot twice; "
+                    f"refusing to hand out a dead session"
+                )
+            return await self.subscribe(sub, client, _retry=False)
         for frame in frames:
             # Snapshot frames ride the non-column path (no column lag-drops)
             # and are protected: cap eviction must never drop Hello.

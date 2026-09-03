@@ -163,7 +163,13 @@ def columns_from_candles(
         lo_r = row_of(min(cd.l, cd.h))
         hi_r = row_of(max(cd.l, cd.h))
         lo_r, hi_r = min(lo_r, hi_r), max(lo_r, hi_r)
-        band = [r for r in range(lo_r, hi_r + 1) if 0 <= r < rows]
+        # Clamp BEFORE building the range: one candle with an absurd high/low
+        # (mis-scaled venue, raw-unit quote, bad tick) yields a row span of
+        # millions-billions and the list comprehension below would hang the
+        # boot inside _boot's _start_lock (M1).
+        lo_r = max(lo_r, 0)
+        hi_r = min(hi_r, rows - 1)
+        band = list(range(lo_r, hi_r + 1)) if lo_r <= hi_r else []
         if band:
             per = float(cd.volume) / len(band)
             close_r = row_of(cd.c)

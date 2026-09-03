@@ -122,6 +122,18 @@ _EPOCHS_SCHEMA = {
     "dt_ns": pl.Int64,
     "p0": pl.Float64,
     "rows": pl.Int64,
+    # Trailing hybrid-scale fields (H1) mirror EpochParams in proto/events.py:
+    # without them a recorded hybrid epoch round-trips as linear and a restart
+    # re-bins every live book with the wrong row<->price map. Old recordings
+    # written before these columns existed simply lack them — load_tail reads
+    # them with defaults, which IS the linear state they were recorded under.
+    "scale_kind": pl.Int64,
+    "dn_rows": pl.Int64,
+    "core_rows": pl.Int64,
+    "core_p0": pl.Float64,
+    "core_step": pl.Float64,
+    "lo_price": pl.Float64,
+    "hi_price": pl.Float64,
 }
 
 
@@ -356,6 +368,13 @@ class SessionRecorder:
                 "dt_ns": [e.dt_ns for e in epochs],
                 "p0": [e.p0 for e in epochs],
                 "rows": [e.rows for e in epochs],
+                "scale_kind": [e.scale_kind for e in epochs],
+                "dn_rows": [e.dn_rows for e in epochs],
+                "core_rows": [e.core_rows for e in epochs],
+                "core_p0": [e.core_p0 for e in epochs],
+                "core_step": [e.core_step for e in epochs],
+                "lo_price": [e.lo_price for e in epochs],
+                "hi_price": [e.hi_price for e in epochs],
             },
             schema=_EPOCHS_SCHEMA,
         )
@@ -448,18 +467,18 @@ class Recorder:
             .tail(limit_cols)
         )
 
-        columns = [self._column_from_row(row) for row in table.iter_rows(named=True)]
-
-        # Every epoch referenced by the loaded columns must be resolvable.
-        # Epochs files are read in full (tiny, and their hour bucket is
-        # heuristic — see module docstring); unreadable ones are skipped.
-        needed = {c.epoch for c in columns}
+        # Resolve epochs BEFORE materializing columns: the row count comes from
+        # the epochs (and the vectorized bid/ask reshape below needs it).
+        needed_epochs = set(table["epoch"].to_numpy().tolist())
         epoch_map: dict[int, EpochParams] = {}
         for path in sorted(d.glob("*-epochs-*.parquet"), key=_by_name):
             df = _read_parquet_safe(path)
             if df is None:
                 continue
             for row in df.iter_rows(named=True):
+                # .get with the linear defaults: recordings written before the
+                # hybrid-scale columns existed (H1) must load as the linear
+                # state they were recorded under, not crash on a missing key.
                 epoch_map[int(row["epoch"])] = EpochParams(
                     epoch=int(row["epoch"]),
                     tick=row["tick"],
@@ -467,9 +486,25 @@ class Recorder:
                     dt_ns=int(row["dt_ns"]),
                     p0=row["p0"],
                     rows=int(row["rows"]),
+                    scale_kind=int(row.get("scale_kind", 0) or 0),
+                    dn_rows=int(row.get("dn_rows", 0) or 0),
+                    core_rows=int(row.get("core_rows", 0) or 0),
+                    core_p0=float(row.get("core_p0", 0.0) or 0.0),
+                    core_step=float(row.get("core_step", 0.0) or 0.0),
+                    lo_price=float(row.get("lo_price", 0.0) or 0.0),
+                    hi_price=float(row.get("hi_price", 0.0) or 0.0),
                 )
-        if not needed.issubset(epoch_map):
+        if not needed_epochs.issubset(epoch_map):
             return None  # epochs pruned: recording unusable -> cold start
+
+        try:
+            columns = self._columns_from_table(table, epoch_map)
+        except (ValueError, TypeError) as exc:
+            # A ragged/corrupt column block must degrade to a cold start (§8.1)
+            # like every other unusable tail — not disable recording for the
+            # whole session by escaping into _boot's except.
+            logger.warning("recorded column arrays unusable (%s); cold start", exc)
+            return None
 
         # Trades/markers within the loaded column range [t0_min, t0_max + dt).
         # Ranged read: only open files whose hour prefix intersects the window.
@@ -503,7 +538,7 @@ class Recorder:
         markers.sort(key=lambda m: m.ts_ns)
 
         return TailData(
-            epochs=[epoch_map[e] for e in sorted(needed)],
+            epochs=[epoch_map[e] for e in sorted(needed_epochs)],
             columns=columns,
             trades=trades,
             markers=markers,
@@ -511,31 +546,56 @@ class Recorder:
         )
 
     @staticmethod
-    def _column_from_row(row: dict) -> FinalizedColumn:
-        epoch = int(row["epoch"])
-        col_seq = int(row["col_seq"])
-        t0_ns = int(row["t0_ns"])
-        # f32 -> f16 is bit-lossless here: every stored value is an exact f16.
-        bid = np.asarray(row["bid"], dtype=np.float32).astype(np.float16)
-        ask = np.asarray(row["ask"], dtype=np.float32).astype(np.float16)
-        bar = BarColumn(
-            # Identity fields equal the column's (grid invariant, see module doc).
-            epoch=epoch,
-            col_seq=col_seq,
-            t0_ns=t0_ns,
-            o=row["o"],
-            h=row["h"],
-            l=row["l"],
-            c=row["c"],
-            vol_buy=row["vol_buy"],
-            vol_sell=row["vol_sell"],
-            cvd_cum=row["cvd_cum"],
-            vwap_num_cum=row["vwap_num_cum"],
-            vwap_den_cum=row["vwap_den_cum"],
+    def _columns_from_table(
+        table: pl.DataFrame, epoch_map: dict[int, EpochParams]
+    ) -> list[FinalizedColumn]:
+        """Materialize FinalizedColumns columnar-ly (H3).
+
+        The bid/ask ``List(Float32)`` columns hold ``height × rows`` values; a
+        per-row ``iter_rows`` pass materialized ~134M Python floats at a full
+        32 768-column × 2048-row ring and blocked the first attach for tens of
+        seconds. The two list columns flatten to one numpy f32 block each and
+        reshape in C; only the 13 scalar columns walk Python. The f32 → f16
+        cast is bit-lossless: every stored value is an exact f16.
+        """
+        height = table.height
+        rows = int(epoch_map[int(table["epoch"][-1])].rows)
+        bid = (
+            np.ascontiguousarray(table["bid"].list.explode().to_numpy(), dtype=np.float32)
+            .astype(np.float16)
+            .reshape(height, rows)
         )
-        return FinalizedColumn(
-            epoch=epoch, col_seq=col_seq, t0_ns=t0_ns, bid=bid, ask=ask, bar=bar
+        ask = (
+            np.ascontiguousarray(table["ask"].list.explode().to_numpy(), dtype=np.float32)
+            .astype(np.float16)
+            .reshape(height, rows)
         )
+        out: list[FinalizedColumn] = []
+        for i, row in enumerate(table.drop(["bid", "ask"]).iter_rows(named=True)):
+            epoch = int(row["epoch"])
+            col_seq = int(row["col_seq"])
+            t0_ns = int(row["t0_ns"])
+            bar = BarColumn(
+                # Identity fields equal the column's (grid invariant, see module doc).
+                epoch=epoch,
+                col_seq=col_seq,
+                t0_ns=t0_ns,
+                o=row["o"],
+                h=row["h"],
+                l=row["l"],
+                c=row["c"],
+                vol_buy=row["vol_buy"],
+                vol_sell=row["vol_sell"],
+                cvd_cum=row["cvd_cum"],
+                vwap_num_cum=row["vwap_num_cum"],
+                vwap_den_cum=row["vwap_den_cum"],
+            )
+            out.append(
+                FinalizedColumn(
+                    epoch=epoch, col_seq=col_seq, t0_ns=t0_ns, bid=bid[i], ask=ask[i], bar=bar
+                )
+            )
+        return out
 
     # -- retention -------------------------------------------------------------
 

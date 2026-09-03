@@ -47,6 +47,7 @@ from flowmap_server.core.price_scale import (
     epoch_scale_fields,
     linear_scale,
     make_hybrid,
+    scale_of,
 )
 from flowmap_server.core.price_scale_np import rows_for_prices
 from flowmap_server.proto.events import (
@@ -263,25 +264,25 @@ class Grid:
         if missing:
             raise ValueError(f"columns reference unknown epochs {sorted(missing)}")
         # In band mode tick_multiple is DERIVED from the first real mid, so a
-        # recorded tail legitimately carries a different one from cfg; it must
-        # still be consistent across the tail (one frozen multiple per session).
-        tail_multiples = {e.tick_multiple for e in ep_map.values()}
-        expect_tm = (
-            next(iter(tail_multiples))
-            if self._banded and len(tail_multiples) == 1
-            else cfg.tick_multiple
-        )
+        # recorded tail legitimately carries a different one from cfg. A tail
+        # that spans the FIRST band anchor carries BOTH: epoch 0 columns were
+        # written under the nominal cfg multiple before the mid froze a banded
+        # one (M3). So the shape fields must match for every epoch, but the
+        # multiple only has to be either the nominal one or the NEWEST epoch's
+        # frozen one — anything else is a shape change and rejects the tail.
+        newest_tm = ep_map[columns[-1].epoch].tick_multiple
+        allowed_tm = {cfg.tick_multiple, newest_tm}
         for e in ep_map.values():
-            if (e.tick, e.tick_multiple, e.dt_ns, e.rows) != (
-                cfg.tick,
-                expect_tm,
-                cfg.dt_ns,
-                cfg.rows,
-            ):
+            if (e.tick, e.dt_ns, e.rows) != (cfg.tick, cfg.dt_ns, cfg.rows):
                 raise ValueError(
                     f"epoch {e.epoch} params {e} do not match grid cfg "
-                    f"(tick={cfg.tick}, tick_multiple={expect_tm}, "
-                    f"dt_ns={cfg.dt_ns}, rows={cfg.rows})"
+                    f"(tick={cfg.tick}, dt_ns={cfg.dt_ns}, rows={cfg.rows})"
+                )
+            if e.tick_multiple not in allowed_tm:
+                raise ValueError(
+                    f"epoch {e.epoch} tick_multiple {e.tick_multiple} matches "
+                    f"neither cfg {cfg.tick_multiple} nor the tail's frozen "
+                    f"{newest_tm}"
                 )
         columns = columns[-cfg.ring_columns :]
         prev = None
@@ -329,6 +330,13 @@ class Grid:
         if self._banded:
             self._band_anchored = True
             self._anchor_mid = self._p0 + (self._cfg.rows * self._step) / 2.0
+        # Rebuild the row<->price map from the tail's epoch, not the __init__
+        # linear seed (H1): a hybrid tail restored without its scale would bin
+        # every live book with the linear map from core_p0 — wing rows land on
+        # wrong prices or off-grid forever (maybe_reanchor is already pinned by
+        # _band_anchored above). scale_of returns the same hybrid/linear kind
+        # the epoch was recorded with.
+        self._scale = scale_of(ep_map[last.epoch])
         # Bar continuity across the restart.
         self._prev_close = last.bar.c
         self._o = self._h = self._l = self._c = last.bar.c
@@ -465,7 +473,12 @@ class Grid:
         dt = self._cfg.dt_ns
         t0 = self._cur_idx * dt
         # Division in float64, then a single cast to float16 (spec §8.1).
-        density16 = (self._acc / float(dt)).astype(np.float16)
+        # Saturate first: a raw venue unit above float16's max finite (65 504)
+        # would cast to +inf and poison ring, wire and recording alike (the
+        # backfill path normalizes instead — see backfill PEAK_TARGET — but the
+        # live path keeps venue units, so the clamp is the only guard).
+        density64 = np.minimum(self._acc / float(dt), np.float16(65504).astype(np.float64))
+        density16 = density64.astype(np.float16)
         bar = self._snap_bar(t0)
 
         i = self._count % self._cfg.ring_columns
