@@ -20,6 +20,7 @@ import socket
 import time
 
 import httpx
+import numpy as np
 import pytest
 import uvicorn
 from websockets.asyncio.client import connect
@@ -312,9 +313,11 @@ async def test_shared_session_two_clients(server):
 
 
 async def test_replay_subscribe_refused_with_1003(server):
-    """This build has no replay engine: mode='replay' must get an explicit
-    refusal Status{feed_state=degraded} + close 1003 — never a live feed
-    silently re-labeled as replay."""
+    """A mode='replay' subscribe with NO recording behind it (the default
+    fixture's store is empty) must get an explicit refusal
+    Status{feed_state=degraded} + close 1003 — never a live feed silently
+    re-labeled as replay. (The replay ENGINE is tested by
+    test_replay_engine_streams_recorded_session below.)"""
     port = server
     statuses: list[events.Status] = []
     async with connect(f"ws://127.0.0.1:{port}/ws") as ws:
@@ -350,3 +353,82 @@ async def test_silent_peer_aborted_after_liveness_timeout(server, monkeypatch):
                 await ws.recv()
     assert ei.value.rcvd is not None
     assert ei.value.rcvd.code == 1000
+
+
+async def test_replay_engine_streams_recorded_session(port, tmp_path):
+    """Full replay path: a pre-seeded recording streams back through a
+    mode='replay' subscribe — Hello advertises capability.replay, recorded
+    columns flow as final DepthColumns, Pause stalls, SetSpeed accelerates."""
+    from flowmap_server.core.grid import FinalizedColumn
+    from flowmap_server.core.record import Recorder
+    from flowmap_server.feeds.sim import SimFeed as Sim
+    from flowmap_server.proto.events import BarColumn, EpochParams
+
+    DT = 250_000_000
+    ROWS = 2048
+    P0 = round((100.0 - ROWS * 0.5 / 2.0) / 0.5) * 0.5
+    ep = EpochParams(epoch=0, tick=0.5, tick_multiple=1, dt_ns=DT, p0=P0, rows=ROWS)
+
+    rec = Recorder(tmp_path / "rec", 20.0)
+    s = rec.open_session("sim", "SIM-DEMO")
+    s.record_epoch(ep)
+    for i in range(12):
+        bid = np.full(ROWS, 5.0, dtype=np.float16)
+        ask = np.full(ROWS, 5.0, dtype=np.float16)
+        bar = BarColumn(epoch=0, col_seq=i, t0_ns=i * DT, o=100.0, h=100.5,
+                        l=99.5, c=100.0, vol_buy=1.0, vol_sell=1.0,
+                        cvd_cum=0.0, vwap_num_cum=100.0, vwap_den_cum=1.0)
+        s.record_column(FinalizedColumn(epoch=0, col_seq=i, t0_ns=i * DT,
+                                        bid=bid, ask=ask, bar=bar))
+    s.flush()
+    s.close()
+
+    cfg = Config(port=port, data_dir=str(tmp_path / "rec"))
+    app, srv, task = await _boot_server(cfg)
+    try:
+        async with connect(f"ws://127.0.0.1:{port}/ws") as ws:
+            await ws.send(
+                wire.encode(events.Subscribe(market="sim", symbol="SIM-DEMO", mode="replay"))
+            )
+            hellos = []
+            finals = []
+
+            async def pump() -> None:
+                async with asyncio.timeout(15):
+                    async for frame in ws:
+                        for ev in decode_frame(frame):
+                            if isinstance(ev, events.Hello):
+                                hellos.append(ev)
+                            elif isinstance(ev, events.DepthColumn) and ev.final:
+                                finals.append(ev)
+
+            pump_task = asyncio.create_task(pump())
+            # Two finals at recorded pace (250 ms cadence).
+            async with asyncio.timeout(10):
+                while len(finals) < 2:
+                    await asyncio.sleep(0.05)
+            assert hellos and hellos[0].capability.get("replay") is True
+
+            # Pause must stall the recorded stream (a live sim would keep
+            # producing; the replay has nothing new once held).
+            await ws.send(wire.encode(events.Pause()))
+            held = len(finals)
+            await asyncio.sleep(1.2)
+            assert len(finals) == held, "paused replay must not deliver finals"
+
+            # Speed alone must NOT un-pause (pause yields only to Resume).
+            await ws.send(wire.encode(events.SetSpeed(x=10_000)))
+            await asyncio.sleep(0.6)
+            assert len(finals) == held, "paused stays paused across SetSpeed"
+
+            # Resume with the 10 000x speed burns through the rest.
+            await ws.send(wire.encode(events.Resume()))
+            async with asyncio.timeout(10):
+                while len(finals) < 10:
+                    await asyncio.sleep(0.05)
+            seqs = [c.col_seq for c in finals]
+            assert all(b > a for a, b in zip(seqs, seqs[1:]))
+
+            pump_task.cancel()
+    finally:
+        await _stop_server(app, srv, task)

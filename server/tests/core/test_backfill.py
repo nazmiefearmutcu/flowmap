@@ -235,7 +235,8 @@ async def test_session_without_backfill_is_unchanged():
         hello = _flatten(sess.attach(ClientTx()))[0]
         assert isinstance(hello, Hello)
         assert "history" not in hello.capability
-        assert hello.capability == feed.capability
+        # replay:True is a SERVER-level badge merged into every Hello.
+        assert hello.capability == {**feed.capability, "replay": True}
         assert grid.history(2**62, 100) == []
     finally:
         sess.teardown_now()

@@ -195,10 +195,12 @@ class _Connection:
             self.latency_ms = rtt_ns / 2 / 1e6
             logger.debug("pong: rtt=%.2f ms", rtt_ns / 1e6)
         else:
-            # Seek/SetSpeed/Pause/Resume are replay transport controls; this
-            # build refuses replay subscriptions outright (see _subscribe), so
-            # a compliant client never sends them. Inert regardless.
-            logger.debug("ignoring %s", type(ev).__name__)
+            # Replay transport controls: forwarded to the session's feed (the
+            # recording-backed ReplayFeed consumes them; live feeds ignore).
+            if self._session is None:
+                logger.debug("%s before Subscribe: ignored", type(ev).__name__)
+            else:
+                self._session.feed_control(ev)
         return True
 
     async def _subscribe(self, sub: events.Subscribe) -> bool:

@@ -213,7 +213,8 @@ async def test_snapshot_shape_over_sim_history():
     assert hello.grid_epoch == 0
     assert hello.epoch_params.rows == 256
     assert hello.epoch_params.dt_ns == DT
-    assert hello.capability == feed.capability
+    # replay:True is a SERVER-level badge merged into every Hello.
+    assert hello.capability == {**feed.capability, "replay": True}
     assert hello.norm_seed > 0.0  # non-empty history -> percentile hint
 
     # EpochStart precedes any DepthColumn (flattened across frames, in order).

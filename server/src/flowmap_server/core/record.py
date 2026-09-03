@@ -599,6 +599,22 @@ class Recorder:
 
     # -- retention -------------------------------------------------------------
 
+    def load_all(self, market: str, symbol: str) -> TailData | None:
+        """Every recorded column for a symbol — the replay data source.
+
+        Same machinery/contract as :meth:`load_tail` (dedup, epoch resolution,
+        corrupt-file tolerance) with the freshness window and column cap
+        removed: ``cutoff`` collapses to 0 and ``limit`` to effectively
+        unbounded. ``None`` when nothing usable is recorded (cold start for a
+        replay subscribe is a refusal — the client gets an explicit error)."""
+        return self.load_tail(
+            market,
+            symbol,
+            max_age_ns=2**62,
+            now_ns=2**62,
+            limit_cols=2**31,
+        )
+
     def enforce_retention(self) -> list[Path]:
         """Prune recordings until total ``*.parquet`` size fits the cap.
 

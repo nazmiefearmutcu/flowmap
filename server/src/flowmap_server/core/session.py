@@ -69,6 +69,7 @@ from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.feeds.base import BookState, Feed
 from flowmap_server.feeds.equity import EQUITY_MARKETS
+from flowmap_server.feeds.replay import ReplayFeed
 from flowmap_server.feeds.router import build_feed
 from flowmap_server.proto import events, wire
 
@@ -516,13 +517,19 @@ class Session:
         )
 
     def _capability(self) -> dict[str, object]:
-        """Feed capability, plus ``history: 'reconstructed'`` when the ring was
-        seeded from candle backfill (GOAL 1/3 honesty badge). Returns the feed's
-        own dict unchanged otherwise, so non-backfilled sessions are byte-identical
-        to before."""
-        if not self._history_reconstructed:
-            return self._feed.capability
-        return {**self._feed.capability, "history": "reconstructed"}
+        """Feed capability, plus server-level badges: ``history:
+        'reconstructed'`` when the ring was seeded from candle backfill
+        (GOAL 1/3 honesty badge), and ``replay: True`` — this build serves the
+        replay engine, and the client gates its Replay toggle on that flag
+        independent of the mode it is currently subscribed to.
+
+        Always returns a fresh dict (never the feed's own object): the badges
+        must not leak back into the feed descriptor."""
+        cap: dict[str, object] = dict(self._feed.capability)
+        cap["replay"] = True
+        if self._history_reconstructed:
+            cap["history"] = "reconstructed"
+        return cap
 
     def _boot_blocking(self) -> tuple[SessionRecorder, TailData | None]:
         """Blocking recorder IO for :meth:`_boot` (runs in the executor)."""
@@ -687,6 +694,14 @@ class Session:
             self._on_teardown()
 
     # -- feed loop -------------------------------------------------------------
+
+    def feed_control(self, ev) -> None:
+        """Forward a replay transport control (Seek/SetSpeed/Pause/Resume) to
+        the feed. Feeds without a control surface — every live feed — ignore
+        it, so this is safe to call on any session."""
+        ctrl = getattr(self._feed, "control", None)
+        if ctrl is not None:
+            ctrl(ev)
 
     async def run(self) -> None:
         """Drain ``feed.events()`` into the grid and broadcast; restart the
@@ -1214,13 +1229,6 @@ class SessionManager:
         they precede every live broadcast. ``_retry`` is internal: it bounds
         the single teardown-during-boot re-subscribe so a pathological teardown
         that keeps winning surfaces as an error instead of recursing forever."""
-        if sub.mode == "replay":
-            # No replay engine exists in this build (feeds route by market only;
-            # the transport controls are not consumed). Fail LOUDLY instead of
-            # minting a session that streams live data under a replay label.
-            raise ReplayUnavailableError(
-                "mode 'replay' has no engine in this build — only 'live' is served"
-            )
         band = canonical_band(sub.band)
         key = (sub.market, sub.symbol, sub.mode, sub.source, band)
         # The band is part of the key (two clients on the same symbol with
@@ -1239,7 +1247,13 @@ class SessionManager:
                     f"session limit reached ({self._cfg.max_sessions}); "
                     f"cannot open {key!r}"
                 )
-            feed = self._feed_factory(sub)
+            if sub.mode == "replay":
+                # The recording-backed replay engine: the recorder IS the data
+                # source, so a replay session opens NO recorder of its own and
+                # runs no backfill (both already gated on mode == "live").
+                feed = self._replay_feed(sub)
+            else:
+                feed = self._feed_factory(sub)
             session = Session(
                 f"{sub.market}:{sub.symbol}:{sub.mode}:{uuid.uuid4().hex[:12]}",
                 feed=feed,
@@ -1292,6 +1306,24 @@ class SessionManager:
             # and are protected: cap eviction must never drop Hello.
             client.offer(frame, col_msg=False, t0_ns=None, protected=True)
         return session
+
+    def _replay_feed(self, sub: events.Subscribe) -> ReplayFeed:
+        """Build the recording-backed replay feed for ``sub``, or refuse.
+
+        The recorder is the replay data source: a store-less manager (tests)
+        or a symbol with no recording raises :class:`ReplayUnavailableError`,
+        which the WS layer turns into an explicit refusal — never a live feed
+        under a replay label."""
+        if self._recorder is None:
+            raise ReplayUnavailableError(
+                "replay needs a recording store; this manager has none"
+            )
+        tail = self._recorder.load_all(sub.market, sub.symbol)
+        if tail is None or not tail.columns:
+            raise ReplayUnavailableError(
+                f"no recording for {sub.market}:{sub.symbol} — replay unavailable"
+            )
+        return ReplayFeed(market=sub.market, symbol=sub.symbol, tail=tail)
 
     def _evict_other_bands(self, key: tuple[str, str, str, str | None, str]) -> None:
         """Tear down sessions that differ from ``key`` ONLY in the band.
