@@ -305,3 +305,48 @@ async def test_shared_session_two_clients(server):
             assert later[-1].col_seq > finals1[-1].col_seq
     finally:
         await ws1.close()
+
+
+# ---------------------------------------------------------------------------
+# Review-fix wave 2: honest replay refusal + dead-peer liveness
+
+
+async def test_replay_subscribe_refused_with_1003(server):
+    """This build has no replay engine: mode='replay' must get an explicit
+    refusal Status{feed_state=degraded} + close 1003 — never a live feed
+    silently re-labeled as replay."""
+    port = server
+    statuses: list[events.Status] = []
+    async with connect(f"ws://127.0.0.1:{port}/ws") as ws:
+        await ws.send(
+            wire.encode(events.Subscribe(market="sim", symbol="SIM-DEMO", mode="replay"))
+        )
+        with pytest.raises(ConnectionClosed) as ei:
+            async with asyncio.timeout(5):
+                while True:
+                    for ev in decode_frame(await ws.recv()):
+                        if isinstance(ev, events.Status):
+                            statuses.append(ev)
+    assert ei.value.rcvd is not None
+    assert ei.value.rcvd.code == 1003
+    assert any(s.feed_state == "degraded" for s in statuses)
+
+
+async def test_silent_peer_aborted_after_liveness_timeout(server, monkeypatch):
+    """A peer that never sends anything (not even an application Pong) is
+    aborted after LIVENESS_TIMEOUT_S instead of pinning its session + tasks
+    forever (a black-holed TCP peer never trips receive EOF)."""
+    from flowmap_server.api import ws as ws_mod
+
+    monkeypatch.setattr(ws_mod, "PING_INTERVAL_S", 0.05)
+    monkeypatch.setattr(ws_mod, "LIVENESS_TIMEOUT_S", 0.3)
+
+    port = server
+    ws = await connect(f"ws://127.0.0.1:{port}/ws")
+    # Deliberately never read/respond: pings accumulate, liveness trips.
+    with pytest.raises(ConnectionClosed) as ei:
+        async with asyncio.timeout(5):
+            while True:
+                await ws.recv()
+    assert ei.value.rcvd is not None
+    assert ei.value.rcvd.code == 1000

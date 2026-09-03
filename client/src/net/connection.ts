@@ -348,6 +348,15 @@ export class Connection {
   // --- socket lifecycle --------------------------------------------------------
 
   private openSocket(status: ConnStatus): void {
+    // Cancel any pending reconnect timer FIRST: otherwise a manual connect()
+    // (e.g. subscribe() with no socket) opens a socket and the armed timer
+    // then opens a SECOND one, overwriting this.socket — the orphan keeps its
+    // handlers alive, both sockets subscribe, trades/BBO arrive twice, and the
+    // orphan's eventual close nulls this.socket out from under the live one.
+    if (this.reconnectTimer !== null) {
+      this.clearTimeoutFn(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.setConnStatus(status);
     const sock = this.wsFactory(this.url);
     sock.binaryType = 'arraybuffer';

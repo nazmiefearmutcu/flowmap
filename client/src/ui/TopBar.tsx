@@ -133,6 +133,9 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
 
       <span className="topbar__spacer" />
 
+      {/* Replay surfaces ONLY when the server advertises the capability: this
+          build's server refuses mode=replay (no engine — the controls would
+          steer nothing), so an always-on toggle would be a dead control. */}
       <div className="modeseg" role="group" aria-label="live or replay" data-testid="mode-toggle">
         <button
           type="button"
@@ -144,16 +147,18 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         >
           Live
         </button>
-        <button
-          type="button"
-          data-mode="replay"
-          className={`modeseg__btn${mode === 'replay' ? ' is-on' : ''}`}
-          aria-pressed={mode === 'replay'}
-          data-testid="mode-replay"
-          onClick={() => onSetMode('replay')}
-        >
-          Replay
-        </button>
+        {capability?.replay === true && (
+          <button
+            type="button"
+            data-mode="replay"
+            className={`modeseg__btn${mode === 'replay' ? ' is-on' : ''}`}
+            aria-pressed={mode === 'replay'}
+            data-testid="mode-replay"
+            onClick={() => onSetMode('replay')}
+          >
+            Replay
+          </button>
+        )}
       </div>
 
       <span

@@ -145,6 +145,22 @@ describe('TopBar venue chip (~106 venues — the asset class is no longer an add
     expect(venue.classList.contains('venue--equity')).toBe(true);
   });
 
+  it('hides the Replay toggle unless the server advertises capability.replay', () => {
+    // No capability (pre-Hello) → hidden: against a server that refuses
+    // mode=replay the button would steer nothing.
+    const a = render(topbar());
+    expect(a.container.querySelector('[data-testid="mode-replay"]')).toBeNull();
+    expect(a.container.querySelector('[data-testid="mode-live"]')).not.toBeNull();
+
+    act(() => useFlowMapStore.setState({ capability: { depth: 'L2' } }));
+    const b = render(topbar());
+    expect(b.container.querySelector('[data-testid="mode-replay"]')).toBeNull();
+
+    act(() => useFlowMapStore.setState({ capability: { depth: 'L2', replay: true } }));
+    const c = render(topbar());
+    expect(c.container.querySelector('[data-testid="mode-replay"]')).not.toBeNull();
+  });
+
   it('defaults to the sim venue with no subscription', () => {
     const { container } = render(topbar());
     const venue = container.querySelector('[data-testid="venue"]')!;

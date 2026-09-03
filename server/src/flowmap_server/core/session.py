@@ -1008,6 +1008,16 @@ class SessionLimitError(RuntimeError):
     """Raised when a new session key would exceed ``Config.max_sessions``."""
 
 
+class ReplayUnavailableError(RuntimeError):
+    """Raised for ``mode='replay'`` subscriptions.
+
+    This build has no replay engine: no feed reads a recording and the
+    Seek/SetSpeed/Pause/Resume controls are not consumed. Refusing explicitly
+    (instead of silently serving the LIVE feed under a replay label) is the
+    honest behaviour — the client hides its Replay toggle unless a server
+    advertises ``capability.replay``."""
+
+
 # Sim grid shape (mirrors feeds.sim private constants: mid starts at 100.0,
 # tick 0.5; kept local so this module does not reach into sim internals).
 _SIM_MID0 = 100.0
@@ -1204,6 +1214,13 @@ class SessionManager:
         they precede every live broadcast. ``_retry`` is internal: it bounds
         the single teardown-during-boot re-subscribe so a pathological teardown
         that keeps winning surfaces as an error instead of recursing forever."""
+        if sub.mode == "replay":
+            # No replay engine exists in this build (feeds route by market only;
+            # the transport controls are not consumed). Fail LOUDLY instead of
+            # minting a session that streams live data under a replay label.
+            raise ReplayUnavailableError(
+                "mode 'replay' has no engine in this build — only 'live' is served"
+            )
         band = canonical_band(sub.band)
         key = (sub.market, sub.symbol, sub.mode, sub.source, band)
         # The band is part of the key (two clients on the same symbol with

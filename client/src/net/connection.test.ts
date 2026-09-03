@@ -496,6 +496,33 @@ describe('Connection — reconnect', () => {
     clock.advance(60_000);
     expect(sockets).toHaveLength(1);
   });
+
+  it('an explicit connect() during the backoff window cancels the pending reconnect (no double socket)', () => {
+    const { sockets, clock, factory } = harness();
+    const conn = new Connection({
+      url: URL,
+      wsFactory: factory,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].drop(); // arms the reconnect backoff timer
+    expect(sockets).toHaveLength(1);
+
+    // A subscribe with no socket connects NOW — it must cancel the armed
+    // reconnect, or the timer opens a second socket and both stream.
+    conn.subscribe('crypto', 'ETHUSDT', 'live');
+    expect(sockets).toHaveLength(2);
+    sockets[1].open();
+    const resub2 = decodeFrame(sockets[1].sent[0]);
+    assertType(resub2[0], MsgType.SUBSCRIBE);
+    expect(resub2[0].symbol).toBe('ETHUSDT');
+
+    clock.advance(60_000); // the armed backoff must NOT open a third socket
+    expect(sockets).toHaveLength(2);
+  });
 });
 
 describe('Connection — history correlation', () => {

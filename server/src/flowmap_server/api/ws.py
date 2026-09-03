@@ -29,6 +29,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from flowmap_server.core.session import (
     ClientTx,
+    ReplayUnavailableError,
     Session,
     SessionLimitError,
     SessionManager,
@@ -44,6 +45,14 @@ router = APIRouter()
 FLUSH_INTERVAL_S = 0.05  # 20 Hz drain cadence
 FLUSH_MAX_BYTES = 256 * 1024
 PING_INTERVAL_S = 1.0
+# A send that cannot complete within this window means the peer is gone or
+# black-holed (TCP send buffers full, no FIN ever coming): abort the connection
+# rather than stalling the flush/ping loops forever.
+SEND_TIMEOUT_S = 10.0
+# A connection that has sent us NOTHING (not even an application Pong — the
+# FlowMap client answers every server Ping) for this long is dead: without this
+# check a black-holed peer pins its Session refcount + flush/ping tasks forever.
+LIVENESS_TIMEOUT_S = 30.0
 
 # WS close codes
 _CLOSE_PROTOCOL_ERROR = 1002  # malformed client frame
@@ -67,24 +76,50 @@ class _Connection:
         self._session: Session | None = None
         self._send_lock = asyncio.Lock()
         self.latency_ms = 0.0
+        self._last_recv_ns = time.monotonic_ns()
 
     # -- sending ---------------------------------------------------------------
 
     async def _send(self, data: bytes) -> None:
         async with self._send_lock:
-            await self._ws.send_bytes(data)
+            await asyncio.wait_for(self._ws.send_bytes(data), SEND_TIMEOUT_S)
 
     async def _flush_loop(self) -> None:
-        while True:
-            for frame in self._client.drain(FLUSH_MAX_BYTES):
-                await self._send(frame)
-            await asyncio.sleep(FLUSH_INTERVAL_S)
+        try:
+            while True:
+                for frame in self._client.drain(FLUSH_MAX_BYTES):
+                    await self._send(frame)
+                await asyncio.sleep(FLUSH_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A dead peer (send timeout / broken pipe) must not leave the
+            # connection half-alive: abort so the receive loop unwinds and the
+            # session is released.
+            await self._abort()
 
     async def _ping_loop(self) -> None:
-        while True:
-            await asyncio.sleep(PING_INTERVAL_S)
-            ping = events.Ping(server_send_ns=time.monotonic_ns())
-            await self._send(wire.encode(ping))
+        try:
+            while True:
+                await asyncio.sleep(PING_INTERVAL_S)
+                if time.monotonic_ns() - self._last_recv_ns > LIVENESS_TIMEOUT_S * 1e9:
+                    logger.warning("ws peer silent for %.0fs: aborting", LIVENESS_TIMEOUT_S)
+                    await self._abort()
+                    return
+                ping = events.Ping(server_send_ns=time.monotonic_ns())
+                await self._send(wire.encode(ping))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._abort()
+
+    async def _abort(self) -> None:
+        """Sender-side teardown (dead peer / failed send). Closing the socket
+        unwinds the receive loop; ``run``'s finally releases the session."""
+        try:
+            await self._ws.close()
+        except Exception:  # noqa: BLE001 — already closing/closed: nothing to do
+            pass
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -110,6 +145,7 @@ class _Connection:
             message = await self._ws.receive()
             if message["type"] == "websocket.disconnect":
                 return
+            self._last_recv_ns = time.monotonic_ns()
             data = message.get("bytes")
             if data is None:  # text frame on a binary-only protocol
                 logger.warning("text WS frame on binary protocol: closing 1002")
@@ -159,9 +195,10 @@ class _Connection:
             self.latency_ms = rtt_ns / 2 / 1e6
             logger.debug("pong: rtt=%.2f ms", rtt_ns / 1e6)
         else:
-            # Seek/SetSpeed/Pause/Resume are replay controls (M3): decodable
-            # but inert at M1.
-            logger.debug("ignoring %s at M1", type(ev).__name__)
+            # Seek/SetSpeed/Pause/Resume are replay transport controls; this
+            # build refuses replay subscriptions outright (see _subscribe), so
+            # a compliant client never sends them. Inert regardless.
+            logger.debug("ignoring %s", type(ev).__name__)
         return True
 
     async def _subscribe(self, sub: events.Subscribe) -> bool:
@@ -173,6 +210,11 @@ class _Connection:
             self._session = await self._manager.subscribe(sub, self._client)
         except SessionLimitError:
             await self._refuse("degraded", _CLOSE_TRY_AGAIN_LATER)
+            return False
+        except ReplayUnavailableError:
+            # Honest refusal (NOT a live feed under a replay label): the client
+            # hides its Replay toggle unless a server advertises the capability.
+            await self._refuse("degraded", _CLOSE_UNSUPPORTED)
             return False
         except NotImplementedError:
             await self._refuse("closed", _CLOSE_UNSUPPORTED)
