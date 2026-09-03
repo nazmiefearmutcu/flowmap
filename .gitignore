@@ -29,3 +29,6 @@ app/icons/FlowMap.iconset/
 
 # Agent working notes / plan files (local only, not part of the product)
 docs/superpowers/plans/
+
+# Generated perf artifacts
+client/perf_report.json

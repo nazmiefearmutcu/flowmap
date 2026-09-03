@@ -133,14 +133,28 @@ class MarketDataCache:
         async with lock:
             cached = self._quotes.get(key)
             if cached is not None and self._fresh(cached[0]):
+                self._release_lock(self._quote_locks, key, lock)
                 return cached[1]
             try:
                 q = await self._quote_fn(market, symbol.upper())
             except Exception:  # noqa: BLE001 — never raise into the handler
                 logger.debug("quote fetch failed for %s:%s", market, symbol, exc_info=True)
+                self._release_lock(self._quote_locks, key, lock)
                 return self._fallback_quote(market, symbol.upper(), cached)
             self._quotes[key] = (self._clock(), q)
+            self._release_lock(self._quote_locks, key, lock)
             return q
+
+    @staticmethod
+    def _release_lock(locks: dict, key, lock: asyncio.Lock) -> None:
+        """Drop a single-flight lock once it is free and no longer mapped.
+
+        Called AFTER the ``async with`` releases the lock: if another request
+        has already grabbed (or is waiting on) this exact object, ``locked()``
+        keeps the entry; otherwise the key is pruned so the dicts do not grow
+        with every symbol ever browsed over a long server lifetime."""
+        if not lock.locked() and locks.get(key) is lock:
+            locks.pop(key, None)
 
     def _fallback_quote(
         self, market: str, symbol: str, cached: tuple[int, QuoteData] | None
@@ -169,13 +183,16 @@ class MarketDataCache:
         async with lock:
             cached = self._movers.get(market)
             if cached is not None and self._fresh(cached[0]):
+                self._release_lock(self._movers_locks, market, lock)
                 return cached[1][:limit]
             try:
                 ranked = await self._movers_fn(market, limit)
             except Exception:  # noqa: BLE001 — never raise into the handler
                 logger.debug("movers fetch failed for %s", market, exc_info=True)
+                self._release_lock(self._movers_locks, market, lock)
                 return cached[1][:limit] if cached is not None else []
             self._movers[market] = (self._clock(), ranked)
+            self._release_lock(self._movers_locks, market, lock)
             return ranked[:limit]
 
     # -- background prewarm (production only) ----------------------------------
