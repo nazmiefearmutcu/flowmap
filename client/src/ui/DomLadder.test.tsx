@@ -372,6 +372,21 @@ describe('DomLadder render', () => {
     expect(container.querySelector('.panel__empty')?.textContent).toBe('market closed');
   });
 
+  it('does not promise a book that replay never sends (F3)', () => {
+    useFlowMapStore.setState({
+      capability: null,
+      epochs: new Map(),
+      gridEpoch: null,
+      status: 'live',
+      feedState: null,
+      subscription: { market: 'sim', symbol: 'SIM-DEMO', mode: 'replay', band: 'native' },
+    });
+    const { container } = render(<DomLadder />);
+    const msg = container.querySelector('.panel__empty')?.textContent;
+    expect(msg).toContain('replay');
+    expect(msg).not.toContain('waiting');
+  });
+
   it('collapses the body via the header chevron', () => {
     useFlowMapStore.setState({
       capability: { depth: 'L2', tape: 'tick' },

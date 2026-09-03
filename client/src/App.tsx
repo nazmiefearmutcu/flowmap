@@ -101,6 +101,9 @@ export function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [streamClock, setStreamClock] = useState<string | null>(null);
+  // WebGL2 unavailable: the heatmap canvas cannot render, but the DOM panels
+  // (ladder, tape, search) can — the app degrades instead of dying (F1).
+  const [glError, setGlError] = useState<string | null>(null);
 
   // Keep the latest settings reachable from the mount-only renderer effect.
   const settingsRef = useRef(settings);
@@ -138,9 +141,27 @@ export function App() {
     // Install the control tap BEFORE the store opens its socket.
     if (spyMode) installControlSpy();
 
-    const renderer = new Renderer(canvas, useFlowMapStore, rendererOpts);
+    // GL setup can legitimately fail (no WebGL2 in browser/context — VMs,
+    // remote desktops, disabled GPU). Catch it: mark the fallback, still
+    // CONNECT (DOM panels run fine without the canvas), and never spawn the
+    // renderer. Letting the throw escape would unmount the whole React tree
+    // into a silent black screen.
+    let renderer: Renderer;
+    try {
+      renderer = new Renderer(canvas, useFlowMapStore, rendererOpts);
+      renderer.attachOverlaySurfaces(priceAxisRef.current, timeAxisRef.current);
+    } catch (err) {
+      setGlError(err instanceof Error ? err.message : String(err));
+      if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
+        useFlowMapStore
+          .getState()
+          .connectAndSubscribe(SIM_MARKET, SIM_SYMBOL, 'live', settingsRef.current.priceBand);
+      }
+      return () => {
+        useFlowMapStore.getState().disconnect();
+      };
+    }
     rendererRef.current = renderer;
-    renderer.attachOverlaySurfaces(priceAxisRef.current, timeAxisRef.current);
     // Apply persisted, live-honourable settings at boot.
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
@@ -406,6 +427,16 @@ export function App() {
         <div className={`stage${settings.overlays.cvd ? ' stage--cvd' : ''}`}>
           <div className="stage__viewport">
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
+            {glError && (
+              <div className="gl-fallback" role="alert" data-testid="gl-fallback">
+                <span className="gl-fallback__title">Heatmap unavailable</span>
+                <span className="gl-fallback__body">
+                  WebGL2 is not available in this browser/context
+                  {glError ? ` (${glError})` : ''}, so the chart canvas cannot render. The DOM
+                  panels — symbol search, DOM ladder, time &amp; sales — keep working.
+                </span>
+              </div>
+            )}
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
             <HeatLegend colormap={settings.colormap} />
             <ClosedBanner />

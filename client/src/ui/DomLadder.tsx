@@ -361,6 +361,7 @@ export function DomLadder(): JSX.Element {
     model.spread !== null && params && params.tick > 0
       ? Math.round(model.spread / params.tick)
       : null;
+  const mode = useFlowMapStore((s) => s.subscription?.mode ?? 'live');
   const emptyMsg =
     feedState === 'closed'
       ? 'market closed'
@@ -368,7 +369,11 @@ export function DomLadder(): JSX.Element {
         ? 'disconnected'
         : status === 'connecting'
           ? 'connecting…'
-          : 'waiting for book…';
+          : mode === 'replay'
+            ? // Replay streams trades but no live book: "waiting for…" would
+              // promise a book that is never coming (F3).
+              'no book stream in replay — the tape keeps playing'
+            : 'waiting for book…';
 
   return (
     <section

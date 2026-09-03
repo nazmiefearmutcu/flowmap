@@ -19,6 +19,9 @@ export interface KeyTargetContext {
   editable: boolean;
   /** A native button / [role=button]: Space must activate it, not the transport. */
   button: boolean;
+  /** Inside a modal dialog (settings drawer / palette): bare app shortcuts yield —
+   *  Space on a drawer row must never toggle the chart's follow state behind it. */
+  dialog: boolean;
 }
 
 /** Modifier state relevant to chord shortcuts (⌘K / Ctrl-K). */
@@ -40,6 +43,7 @@ export function routeGlobalKey(
   // is safe even inside a text field (unlike the bare `/`).
   if ((mods.meta || mods.ctrl) && (key === 'k' || key === 'K')) return { type: 'focus-search' };
   if (ctx.editable) return null; // never hijack plain typing
+  if (ctx.dialog) return null; // a modal owns the keyboard while it is open
   if (key === '/') return { type: 'focus-search' };
   if (key === ' ' || key === 'Spacebar') {
     if (ctx.button) return null; // let a focused button take its own Space
@@ -51,7 +55,9 @@ export function routeGlobalKey(
 /** Classify a DOM event target for {@link routeGlobalKey}. */
 export function classifyTarget(target: EventTarget | null): KeyTargetContext {
   const el = target as (HTMLElement & { isContentEditable?: boolean }) | null;
-  if (!el || typeof el.tagName !== 'string') return { editable: false, button: false };
+  if (!el || typeof el.tagName !== 'string') {
+    return { editable: false, button: false, dialog: false };
+  }
   const tag = el.tagName.toUpperCase();
   const editable =
     tag === 'INPUT' ||
@@ -59,7 +65,9 @@ export function classifyTarget(target: EventTarget | null): KeyTargetContext {
     tag === 'SELECT' ||
     el.isContentEditable === true;
   const button = tag === 'BUTTON' || el.getAttribute?.('role') === 'button';
-  return { editable, button };
+  const dialog =
+    typeof el.closest === 'function' && el.closest('[role="dialog"]') !== null;
+  return { editable, button, dialog };
 }
 
 export interface GlobalKeyHandlers {

@@ -155,6 +155,9 @@ describe('TopBar venue chip (~106 venues — the asset class is no longer an add
 
 describe('TopBar clock + status a11y', () => {
   it('labels the wall zone and marks the stream row UTC', () => {
+    act(() =>
+      useFlowMapStore.setState({ subscription: { market: 'binance-usdm', symbol: 'BTCUSDT', mode: 'live', band: 'native' } }),
+    );
     const { container } = render(topbar('12:00:00'));
     const clock = container.querySelector('[data-testid="clock"]')!;
     expect(clock.querySelector('.clock__zone')).not.toBeNull();
@@ -162,10 +165,20 @@ describe('TopBar clock + status a11y', () => {
     expect(clock.getAttribute('aria-label')).toContain('UTC');
   });
 
-  it('renders the stream placeholder as UTC when there is no stream clock', () => {
+  it('does NOT claim UTC for the sim session-relative stream clock', () => {
+    act(() =>
+      useFlowMapStore.setState({ subscription: { market: 'sim', symbol: 'SIM-DEMO', mode: 'live', band: 'native' } }),
+    );
+    const { container } = render(topbar('00:00:06'));
+    const clock = container.querySelector('[data-testid="clock"]')!;
+    expect(clock.querySelector('.clock__stream')!.textContent).not.toContain('UTC');
+    expect(clock.getAttribute('aria-label')).toContain('session-relative');
+  });
+
+  it('renders a bare placeholder when there is no stream clock (no zone to claim)', () => {
     const { container } = render(topbar(null));
     const stream = container.querySelector('.clock__stream')!;
-    expect(stream.textContent).toContain('UTC');
+    expect(stream.textContent).toBe('—');
   });
 
   it('announces connection status to assistive tech', () => {

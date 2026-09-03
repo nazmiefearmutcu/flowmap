@@ -89,6 +89,9 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
       ? wall.toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour12: false })
       : null;
   const feedSuffix = feedState && feedState !== 'live' ? ` · ${feedState}` : '';
+  // The sim's stream ts is SESSION-RELATIVE (a T+ elapsed clock), so printing
+  // "UTC" next to it would claim a zone the number does not have.
+  const streamZone = group === 'sim' ? '' : ' UTC';
 
   return (
     <header className="topbar">
@@ -170,13 +173,17 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         data-testid="clock"
         aria-label={`Wall clock ${wallText} ${zoneAbbrev}${
           etText ? `, Eastern ${etText}` : ''
-        }, stream ${streamClock ?? 'none'} UTC`}
+        }, stream ${streamClock ?? 'none'}${
+          streamClock ? (group === 'sim' ? ', session-relative' : ' UTC') : ''
+        }`}
       >
         <span className="clock__wall">
           {wallText} <span className="clock__zone">{zoneAbbrev}</span>
         </span>
         {etText ? <span className="clock__et">{etText} ET</span> : null}
-        <span className="clock__stream">{streamClock ? `T ${streamClock} UTC` : '— UTC'}</span>
+        <span className="clock__stream">
+          {streamClock ? `T ${streamClock}${streamZone}` : '—'}
+        </span>
       </span>
 
       <button

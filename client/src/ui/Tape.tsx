@@ -81,6 +81,9 @@ export function Tape(): JSX.Element {
   const gridEpoch = useFlowMapStore((s) => s.gridEpoch);
   const [snap, setSnap] = useState<BookSnapshot>(() => getSnapshot());
   const [collapsed, setCollapsed] = useState(false);
+  // Hover-pause freezes the list so a row can be read; without a visible
+  // indicator that read like a stuck feed, so the header says HELD.
+  const [held, setHeld] = useState(false);
   const pausedRef = useRef(false);
 
   useEffect(
@@ -93,9 +96,11 @@ export function Tape(): JSX.Element {
 
   const onEnter = (): void => {
     pausedRef.current = true;
+    setHeld(true);
   };
   const onLeave = (): void => {
     pausedRef.current = false;
+    setHeld(false);
     setSnap(getSnapshot());
   };
 
@@ -122,6 +127,11 @@ export function Tape(): JSX.Element {
         <span className="panel__badge panel__badge--tape" data-testid="tape-badge">
           {badge}
         </span>
+        {held && (
+          <span className="panel__badge tape__held" data-testid="tape-held" title="updates paused while reading — leave the tape to resume">
+            HELD
+          </span>
+        )}
       </header>
       {!collapsed && (
         <div

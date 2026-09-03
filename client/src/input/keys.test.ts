@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { attachGlobalKeys, classifyTarget, routeGlobalKey } from './keys';
 
-const PLAIN = { editable: false, button: false };
+const PLAIN = { editable: false, button: false, dialog: false };
 
 describe('routeGlobalKey', () => {
   it('routes `/` to focus-search when not typing', () => {
@@ -15,13 +15,13 @@ describe('routeGlobalKey', () => {
   });
 
   it('never hijacks keys while typing in an editable target', () => {
-    expect(routeGlobalKey('/', { editable: true, button: false })).toBeNull();
-    expect(routeGlobalKey(' ', { editable: true, button: false })).toBeNull();
+    expect(routeGlobalKey('/', { ...PLAIN, editable: true })).toBeNull();
+    expect(routeGlobalKey(' ', { ...PLAIN, editable: true })).toBeNull();
   });
 
   it('lets a focused button take its own Space, but still focuses search on `/`', () => {
-    expect(routeGlobalKey(' ', { editable: false, button: true })).toBeNull();
-    expect(routeGlobalKey('/', { editable: false, button: true })).toEqual({ type: 'focus-search' });
+    expect(routeGlobalKey(' ', { ...PLAIN, button: true })).toBeNull();
+    expect(routeGlobalKey('/', { ...PLAIN, button: true })).toEqual({ type: 'focus-search' });
   });
 
   it('ignores unrelated keys (canvas keeps arrows / F / R)', () => {
@@ -30,10 +30,21 @@ describe('routeGlobalKey', () => {
     }
   });
 
+  it('yields bare shortcuts to an open modal dialog (Space must not flip chart state behind it)', () => {
+    expect(routeGlobalKey(' ', { ...PLAIN, dialog: true })).toBeNull();
+    expect(routeGlobalKey('/', { ...PLAIN, dialog: true })).toBeNull();
+  });
+
+  it('⌘K still works inside a dialog (explicit chord)', () => {
+    expect(routeGlobalKey('k', { ...PLAIN, dialog: true }, { meta: true, ctrl: false })).toEqual({
+      type: 'focus-search',
+    });
+  });
+
   it('opens search on ⌘K / Ctrl-K, even while typing (an explicit chord)', () => {
     expect(routeGlobalKey('k', PLAIN, { meta: true, ctrl: false })).toEqual({ type: 'focus-search' });
     expect(routeGlobalKey('K', PLAIN, { meta: false, ctrl: true })).toEqual({ type: 'focus-search' });
-    expect(routeGlobalKey('k', { editable: true, button: false }, { meta: true, ctrl: false })).toEqual({
+    expect(routeGlobalKey('k', { ...PLAIN, editable: true }, { meta: true, ctrl: false })).toEqual({
       type: 'focus-search',
     });
     // plain k (no modifier) is not a shortcut
@@ -61,8 +72,16 @@ describe('classifyTarget', () => {
     expect(classifyTarget(el('CANVAS')).button).toBe(false);
   });
 
+  it('flags targets inside a modal dialog via closest("[role=dialog]")', () => {
+    const inDrawer = el('DIV', {
+      closest: (sel: string) => (sel === '[role="dialog"]' ? { role: 'dialog' } : null),
+    });
+    expect(classifyTarget(inDrawer).dialog).toBe(true);
+    expect(classifyTarget(el('DIV')).dialog).toBe(false);
+  });
+
   it('tolerates a null / non-element target', () => {
-    expect(classifyTarget(null)).toEqual({ editable: false, button: false });
+    expect(classifyTarget(null)).toEqual({ editable: false, button: false, dialog: false });
   });
 });
 
