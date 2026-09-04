@@ -1,0 +1,91 @@
+## Server core review — `flowmap_server/core/{backfill,grid,session,record,price_scale,price_scale_np}.py` + `config.py`
+
+Scope: the seven files above, read in full. Cross-file facts (feed size units, `EpochParams` wire fields) were verified in `feeds/crypto.py` and `proto/events.py` but not reviewed.
+
+---
+
+### Critical
+
+**C1. Live density overflows float16 to `+inf` — no saturation clamp on the live path (`grid.py:468`).**
+`_finalize_current` does `density16 = (self._acc / float(dt)).astype(np.float16)`. `self._acc` holds raw venue sizes time-weighted in float64; float16 max finite is 65 504, and values above it cast to `+inf`. The crypto feed passes raw base-asset amounts straight through (`feeds/crypto.py:386` `bid_sz=bid[:, 1]`, no normalization), so any market whose per-level size exceeds ~65k in venue units renders the entire heatmap as `inf`: on Binance, SHIB/DOGE/FLOKI-class books routinely carry 10⁶–10⁹ units per level. The authors know the hazard — `backfill.py:66-71` says exactly this ("A liquid name's raw candle volume cast to the grid's float16 ring (max 65 504) would overflow to inf") and fixes it for the backfill path only (`PEAK_TARGET = 1000.0`, `backfill.py:205-208`). The `inf` poisons everything downstream: the ring (`grid.py:472`), the wire (`to_depth` casts inf f16→f32), the Parquet recording (`record.py:307-308`), and thus future rehydration. The NaN/inf input filter in `_map_levels` (`grid.py:447`) only drops non-finite *inputs*; it cannot catch the overflow produced by the cast.
+Fix: clamp before the cast (`np.minimum(density, np.float16(65504).astype(np.float64))`, same in `current_partial`), or better, mirror the backfill's per-session peak normalization so magnitudes stay relative; document the chosen unit contract next to `BookState`.
+
+---
+
+### High
+
+**H1. Hybrid price scale is not persisted or restored — `deep`-band rehydration mis-bins live books and mis-renders the tail (`record.py:118-125`, `record.py:463-470`, `grid.py:307-337`, `grid.py:450-461`).**
+Three gaps compose into one corruption path. (a) `_EPOCHS_SCHEMA` stores only 6 fields — `scale_kind`/`dn_rows`/`core_rows`/`core_p0`/`core_step`/`lo_price`/`hi_price` are all dropped, and `load_tail` rebuilds `EpochParams(...)` without them, so every recorded hybrid epoch round-trips as linear (`scale_kind=0`). (b) `Grid.preload` restores `_p0`, `_tick_multiple`, `_step` and sets `_band_anchored = True` (`grid.py:327-331`) but never touches `self._scale`, which stays the linear seed built in `__init__` (`grid.py:170`). (c) `_map_levels` dispatches on `self._scale.kind == SCALE_HYBRID` (`grid.py:450`), so after rehydration all live books are binned with the *linear* map from `core_p0` — wing prices either land on wrong rows or fall outside `[0, rows)` and are dropped — while `maybe_reanchor` refuses to fix it because `_band_anchored` is already True (`grid.py:647-656`). Meanwhile the client is served the linear-ized epoch params via `epoch_params_for`, so it also renders the rehydrated tail's wing rows at wrong prices. Net effect: a `deep` band (shipped in `BANDS`, `session.py:1064`) + recording (on by default) + restart = permanently wrong binning for the whole session, recorded to disk. Preload's validation (`grid.py:274-285`) passes because it only compares `(tick, tick_multiple, dt_ns, rows)`.
+Fix: add the seven scale fields to `_EPOCHS_SCHEMA`/`_epochs_frame`/`load_tail`, and in `preload` rebuild `self._scale` via `scale_of(ep_map[last.epoch])` (falling back to `linear_scale`), mirroring what `_commit_anchor` installs.
+
+**H2. Teardown during boot leaks an unkillable feed task + full ring (`session.py:389-402`, `session.py:656-668`, `session.py:1233-1248`).**
+`start()` awaits `_boot()` (which can take seconds — executor Parquet load, and with the default backfill seam a network fetch) and then unconditionally does `self.run_task = asyncio.create_task(self.run(), ...)` with no re-check of `self._closed`. During that await, `_evict_other_bands` (a different-band subscribe on the same symbol — the booting session has `client_count == 0` because `attach` happens only after `start()` returns) or a grace-timer `_teardown` can fire: `_teardown` proceeds (no clients, not closed), cancels the not-yet-existing `run_task` (no-op), closes the recorder, and calls `_on_teardown`, removing the key. The original subscriber then finishes boot and starts `run()` on a closed session — a zombie that consumes feed events forever, broadcasts to zero clients, and can never be torn down again (`_teardown` early-returns on `_closed`; the remover already ran). Each occurrence leaks a live feed connection plus a `ring_columns*2*rows*2`-byte ring (256 MiB crypto / 512 MiB equity) until process exit, and the subscriber itself gets `RuntimeError` from `attach` (`session.py:618-619`).
+Fix: after `await self._boot()`, bail if `self._closed` (return without creating the task, or return an already-failed task); optionally make `subscribe` tolerate the torn-down race by re-fetching the key.
+
+**H3. Full-ring rehydration is an O(ring) Python-row decode: tens of seconds, subscribe-blocking (`record.py:426-451`).**
+`load_tail` is called with `limit_cols=cfg.ring_columns` (32 768) and `max_age_ns = ring_columns * dt` (`session.py:519-525`) — i.e. after ~2.3 h of crypto uptime every recorded column is fresh. The loader then does `[self._column_from_row(row) for row in table.iter_rows(named=True)]` over `bid`/`ask` Polars `List(Float32)` columns: 32 768 × 2 × rows Python floats materialized one row at a time (~134 M values at 2048 rows, ~268 M at 4096). That is tens of seconds of pure Python conversion plus a ~1 GB transient (Arrow table + output f16 list), and it runs inside `subscribe` → `await self._boot()`, so the first attach hangs for the whole decode; a second subscriber waits on `_start_lock`. The event loop itself is spared (executor), but "restart the app" becomes a minute-long freeze on a fully-warmed recording.
+Fix: cap the rehydration depth (`limit_cols=min(ring_columns, SNAPSHOT_COLS)` — the client snapshot is 512 anyway), and/or convert list columns to numpy columnar per file (`to_numpy` on a fixed-size-list / exploded frame) instead of `iter_rows`.
+
+---
+
+### Medium
+
+**M1. `columns_from_candles` can hang the boot on one degenerate candle (`backfill.py:162-166`).**
+`band = [r for r in range(lo_r, hi_r + 1) if 0 <= r < rows]` iterates the full `hi_r - lo_r` span before filtering. `lo_r`/`hi_r` come from `row_of(cd.l/h)` with no clamp, so a single candle with an absurd high/low (mis-scaled venue, raw-unit quote, bad tick) yields millions–billions of iterations and an int list of the same order — the first-subscribe boot stalls indefinitely inside `_boot` while holding `_start_lock`. Fix: clamp first (`lo_r = max(lo_r, 0); hi_r = min(hi_r, rows - 1)` and skip when inverted) before building the range.
+
+**M2. A failed tail application still disables backfill (`session.py:423-426`).**
+`_boot` sets `tail_applied = True` unconditionally after `self._apply_tail(tail)` returns, but `_apply_tail` swallows a failed `preload` internally and cold-starts (`session.py:530-539`). Result: a corrupt/shape-changed recording produces a genuinely virgin ring, yet the candle backfill at `session.py:430-431` is skipped ("never on top of a rehydrated tail") — the session gets no history at all when both sources were available. This is safe to flip: preload validates everything before mutating, so a failed preload leaves the grid virgin (verified below).
+Fix: have `_apply_tail` return success and only then set `tail_applied`.
+
+**M3. A banded tail that spans the first anchor can never rehydrate — permanently, and silently (`grid.py:268-273`).**
+`expect_tm = next(iter(tail_multiples)) if self._banded and len(tail_multiples) == 1 else cfg.tick_multiple`. If the feed's first books carry no usable mid (one-sided/NaN), columns accumulate under epoch 0 with the nominal `tick_multiple` before the first band anchor freezes a different one; the recorded tail then contains two multiples, `len(tail_multiples) == 2`, `expect_tm` falls back to `cfg.tick_multiple`, and the epoch validation at `grid.py:274-285` rejects every epoch → `preload` raises → `_apply_tail` cold-starts on every future restart of that symbol. The recording is never usable again and nothing but an exception log says so. Fix: validate each epoch against the multiple of its own epoch group (or reject only *cross-column* inconsistency within one epoch), and/or tag recordings with "band anchored at seq N".
+
+**M4. `ClientTx` non-column drop-oldest is an O(queue) scan per offer once at cap (`session.py:221-227`).**
+Every non-column offer past `noncol_cap` (1000) walks the queue to find the first droppable frame. A tape flood (trades are non-column frames) to a slow client that is also draining at `max_bytes`-limited pace turns each offer into ~1000-entry scans — O(n²) on the hot path. Fix: keep a ring/index of non-column frame positions, or evict from a small dedicated deque whose members are pointers into the main queue.
+
+**M5. Retention never deletes epochs files, and every boot re-reads all of them (`record.py:44-56`, `record.py:573`, `record.py:458-470`).**
+`enforce_retention` skips `*-epochs-*` unconditionally, so epochs parts accumulate without bound across sessions/re-anchors; `load_tail` then globs and full-reads every epochs file on each restart ("Epochs files are read in full"). Slow, but unbounded disk growth plus a growing fixed boot cost. Fix: cap/compact epochs parts (e.g. rewrite a single consolidated epochs file per symbol on close), and only keep epochs still referenced by surviving columns.
+
+---
+
+### Low
+
+**L1. `_safe_component` collisions (`record.py:135`).** `"BTC/USDT"` and a literal `"BTC_USDT"` both map to `BTC_USDT` → two symbols share one recording directory; if grid shapes match, `load_tail` silently mixes their columns. Fix: percent-encode or hash the component instead of blanket replacement.
+
+**L2. Grace-timer teardown races `subscribe` → `attach` (`session.py:611-624`, `session.py:651-654`).** If the grace timer fires during a re-subscriber's `await session.start()`, `attach` raises `RuntimeError("session ... is torn down")` straight into the WS layer. Fix: catch-and-retry once in `subscribe` (the key is by then absent from `_sessions`, so the retry path creates a fresh session).
+
+**L3. `from_env` accepts junk numerics/booleans (`config.py:80-105`).** `int(...)`/`float(...)` raise opaque ValueErrors at boot for bad env values, `FLOWMAP_RING_COLUMNS=0` passes parsing and only explodes later at `Grid.__init__` via subscribe, and `recording_enabled` treats `"FALSE"`, `"0 "` etc. as enabled (`not in ("0", "false", "False")`). Fix: validate positivity of `ring_columns`/`max_rows`/`dt_*` and case-fold the boolean parse in `from_env`.
+
+**L4. Comment/behavior mismatch on duplicate candles (`backfill.py:124-125` vs `backfill.py:157-159`).** The comment says "Newest kept when two snap together"; the code keeps both and forces the newer one to `prev_t0 + dt`. Harmless at 1 m candles on a 250 ms/1 s grid, but the docstring is the contract future editors will trust.
+
+**L5. `_hardened_backfill` reaches into aiohttp internals (`backfill.py:399`).** `session._connector.close()` on the error path; a private API that can silently stop closing sessions across aiohttp upgrades. Fix: `await session.close()` in an outer `finally` keyed on a success flag instead of sync-poking the connector.
+
+**L6. `_equity_grid_for` ignores `BandSpec.rows` (`session.py:1159`).** The sim path honors `spec.rows` (`session.py:1125-1127`); equity hardcodes `min(_EQUITY_ROWS, max_rows)`. Currently coincidentally identical for `deep` (4096 == 4096), but a future band with `rows != 4096` diverges silently between markets.
+
+**L7. Partial-pair coalescing can transiently misorder bar/depth (`session.py:204-213`).** When a third frame for the same `t0` arrives, the oldest is deleted, leaving `(bar, depth)` order once before the next offer restores depth-first. Self-correcting at 20 Hz and client-side latest-wins, but the comment "FIFO eviction keeps replacements kind-paired" overstates the guarantee.
+
+**L8. Legacy (non-banded) re-anchor has no hysteresis (`grid.py:704-711`).** A mid oscillating across the `p0 + 0.15*span` boundary re-anchors (epoch bump + broadcast + record) on each crossing; the ratio trip that prevents this for bands (`BAND_TRIP_RATIO`) has no legacy counterpart. Re-anchors are cheap but an epoch storm pollutes `self._epoch_params`, the wire, and the never-pruned epochs files (see M5).
+
+**L9. Boot retry after a cancelled `_boot` re-opens the recorder (`session.py:396-398`).** The `_boot_done` flag correctly stays False on cancellation, but a retry runs `open_session` again while the first `SessionRecorder` is simply dropped. Benign today only because the discarded recorder's buffers are provably empty (nothing is recorded before boot completes) and it never flushed; a comment or an explicit `close()` on abandon would lock that invariant in.
+
+---
+
+### Verified non-issues
+
+- **`SessionManager.subscribe` session-creation race:** there is no `await` between `self._sessions.get(key)` (`session.py:1194`) and `self._sessions[key] = session` (`session.py:1220`), so two concurrent first subscribers cannot mint duplicate sessions under the asyncio loop.
+- **`on_book` gap-cap bookkeeping:** `self._count += new_idx - self._cur_idx` / `self._cur_idx = new_idx` (`grid.py:390-393`) preserves the col_seq↔interval lockstep; `new_idx > _cur_idx` is guaranteed by the `> rc + 1` guard; the ring is fully overwritten by the last rc columns so `history`/`oldest_retained_t0_ns` never read skipped seqs' slots; the arithmetic also stays correct for `count > ring_columns` after an oversized backfill `preload`.
+- **Boundary/idempotent duplicate re-return:** the `ts_eff < end` loop, zero-span tail accumulate, and the `_ring_t0[i] + dt == ts_ns` re-return condition (`grid.py:412-417`) match the documented contract, including a book landing exactly on an interval boundary.
+- **`_shift_rows` direction and overlap:** `new[r] = old[r + offset]` is correct for a p0 increase, and NumPy (≥1.13) buffers overlapping basic-slice self-assignment; `_commit_anchor`'s row-shift is exact whenever the step is frozen (both p0s snapped to the same grid), and the hybrid/banded *first* anchor correctly zeroes the accumulator (the hybrid path pre-assigns `self._p0`, making the shift guard false; the banded path's shift is degenerate only on an accumulator that is provably empty — the first anchor precedes any finalization because `_on_book` re-anchors after `on_book`, which anchors time without accumulating).
+- **Non-monotonic timestamps:** clamped to zero span (`grid.py:369`) without corrupting `_prev_ts`; state replacement still applied.
+- **UTC/epoch-ns math:** `_hour_key` uses `fromtimestamp(..., tz=timezone.utc)` (`record.py:130`); filename order == chronological order via fixed-width hour prefix + zero-padded part counter; backfill ms↔ns conversions (`backfill.py:441,451`) and `_INTERVAL_NS` spans are correct.
+- **`load_tail` dedup/epoch resolution:** newest-file-first frame order + `unique(subset="col_seq", keep="first")` genuinely prefers the newest recording; per-symbol part counters from `_scan_next_part` keep cross-restart epochs files sorted so last-read-wins epoch params are the newest; corrupt files are skipped without killing the cold-start path.
+- **Recording flush exception-safety:** tmp + `os.replace` per group, rows dropped from the buffer the moment their file lands, part counter burned on failure (`record.py:276-297`) — no duplicate `col_seq` on retry; a `replace` failure (e.g. Windows reader hold) re-buffers for a later part number.
+- **`preload` fails clean:** all validation (epoch coverage, params match, row counts, seq contiguity, t0 monotonicity) runs before any mutation (`grid.py:256-305`), so a rejected tail leaves the grid virgin.
+- **`ClientTx` accounting:** `_evict_lagged`'s prefix assumption holds (monotonic `enq_ns`); gap runs count depth+bar once per `t0`, exclude partials, and merge across offers; `_noncol` is incremented on offer, decremented on drain, untouched by lag eviction (only column frames are dropped there); `drain` always makes progress on oversized frames; protected snapshot frames are exempt from the cap and never counted toward it.
+- **Snapshot/history ordering:** no `await` between `_clients.add` and snapshot enqueue; Hello → per-epoch `EpochStart` (ascending) → column chunks → markers/tape/BBO order is correct, and the marker window `[cols[0].t0_ns, last+dt)` matches the emitted gap markers (`ts = end_ns - 1`).
+- **Recording isolation:** every recorder call and flush is wrapped and disables recording on failure instead of killing the feed loop; `CancelledError` is deliberately not swallowed in `_boot`/`_run_backfill`; backfill/replay gating (`sub.mode == "live"`) is correct.
+- **`canonical_band`:** unvalidated client band strings cannot mint sessions (`session.py:1070-1079`); `_evict_other_bands`' `other[:4]` slice comparison is correct for the 5-tuple key.
+- **`band_frame` guards:** non-finite/non-positive mid, span, and rows are rejected before `math.ceil` (`grid.py:120-126`), protecting the un-`try`-ed `maybe_reanchor` call path; the `BAND_TRIP_RATIO` asymmetric-band rationale checks out; the snapped-frame re-check loop bounds `tick_multiple`.
+- **`price_scale` ↔ `price_scale_np` agreement:** all four regions (core, low wing with `dn_rows > 0` and `== 0`, high wing with `up > 0` and `== 0`) plus the NaN-for-non-positive contract are branch-for-branch identical; `usable` gates both entry points; `make_hybrid` rejects degenerate frames before any state mutation.
+- **Backfill failure containment:** `default_backfill_fn` and both kline paths degrade to `[]`/cold start on any exception; `CancelledError` is re-raised (`session.py:457-458`); native→ccxt fallback only swallows the native leg.
+- **Memory bounds:** per-session ring sizes (256/512 MiB) and `max_sessions=4` are documented and enforced; `self._epoch_params` growth is bounded by re-anchor frequency (see L8 caveat); `_tape` (500) and `_markers` (1024) are capped deques.
