@@ -120,12 +120,20 @@ vec2 fetch0(int x, int y, int layer) {
   return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
 }
 
-// Bilinear sample of the resident density at a continuous (col, row). Turns the
-// blocky per-cell staircase into a continuous field when a cell covers several
-// device pixels — the difference between a sharp spreadsheet grid and a smooth
-// liquidity surface.
-vec2 bilinear0(float colf, float rowf, int layer) {
-  float xf = colf - 0.5;
+// Bilinear sample of the resident density at a CONTINUOUS ABSOLUTE column. The
+// absolute col_seq is folded into ring slot space (mod capacity, then layer +
+// tile-column) HERE, inside the sampler — the caller passes the same absolute
+// coordinate the view transform produces. Getting this wrong (fetching by
+// absolute column without the mod) silently reads the wrong texel for every
+// column beyond the first tile, which is exactly the "heatmap fades out after
+// 256 columns" failure mode. Turns the blocky per-cell staircase into a
+// continuous field when a cell covers several device pixels.
+vec2 bilinear0(float colf, float rowf) {
+  float slotF = mod(colf, float(u_capacityCols));
+  int layer = int(floor(slotF / float(u_colsPerTile)));
+  // Tile-column in [0, colsPerTile); the ±half-texel sample straddling a tile
+  // seam clamps into the tile (a 1-texel discontinuity every 256 columns).
+  float xf = mod(slotF, float(u_colsPerTile)) - 0.5;
   float yf = rowf - 0.5;
   int x0 = int(floor(xf));
   int y0 = int(floor(yf));
@@ -142,12 +150,17 @@ vec2 bilinear0(float colf, float rowf, int layer) {
 // (0.25 / 0.5 / 0.25). Per-interval book noise is exactly ONE column wide, so
 // the blur collapses the confetti while a wall — present in all three columns —
 // keeps its true magnitude. Row resolution is untouched: price structure stays
-// crisp, time gets the smoothing.
-vec2 sampleField0(float colf, float rowf, int layer) {
-  vec2 core = bilinear0(colf, rowf, layer);
-  vec2 left = bilinear0(colf - 1.0, rowf, layer);
-  vec2 right = bilinear0(colf + 1.0, rowf, layer);
-  return left * 0.25 + core * 0.5 + right * 0.25;
+// crisp, time gets the smoothing. Blur neighbours that fall outside the RESIDENT
+// window (the live edge's not-yet-written future column, the oldest edge) are
+// dropped and their weight folded into the core, so the newest column paints at
+// full weight instead of blending against an empty slot.
+vec2 sampleField0(float colf, float rowf) {
+  float wL = colf - 1.0 >= float(u_residentOldest) ? 0.25 : 0.0;
+  float wR = colf + 1.0 <= float(u_residentNewest) ? 0.25 : 0.0;
+  float wC = 1.0 - wL - wR;
+  return bilinear0(colf - 1.0, rowf) * wL
+       + bilinear0(colf, rowf) * wC
+       + bilinear0(colf + 1.0, rowf) * wR;
 }
 
 void main() {
@@ -174,7 +187,7 @@ void main() {
   vec2 acc;
   if (u_level == 0) {
     // Smooth continuous field (see sampleField0).
-    acc = sampleField0(colf, rowf, layer);
+    acc = sampleField0(colf, rowf);
   } else {
     // Zoomed out: exact SUM path over the coarse level (unchanged).
     acc = vec2(0.0);
