@@ -100,7 +100,7 @@ describe('normalizeSettings', () => {
     // returning users silently never see the new default ramp.
     expect(normalizeSettings({ colormap: 'thermal' }).colormap).toBe(DEFAULT_SETTINGS.colormap);
     expect(normalizeSettings({ colormap: 'alt' }).colormap).toBe(DEFAULT_SETTINGS.colormap);
-    expect(DEFAULT_SETTINGS.colormap).toBe('inferno');
+    expect(DEFAULT_SETTINGS.colormap).toBe('flow');
   });
 
   it('coerces the new tolerance / followPrice / priceBand fields', () => {

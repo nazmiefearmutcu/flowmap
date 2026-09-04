@@ -10,7 +10,7 @@
  */
 
 import { checkGLError, type GLContext } from './context';
-import { RAMP_INFERNO } from './lut';
+import { RAMP_FLOW } from './lut';
 import type { MipChain } from './mips';
 import { HEATMAP_FRAG, HEATMAP_VERT } from './shaders/heatmap';
 import { TileRing } from './tileRing';
@@ -29,7 +29,7 @@ export interface HeatmapEncoding {
   decodeScale: number;
   /** Normalization divisor (percentile) mapping intensity into ~[0,1]. */
   norm: number;
-  /** Colormap row: RAMP_INFERNO | RAMP_SYNTH | RAMP_CLASSIC. */
+  /** Colormap row: RAMP_FLOW | RAMP_INFERNO | RAMP_SYNTH | RAMP_CLASSIC. */
   ramp: number;
 }
 
@@ -208,7 +208,7 @@ export class Heatmap {
   /** SUM-mip chain (T7). null → the shader stays on the level-0 single-tap path. */
   mips: MipChain | null = null;
 
-  encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_INFERNO };
+  encoding: HeatmapEncoding = { decodeScale: 1, norm: 1, ramp: RAMP_FLOW };
 
   /**
    * Perceptual display gamma applied to the normalized intensity before the LUT

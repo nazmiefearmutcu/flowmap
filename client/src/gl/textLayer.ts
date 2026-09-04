@@ -33,6 +33,14 @@ export interface BadgeOpts extends TextOpts {
   bg?: string;
   /** Padding in CSS px around the text (default 3). */
   pad?: number;
+  /** Corner radius in CSS px (default 0 = square, the terminal look). */
+  radius?: number;
+}
+
+/** A device-independent point in CSS-px coordinates on this layer. */
+export interface Pt {
+  x: number;
+  y: number;
 }
 
 /** A thin 2D canvas layer; owns its `<canvas>` when created via {@link over}. */
@@ -123,12 +131,85 @@ export class TextLayer {
     let by = y - boxH / 2;
     if (baseline === 'top') by = y;
     else if (baseline === 'bottom') by = y - boxH;
-    ctx.fillStyle = opts.bg ?? 'rgba(5, 8, 12, 0.82)';
-    ctx.fillRect(bx, by, boxW, boxH);
+    const r = Math.min(opts.radius ?? 0, boxH / 2, boxW / 2);
+    if (r > 0) {
+      ctx.beginPath();
+      ctx.moveTo(bx + r, by);
+      ctx.arcTo(bx + boxW, by, bx + boxW, by + boxH, r);
+      ctx.arcTo(bx + boxW, by + boxH, bx, by + boxH, r);
+      ctx.arcTo(bx, by + boxH, bx, by, r);
+      ctx.arcTo(bx, by, bx + boxW, by, r);
+      ctx.closePath();
+      ctx.fillStyle = opts.bg ?? 'rgba(5, 8, 12, 0.82)';
+      ctx.fill();
+    } else {
+      ctx.fillStyle = opts.bg ?? 'rgba(5, 8, 12, 0.82)';
+      ctx.fillRect(bx, by, boxW, boxH);
+    }
     ctx.fillStyle = opts.color ?? 'rgba(230, 237, 243, 1)';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
     ctx.fillText(str, bx + pad, by + boxH / 2 + 0.5);
+  }
+
+  /**
+   * An anti-aliased polyline through CSS-px points (round joins/caps). This is
+   * how the price line gets its TradingView-smooth look: 2D-canvas stroking has
+   * real AA + join geometry, which the raw GL triangle batches cannot give.
+   */
+  polyline(pts: Pt[], opts: { width: number; color: string; alpha?: number } = { width: 1, color: '#fff' }): void {
+    if (pts.length < 2) return;
+    const ctx = this.ctx;
+    ctx.save();
+    if (opts.alpha !== undefined) ctx.globalAlpha = opts.alpha;
+    ctx.strokeStyle = opts.color;
+    ctx.lineWidth = opts.width;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /**
+   * Fill the region between a polyline and a horizontal baseline with a vertical
+   * gradient (top color under the line → bottom color, usually transparent).
+   * The subtle "area under the price" wash a trading chart expects.
+   */
+  fillUnder(pts: Pt[], yBase: number, colorTop: string, colorBottom: string): void {
+    if (pts.length < 2) return;
+    const ctx = this.ctx;
+    let yMin = pts[0].y;
+    for (const p of pts) yMin = Math.min(yMin, p.y);
+    if (yMin >= yBase) return;
+    ctx.save();
+    const grad = ctx.createLinearGradient(0, yMin, 0, yBase);
+    grad.addColorStop(0, colorTop);
+    grad.addColorStop(1, colorBottom);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, yBase);
+    for (const p of pts) ctx.lineTo(p.x, p.y);
+    ctx.lineTo(pts[pts.length - 1].x, yBase);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /** A dashed 1px line (the last-price level marker across the chart). */
+  dashedLine(x0: number, y0: number, x1: number, y1: number, color: string, dash: number[] = [4, 4], width = 1): void {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    ctx.restore();
   }
 
   /** A thin 1px CSS-px line (axis ticks / rules on the text layer). */

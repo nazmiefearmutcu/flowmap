@@ -122,13 +122,19 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
         y: cvdValueToY(p.cvd, bounds, cssH),
       }));
 
-      // Filled area between the line and the zero baseline.
+      // Filled area between the line and the zero baseline — a vertical fade
+      // (strongest at the line, gone at the baseline) so the pane reads as one
+      // polished series instead of a flat brown slab.
+      const yMin = xy.reduce((m, p) => Math.min(m, p.y), xy[0].y);
+      const grad = ctx.createLinearGradient(0, yMin, 0, zeroY);
+      grad.addColorStop(0, 'rgba(232, 176, 74, 0.26)');
+      grad.addColorStop(1, 'rgba(232, 176, 74, 0.02)');
       ctx.beginPath();
       ctx.moveTo(xy[0].x, zeroY);
       for (const p of xy) ctx.lineTo(p.x, p.y);
       ctx.lineTo(xy[xy.length - 1].x, zeroY);
       ctx.closePath();
-      ctx.fillStyle = 'rgba(232, 176, 74, 0.16)';
+      ctx.fillStyle = grad;
       ctx.fill();
 
       // The CVD line itself.
@@ -136,7 +142,9 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.moveTo(xy[0].x, xy[0].y);
       for (let i = 1; i < xy.length; i++) ctx.lineTo(xy[i].x, xy[i].y);
       ctx.strokeStyle = OVERLAY.cvd.css;
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = 1.8;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
       ctx.stroke();
 
       // Latest value marker + label on the right.

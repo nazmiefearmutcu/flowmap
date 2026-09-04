@@ -72,17 +72,25 @@ async function bootLive(page: Page): Promise<string[]> {
  * on its own with every arriving column until the ring holds a full screen. Any
  * "time zoom was untouched" assertion taken before that saturates would be
  * measuring the feed, not the gesture.
+ *
+ * Stability requires THREE equal reads spanning ~1 s: the eager history
+ * backfill lands in batches, and a two-read check can pass inside one
+ * inter-batch lull while a later batch is still queued — which would then
+ * widen colScale mid-test and fail a "colScale unchanged" assertion that has
+ * nothing to do with the gesture under test.
  */
 async function settleTimeFrame(page: Page): Promise<void> {
   await expect
     .poll(
       async () => {
         const a = (await view(page)).colScale;
-        await page.waitForTimeout(350);
+        await page.waitForTimeout(400);
         const b = (await view(page)).colScale;
-        return a === b;
+        await page.waitForTimeout(400);
+        const c = (await view(page)).colScale;
+        return a === b && b === c;
       },
-      { timeout: 60_000 },
+      { timeout: 90_000 },
     )
     .toBe(true);
 }
@@ -109,7 +117,11 @@ test('§9 price gutter scales price like TradingView, and never touches time', a
 
   // --- (b) a SECOND wheel is exactly cursor-anchored, and time is untouched ---
   // Measured now that priceFollow is 'track': the price frame is user-owned, so
-  // nothing but this gesture can move it between the two samples.
+  // nothing but this gesture can move it between the two samples. The TIME frame
+  // is re-settled first — a history-backfill batch arriving between the two
+  // reads widens colScale on its own and would fail the untouched assertion
+  // without this gesture having anything to do with it.
+  await settleTimeFrame(page);
   const before = await view(page);
   const anchorBefore = before.rowOffset + before.rowScale * 0.5;
   await page.mouse.wheel(0, -120);

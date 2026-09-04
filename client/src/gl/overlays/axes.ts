@@ -22,6 +22,7 @@ import {
   timeTickModel,
 } from './axisTicks';
 import type { GridMap } from './coords';
+import type { LastClose } from './priceLine';
 import { OVERLAY } from './palette';
 import type { TextLayer } from '../textLayer';
 
@@ -133,14 +134,36 @@ export function timeTickPositions(gm: GridMap, cssW: number): number[] {
   return out;
 }
 
-/** Draw the right-hand price axis into its gutter layer. */
-export function drawPriceAxis(layer: TextLayer, gm: GridMap): void {
+/**
+ * Draw the right-hand price axis into its gutter layer.
+ *
+ * `last` (the newest close, when the price overlay is on) is drawn as a
+ * near-white rounded pill pinned to the gutter edge at its price — the
+ * TradingView "last price tag": the one number on the axis that matters gets a
+ * plate, and it stays readable over any heatmap. Clamped into the gutter so a
+ * last price at the very edge of the visible band keeps its tag.
+ */
+export function drawPriceAxis(layer: TextLayer, gm: GridMap, last: LastClose | null = null): void {
   layer.clear();
+  const cssW = layer.width;
   const model = priceAxisModel(gm, layer.height);
   for (const t of model) {
     layer.line(0, t.pos, 4, t.pos, OVERLAY.axis.css, 1);
-    layer.text(7, t.pos, t.label, { baseline: 'middle', color: OVERLAY.axis.css, size: 10 });
+    layer.text(cssW - 6, t.pos, t.label, { align: 'right', baseline: 'middle', color: OVERLAY.axis.css, size: 10 });
   }
+  if (last === null || gm.price === null) return;
+  const step = localStep(gm) || gm.price.step;
+  const dec = priceDecimals(step > 0 ? step : gm.price.step);
+  const y = gm.cssY(gm.priceToRow(last.price));
+  if (y < -8 || y > layer.height + 8) return;
+  layer.badge(cssW - 3, Math.min(Math.max(y, 9), layer.height - 9), last.price.toFixed(dec), {
+    align: 'right',
+    bg: OVERLAY.pricePill.css,
+    color: OVERLAY.pricePillText.css,
+    size: 10,
+    weight: 600,
+    radius: 3,
+  });
 }
 
 /** Draw the bottom time axis into its gutter layer. */

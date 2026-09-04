@@ -1,14 +1,16 @@
 /**
  * Heatmap colormaps (§8.3 / §9).
  *
- * Three ramps live side by side in one 256×3 RGBA8 atlas texture so the fragment
+ * Four ramps live side by side in one 256×4 RGBA8 atlas texture so the fragment
  * shader can select a ramp with a single uniform and a single texture bind:
- *   - row 0 (RAMP_INFERNO): the DEFAULT density ramp — near-black → indigo →
- *     violet → magenta → RED → orange → saturated gold as density rises.
+ *   - row 0 (RAMP_INFERNO): density ramp — near-black → indigo → violet →
+ *     magenta → RED → orange → saturated gold as density rises.
  *   - row 1 (RAMP_SYNTH): a distinct single-hue amber ramp for SYNTHETIC equity
  *     depth, so fabricated density reads as visually different from real L2.
  *   - row 2 (RAMP_CLASSIC): the legacy thermal ramp (blue → cyan → yellow →
  *     saturated yellow-gold), kept as a user-selectable option.
+ *   - row 3 (RAMP_FLOW): the DEFAULT — a restrained "deep water" ramp (near-black
+ *     slate → dark navy → deep teal → sage → sand → bright gold). See FLOW_STOPS.
  *
  * **Why the default changed.** The classic thermal ramp crosses half its
  * luminance range by LUT index 96 and spent its top third in bright
@@ -48,18 +50,19 @@ export const LUT_SIZE = 256;
 export const RAMP_INFERNO = 0;
 export const RAMP_SYNTH = 1;
 export const RAMP_CLASSIC = 2;
+export const RAMP_FLOW = 3;
 
 /**
  * Row 0 is "whatever REAL depth renders as" — a contract the e2e parity matrix
  * asserts numerically. RAMP_SYNTH is pinned at row 1 for the same reason. New
  * ramps therefore append at row 2 and above; they never renumber these two.
  */
-export const LUT_ROWS = 3;
+export const LUT_ROWS = 4;
 
 /** The colormap families a user can choose between (the §9 Settings knob). */
-export type Colormap = 'inferno' | 'classic';
+export type Colormap = 'flow' | 'inferno' | 'classic';
 
-export const DEFAULT_COLORMAP: Colormap = 'inferno';
+export const DEFAULT_COLORMAP: Colormap = 'flow';
 
 /**
  * Highest LUT index at which a PIXEL probe can still prove the §7 synthetic-
@@ -125,17 +128,46 @@ const SYNTH_STOPS: Stop[] = [
   { t: 1.0, rgb: [255, 240, 200] },
 ];
 
+// Flow (the DEFAULT ramp): a restrained "deep water" thermal — near-black slate
+// → dark navy → deep teal → sage → sand → bright gold. Designed against the two
+// failure modes that made the old default read as "colour soup":
+//   1. The field stays DARK and DESATURATED through its lower half — the median
+//      resting cell (a few % of the p97 white point, gamma-lifted into the
+//      mid-ramp) lands in quiet slate/teal instead of inferno's loud
+//      violet/magenta, so the ladder no longer screams at baseline.
+//   2. Warmth is EARNED: hue only turns warm in the top ~28% of the ramp, so a
+//      sand/gold pixel is unambiguous density signal, not ambient noise.
+// Rec.601 luma at the stops: 8.3 → 26.1 → 44.5 → 63.9 → 86.9 → 126.9 → 170.6 →
+// 209.6 — strictly increasing, so the rasterized ramp is luminance-monotone.
+// The endpoint is bright gold (blue-starved, luma > 200, never white), so the
+// e2e "wall is bright gold, distinct from the white price line" contract still
+// holds, and the low half stays COOL (B ≥ G up to index ≈147) keeping the §7
+// cool-pixel probe sound exactly like inferno's band did.
+const FLOW_STOPS: Stop[] = [
+  { t: 0.0, rgb: [5, 8, 14] },
+  { t: 0.14, rgb: [17, 27, 43] },
+  { t: 0.3, rgb: [25, 48, 68] },
+  { t: 0.46, rgb: [26, 74, 88] },
+  { t: 0.6, rgb: [43, 104, 101] },
+  { t: 0.72, rgb: [112, 138, 104] },
+  { t: 0.85, rgb: [210, 172, 82] },
+  { t: 1.0, rgb: [255, 216, 104] },
+];
+
 /** Atlas row → stop list. The single source of truth for both the GPU texture
  *  and the HTML legend gradient, so they can never drift apart. */
 const RAMP_STOPS: Record<number, Stop[]> = {
   [RAMP_INFERNO]: INFERNO_STOPS,
   [RAMP_SYNTH]: SYNTH_STOPS,
   [RAMP_CLASSIC]: CLASSIC_STOPS,
+  [RAMP_FLOW]: FLOW_STOPS,
 };
 
 /** Atlas row for a user colormap choice (real depth only — see rampForMode). */
 export function rampForColormap(colormap: Colormap): number {
-  return colormap === 'classic' ? RAMP_CLASSIC : RAMP_INFERNO;
+  if (colormap === 'classic') return RAMP_CLASSIC;
+  if (colormap === 'flow') return RAMP_FLOW;
+  return RAMP_INFERNO;
 }
 
 /**
@@ -211,6 +243,10 @@ export function buildSynthLUT(): Uint8Array {
   return buildRamp(SYNTH_STOPS);
 }
 
+export function buildFlowLUT(): Uint8Array {
+  return buildRamp(FLOW_STOPS);
+}
+
 /**
  * A CSS `linear-gradient` colour-stop list for an atlas row, low → high.
  *
@@ -237,6 +273,7 @@ export function buildLUTAtlas(): Uint8Array {
   atlas.set(buildInfernoLUT(), RAMP_INFERNO * LUT_SIZE * 4);
   atlas.set(buildSynthLUT(), RAMP_SYNTH * LUT_SIZE * 4);
   atlas.set(buildClassicLUT(), RAMP_CLASSIC * LUT_SIZE * 4);
+  atlas.set(buildFlowLUT(), RAMP_FLOW * LUT_SIZE * 4);
   return atlas;
 }
 

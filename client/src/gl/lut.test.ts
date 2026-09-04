@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildClassicLUT,
+  buildFlowLUT,
   buildInfernoLUT,
   buildLUTAtlas,
   buildSynthLUT,
@@ -13,6 +14,7 @@ import {
   rampForMode,
   RAMP_CLASSIC,
   SYNTH_HUE_SAFE_MAX,
+  RAMP_FLOW,
   RAMP_INFERNO,
   RAMP_SYNTH,
 } from './lut';
@@ -139,6 +141,71 @@ describe('inferno LUT (the default ramp)', () => {
   });
 });
 
+describe('flow LUT (the default ramp)', () => {
+  const lut = buildFlowLUT();
+
+  it('is a 256×1 RGBA8 buffer with opaque alpha', () => {
+    expect(lut.length).toBe(LUT_SIZE * 4);
+    for (let i = 0; i < LUT_SIZE; i++) {
+      expect(lut[i * 4 + 3]).toBe(255);
+    }
+  });
+
+  it('starts near-black and ends in bright gold (never white)', () => {
+    expect(luma(lut, 0)).toBeLessThan(10);
+    expect(luma(lut, LUT_SIZE - 1)).toBeGreaterThan(200);
+    // Gold endpoint: red-dominant, blue-starved — a max-density wall must not
+    // merge into the white price line overlay (same contract as inferno's, and
+    // the same numbers the e2e wall-pixel probe asserts).
+    const [r, g, b] = rgb(lut, LUT_SIZE - 1);
+    expect(r).toBeGreaterThan(200);
+    expect(g).toBeGreaterThan(150);
+    expect(b).toBeLessThan(150);
+    expect(b).toBeLessThan(g);
+  });
+
+  it('brightens monotonically', () => {
+    expectMonotone(lut);
+  });
+
+  it('keeps the field DARK and quiet through the lower half — the anti-soup contract', () => {
+    // The median active cell (a few % of the p97 white point, gamma-lifted)
+    // lands around the lower third of the ramp. That zone must stay dim and
+    // desaturated: the baseline field may not shout.
+    expect(luma(lut, 96)).toBeLessThan(58);
+    // Still cool (B over G) there — no magenta/violet heat.
+    expect(lut[96 * 4 + 2]).toBeGreaterThan(lut[96 * 4 + 1]);
+  });
+
+  it('earns its warmth: hue turns warm only in the top of the ramp', () => {
+    // Just below the crossover the pixel is still green-dominant-over-red.
+    expect(lut[178 * 4 + 1]).toBeGreaterThan(lut[178 * 4]);
+    // At the sand stop it is unmistakably warm: red over green over blue.
+    const [r, g, b] = rgb(lut, 224);
+    expect(r).toBeGreaterThan(200);
+    expect(g).toBeGreaterThan(170);
+    expect(b).toBeLessThan(100);
+  });
+
+  it('stays cool (blue-dominant) at the low end', () => {
+    const i = 48;
+    expect(lut[i * 4 + 2]).toBeGreaterThan(lut[i * 4 + 0]);
+  });
+
+  it('keeps a cool probe band for the §7 synthetic-depth pixel check', () => {
+    // Same soundness requirement as inferno's SYNTH_HUE_SAFE_MAX band: where
+    // most of the screen lives, flow is COOL (B ≥ G), while the synth ramp is
+    // WARM everywhere — so a cool pixel discriminates real depth from synthetic.
+    for (let i = 0; i <= 146; i++) {
+      expect(lut[i * 4 + 2], `flow[${i}] must stay cool (B ≥ G)`).toBeGreaterThanOrEqual(
+        lut[i * 4 + 1],
+      );
+    }
+    const [, g, b] = rgb(lut, 152);
+    expect(g).toBeGreaterThan(b);
+  });
+});
+
 describe('classic LUT (the legacy thermal ramp)', () => {
   const lut = buildClassicLUT();
 
@@ -202,13 +269,15 @@ describe('synth (amber) LUT', () => {
 });
 
 describe('rampForColormap (§9 user choice)', () => {
-  it('maps the two families to their atlas rows', () => {
+  it('maps the three families to their atlas rows', () => {
+    expect(rampForColormap('flow')).toBe(RAMP_FLOW);
     expect(rampForColormap('inferno')).toBe(RAMP_INFERNO);
     expect(rampForColormap('classic')).toBe(RAMP_CLASSIC);
   });
 
-  it('defaults to inferno', () => {
-    expect(rampForColormap(DEFAULT_COLORMAP)).toBe(RAMP_INFERNO);
+  it('defaults to flow', () => {
+    expect(rampForColormap(DEFAULT_COLORMAP)).toBe(RAMP_FLOW);
+    expect(DEFAULT_COLORMAP).toBe('flow');
   });
 });
 
@@ -217,14 +286,15 @@ describe('rampForMode (§7 mode → colormap)', () => {
     expect(rampForMode(MODE_SYNTH_PROFILE)).toBe(RAMP_SYNTH);
   });
 
-  it('maps real L2 / L1 depth to the default (inferno) ramp', () => {
-    expect(rampForMode(MODE_L2)).toBe(RAMP_INFERNO);
-    expect(rampForMode(MODE_L1_BAND)).toBe(RAMP_INFERNO);
+  it('maps real L2 / L1 depth to the default (flow) ramp', () => {
+    expect(rampForMode(MODE_L2)).toBe(RAMP_FLOW);
+    expect(rampForMode(MODE_L1_BAND)).toBe(RAMP_FLOW);
   });
 
   it('honours the user colormap for REAL depth', () => {
     expect(rampForMode(MODE_L2, 'L2', 'classic')).toBe(RAMP_CLASSIC);
     expect(rampForMode(MODE_L2, 'L2', 'inferno')).toBe(RAMP_INFERNO);
+    expect(rampForMode(MODE_L2, 'L2', 'flow')).toBe(RAMP_FLOW);
   });
 
   it('colours SYNTHETIC depth amber by its capability tier, not the render mode', () => {
@@ -234,35 +304,37 @@ describe('rampForMode (§7 mode → colormap)', () => {
     expect(rampForMode(MODE_L1_BAND, 'SYNTH')).toBe(RAMP_SYNTH);
     expect(rampForMode(MODE_L1_BAND, 'SYNTH_PROFILE')).toBe(RAMP_SYNTH);
     // Real depth keeps a real-depth ramp.
-    expect(rampForMode(MODE_L1_BAND, 'L1')).toBe(RAMP_INFERNO);
-    expect(rampForMode(MODE_L2, 'L2')).toBe(RAMP_INFERNO);
+    expect(rampForMode(MODE_L1_BAND, 'L1')).toBe(RAMP_FLOW);
+    expect(rampForMode(MODE_L2, 'L2')).toBe(RAMP_FLOW);
   });
 
   it('NO colormap choice can dress synthetic depth as real depth', () => {
-    for (const cm of ['inferno', 'classic'] as const) {
+    for (const cm of ['flow', 'inferno', 'classic'] as const) {
       expect(rampForMode(MODE_L1_BAND, 'SYNTH', cm)).toBe(RAMP_SYNTH);
       expect(rampForMode(MODE_SYNTH_PROFILE, undefined, cm)).toBe(RAMP_SYNTH);
     }
   });
 
   it('defaults an unknown mode to a real-depth ramp (never fabricates synth)', () => {
-    expect(rampForMode(99)).toBe(RAMP_INFERNO);
-    expect(rampForMode(99, 'L2')).toBe(RAMP_INFERNO);
+    expect(rampForMode(99)).toBe(RAMP_FLOW);
+    expect(rampForMode(99, 'L2')).toBe(RAMP_FLOW);
   });
 });
 
 describe('LUT atlas', () => {
-  it('stacks inferno (row 0), synth (row 1), classic (row 2) as 256×3 RGBA8', () => {
+  it('stacks inferno/synth/classic/flow as 256×4 RGBA8', () => {
     const atlas = buildLUTAtlas();
     expect(atlas.length).toBe(LUT_SIZE * LUT_ROWS * 4);
     expect(atlas.slice(0, LUT_SIZE * 4)).toEqual(buildInfernoLUT());
     expect(atlas.slice(LUT_SIZE * 4, LUT_SIZE * 8)).toEqual(buildSynthLUT());
     expect(atlas.slice(LUT_SIZE * 8, LUT_SIZE * 12)).toEqual(buildClassicLUT());
+    expect(atlas.slice(LUT_SIZE * 12, LUT_SIZE * 16)).toEqual(buildFlowLUT());
   });
 
   it('pins the row indices the e2e parity matrix asserts numerically', () => {
-    expect(RAMP_INFERNO).toBe(0); // "whatever real depth renders as"
+    expect(RAMP_INFERNO).toBe(0); // "whatever real depth renders as" (legacy)
     expect(RAMP_SYNTH).toBe(1); // the §7 honesty row
+    expect(RAMP_FLOW).toBe(3); // the default real-depth row
   });
 });
 

@@ -32,6 +32,16 @@ export const OVERLAY = {
   price: { gl: rgba(245, 248, 252, 0.98), css: css(245, 248, 252) },
   /** Soft glow drawn under the price line to fatten it without hard edges. */
   priceGlow: { gl: rgba(245, 248, 252, 0.22), css: css(245, 248, 252, 0.22) },
+  /** Area wash under the price line (text-layer gradient, top → bottom). Kept
+   *  very faint: the density field is the protagonist, the wash only seats the
+   *  line visually. */
+  priceFillTop: { gl: rgba(245, 248, 252, 0.07), css: css(210, 225, 245, 0.07) },
+  priceFillBottom: { gl: rgba(245, 248, 252, 0.0), css: css(210, 225, 245, 0) },
+  /** Dashed last-price level marker (quieter than the line itself). */
+  priceLevel: { gl: rgba(245, 248, 252, 0.38), css: css(245, 248, 252, 0.38) },
+  /** Price-axis pill: near-white plate, near-black text (the axis "last" tag). */
+  pricePill: { gl: rgba(245, 248, 252, 0.95), css: css(245, 248, 252, 0.95) },
+  pricePillText: { gl: rgba(10, 14, 20, 1), css: css(10, 14, 20) },
   /** Session VWAP polyline — distinct violet so it reads apart from buy/sell. */
   vwap: { gl: rgba(196, 142, 255, 0.95), css: css(196, 142, 255) },
   /** CVD (cumulative volume delta) line in the lower pane. Amber-gold. */

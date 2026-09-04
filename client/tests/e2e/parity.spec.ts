@@ -19,7 +19,7 @@ import { expect, test, type Page } from '@playwright/test';
  * injected data). Per §7:
  *
  *   feature      crypto (L2/tick)            equity keyless (SYNTH/poll)
- *   heatmap      RAMP_INFERNO                RAMP_SYNTH (amber) — ramps DIFFER
+ *   heatmap      RAMP_FLOW (default)         RAMP_SYNTH (amber) — ramps DIFFER
  *   DOM ladder   full bid/ask book, L2      SYNTH profile, SYNTH badge, no bid/ask
  *   tape         TAPE TICK                  TAPE POLL
  *   CVD / side   SIDE EXCHANGE (real)       SIDE NA (keyless)
@@ -53,6 +53,7 @@ const SIDE_UNKNOWN = 2;
 const SIDE_SRC_EXCHANGE = 0;
 const SIDE_SRC_NA = 2;
 const RAMP_INFERNO = 0;
+const RAMP_FLOW = 3;
 const RAMP_SYNTH = 1;
 
 const TAGS = {
@@ -390,7 +391,7 @@ async function assertCrosshairAndReplay(page: Page): Promise<void> {
 /** Assert the crypto column of the §7 table (full-fidelity L2/tick). */
 async function assertCryptoCells(page: Page, cap: Captured): Promise<void> {
   // heatmap: thermal ramp.
-  expect(cap.ramp, 'crypto heatmap is RAMP_INFERNO').toBe(RAMP_INFERNO);
+  expect(cap.ramp, 'crypto heatmap is RAMP_FLOW (the default real-depth ramp)').toBe(RAMP_FLOW);
 
   // Wait for the throttled (~10 Hz) bookStore flush to paint the L2 ladder.
   await page.waitForFunction(() => !!document.querySelector('[data-testid="ladder-row"]'), undefined, {
@@ -543,7 +544,7 @@ test('§7 parity — both markets through ONE renderer: ramps differ + matrix', 
   );
 
   // The headline honest-parity claim: the SAME renderer paints DIFFERENT ramps.
-  expect(crypto.ramp, 'crypto → inferno (real depth)').toBe(RAMP_INFERNO);
+  expect(crypto.ramp, 'crypto → flow (real depth)').toBe(RAMP_FLOW);
   expect(equity.ramp, 'equity → SYNTH amber').toBe(RAMP_SYNTH);
   expect(crypto.ramp, 'ramps differ across markets').not.toBe(equity.ramp);
 

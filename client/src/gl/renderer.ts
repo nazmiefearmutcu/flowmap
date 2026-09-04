@@ -43,7 +43,7 @@ import {
   TOLERANCE_MAX_FLOOR,
   type HeatmapView,
 } from './heatmap';
-import { createLUTTexture, rampForMode, RAMP_INFERNO, type Colormap } from './lut';
+import { createLUTTexture, rampForMode, RAMP_FLOW, type Colormap } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import {
@@ -262,7 +262,7 @@ export class Renderer {
   /** Fixed per-instrument decode scale (capability-driven; 1 for the sim). */
   private decodeScale = 1;
   /** Current colormap row (inferno / synth / classic), from mode + user choice. */
-  private ramp = RAMP_INFERNO;
+  private ramp = RAMP_FLOW;
   /** The user's colormap family. Remembered here, like {@link contrastGamma},
    *  so it survives Heatmap re-creation on session reset / context restore. */
   private colormap: Colormap = 'inferno';
@@ -402,7 +402,7 @@ export class Renderer {
   }
 
   /**
-   * Active colormap row (RAMP_INFERNO 0 / RAMP_SYNTH 1) — the heatmap encoding's
+   * Active colormap row (RAMP_INFERNO 0 / RAMP_FLOW 3 / RAMP_SYNTH 1) — the heatmap encoding's
    * ramp when a heatmap exists, else the mode selected by the last column.
    * Diagnostics / e2e (asserts a SYNTH_PROFILE session renders the amber ramp).
    */
@@ -690,7 +690,7 @@ export class Renderer {
     this.overlays.reset();
     this.normSeeded = false;
     this.decodeScale = 1;
-    this.ramp = RAMP_INFERNO;
+    this.ramp = RAMP_FLOW;
     this.lastColMode = null;
     this.overlayIngestWarned = false;
 
@@ -1804,7 +1804,7 @@ export class Renderer {
       this.extentSeq[slot] = s;
     }
     this.newestSeq = n - 1;
-    heatmap.encoding = { decodeScale: 1, norm: 150, ramp: RAMP_INFERNO };
+    heatmap.encoding = { decodeScale: 1, norm: 150, ramp: RAMP_FLOW };
     this.camera.reset(ring.residentRange(), rows);
     this.updateView();
     this.dirty = true;
@@ -1879,7 +1879,7 @@ export class Renderer {
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
-    this.ramp = RAMP_INFERNO;
+    this.ramp = RAMP_FLOW;
     this.camera.setLimits(limitsFor(rows, cap));
 
     for (let s = 0; s < total; s++) {
@@ -2070,7 +2070,7 @@ export class Renderer {
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
     this.decodeScale = 1;
-    this.ramp = RAMP_INFERNO;
+    this.ramp = RAMP_FLOW;
     this.camera.setLimits(limitsFor(rows, cap));
 
     for (let s = 0; s < total; s++) {
@@ -2099,7 +2099,7 @@ export class Renderer {
       this.writeColumn(col, rows);
     }
     this.newestSeq = total - 1;
-    this.heatmap.encoding = { decodeScale: 1, norm: 30, ramp: RAMP_INFERNO };
+    this.heatmap.encoding = { decodeScale: 1, norm: 30, ramp: RAMP_FLOW };
 
     // Frame the recent ~200 columns and a price band around the mid.
     const colScale = 200;

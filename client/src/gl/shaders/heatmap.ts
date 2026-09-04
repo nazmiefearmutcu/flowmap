@@ -39,7 +39,8 @@ uniform highp sampler2DArray u_tiles;
 // caller binds u_tiles here too (they are never sampled while u_level == 0).
 uniform highp sampler2DArray u_mip1; // level 1: colsPerTile/4 x rows/4
 uniform highp sampler2DArray u_mip2; // level 2: colsPerTile/16 x rows/16
-// Colormap atlas: 256x2 RGBA8, row 0 thermal, row 1 synth.
+// Colormap atlas: 256x4 RGBA8 — row 0 inferno, row 1 synth amber, row 2 classic
+// thermal, row 3 flow (the default).
 uniform sampler2D u_lut;
 
 // View transform (screen uv -> absolute column/row). Driven by T6; identity-ish
@@ -111,6 +112,44 @@ vec2 fetchLevel(int x, int y, int layer) {
   return texelFetch(u_mip2, ivec3(x, y, layer), 0).rg;
 }
 
+// Clamped level-0 texel fetch (bid, ask) — clamping only affects the half-texel
+// frame around the resident field, where the alternative is a hard edge.
+vec2 fetch0(int x, int y, int layer) {
+  x = clamp(x, 0, u_colsPerTile - 1);
+  y = clamp(y, 0, u_rows - 1);
+  return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
+}
+
+// Bilinear sample of the resident density at a continuous (col, row). Turns the
+// blocky per-cell staircase into a continuous field when a cell covers several
+// device pixels — the difference between a sharp spreadsheet grid and a smooth
+// liquidity surface.
+vec2 bilinear0(float colf, float rowf, int layer) {
+  float xf = colf - 0.5;
+  float yf = rowf - 0.5;
+  int x0 = int(floor(xf));
+  int y0 = int(floor(yf));
+  float fx = xf - float(x0);
+  float fy = yf - float(y0);
+  vec2 a = fetch0(x0, y0, layer);
+  vec2 b = fetch0(x0 + 1, y0, layer);
+  vec2 c = fetch0(x0, y0 + 1, layer);
+  vec2 d = fetch0(x0 + 1, y0 + 1, layer);
+  return mix(mix(a, b, fx), mix(c, d, fx), fy);
+}
+
+// The level-0 field sample: bilinear + a light 1-texel column blur
+// (0.25 / 0.5 / 0.25). Per-interval book noise is exactly ONE column wide, so
+// the blur collapses the confetti while a wall — present in all three columns —
+// keeps its true magnitude. Row resolution is untouched: price structure stays
+// crisp, time gets the smoothing.
+vec2 sampleField0(float colf, float rowf, int layer) {
+  vec2 core = bilinear0(colf, rowf, layer);
+  vec2 left = bilinear0(colf - 1.0, rowf, layer);
+  vec2 right = bilinear0(colf + 1.0, rowf, layer);
+  return left * 0.25 + core * 0.5 + right * 0.25;
+}
+
 void main() {
   float colf = u_colOffset + u_colScale * v_uv.x;
   float rowf = u_rowOffset + u_rowScale * v_uv.y;
@@ -132,12 +171,19 @@ void main() {
   // Center the finer-level taps on the pixel's row footprint.
   int y0 = (row / blk) - (u_nRowTaps / 2);
 
-  vec2 acc = vec2(0.0);
-  for (int t = 0; t < 4; t++) {
-    if (t >= u_nRowTaps) break;
-    int y = y0 + t;
-    if (y < 0 || y >= rowsL) continue;
-    acc += fetchLevel(xL, y, layer);
+  vec2 acc;
+  if (u_level == 0) {
+    // Smooth continuous field (see sampleField0).
+    acc = sampleField0(colf, rowf, layer);
+  } else {
+    // Zoomed out: exact SUM path over the coarse level (unchanged).
+    acc = vec2(0.0);
+    for (int t = 0; t < 4; t++) {
+      if (t >= u_nRowTaps) break;
+      int y = y0 + t;
+      if (y < 0 || y >= rowsL) continue;
+      acc += fetchLevel(xL, y, layer);
+    }
   }
 
   // Price rows are SUMMED across the block + taps (a 500-lot wall stays ~500 when

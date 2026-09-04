@@ -182,7 +182,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
           <div className="setting">
             <span className="setting__label">Colormap</span>
             <div className="segrow" role="group" aria-label="colormap" data-testid="setting-colormap">
-              {(['inferno', 'classic'] as Colormap[]).map((c) => (
+              {(['flow', 'inferno', 'classic'] as Colormap[]).map((c) => (
                 <button
                   type="button"
                   key={c}
@@ -191,13 +191,14 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`colormap-${c}`}
                   onClick={() => onChange({ colormap: c })}
                 >
-                  {c === 'inferno' ? 'Inferno' : 'Classic'}
+                  {c === 'flow' ? 'Flow' : c === 'inferno' ? 'Inferno' : 'Classic'}
                 </button>
               ))}
             </div>
             <span className="setting__hint">
-              Inferno separates size by hue (indigo → red → gold); Classic is the
-              legacy blue→cyan→yellow ramp. Synthetic depth always stays amber.
+              Flow keeps the field dark and lets walls earn warm gold; Inferno
+              separates size by hue (indigo → red → gold); Classic is the legacy
+              blue→cyan→yellow ramp. Synthetic depth always stays amber.
             </span>
           </div>
 

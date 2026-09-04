@@ -155,10 +155,13 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
   return {
     contrast: Math.round(clampNumber(o.contrast, 0, 100, DEFAULT_SETTINGS.contrast)),
     tolerance: Math.round(clampNumber(o.tolerance, 0, 100, DEFAULT_SETTINGS.tolerance)),
-    // Only 'classic' is honoured; every other stored value (including the legacy
-    // 'thermal' / 'alt' from the never-applied knob) adopts the default. See the
-    // migration note in the module docblock.
-    colormap: o.colormap === 'classic' ? 'classic' : DEFAULT_COLORMAP,
+    // 'classic', 'inferno' and 'flow' are honoured; every other stored value
+    // (including the legacy 'thermal' / 'alt' from the never-applied knob)
+    // adopts the default. See the migration note in the module docblock.
+    colormap:
+      o.colormap === 'classic' || o.colormap === 'inferno' || o.colormap === 'flow'
+        ? o.colormap
+        : DEFAULT_COLORMAP,
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
     tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 32, DEFAULT_SETTINGS.tickGrouping)),
     bubbleMinSize: clampNumber(o.bubbleMinSize, 0, 1e9, DEFAULT_SETTINGS.bubbleMinSize),

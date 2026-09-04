@@ -15,27 +15,45 @@
  * resident window as the heatmap, so it persists exactly as far back as the
  * depth history and never truncates independently.
  *
- * It is drawn prominently: a soft translucent glow underneath a thick bright
- * core, so it stays legible over the busiest heatmap without hiding it.
+ * It draws on the 2D text layer (NOT the GL batches): canvas stroking gives
+ * anti-aliased joins and a gradient wash that raw GL triangles cannot, which is
+ * the difference between a chart-grade line and a jagged one. Three passes — a
+ * soft area wash under the line, a wide translucent glow, then the bright core.
+ * It also paints the dashed last-price level marker across the chart (the
+ * TradingView signature) and exposes {@link last} so the price axis can draw
+ * the matching right-edge price pill.
  */
 
 import type { OverlayFrame } from './frame';
 import { OVERLAY } from './palette';
 import type { BarColumn } from '../../proto/types';
 import { visibleColRange } from './coords';
+import type { Pt } from '../textLayer';
 
 /** CSS-px width of the bright price-line core. */
-export const PRICE_LINE_WIDTH = 2.8;
+export const PRICE_LINE_WIDTH = 1.8;
 /** CSS-px width of the translucent glow drawn underneath the core. */
-export const PRICE_GLOW_WIDTH = 6.5;
+export const PRICE_GLOW_WIDTH = 5.5;
+
+/** The most recent close: the column with the highest col_seq ever added. */
+export interface LastClose {
+  col: number;
+  price: number;
+}
 
 export class PriceLine {
   /** Absolute col_seq → close price. */
   private readonly closes = new Map<number, number>();
+  /** Newest close (highest col_seq seen) — O(1) maintenance, O(1) read. */
+  private lastClose: LastClose | null = null;
 
   /** Record / refresh a column's close price at its absolute col_seq. */
   add(bar: BarColumn): void {
-    if (Number.isFinite(bar.c)) this.closes.set(bar.col_seq, bar.c);
+    if (!Number.isFinite(bar.c)) return;
+    this.closes.set(bar.col_seq, bar.c);
+    if (this.lastClose === null || bar.col_seq >= this.lastClose.col) {
+      this.lastClose = { col: bar.col_seq, price: bar.c };
+    }
   }
 
   get size(): number {
@@ -53,6 +71,12 @@ export class PriceLine {
 
   reset(): void {
     this.closes.clear();
+    this.lastClose = null;
+  }
+
+  /** The newest close (for the price-axis pill), or null with no data. */
+  last(): LastClose | null {
+    return this.lastClose;
   }
 
   /** Close price at a column (for tests / readouts), or NaN. */
@@ -62,40 +86,51 @@ export class PriceLine {
   }
 
   draw(frame: OverlayFrame): void {
-    const { gm, solid } = frame;
+    const { gm, text } = frame;
     if (!gm.hasEvents || this.closes.size === 0) return;
     const range = visibleColRange(gm.view, frame.resident);
     if (range === null) return;
 
     // One vertex per visible column, in ascending column order.
-    const pts: Array<{ x: number; y: number }> = [];
+    const pts: Pt[] = [];
     for (let c = range.lo; c <= range.hi; c++) {
       const close = this.closes.get(c);
       if (close === undefined || !Number.isFinite(close)) continue;
-      pts.push({ x: gm.clipX(c + 0.5), y: gm.clipY(gm.priceToRow(close)) });
+      pts.push({ x: gm.cssX(c + 0.5), y: gm.cssY(gm.priceToRow(close)) });
     }
     if (pts.length === 0) return;
 
-    const cssW = gm.dims.cssW;
-    const cssH = gm.dims.cssH;
+    // Soft area wash under the line — the chart-grade "area" cue, kept faint so
+    // the density field stays the protagonist.
+    text.fillUnder(
+      pts,
+      gm.dims.cssH,
+      OVERLAY.priceFillTop.css,
+      OVERLAY.priceFillBottom.css,
+    );
 
-    // Glow pass (wide, translucent) — flushed first so the bright core sits on top.
-    solid.begin();
-    for (let i = 1; i < pts.length; i++) {
-      solid.addThickLine(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, PRICE_GLOW_WIDTH, OVERLAY.priceGlow.gl, cssW, cssH);
-    }
-    solid.flush();
-
+    // Glow pass (wide, translucent) — flushed first so the bright core sits on
+    // top; canvas AA + round joins make the two passes read as one smooth line.
+    text.polyline(pts, {
+      width: PRICE_GLOW_WIDTH,
+      color: OVERLAY.price.css,
+      alpha: 0.18,
+    });
     // Bright core pass.
-    solid.begin();
-    for (let i = 1; i < pts.length; i++) {
-      solid.addThickLine(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, PRICE_LINE_WIDTH, OVERLAY.price.gl, cssW, cssH);
-    }
+    text.polyline(pts, { width: PRICE_LINE_WIDTH, color: OVERLAY.price.css });
     // A single visible vertex: draw a short dash so it's still visible.
     if (pts.length === 1) {
-      const dx = gm.pxToClipW(4);
-      solid.addThickLine(pts[0].x - dx, pts[0].y, pts[0].x + dx, pts[0].y, PRICE_LINE_WIDTH, OVERLAY.price.gl, cssW, cssH);
+      text.dashedLine(pts[0].x - 4, pts[0].y, pts[0].x + 4, pts[0].y, OVERLAY.price.css, [99, 0], PRICE_LINE_WIDTH);
     }
-    solid.flush();
+
+    // Dashed last-price level marker across the chart, with a solid right-edge
+    // stub that meets the axis pill drawn by drawPriceAxis.
+    const last = this.lastClose;
+    if (last !== null && gm.price !== null) {
+      const y = gm.cssY(gm.priceToRow(last.price));
+      if (y >= -1 && y <= gm.dims.cssH + 1) {
+        text.dashedLine(0, y, gm.dims.cssW, y, OVERLAY.priceLevel.css, [2, 4], 1);
+      }
+    }
   }
 }

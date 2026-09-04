@@ -236,7 +236,7 @@ export class OverlayManager {
     if (this.visibility.axes) {
       if (this.priceAxis) {
         this.priceAxis.syncSize(this.priceAxis.canvas.clientWidth, ctx.dims.cssH, ctx.dpr);
-        drawPriceAxis(this.priceAxis, gm);
+        drawPriceAxis(this.priceAxis, gm, this.visibility.price ? this.priceLine.last() : null);
       }
       if (this.timeAxis) {
         this.timeAxis.syncSize(ctx.dims.cssW, this.timeAxis.canvas.clientHeight, ctx.dpr);
