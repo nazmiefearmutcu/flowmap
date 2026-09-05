@@ -355,6 +355,24 @@ describe('fuzzyScore — tiered ranking', () => {
   it('empty query matches everything with score 0', () => {
     expect(fuzzyScore('', 'anything')).toBe(0);
   });
+  it('rewards subsequence hits on word boundaries (A5)', () => {
+    // `EU` against `ETH/USD`: the `u` sits right after the `/` separator, so it
+    // outranks the same letters scattered mid-word at the same text length
+    // (`zesuad` — scattered, and crucially NOT a substring hit).
+    const boundary = fuzzyScore('eu', 'eth/usd');
+    const scattered = fuzzyScore('eu', 'zesuad');
+    expect(boundary).toBeGreaterThan(scattered);
+    // camelCase word starts count too.
+    expect(fuzzyScore('ub', 'UsdtBtc')).toBeGreaterThan(fuzzyScore('ub', 'usdtbtc'));
+    // All-caps tickers do NOT fire the camel bonus (every char is uppercase,
+    // there is no inner word start to reward): same score, raw or lowercased.
+    expect(fuzzyScore('sd', 'BTCUSDT')).toBe(fuzzyScore('sd', 'btcusdt'));
+  });
+  it('ranks a boundary-hit subsequence above a scattered one (A5)', () => {
+    // `TU` against `XBT/USD`: the `u` is an after-separator word start; against
+    // `atzubd` (same idea, no boundary) both letters land mid-word.
+    expect(fuzzyScore('tu', 'xbt/usd')).toBeGreaterThan(fuzzyScore('tu', 'atzubd'));
+  });
 });
 
 describe('fuzzyRank — best symbol match first', () => {

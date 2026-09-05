@@ -2,17 +2,20 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { floorForTolerance, gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
-import { attachGlobalKeys } from './input/keys';
+import { attachGlobalKeys, classifyTarget } from './input/keys';
 import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { CvdPane } from './ui/CvdPane';
 import { DomLadder } from './ui/DomLadder';
+import { isHelpToggle } from './ui/keysheet';
 import { LiveControls } from './ui/LiveControls';
 import { HeatLegend } from './ui/HeatLegend';
 import { PriceAxis } from './ui/PriceAxis';
+import { ReconnectBanner } from './ui/ReconnectBanner';
 import { SettingsDrawer } from './ui/SettingsDrawer';
+import { ShortcutsOverlay } from './ui/ShortcutsOverlay';
 import { Tape } from './ui/Tape';
 import { TimeAxis } from './ui/TimeAxis';
 import { Timeline } from './ui/Timeline';
@@ -100,6 +103,9 @@ export function App() {
     loadSettings(typeof window !== 'undefined' ? window.localStorage : null),
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The `?` shortcuts overlay (ui/ShortcutsOverlay) — a small modal listing the
+  // same keysheet the settings drawer renders.
+  const [helpOpen, setHelpOpen] = useState(false);
   const [streamClock, setStreamClock] = useState<string | null>(null);
   // WebGL2 unavailable: the heatmap canvas cannot render, but the DOM panels
   // (ladder, tape, search) can — the app degrades instead of dying (F1).
@@ -364,6 +370,22 @@ export function App() {
     });
   }, []);
 
+  // --- `?` toggles the shortcuts overlay ---------------------------------------
+  // Handled OUTSIDE attachGlobalKeys (input/keys.ts is not aware of `?`), but
+  // with the SAME focus-safety rules via the shared isHelpToggle: never fires
+  // while typing (a typed `?` is a search character) and never while a dialog
+  // owns the keyboard (the overlay closes itself with Escape).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (!isHelpToggle(e.key, classifyTarget(e.target))) return;
+      e.preventDefault();
+      setHelpOpen((v) => !v);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   // --- settings patch (merge → state → effect persists + applies) --------------
   const applyPatch = useCallback((patch: Partial<FlowMapSettings>) => {
     setSettings((prev) => ({ ...prev, ...patch }));
@@ -440,6 +462,7 @@ export function App() {
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
             <HeatLegend colormap={settings.colormap} />
             <ClosedBanner />
+            <ReconnectBanner />
             <LiveControls
               rendererRef={rendererRef}
               onGoLive={onGoLive}
@@ -473,6 +496,8 @@ export function App() {
           onClose={() => setSettingsOpen(false)}
         />
       )}
+
+      {helpOpen && <ShortcutsOverlay onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }

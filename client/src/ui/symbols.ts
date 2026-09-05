@@ -238,11 +238,29 @@ export function flattenGroups(groups: readonly SymbolGroup[]): SymbolEntry[] {
 }
 
 /**
+ * Word-boundary positions of `text`: index 0, any character right after a
+ * separator (`-`, `_`, `.`, `:`, `/`, space, `+`), and any lower→UPPER camelCase
+ * transition (so `XBTUSDT`-style all-caps tickers do NOT fire it — every char is
+ * uppercase, there are no inner word starts to reward). Computed on the RAW text,
+ * before lowercasing, because lowercasing erases the camel signal.
+ */
+function isWordBoundary(raw: string, i: number): boolean {
+  if (i <= 0) return false; // index 0 is rewarded separately (start-of-string)
+  const prevCh = raw[i - 1];
+  if ('-_.:/ +'.includes(prevCh)) return true;
+  const cur = raw[i];
+  const prev = raw[i - 1];
+  return cur >= 'A' && cur <= 'Z' && prev >= 'a' && prev <= 'z';
+}
+
+/**
  * Fuzzy score of `query` against `text` (higher = better; -1 = no match). Tiers,
  * highest first: exact → prefix → substring → scattered subsequence. Within the
- * subsequence tier, contiguous runs and a start-of-string hit are rewarded, and
- * shorter texts win ties — so "BT" ranks BTCUSDT above a coincidental match in a
- * longer ticker. This is the ranking the substring-only server filter lacked.
+ * subsequence tier, contiguous runs, a start-of-string hit and WORD-BOUNDARY hits
+ * are rewarded, and shorter texts win ties — so "BT" ranks BTCUSDT above a
+ * coincidental match in a longer ticker, and "EU" ranks `ETH/USD`'s `U` (an
+ * after-separator hit) above a mid-word `u`. This is the ranking the
+ * substring-only server filter lacked.
  */
 export function fuzzyScore(query: string, text: string): number {
   const q = query.trim().toLowerCase();
@@ -261,6 +279,9 @@ export function fuzzyScore(query: string, text: string): number {
       run = ti === prev + 1 ? run + 1 : 1;
       score += run;
       if (ti === 0) score += 5;
+      // A subsequence hit on a word start (after `-`, `.`, `/`, camelCase, …) is
+      // worth much more to a trader than the same letters scattered mid-word.
+      else if (isWordBoundary(text, ti)) score += 4;
       prev = ti;
       qi += 1;
     }

@@ -436,18 +436,28 @@ export function DomLadder(): JSX.Element {
                 {shape === 'profile' ? (
                   <div className="ladder__profile">
                     <div className="ladder__bar ladder__bar--profile" style={{ width: `${r.profilePct}%` }} />
-                    <span className="ladder__sz">{fmtSz(r.profileSz)}</span>
+                    {/* Keyed by the size VALUE: a quantity change remounts the span,
+                        which replays the CSS `ladder-flash` animation — a change
+                        indicator that costs no rAF/timer and stays silent while a
+                        level is unchanged (reduced-motion turns it off in CSS). */}
+                    <span key={r.profileSz} className="ladder__sz">
+                      {fmtSz(r.profileSz)}
+                    </span>
                   </div>
                 ) : (
                   <>
                     <div className="ladder__cell ladder__cell--bid">
                       <div className="ladder__bar ladder__bar--bid" style={{ width: `${r.bidPct}%` }} />
-                      <span className="ladder__sz">{fmtSz(r.bidSz)}</span>
+                      <span key={r.bidSz} className="ladder__sz">
+                        {fmtSz(r.bidSz)}
+                      </span>
                     </div>
                     <div className="ladder__px">{r.price.toFixed(model.priceDecimals)}</div>
                     <div className="ladder__cell ladder__cell--ask">
                       <div className="ladder__bar ladder__bar--ask" style={{ width: `${r.askPct}%` }} />
-                      <span className="ladder__sz">{fmtSz(r.askSz)}</span>
+                      <span key={r.askSz} className="ladder__sz">
+                        {fmtSz(r.askSz)}
+                      </span>
                     </div>
                   </>
                 )}

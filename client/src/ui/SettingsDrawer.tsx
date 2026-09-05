@@ -13,6 +13,7 @@ import { useEffect, useRef } from 'react';
 
 import type { OverlayVisibility } from '../gl/overlays/frame';
 import { OverlayToggles } from './OverlayToggles';
+import { KEYSHEET } from './keysheet';
 import {
   DEFAULT_SETTINGS,
   HISTORY_DEPTHS,
@@ -47,20 +48,11 @@ const HISTORY_LABEL: Record<HistoryDepth, string> = {
 };
 
 /**
- * The keyboard surface, verbatim from input/keys.ts (global) and
- * input/gestures.ts (canvas-focused). Static reference — every entry is a
- * binding that actually exists in code, no aspirational ones.
+ * The keyboard surface lives in ui/keysheet.ts, SHARED with the `?` shortcuts
+ * overlay so the drawer and the overlay can never drift apart. Every entry is a
+ * binding that actually exists in code (input/keys.ts, input/gestures.ts, the
+ * App-level `?` toggle) — no aspirational ones.
  */
-const KEYSHEET: ReadonlyArray<[string, string]> = [
-  ['Space', 'follow live edge · play/pause in replay'],
-  ['/', '⌘K / Ctrl-K — symbol search'],
-  ['← → ↑ ↓', 'pan time / price (chart focused)'],
-  ['+ / −', 'zoom time (chart focused)'],
-  ['F', 'toggle time follow (chart focused)'],
-  ['P', 'price track on/off · Shift+P re-fit'],
-  ['R', 'return to the live edge'],
-  ['axis wheel / drag', 'price zoom / scale · dbl-click re-fit'],
-];
 
 interface SettingsDrawerProps {
   settings: FlowMapSettings;
@@ -401,10 +393,10 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             Keyboard
           </span>
           <div className="keysheet" data-testid="keysheet">
-            {KEYSHEET.map(([keys, action]) => (
-              <div key={keys} className="keysheet__row">
-                <kbd className="keysheet__keys">{keys}</kbd>
-                <span className="keysheet__action">{action}</span>
+            {KEYSHEET.map((entry) => (
+              <div key={entry.keys} className="keysheet__row">
+                <kbd className="keysheet__keys">{entry.keys}</kbd>
+                <span className="keysheet__action">{entry.action}</span>
               </div>
             ))}
           </div>

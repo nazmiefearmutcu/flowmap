@@ -44,6 +44,7 @@ import {
   useMemo,
   useRef,
   useState,
+  Fragment,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
@@ -63,6 +64,7 @@ import {
   type VenueInfo,
   type VenueOption,
 } from './symbols';
+import { loadRecents, pushRecent, type RecentPick } from './recents';
 import { fmtPct, fmtPrice, sparkDirection, sparkPath } from './spark';
 
 export interface SymbolSearchHandle {
@@ -144,6 +146,12 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     // Venue scope: `all` = the bundled directory (instant), else a market string
     // enumerated live. `venues === null` means /api/venues has not answered yet.
     const [venues, setVenues] = useState<VenueInfo[] | null>(null);
+    // Recent picks (localStorage, max 5, most recent first) — shown as their own
+    // section above the movers when the query is empty. Read once at mount; a
+    // pick rewrites both the persisted list and this state.
+    const [recents, setRecents] = useState<RecentPick[]>(() =>
+      loadRecents(typeof window !== 'undefined' ? window.localStorage : null),
+    );
     const [scope, setScope] = useState<string>(ALL_VENUES);
     const [pickingVenue, setPickingVenue] = useState(false);
     const [scopeRows, setScopeRows] = useState<SymbolEntry[] | null>(null);
@@ -261,7 +269,8 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     }, [open]);
 
     // The visible rows. Scoped to a venue: that venue's own listing, browsable on
-    // an empty query. Scoped to `all`: movers on an empty query, fuzzy universe
+    // an empty query. Scoped to `all`: recent picks + movers on an empty query
+    // (a recent that is also a mover renders ONCE, in Recent), fuzzy universe
     // hits otherwise.
     const rows = useMemo<Row[]>(() => {
       const byKey = new Map(movers.map((m) => [`${m.market}:${m.symbol}`, m] as const));
@@ -272,13 +281,28 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
         }));
       }
       if (query.trim() === '') {
-        return movers.map((m) => ({ entry: { market: m.market, symbol: m.symbol, capability: {} }, quote: m }));
+        const recentKeys = new Set(recents.map((r) => `${r.market}:${r.symbol}`));
+        const recentRows: Row[] = recents.map((r) => ({
+          entry: { market: r.market, symbol: r.symbol, capability: {} },
+          quote: byKey.get(`${r.market}:${r.symbol}`),
+        }));
+        const moverRows = movers
+          .filter((m) => !recentKeys.has(`${m.market}:${m.symbol}`))
+          .map((m) => ({ entry: { market: m.market, symbol: m.symbol, capability: {} }, quote: m }));
+        return [...recentRows, ...moverRows];
       }
       return fuzzyRank(universe, query, 60).map((entry) => ({
         entry,
         quote: byKey.get(`${entry.market}:${entry.symbol}`),
       }));
-    }, [query, movers, universe, scope, scopeRows]);
+    }, [query, movers, universe, scope, scopeRows, recents]);
+
+    // How many LEADING rows are the Recent section (0 unless the empty-query
+    // bundled-directory view) — the render uses it to place section headers.
+    const recentCount = useMemo(
+      () => (scope === ALL_VENUES && query.trim() === '' ? recents.length : 0),
+      [scope, query, recents.length],
+    );
 
     // The venue list reuses the SAME input as its filter, so the palette stays one
     // box with two modes rather than growing a second search field.
@@ -340,12 +364,22 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       (row: Row | undefined) => {
         if (!row) return;
         onSelect(row.entry.market, row.entry.symbol);
+        // Record the pick as a recent (localStorage, max 5, deduped, MRU first)
+        // so the next empty-query open surfaces it above the movers.
+        setRecents(
+          pushRecent(
+            typeof window !== 'undefined' ? window.localStorage : null,
+            row.entry.market,
+            row.entry.symbol,
+            recents,
+          ),
+        );
         // Route through close() so selecting restores focus to the trigger too —
         // otherwise the portal unmounts the focused input and focus drops to
         // <body>, losing a keyboard/screen-reader user's place.
         close();
       },
-      [onSelect, close],
+      [onSelect, close, recents],
     );
 
     /** Adopt a venue scope and drop back to the symbol list. */
@@ -383,6 +417,13 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
         } else {
           commit(rows[active]);
         }
+      } else if (e.key === 'Home') {
+        // Jump to the first row (the list is short, but scanning it is not).
+        e.preventDefault();
+        if (count) setActive(0);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        if (count) setActive(last);
       } else if (e.key === 'Escape') {
         e.preventDefault();
         // Escape out of the venue list first — one keystroke should not throw
@@ -605,18 +646,29 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                       </div>
                     ) : (
                       <>
-                        {query.trim() === '' && (
-                          <div className="sympal__section">
-                            {scope === ALL_VENUES ? 'Top movers today' : `${scope} · ${scopeRows?.length ?? 0} symbols`}
-                          </div>
+                        {query.trim() === '' && scope !== ALL_VENUES && (
+                          <div className="sympal__section">{`${scope} · ${scopeRows?.length ?? 0} symbols`}</div>
+                        )}
+                        {query.trim() === '' && scope === ALL_VENUES && recentCount === 0 && rows.length > 0 && (
+                          <div className="sympal__section">Top movers today</div>
                         )}
                         {rows.map((row, idx) => {
                         const g = marketGroup(row.entry.market);
                         const chg = row.quote?.changePct ?? null;
                         const dir = sparkDirection(row.quote?.spark ?? []);
                         return (
+                          <Fragment key={`${row.entry.market}:${row.entry.symbol}`}>
+                          {/* Section headers ride INSIDE the map so they scroll with
+                              their rows: Recent first, then Top movers. */}
+                          {idx === 0 && recentCount > 0 && (
+                            <div className="sympal__section" data-testid="recent-section">
+                              Recent
+                            </div>
+                          )}
+                          {idx === recentCount && recentCount > 0 && (
+                            <div className="sympal__section">Top movers today</div>
+                          )}
                           <div
-                            key={`${row.entry.market}:${row.entry.symbol}`}
                             id={`sympal-opt-${idx}`}
                             className={`sympal__row${idx === active ? ' is-active' : ''}`}
                             role="option"
@@ -624,6 +676,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                             data-testid="symbol-row"
                             data-market={row.entry.market}
                             data-symbol={row.entry.symbol}
+                            data-recent={idx < recentCount ? 'true' : undefined}
                             onMouseEnter={() => setActive(idx)}
                             onMouseDown={(e) => {
                               e.preventDefault();
@@ -663,6 +716,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                               {fmtPct(chg)}
                             </span>
                           </div>
+                          </Fragment>
                         );
                         })}
                       </>
@@ -738,6 +792,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
 
                 <div className="sympal__foot">
                   <span><kbd>↑↓</kbd> navigate</span>
+                  <span><kbd>Home/End</kbd> first/last</span>
                   <span><kbd>↵</kbd> select</span>
                   <span><kbd>esc</kbd> {pickingVenue ? 'back' : 'close'}</span>
                 </div>

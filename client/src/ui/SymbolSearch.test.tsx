@@ -105,7 +105,7 @@ afterEach(() => {
   }
 });
 
-function render(): HTMLElement {
+function render(onSelect?: (market: string, symbol: string) => void): HTMLElement {
   const container = document.createElement('div');
   document.body.appendChild(container);
   let root!: Root;
@@ -115,9 +115,9 @@ function render(): HTMLElement {
       <SymbolSearch
         ref={{ current: null } as unknown as React.Ref<SymbolSearchHandle>}
         current="sim:SIM-DEMO"
-        onSelect={() => {
+        onSelect={onSelect ?? (() => {
           /* no-op */
-        }}
+        })}
       />,
     );
   });
@@ -406,5 +406,94 @@ describe('SymbolSearch venue enumeration — a failed listing', () => {
     // A 200 that says "no symbols" is an answer, not a failure — cache it.
     expect(listings('gateio')).toBe(1);
     expect(palette().querySelector('.sympal__empty')!.textContent).toContain('listed no symbols');
+  });
+});
+
+// --- A5: recent symbols (localStorage, max 5) + Home/End navigation ---
+describe('SymbolSearch recents + keyboard navigation', () => {
+  const RECENTS_KEY = 'flowmap.recents';
+
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  /** Type into the palette's controlled input. */
+  function type(el: Element, value: string): void {
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+
+  function key(el: Element, k: string): void {
+    act(() => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    });
+  }
+
+  it('shows seeded recents (marked) above the movers on an empty query', async () => {
+    window.localStorage.setItem(RECENTS_KEY, JSON.stringify(['kraken:XBT/USD']));
+    await open();
+    const section = palette().querySelector('[data-testid="recent-section"]');
+    expect(section).not.toBeNull();
+    const rows = [...document.body.querySelectorAll('[data-testid="symbol-row"]')];
+    expect(rows[0].getAttribute('data-symbol')).toBe('XBT/USD');
+    expect(rows[0].getAttribute('data-recent')).toBe('true');
+    // Typing replaces the browse view entirely — recents are not a filter.
+    type(document.body.querySelector('[data-testid="symbol-search-input"]')!, 'btc');
+    expect(palette().querySelector('[data-testid="recent-section"]')).toBeNull();
+  });
+
+  it('records a picked row as a recent for the next empty-query open', async () => {
+    const container = await openVenueList();
+    press(document.body.querySelector('[data-testid="venue-row"][data-market="binance-usdm"]'));
+    await settle();
+    press(document.body.querySelector('[data-testid="symbol-row"][data-symbol="BTCUSDT"]'));
+    await settle();
+    expect(JSON.parse(window.localStorage.getItem(RECENTS_KEY)!)).toEqual(['binance-usdm:BTCUSDT']);
+
+    // Reopen, switch back to the bundled scope: the pick leads under "Recent".
+    click(container.querySelector('[data-testid="symbol-search-trigger"]'));
+    await settle();
+    click(palette().querySelector('[data-testid="venue-picker-toggle"]'));
+    await settle();
+    press(document.body.querySelector('[data-testid="venue-row"][data-market="all"]'));
+    await settle();
+    expect(palette().querySelector('[data-testid="recent-section"]')).not.toBeNull();
+    const first = document.body.querySelector('[data-testid="symbol-row"]');
+    expect(first!.getAttribute('data-symbol')).toBe('BTCUSDT');
+    expect(first!.getAttribute('data-recent')).toBe('true');
+  });
+
+  it('moves the highlight with Home/End (wrapping arrows already covered)', async () => {
+    // Three movers give the listbox more than one row to traverse.
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/movers')) {
+        // Only the crypto call carries rows — the palette fetches crypto AND
+        // equity, and this stub must not double the list.
+        const movers = url.includes('market=equity')
+          ? []
+          : [
+              { market: 'sim', symbol: 'AAA', price: 1, changePct: 1, spark: [] },
+              { market: 'sim', symbol: 'BBB', price: 1, changePct: 1, spark: [] },
+              { market: 'sim', symbol: 'CCC', price: 1, changePct: 1, spark: [] },
+            ];
+        return Promise.resolve({ ok: true, json: async () => ({ movers }) } as unknown as Response);
+      }
+      if (url.includes('/api/venues')) return Promise.resolve({ ok: true, json: async () => ({ venues: VENUES }) } as unknown as Response);
+      if (url.includes('market=all')) return Promise.resolve({ ok: true, json: async () => ({ symbols: BUNDLED }) } as unknown as Response);
+      if (url.includes('/api/quote')) return Promise.resolve({ ok: true, json: async () => ({ market: 'x', symbol: 'y', price: 1, changePct: 0, spark: [] }) } as unknown as Response);
+      return Promise.resolve({ ok: true, json: async () => ({ symbols: [] }) } as unknown as Response);
+    }) as unknown as typeof fetch;
+
+    await open();
+    const input = document.body.querySelector('[data-testid="symbol-search-input"]')!;
+    expect(input.getAttribute('aria-activedescendant')).toBe('sympal-opt-0');
+    key(input, 'End');
+    expect(input.getAttribute('aria-activedescendant')).toBe('sympal-opt-2');
+    key(input, 'Home');
+    expect(input.getAttribute('aria-activedescendant')).toBe('sympal-opt-0');
   });
 });

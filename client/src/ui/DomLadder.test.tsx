@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { MODE_L1_BAND, MODE_L2, MODE_SYNTH_PROFILE, type EpochParams } from '../proto/types';
 import {
+  flushForTest,
   ingestForTest,
   resetForTest,
   type BookSnapshot,
@@ -410,5 +411,63 @@ describe('DomLadder render', () => {
 
     click(container.querySelector('[data-testid="ladder-collapse"]')!);
     expect(container.querySelector('[data-testid="ladder-body"]')).toBeNull();
+  });
+});
+
+// --- A5: truthful states + flash-on-quantity-change ---
+describe('DomLadder states (A5)', () => {
+  it('says disconnected — not waiting — while the socket is down', () => {
+    useFlowMapStore.setState({
+      capability: null,
+      epochs: new Map(),
+      gridEpoch: null,
+      status: 'reconnecting',
+      feedState: null,
+    });
+    const { container } = render(<DomLadder />);
+    const msg = container.querySelector('.panel__empty')?.textContent;
+    expect(msg).toBe('disconnected');
+    expect(msg).not.toContain('waiting');
+  });
+
+  it('remounts a size cell only when its quantity changes (flash-on-change)', () => {
+    useFlowMapStore.setState({
+      capability: { depth: 'L2', tape: 'tick' },
+      epochs: new Map([[1, PARAMS]]),
+      gridEpoch: 1,
+    });
+    const { bid, ask } = makeBook();
+    const col = (seq: number, b: Float32Array): unknown => ({
+      type: 3,
+      epoch: 1,
+      col_seq: seq,
+      t0_ns: BigInt(seq) * 1_000_000n,
+      mode: MODE_L2,
+      final: true,
+      bid: b,
+      ask,
+    });
+    ingestForTest(col(1, bid) as never);
+    const { container } = render(<DomLadder />);
+    const szAt = () => container.querySelector('[data-row="100"] .ladder__cell--bid .ladder__sz');
+    const first = szAt();
+    expect(first).not.toBeNull();
+
+    // A new column with IDENTICAL quantities: same DOM node — the keyed flash
+    // does not replay for an unchanged level (the ladder stays quiet).
+    act(() => {
+      ingestForTest(col(2, bid) as never);
+      flushForTest(); // the store throttles notifications; deliver synchronously
+    });
+    expect(szAt()).toBe(first);
+
+    // Quantity changed at row 100: a NEW node — remount replays the CSS flash.
+    const bid2 = bid.slice();
+    bid2[100] = 9;
+    act(() => {
+      ingestForTest(col(3, bid2) as never);
+      flushForTest();
+    });
+    expect(szAt()).not.toBe(first);
   });
 });
