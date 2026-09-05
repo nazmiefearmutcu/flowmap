@@ -134,10 +134,11 @@ class FakeWebSocket implements SocketLike {
   open(): void {
     this.onopen?.();
   }
-  /** Simulate the socket dropping (server-side close, not a client close()). */
-  drop(): void {
+  /** Simulate the socket dropping (server-side close, not a client close()).
+   *  `code` mirrors the browser CloseEvent.code (e.g. 1003 = unsupported). */
+  drop(code?: number): void {
     this.closed = true;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
   deliver(bytes: Uint8Array): void {
     // Copy into a realm-local ArrayBuffer, as a real socket would hand the
@@ -616,5 +617,75 @@ describe('Connection — robustness', () => {
     assertType(pong[0], MsgType.PONG);
 
     warn.mockRestore();
+  });
+});
+
+describe('Connection — replay refusal (close 1003)', () => {
+  function setupReplay(onReplayRefused: () => void): { conn: Connection; sock: FakeWebSocket } {
+    let sock: FakeWebSocket | undefined;
+    const conn = new Connection({
+      url: 'wss://test.invalid/ws',
+      wsFactory: (url) => {
+        sock = new FakeWebSocket(url);
+        return sock;
+      },
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
+      onReplayRefused,
+    });
+    conn.subscribe('crypto', 'BTCUSDT', 'replay');
+    const s = sock as FakeWebSocket;
+    s.open();
+    return { conn, sock: s };
+  }
+
+  it('fires onReplayRefused when the server closes 1003 on an active replay subscribe', () => {
+    let refused = 0;
+    const { conn, sock } = setupReplay(() => {
+      refused += 1;
+    });
+    sock.drop(1003);
+    expect(refused).toBe(1);
+    // The refusal STILL schedules a reconnect — the store is expected to have
+    // re-subscribed live; the transport just must not silently swallow it.
+    expect(conn.status).toBe('reconnecting');
+  });
+
+  it('does NOT fire for other close codes or non-replay subscriptions', () => {
+    let refused = 0;
+    const { sock } = setupReplay(() => {
+      refused += 1;
+    });
+    sock.drop(1000); // normal closure
+    expect(refused).toBe(0);
+
+    let refusedLive = 0;
+    const conn2 = new Connection({
+      url: 'wss://test.invalid/ws',
+      wsFactory: () => new FakeWebSocket('wss://test.invalid/ws'),
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
+      onReplayRefused: () => {
+        refusedLive += 1;
+      },
+    });
+    conn2.subscribe('crypto', 'BTCUSDT', 'live');
+    const s2 = (conn2 as unknown as { socket: FakeWebSocket }).socket;
+    s2.open();
+    s2.drop(1003);
+    expect(refusedLive).toBe(0);
+  });
+
+  it('does not fire when the client closed intentionally', () => {
+    let refused = 0;
+    const { conn, sock } = setupReplay(() => {
+      refused += 1;
+    });
+    conn.close();
+    expect(refused).toBe(0);
+    // The intentional close() already ran onclose once (code-less) — the
+    // guard must also hold if the driver replays a coded close afterwards.
+    sock.drop(1003);
+    expect(refused).toBe(0);
   });
 });

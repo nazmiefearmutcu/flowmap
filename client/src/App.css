@@ -216,6 +216,20 @@ body,
   background: var(--sell);
 }
 
+/* Replay was refused (1003 — no recording for this session): an honest amber
+   note beside the connection status, with the explanation in its tooltip. */
+.replay-unavailable {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 4px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  cursor: help;
+}
+
 @keyframes pulse {
   0% {
     box-shadow: 0 0 0 0 var(--accent-glow);

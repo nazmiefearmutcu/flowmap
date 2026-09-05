@@ -76,6 +76,14 @@ export interface FlowMapState {
   clockSkewMs: number | null;
   epochs: Map<number, EpochParams>;
   subscription: Subscription | null;
+  /**
+   * The server refused a replay subscribe with the unsupported close (1003) —
+   * there is NO recording for this symbol/session (§7: the server refuses
+   * honestly). The store already fell back to live mode when this is set; the
+   * TopBar surfaces it as an explanatory badge until the next successful
+   * handshake clears it.
+   */
+  replayUnavailable: boolean;
   /** Replay transport (low-frequency UI state; ignored in live mode). */
   speed: number;
   paused: boolean;
@@ -135,6 +143,7 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   clockSkewMs: null,
   epochs: new Map(),
   subscription: null,
+  replayUnavailable: false,
   speed: 1,
   paused: false,
 
@@ -154,6 +163,11 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
             normSeed: hello.norm_seed,
             gridEpoch: hello.grid_epoch,
             epochs,
+            // NOTE `replayUnavailable` is deliberately NOT cleared here. The
+            // live fallback triggered by the refusal lands its own handshake
+            // moments later — clearing on Hello would erase the refusal the
+            // instant it is shown. It retires on a NEW replay attempt or a
+            // different stream instead (see connectAndSubscribe).
           });
         },
         onEpochStart: (ev) => {
@@ -180,6 +194,18 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
           });
         },
         onConnStatus: (status) => set({ status }),
+        // The server honestly refused the replay subscribe (1003 — no recording
+        // for this session). Fall back to LIVE right away so the user is not
+        // stranded on a "reconnecting · degraded" loop that can never succeed,
+        // and flag it so the TopBar can say WHY the replay did not start. The
+        // flag clears on the next accepted handshake (the live re-subscribe's).
+        onReplayRefused: () => {
+          set({ replayUnavailable: true });
+          const sub = get().subscription;
+          if (sub && sub.mode === 'replay') {
+            get().connectAndSubscribe(sub.market, sub.symbol, 'live', sub.band);
+          }
+        },
       });
     }
     // A DIFFERENT stream is a different server session, so nothing the previous
@@ -220,6 +246,20 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         // scale (a $60k book's p99 against a $180 stock's).
         normSeed: null,
       });
+      // `replayUnavailable` is deliberately NOT in the reset block: the live
+      // fallback below (a mode change) passes through here, and wiping the flag
+      // the same instant it is set would hide the refusal from the TopBar. It
+      // is cleared only where its meaning genuinely ends — a fresh REPLAY
+      // attempt (a new "maybe this one has a recording") and the next accepted
+      // handshake — and retired when a DIFFERENT stream is subscribed (a new
+      // symbol/recording pair).
+      if (mode === 'replay') set({ replayUnavailable: false });
+      else if (
+        prev !== null &&
+        (prev.market !== market || prev.symbol !== symbol)
+      ) {
+        set({ replayUnavailable: false });
+      }
     }
     conn.subscribe(market, symbol, mode, band);
   },

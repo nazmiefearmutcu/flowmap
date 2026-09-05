@@ -83,6 +83,14 @@ export interface ConnectionHandlers {
   onStatus?: (status: Status) => void;
   /** Connection lifecycle transitions. */
   onConnStatus?: (status: ConnStatus) => void;
+  /**
+   * The server REFUSED the current subscription with the unsupported close code
+   * (1003) — today only mode=replay against a session with no recording (§7:
+   * the server refuses honestly instead of steering nothing). The store uses
+   * this to surface "replay unavailable" and fall back to live instead of
+   * reconnect-looping into the same refusal forever.
+   */
+  onReplayRefused?: () => void;
 }
 
 export interface ConnectionOptions extends ConnectionHandlers {
@@ -182,6 +190,7 @@ export class Connection {
       onEpochStart: options.onEpochStart,
       onStatus: options.onStatus,
       onConnStatus: options.onConnStatus,
+      onReplayRefused: options.onReplayRefused,
     };
   }
 
@@ -362,7 +371,8 @@ export class Connection {
     sock.binaryType = 'arraybuffer';
     sock.onopen = () => this.onSocketOpen();
     sock.onmessage = (ev) => this.onSocketMessage(ev);
-    sock.onclose = () => this.onSocketClose();
+    sock.onclose = (ev) =>
+      this.onSocketClose(ev as { code?: number } | undefined);
     sock.onerror = () => {
       // WebSocket errors arrive just before close; the close handler drives
       // reconnect. Nothing actionable here beyond a breadcrumb.
@@ -378,10 +388,27 @@ export class Connection {
     this.sendSubscribe();
   }
 
-  private onSocketClose(): void {
+  /** Browser close code the server uses for "subscription not supported here". */
+  private static readonly CLOSE_UNSUPPORTED = 1003;
+
+  private onSocketClose(ev?: { code?: number }): void {
+    // A 1003 while a REPLAY subscribe is the active subscription is the server's
+    // honest refusal of a replay against a session with no recording. Surface it
+    // BEFORE resetting activeSub, and DON'T schedule the reconnect loop here: the
+    // store falls back to live and re-subscribes, which reconnects through the
+    // normal path — looping straight back into the same refusal would just pin
+    // the UI on "reconnecting · degraded" forever.
+    const refusedReplay =
+      this.activeSub?.mode === 'replay' &&
+      (ev as { code?: number } | undefined)?.code === Connection.CLOSE_UNSUPPORTED;
     this.socketOpen = false;
     this.activeSub = null;
     this.socket = null;
+    if (refusedReplay) {
+      this.handlers.onReplayRefused?.();
+      this.scheduleReconnect();
+      return;
+    }
     if (this.intentionalClose) {
       this.setConnStatus('closed');
       return;

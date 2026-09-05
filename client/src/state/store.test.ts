@@ -61,6 +61,10 @@ class FakeWebSocket implements SocketLike {
   close(): void {
     this.onclose?.();
   }
+  /** Server-side drop with an optional CloseEvent.code (e.g. 1003). */
+  drop(code?: number): void {
+    this.onclose?.({ code });
+  }
   open(): void {
     this.onopen?.();
   }
@@ -379,5 +383,56 @@ describe('sessionResetKey', () => {
 
   it('is stable for an identical subscription', () => {
     expect(sessionResetKey({ ...sub })).toBe(sessionResetKey(sub));
+  });
+});
+
+describe('FlowMap store — replay refusal fallback (close 1003)', () => {
+  it('flags replayUnavailable + falls back to LIVE when the server refuses replay', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'replay');
+    const sock = sockets[sockets.length - 1];
+    sock.open(); // subscribe(mode=replay) sent
+
+    // The server refuses: close 1003 on the active replay subscribe.
+    sock.drop(1003);
+
+    const st = store.getState();
+    expect(st.replayUnavailable).toBe(true);
+    // The store fell back to LIVE — the UI is not stranded on a replay loop.
+    expect(st.subscription?.mode).toBe('live');
+    // ...and the fallback re-subscribes LIVE on the replacement connection
+    // (the socket opens; the Subscribe rides the open handshake).
+    const newSock = sockets[sockets.length - 1];
+    expect(newSock).not.toBe(sock);
+    newSock.open();
+    const sent = newSock.sent.map(sentMsg).find((m) => m.type === MsgType.SUBSCRIBE);
+    expect(sent).toBeDefined();
+    expect((sent as Extract<Msg, { type: MsgType.SUBSCRIBE }>).mode).toBe('live');
+  });
+
+  it('KEEPS the flag across the fallback handshake (Hello) — the user must see WHY', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    store.setState({ replayUnavailable: true });
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'live');
+    const sock = sockets[sockets.length - 1];
+    sock.open();
+    sock.deliver(goldenU8('cold_hello'));
+    // The refusal note survives its own fallback's handshake: it is the only
+    // explanation the user gets for why Replay did not start. It retires on a
+    // new replay attempt or a different stream, not on Hello.
+    expect(store.getState().replayUnavailable).toBe(true);
+  });
+
+  it('retires the flag when subscribing to a DIFFERENT stream', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    // A session the flag "belongs" to, then a switch to a different symbol —
+    // the refusal described BTCUSDT's missing recording, not ETHUSDT's.
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'live');
+    store.setState({ replayUnavailable: true });
+    store.getState().connectAndSubscribe('crypto', 'ETHUSDT', 'live');
+    expect(store.getState().replayUnavailable).toBe(false);
   });
 });

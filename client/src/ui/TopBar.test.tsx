@@ -44,7 +44,7 @@ function topbar(streamClock: string | null = null): JSX.Element {
 }
 
 beforeEach(() => {
-  useFlowMapStore.setState({ capability: null, subscription: undefined, feedState: undefined });
+  useFlowMapStore.setState({ capability: null, subscription: undefined, feedState: undefined, replayUnavailable: false });
 });
 
 afterEach(() => {
@@ -52,6 +52,34 @@ afterEach(() => {
     act(() => root.unmount());
     container.remove();
   }
+});
+
+describe('TopBar replay-unavailable badge', () => {
+  it('says WHY the replay did not start when the server refused (close 1003)', () => {
+    act(() =>
+      useFlowMapStore.setState({
+        capability: { replay: true, depth: 'L2', tape: 'tick' },
+        subscription: { market: 'binance-spot', symbol: 'BTCUSDT', mode: 'live', band: 'deep' },
+        replayUnavailable: true,
+      }),
+    );
+    const { container } = render(topbar());
+    const badge = container.querySelector('[data-testid="replay-unavailable"]');
+    expect(badge).not.toBeNull();
+    expect(badge!.textContent).toContain('replay unavailable');
+  });
+
+  it('renders no badge in the normal flow', () => {
+    act(() =>
+      useFlowMapStore.setState({
+        capability: { replay: true, depth: 'L2', tape: 'tick' },
+        subscription: { market: 'binance-spot', symbol: 'BTCUSDT', mode: 'live', band: 'deep' },
+        replayUnavailable: false,
+      }),
+    );
+    const { container } = render(topbar());
+    expect(container.querySelector('[data-testid="replay-unavailable"]')).toBeNull();
+  });
 });
 
 describe('TopBar capability badges', () => {

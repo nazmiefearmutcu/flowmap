@@ -68,6 +68,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
   const feedState = useFlowMapStore((s) => s.feedState);
   const capability = useFlowMapStore((s) => s.capability);
   const subscription = useFlowMapStore((s) => s.subscription);
+  const replayUnavailable = useFlowMapStore((s) => s.replayUnavailable);
 
   const [wall, setWall] = useState(() => new Date());
   useEffect(() => {
@@ -172,6 +173,20 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         {statusText}
         {feedSuffix}
       </span>
+
+      {/* §7 honesty: when a Replay toggle was refused (1003 — this symbol has no
+          recording), say exactly that instead of leaving the user to guess why
+          the replay never started. Cleared by the live fallback's handshake. */}
+      {replayUnavailable && (
+        <span
+          className="replay-unavailable"
+          data-testid="replay-unavailable"
+          role="status"
+          title="This session has no recording, so the server refused Replay (close 1003). The chart re-subscribed to LIVE; switch symbols to build a recording, then try Replay again."
+        >
+          no recording — replay unavailable
+        </span>
+      )}
 
       <span
         className="clock"
