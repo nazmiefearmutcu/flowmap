@@ -267,6 +267,36 @@ describe('FlowMap store', () => {
     expect(store.getState().gridEpoch).toBe(4); // held at the newest
     expect(store.getState().epochs.get(2)).toMatchObject({ epoch: 2 }); // still recorded
   });
+
+  it('a duplicate EpochStart for a KNOWN epoch is a no-op — no Map rebuild, no subscriber churn', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello')); // seeds epoch 3, grid_epoch 3
+    const epochsBefore = store.getState().epochs;
+
+    let notified = 0;
+    const unsub = store.subscribe(() => {
+      notified += 1;
+    });
+
+    // A reconnect snapshot re-sends the SAME epoch: geometry is immutable per
+    // epoch and the grid cursor would not advance → zero new information.
+    const params3 = { epoch: 3, tick: 0.01, tick_multiple: 5, dt_ns: 250_000_000, p0: 100.0, rows: 2048 };
+    sockets[0].deliver(coldFrameBytes(MsgType.EPOCH_START, { epoch: 3, epoch_params: params3 }));
+    expect(store.getState().epochs).toBe(epochsBefore); // same Map reference
+    expect(notified).toBe(0); // no store update fired at all
+
+    // A genuinely NEW epoch still advances the grid and notifies once.
+    const params4 = { epoch: 4, tick: 0.01, tick_multiple: 5, dt_ns: 250_000_000, p0: 101.0, rows: 2048 };
+    sockets[0].deliver(coldFrameBytes(MsgType.EPOCH_START, { epoch: 4, epoch_params: params4 }));
+    expect(store.getState().gridEpoch).toBe(4);
+    expect(notified).toBe(1);
+
+    unsub();
+  });
 });
 
 describe('FlowMap store — replay transport', () => {

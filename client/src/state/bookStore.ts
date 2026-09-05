@@ -86,9 +86,31 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
 /** Unsubscribe handle for the single store.onStream subscription (lazy). */
 let streamUnsub: (() => void) | null = null;
 
-/** Coerce a canonical ns field to bigint (cold-JSON small ints decode as number). */
+/**
+ * Coerce a canonical ns field to bigint (cold-JSON small ints decode as number).
+ * NaN/±Inf quarantined to 0n at the boundary: `BigInt(NaN)` THROWS, so one
+ * corrupt field would otherwise tear down the whole fan-out loop mid-frame.
+ */
 function toBigNs(x: bigint | number): bigint {
-  return typeof x === 'bigint' ? x : BigInt(Math.round(x));
+  if (typeof x === 'bigint') return x;
+  if (!Number.isFinite(x)) return 0n;
+  return BigInt(Math.round(x));
+}
+
+/**
+ * NaN quarantine for depth densities. A non-finite entry is corrupt wire data
+ * (a bad server-side float) and would poison every downstream max/sum — the
+ * ladder's per-level size, the imbalance ratio. Zero it: "no resting size" is
+ * the honest reading of a corrupt level, and the REST of the book survives.
+ * This is also where the protocol's quantity-to-zero rule lands on the client:
+ * a zeroed density IS a removed level — there is no separate level map to
+ * forget, the arrays are the state.
+ */
+function quarantineF32(a: Float32Array): Float32Array {
+  for (let i = 0; i < a.length; i += 1) {
+    if (!Number.isFinite(a[i])) a[i] = 0;
+  }
+  return a;
 }
 
 /** Mark the buffer dirty and schedule one throttled listener notification. */
@@ -116,21 +138,38 @@ function handle(msg: StreamMsg): void {
       // both). Ignore partials for the ladder — the heatmap/crosshair use them, the
       // DOM ladder wants the last settled snapshot.
       if (!c.final) return;
-      // Newest finalized column wins; ignore a late/out-of-order column.
-      if (book !== null && c.epoch === book.epoch && c.col_seq < book.colSeq) return;
+      // Newest SESSION position wins, epoch-major: a late column from an OLD
+      // epoch (a straggler frame arriving after a mid-stream re-anchor or a
+      // replay seek — the server bumps epoch and resnapshots) must never clobber
+      // the newer grid's book, however high its col_seq is. Within one epoch,
+      // equal col_seq overwrites idempotently (re-delivery), lower is stale.
+      if (book !== null) {
+        if (c.epoch < book.epoch) return;
+        if (c.epoch === book.epoch && c.col_seq < book.colSeq) return;
+      }
       book = {
         epoch: c.epoch,
         mode: c.mode,
         colSeq: c.col_seq,
         t0Ns: toBigNs(c.t0_ns),
-        bid: c.bid,
-        ask: c.ask,
+        bid: quarantineF32(c.bid),
+        ask: c.ask === null ? null : quarantineF32(c.ask),
       };
       bump();
       return;
     }
     case MsgType.BBO: {
       const b = msg as BBO;
+      // Quarantine: a BBO carrying a non-finite price/size is corrupt — keep the
+      // LAST GOOD quote instead of painting NaN into the panel.
+      if (
+        !Number.isFinite(b.bid_px) ||
+        !Number.isFinite(b.bid_sz) ||
+        !Number.isFinite(b.ask_px) ||
+        !Number.isFinite(b.ask_sz)
+      ) {
+        return;
+      }
       bbo = {
         tsNs: toBigNs(b.ts_ns),
         bidPx: b.bid_px,
@@ -143,6 +182,10 @@ function handle(msg: StreamMsg): void {
     }
     case MsgType.TRADE: {
       const t = msg as Trade;
+      // Quarantine: a trade with a non-finite price or size is corrupt wire data
+      // — dropping it keeps the last-good tape instead of a NaN row (and keeps
+      // `toBigNs(NaN)` from ever being reached).
+      if (!Number.isFinite(t.price) || !Number.isFinite(t.size)) return;
       trades.push({
         tsNs: toBigNs(t.ts_ns),
         price: t.price,

@@ -181,8 +181,14 @@ export class HistoryLoader {
     try {
       const resp = await this.deps.requestHistory(beforeT, n);
       this.oldestAvailableT0 = resp.oldest_available_t_ns;
+      this.lastError = null; // the previous failure no longer describes the tail
       // Splice ascending (oldest first) so each lands adjacent to the window.
-      const cols = resp.depth_cols;
+      // The server is expected to return the page in column order; sorting is a
+      // cheap defense so a deviant/OUT-OF-ORDER page still splices monotonically
+      // (each column sliding the ring backward one slot) instead of in arrival
+      // order. Overlap with already-resident columns is fine: the sink writes
+      // idempotently by absolute col_seq.
+      const cols = resp.depth_cols.slice().sort((a, b) => a.col_seq - b.col_seq);
       if (cols.length === 0) {
         // Nothing older on the server → scroll-back exhausted.
         this.startOfHistoryFlag = true;
@@ -249,10 +255,29 @@ export class HistoryLoader {
     }
   }
 
-  /** Clear scroll-back state (e.g. on go-live / re-subscribe / context restore). */
+  /**
+   * Clear ALL scroll-back state (go-live / re-subscribe / context restore).
+   *
+   * This is more than the in-flight/latch pair it used to clear: the (col_seq →
+   * t0_ns) cache, the oldest-known anchor and the server's oldest-available
+   * bound belong to the SESSION the loader was backfilling. A re-subscribe
+   * reuses this instance for a NEW session whose grid restarts at col_seq 0 —
+   * a surviving cache would (a) derive before_t from the OLD symbol's price
+   * frame (wrong t0s under the reused seq keys) and (b) false-latch
+   * start-of-history as soon as the new session's early t0s fall below the old
+   * server bound, killing scroll-back for the new symbol. Clearing costs a
+   * re-seed (the renderer notes every column it writes, so the next live column
+   * restores the mapping) and at worst one wasted probe round-trip after
+   * go-live.
+   */
   reset(): void {
     this.inFlightBeforeT = null;
     this.startOfHistoryFlag = false;
+    this.colT0.clear();
+    this.oldestKnownSeq = -1;
+    this.oldestKnownT0 = 0n;
+    this.oldestAvailableT0 = 0n;
+    this.lastError = null;
   }
 
   // --- diagnostics (dev hook / e2e) --------------------------------------------

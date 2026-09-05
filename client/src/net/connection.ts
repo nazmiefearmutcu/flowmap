@@ -10,8 +10,13 @@
  *   Marker are forwarded to a single high-frequency `onStream` consumer (columns
  *   deduped by (epoch, col_seq)); HistoryResponse resolves the matching
  *   requestHistory() promise;
- * - reconnects on unexpected close with exponential backoff (base 500ms, cap 10s),
- *   resetting the backoff once a Hello handshake lands.
+ * - reconnects on unexpected close with EXPONENTIAL BACKOFF + FULL JITTER
+ *   (base 500ms, cap 15s: delay = random() · min(cap, base·2^n)) — the jitter
+ *   spreads simultaneous dropouts (sidecar restart, network blip) instead of
+ *   synchronizing every client on the same retry tick. The attempt counter
+ *   resets once a Hello handshake lands (a completed session attach, not merely
+ *   a TCP/WS open); a clean server close (1000/1001) and an abnormal transport
+ *   death are both recorded on `lastClose` and both reconnect with backoff.
  *
  * Everything the renderer needs at frame rate (the columns/trades/BBO stream)
  * flows through `onStream`, deliberately NOT through React state, so a live feed
@@ -104,6 +109,14 @@ export interface ConnectionOptions extends ConnectionHandlers {
   now?: () => number;
   backoffBaseMs?: number;
   backoffCapMs?: number;
+  /**
+   * Uniform random source for FULL-JITTER backoff, `() => number` in [0, 1).
+   * The reconnect delay is `jitter() · min(cap, base · 2^attempt)`, so a hundred
+   * clients that dropped together retry spread out instead of in a synchronized
+   * herd against a restarting sidecar. Injectable so tests pin deterministic
+   * delays (`() => 1` reproduces the bare exponential ceiling).
+   */
+  jitter?: () => number;
   historyTimeoutMs?: number;
 }
 
@@ -150,6 +163,7 @@ export class Connection {
   private readonly now: () => number;
   private readonly backoffBaseMs: number;
   private readonly backoffCapMs: number;
+  private readonly jitterFn: () => number;
   private readonly historyTimeoutMs: number;
   private readonly handlers: ConnectionHandlers;
 
@@ -165,6 +179,14 @@ export class Connection {
 
   private backoffAttempt = 0;
   private reconnectTimer: unknown = null;
+  /**
+   * How the LAST socket closed (`null` until one does). `wasClean` distinguishes
+   * a server-initiated close frame (1000 normal / 1001 going away — a sidecar
+   * shutting down) from an abnormal transport death (no code / 1006-style). Both
+   * reconnect with backoff; the flag exists so the stall watchdog / UI can tell
+   * "the server said goodbye" from "the wire died" without sniffing events.
+   */
+  private lastClose: { code: number | null; wasClean: boolean } | null = null;
 
   /** Latest col_seq forwarded per epoch — the (epoch, col_seq) dedup cursor. */
   private readonly lastColSeq = new Map<number, number>();
@@ -182,7 +204,8 @@ export class Connection {
     this.clearTimeoutFn = options.clearTimeout ?? defaultClearTimeout;
     this.now = options.now ?? (() => Date.now());
     this.backoffBaseMs = options.backoffBaseMs ?? 500;
-    this.backoffCapMs = options.backoffCapMs ?? 10_000;
+    this.backoffCapMs = options.backoffCapMs ?? 15_000;
+    this.jitterFn = options.jitter ?? (() => Math.random());
     this.historyTimeoutMs = options.historyTimeoutMs ?? 10_000;
     this.handlers = {
       onStream: options.onStream,
@@ -202,6 +225,11 @@ export class Connection {
 
   get session(): string | null {
     return this.sessionId;
+  }
+
+  /** How the last socket closed (see `lastClose`), or null if none has. */
+  get closeInfo(): { code: number | null; wasClean: boolean } | null {
+    return this.lastClose;
   }
 
   /** Read-only view of the epoch geometry gathered from Hello / EpochStart. */
@@ -257,9 +285,16 @@ export class Connection {
     this.lastColSeq.clear();
     this.epochMap.clear();
     this.sessionId = null;
+    this.failHistoryWaiters(
+      new Error('flowmap: history request abandoned — subscription changed'),
+    );
+  }
+
+  /** Reject every pending history request (timer cleared) and drop the waiters. */
+  private failHistoryWaiters(err: Error): void {
     for (const waiter of this.historyWaiters.values()) {
       this.clearTimeoutFn(waiter.timer);
-      waiter.reject(new Error('flowmap: history request abandoned — subscription changed'));
+      waiter.reject(err);
     }
     this.historyWaiters.clear();
   }
@@ -334,11 +369,7 @@ export class Connection {
       this.clearTimeoutFn(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    for (const waiter of this.historyWaiters.values()) {
-      this.clearTimeoutFn(waiter.timer);
-      waiter.reject(new Error('flowmap: connection closed'));
-    }
-    this.historyWaiters.clear();
+    this.failHistoryWaiters(new Error('flowmap: connection closed'));
 
     const sock = this.socket;
     this.socket = null;
@@ -391,35 +422,55 @@ export class Connection {
   /** Browser close code the server uses for "subscription not supported here". */
   private static readonly CLOSE_UNSUPPORTED = 1003;
 
+  /** Browser close code for "the server said goodbye cleanly". */
+  private static readonly CLEAN_CLOSE_CODES = new Set([1000, 1001]);
+
   private onSocketClose(ev?: { code?: number }): void {
+    const code = (ev as { code?: number } | undefined)?.code;
     // A 1003 while a REPLAY subscribe is the active subscription is the server's
-    // honest refusal of a replay against a session with no recording. Surface it
-    // BEFORE resetting activeSub, and DON'T schedule the reconnect loop here: the
-    // store falls back to live and re-subscribes, which reconnects through the
-    // normal path — looping straight back into the same refusal would just pin
-    // the UI on "reconnecting · degraded" forever.
+    // honest refusal of a replay against a session with no recording. Compute it
+    // BEFORE resetting activeSub. It must NOT outrank our own intentional close:
+    // when close() already ran, nothing here may fire callbacks or reconnect.
     const refusedReplay =
-      this.activeSub?.mode === 'replay' &&
-      (ev as { code?: number } | undefined)?.code === Connection.CLOSE_UNSUPPORTED;
+      this.activeSub?.mode === 'replay' && code === Connection.CLOSE_UNSUPPORTED;
+    this.lastClose = {
+      code: code ?? null,
+      wasClean: code !== undefined && Connection.CLEAN_CLOSE_CODES.has(code),
+    };
     this.socketOpen = false;
     this.activeSub = null;
     this.socket = null;
-    if (refusedReplay) {
-      this.handlers.onReplayRefused?.();
-      this.scheduleReconnect();
-      return;
-    }
+    // The socket is gone either way: fail in-flight history requests NOW rather
+    // than letting them coast to their 10 s timeout, so the HistoryLoader's next
+    // pan retries on the replacement socket instead of stalling through the
+    // whole backoff window.
+    this.failHistoryWaiters(new Error('flowmap: history request abandoned — connection lost'));
     if (this.intentionalClose) {
       this.setConnStatus('closed');
       return;
     }
+    if (refusedReplay) {
+      this.handlers.onReplayRefused?.();
+      // STILL schedule the reconnect — the store is expected to have
+      // re-subscribed live; the transport must not silently swallow the socket.
+      this.scheduleReconnect();
+      return;
+    }
+    // Clean (server shutdown) and abnormal (wire death) closes both reconnect:
+    // a sidecar that said goodbye is exactly the one worth waiting for. The
+    // distinction rides on `closeInfo` for whoever needs it.
     this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
     this.setConnStatus('reconnecting');
     const exp = Math.min(this.backoffAttempt, 20); // guard 2**n overflow
-    const delay = Math.min(this.backoffCapMs, this.backoffBaseMs * 2 ** exp);
+    // Exponential growth, capped, then FULL JITTER: the delay is a uniform draw
+    // from [0, ceiling). Without the draw, every client that dropped together
+    // retries on the same tick — a herd against a just-restarting sidecar. The
+    // ceiling still grows exponentially so a dead endpoint is polled gently.
+    const ceiling = Math.min(this.backoffCapMs, this.backoffBaseMs * 2 ** exp);
+    const delay = Math.round(this.jitterFn() * ceiling);
     this.backoffAttempt += 1;
     this.reconnectTimer = this.setTimeoutFn(() => {
       this.reconnectTimer = null;

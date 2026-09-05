@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { decodeFrame } from '../proto/decode';
 import { MsgType, type Msg } from '../proto/types';
-import { Connection, type SocketLike } from './connection';
+import { Connection, type ConnectionOptions, type SocketLike } from './connection';
 
 // The fixed ns timestamp baked into the server's golden fixture
 // (2025-07-17T00:00:00Z); the hot_ping golden carries server_send_ns = T0 + 4000.
@@ -180,6 +180,10 @@ interface Harness {
   sockets: FakeWebSocket[];
   clock: FakeClock;
   factory: (url: string) => SocketLike;
+  /** Build a Connection wired to this harness. Jitter defaults to 1 — the
+   *  deterministic full-jitter draw (exact exponential ceiling) the existing
+   *  clock assertions rely on; pass `{ jitter }` in `extra` for other draws. */
+  makeConn: (extra?: Partial<ConnectionOptions>) => Connection;
 }
 
 function harness(): Harness {
@@ -190,7 +194,16 @@ function harness(): Harness {
     sockets.push(s);
     return s;
   };
-  return { sockets, clock, factory };
+  const makeConn = (extra: Partial<ConnectionOptions> = {}): Connection =>
+    new Connection({
+      url: URL,
+      wsFactory: factory,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+      jitter: () => 1,
+      ...extra,
+    });
+  return { sockets, clock, factory, makeConn };
 }
 
 // Fake endpoint handed to the injected FakeWebSocket, which ignores it (no real
@@ -202,13 +215,8 @@ const URL = 'wss://test.invalid/ws';
 
 describe('Connection — subscription lifecycle', () => {
   it('sends Subscribe on open with the requested market/symbol/mode', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     expect(sockets).toHaveLength(1);
@@ -225,13 +233,8 @@ describe('Connection — subscription lifecycle', () => {
   });
 
   it('replacing a subscription sends Unsubscribe then Subscribe on the open socket', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open(); // Subscribe #1
@@ -248,12 +251,9 @@ describe('Connection — subscription lifecycle', () => {
   });
 
   it('rewinds the per-session cursors when the stream changes', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onStream = vi.fn();
-    const conn = new Connection({
-      url: URL, wsFactory: factory,
-      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
-    });
+    const conn = makeConn({ onStream });
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -273,12 +273,9 @@ describe('Connection — subscription lifecycle', () => {
   });
 
   it('keeps the dedup cursor across a reconnect of the SAME stream', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, clock, makeConn } = harness();
     const onStream = vi.fn();
-    const conn = new Connection({
-      url: URL, wsFactory: factory,
-      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
-    });
+    const conn = makeConn({ onStream });
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -296,13 +293,8 @@ describe('Connection — subscription lifecycle', () => {
   });
 
   it('rejects an in-flight history request when the stream changes', async () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -324,15 +316,9 @@ describe('Connection — subscription lifecycle', () => {
 
 describe('Connection — message routing', () => {
   it('routes Hello to onHello, seeds session/epoch state, and goes live', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onHello = vi.fn();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      onHello,
-    });
+    const conn = makeConn({ onHello });
 
     conn.connect();
     sockets[0].open();
@@ -348,15 +334,9 @@ describe('Connection — message routing', () => {
   });
 
   it('builds the epoch map from EpochStart', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onEpochStart = vi.fn();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      onEpochStart,
-    });
+    const conn = makeConn({ onEpochStart });
 
     conn.connect();
     sockets[0].open();
@@ -367,13 +347,8 @@ describe('Connection — message routing', () => {
   });
 
   it('auto-replies to Ping with Pong echoing server_send_ns', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
 
     conn.connect();
     sockets[0].open();
@@ -386,15 +361,9 @@ describe('Connection — message routing', () => {
   });
 
   it('forwards columns to the stream consumer and dedups by (epoch, col_seq)', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onStream = vi.fn();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      onStream,
-    });
+    const conn = makeConn({ onStream });
 
     conn.connect();
     sockets[0].open();
@@ -409,12 +378,9 @@ describe('Connection — message routing', () => {
   });
 
   it('forwards every forming (final=false) depth re-send, then the finalizing one', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onStream = vi.fn();
-    const conn = new Connection({
-      url: URL, wsFactory: factory,
-      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
-    });
+    const conn = makeConn({ onStream });
     conn.connect();
     sockets[0].open();
 
@@ -434,12 +400,9 @@ describe('Connection — message routing', () => {
   });
 
   it('never drops BarColumn even when it shares a just-finalized depth col_seq', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onStream = vi.fn();
-    const conn = new Connection({
-      url: URL, wsFactory: factory,
-      setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStream,
-    });
+    const conn = makeConn({ onStream });
     conn.connect();
     sockets[0].open();
 
@@ -454,13 +417,8 @@ describe('Connection — message routing', () => {
 
 describe('Connection — reconnect', () => {
   it('re-opens after an unexpected close and re-sends Subscribe past the backoff', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -480,13 +438,8 @@ describe('Connection — reconnect', () => {
   });
 
   it('does not reconnect after an intentional close()', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -499,13 +452,8 @@ describe('Connection — reconnect', () => {
   });
 
   it('an explicit connect() during the backoff window cancels the pending reconnect (no double socket)', () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
 
     conn.subscribe('crypto', 'BTCUSDT', 'live');
     sockets[0].open();
@@ -526,16 +474,128 @@ describe('Connection — reconnect', () => {
   });
 });
 
+describe('Connection — backoff with full jitter', () => {
+  it('draws the delay from [0, ceiling): jitter 0 reconnects immediately', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn({ jitter: () => 0 });
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].drop();
+    expect(sockets).toHaveLength(1);
+    clock.advance(0); // delay 0 → the timer is due right away
+    expect(sockets).toHaveLength(2);
+  });
+
+  it('jitter 1 keeps the deterministic exponential ceiling: 500 → 1000 → 2000', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn(); // default harness jitter = 1 (exact ceiling)
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+
+    sockets[0].drop();
+    clock.advance(499);
+    expect(sockets).toHaveLength(1);
+    clock.advance(1); // 500
+    expect(sockets).toHaveLength(2);
+
+    sockets[1].drop();
+    clock.advance(999);
+    expect(sockets).toHaveLength(2);
+    clock.advance(1); // 1000
+    expect(sockets).toHaveLength(3);
+
+    sockets[2].drop();
+    clock.advance(1999);
+    expect(sockets).toHaveLength(3);
+    clock.advance(1); // 2000
+    expect(sockets).toHaveLength(4);
+  });
+
+  it('caps the ceiling at backoffCapMs (default 15s) instead of growing forever', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    // Burn through attempts without ever completing a handshake, so the attempt
+    // counter keeps climbing: 500·2^n passes the 15000 cap at attempt 5. Each
+    // advance(60_000) fires whatever delay is armed and opens the next socket.
+    for (let i = 0; i < 6; i += 1) {
+      sockets[i].drop();
+      clock.advance(60_000);
+    }
+    expect(sockets).toHaveLength(7);
+
+    sockets[6].open(); // no Hello delivered — the counter is NOT reset
+    sockets[6].drop(); // attempt 6: ceiling still capped at 15_000
+    clock.advance(14_999);
+    expect(sockets).toHaveLength(7);
+    clock.advance(1);
+    expect(sockets).toHaveLength(8);
+  });
+
+  it('resets to the base delay once a Hello handshake lands', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].drop(); // attempt 0 → 500
+    clock.advance(500);
+    expect(sockets).toHaveLength(2);
+    sockets[1].drop(); // attempt 1 → 1000
+    clock.advance(1000);
+    expect(sockets).toHaveLength(3);
+
+    // Socket 2 completes the HANDSHAKE (Hello) — a completed session attach,
+    // not merely an open — so the attempt counter rewinds to the base delay.
+    sockets[2].open();
+    sockets[2].deliver(goldenU8('cold_hello'));
+    sockets[2].drop();
+    clock.advance(499);
+    expect(sockets).toHaveLength(3); // 2000 would not have fired yet
+    clock.advance(1); // 500
+    expect(sockets).toHaveLength(4);
+  });
+
+  it('records whether the last close was clean (1000/1001) or abnormal', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    expect(conn.closeInfo).toBeNull();
+
+    sockets[0].open();
+    sockets[0].drop(1001); // server going away — a CLEAN close frame
+    expect(conn.closeInfo).toEqual({ code: 1001, wasClean: true });
+    // …and a clean server close still reconnects (the sidecar is exactly the
+    // endpoint worth waiting for) — the flag is diagnostic, not a suppressor.
+    expect(conn.status).toBe('reconnecting');
+
+    clock.advance(500);
+    sockets[1].open();
+    sockets[1].drop(); // no close frame — abnormal transport death
+    expect(conn.closeInfo).toEqual({ code: null, wasClean: false });
+  });
+
+  it('fails in-flight history requests on an unexpected close (no 10 s timeout coast)', async () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn({ historyTimeoutMs: 5_000 });
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+
+    const pending = conn.requestHistory(1n, 10);
+    const assertion = expect(pending).rejects.toThrow(/connection lost/);
+    sockets[0].drop();
+    await assertion;
+
+    // The reconnect machinery is unaffected by the waiter teardown.
+    clock.advance(500);
+    expect(sockets).toHaveLength(2);
+  });
+});
+
 describe('Connection — history correlation', () => {
   it('resolves requestHistory on the HistoryResponse with the matching req_id', async () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      historyTimeoutMs: 5_000,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn({ historyTimeoutMs: 5_000 });
 
     conn.connect();
     sockets[0].open();
@@ -554,14 +614,8 @@ describe('Connection — history correlation', () => {
   });
 
   it('rejects requestHistory on timeout', async () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      historyTimeoutMs: 5_000,
-    });
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn({ historyTimeoutMs: 5_000 });
 
     conn.connect();
     sockets[0].open();
@@ -573,13 +627,8 @@ describe('Connection — history correlation', () => {
   });
 
   it('ignores a HistoryResponse whose req_id has no waiter', async () => {
-    const { sockets, clock, factory } = harness();
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-    });
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
 
     conn.connect();
     sockets[0].open();
@@ -590,16 +639,10 @@ describe('Connection — history correlation', () => {
 
 describe('Connection — robustness', () => {
   it('drops a malformed frame without closing or killing the connection', () => {
-    const { sockets, clock, factory } = harness();
+    const { sockets, makeConn } = harness();
     const onStream = vi.fn();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const conn = new Connection({
-      url: URL,
-      wsFactory: factory,
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      onStream,
-    });
+    const conn = makeConn({ onStream });
 
     conn.connect();
     sockets[0].open();

@@ -224,6 +224,75 @@ describe('bookStore resetForSession (symbol switch)', () => {
   });
 });
 
+describe('bookStore NaN quarantine + epoch consistency', () => {
+  it('rejects a late column from an OLDER epoch — stale levels never clobber the new grid', () => {
+    ingestForTest(depthCol(2, 5, [1, 2], [3, 4]));
+    // A straggler from the OLD epoch with a huge col_seq must not win: epoch
+    // order dominates col_seq order (a re-anchor/seek bumps the epoch).
+    ingestForTest(depthCol(1, 9999, [9, 9], [9, 9]));
+    const book = getSnapshot().book;
+    expect(book?.epoch).toBe(2);
+    expect(book?.colSeq).toBe(5);
+    expect(Array.from(book?.bid ?? [])).toEqual([1, 2]);
+  });
+
+  it('overwrites idempotently on the same (epoch, col_seq) re-delivery', () => {
+    ingestForTest(depthCol(1, 10, [1, 1], [2, 2]));
+    ingestForTest(depthCol(1, 10, [7, 7], [8, 8]));
+    const book = getSnapshot().book;
+    expect(book?.colSeq).toBe(10);
+    expect(Array.from(book?.bid ?? [])).toEqual([7, 7]);
+  });
+
+  it('quarantines non-finite densities to zero instead of poisoning the ladder', () => {
+    ingestForTest(depthCol(1, 10, [1, NaN, Infinity], [-Infinity, 0, 4]));
+    const book = getSnapshot().book;
+    // Corrupt entries become "no resting size" (the protocol's qty-to-zero);
+    // the healthy rows survive.
+    expect(Array.from(book?.bid ?? [])).toEqual([1, 0, 0]);
+    expect(Array.from(book?.ask ?? [])).toEqual([0, 0, 4]);
+  });
+
+  it('drops a corrupt BBO (non-finite price/size) and keeps the last good quote', () => {
+    ingestForTest(bbo(99.5, 12, 100.5, 7));
+    ingestForTest(bbo(NaN, 1, 101, 1)); // corrupt bid_px — update rejected whole
+    expect(getSnapshot().bbo).toMatchObject({
+      bidPx: 99.5,
+      bidSz: 12,
+      askPx: 100.5,
+      askSz: 7,
+    });
+  });
+
+  it('drops trades with non-finite price/size and never throws on a NaN ns field', () => {
+    ingestForTest(trade(1, NaN, 1, SIDE_SELL)); // NaN price
+    ingestForTest(trade(2, Infinity, 1, SIDE_BUY)); // Inf price
+    ingestForTest(trade(3, 101, NaN, SIDE_SELL)); // NaN size
+    expect(getSnapshot().trades).toHaveLength(0);
+
+    // A NaN reaching the bigint coercion (BigInt(NaN) throws) must be
+    // quarantined at the boundary, not tear down the fan-out. The trade record
+    // itself survives (price/size — its essence — are valid); the corrupt FIELD
+    // is clamped to 0n, mirroring the depth-array zeroing policy.
+    const corruptNs: Trade = {
+      type: MsgType.TRADE,
+      ts_ns: NaN as unknown as bigint,
+      price: 100,
+      size: 1,
+      side: SIDE_BUY,
+      side_src: 0,
+      venue: 'sim',
+    };
+    expect(() => ingestForTest(corruptNs)).not.toThrow();
+    expect(getSnapshot().trades).toHaveLength(1);
+    expect(getSnapshot().trades[0].tsNs).toBe(0n);
+
+    ingestForTest(trade(4, 102, 1, SIDE_BUY));
+    expect(getSnapshot().trades).toHaveLength(2);
+    expect(getSnapshot().trades[0].tsNs).toBe(4n);
+  });
+});
+
 describe('bookStore stream wiring', () => {
   it('receives depth columns through the real store.onStream fan-out', () => {
     const sockets: FakeWebSocket[] = [];

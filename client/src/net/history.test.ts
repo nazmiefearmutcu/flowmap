@@ -214,3 +214,99 @@ describe('HistoryLoader (T8 backfill)', () => {
     await flush();
   });
 });
+
+describe('HistoryLoader — session reset + page hygiene', () => {
+  it('reset() drops the SESSION-scoped state: a stale oldest-available bound must not kill the new session’s scroll-back', async () => {
+    // Old session: the server floor IS the resident oldest → empty page →
+    // start-of-history latched AND oldest_available = t0(100).
+    const h = harness(BigInt(100 * DT), /* serverFloorSeq */ 100);
+    h.loader.noteColumn(100, BigInt(100 * DT));
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    expect(h.loader.startOfHistory).toBe(true);
+    expect(h.loader.requestCount).toBe(1);
+
+    // A session switch hands the SAME loader a NEW session whose grid restarts
+    // at col_seq 0 with its own server bound. reset() must clear the latch AND
+    // the old session's oldest_available: without that, before_t (= t0(100))
+    // ≤ the stale bound latches exhaustion and the new session never probes.
+    h.loader.reset();
+    expect(h.loader.startOfHistory).toBe(false);
+    h.loader.noteColumn(100, BigInt(100 * DT)); // re-seeded by the next live write
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    expect(h.loader.requestCount).toBe(2);
+    expect(h.loader.inFlight).toBe(true);
+    await flush();
+  });
+
+  it('splices an out-of-order page ASCENDING (oldest first) regardless of arrival order', async () => {
+    const spliced: number[] = [];
+    const loader = new HistoryLoader({
+      requestHistory: (): Promise<HistoryResponse> =>
+        Promise.resolve({
+          type: MsgType.HISTORY_RESP,
+          req_id: 1,
+          epoch: 0,
+          oldest_available_t_ns: -1_000_000n,
+          // A deviant server: the page arrives shuffled.
+          depth_cols: [
+            makeCol(98, BigInt(98 * DT)),
+            makeCol(96, BigInt(96 * DT)),
+            makeCol(99, BigInt(99 * DT)),
+            makeCol(97, BigInt(97 * DT)),
+          ],
+          bar_cols: [],
+          markers: [],
+          big_trades: [],
+        }),
+      spliceColumn: (col) => spliced.push(col.col_seq),
+      residentRange: () => ({ oldest: 100, newest: 199, count: 100 }),
+      budgetCols: () => 256,
+      dtNs: () => DT,
+    });
+    loader.noteColumn(100, BigInt(100 * DT));
+
+    loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    expect(spliced).toEqual([96, 97, 98, 99]);
+    expect(loader.startOfHistory).toBe(false); // floor far below — not exhausted
+  });
+
+  it('a transient failure does NOT latch exhaustion — the next pan retries and success clears the error', async () => {
+    let fail = true;
+    const spliced: number[] = [];
+    const loader = new HistoryLoader({
+      requestHistory: (before_t): Promise<HistoryResponse> => {
+        if (fail) return Promise.reject(new Error('history request 7 timed out'));
+        return Promise.resolve({
+          type: MsgType.HISTORY_RESP,
+          req_id: 7,
+          epoch: 0,
+          oldest_available_t_ns: -1_000_000n,
+          depth_cols: [makeCol(Number(before_t) / DT - 1, before_t - BigInt(DT))],
+          bar_cols: [],
+          markers: [],
+          big_trades: [],
+        });
+      },
+      spliceColumn: (col) => spliced.push(col.col_seq),
+      residentRange: () => ({ oldest: 100, newest: 199, count: 100 }),
+      budgetCols: () => 256,
+      dtNs: () => DT,
+    });
+    loader.noteColumn(100, BigInt(100 * DT));
+
+    loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    expect(loader.error).toMatch(/timed out/);
+    expect(loader.startOfHistory).toBe(false); // NOT latched on a transient error
+    expect(loader.inFlight).toBe(false); // channel freed for a retry
+
+    fail = false;
+    loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    expect(loader.requestCount).toBe(2);
+    expect(spliced).toEqual([99]);
+    expect(loader.error).toBeNull(); // success clears the stale error
+  });
+});

@@ -171,8 +171,6 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
           });
         },
         onEpochStart: (ev) => {
-          const epochs = new Map(get().epochs);
-          epochs.set(ev.epoch, ev.epoch_params);
           // Advance the grid epoch to the newest re-anchored frame so the price
           // axis + overlays follow it (e.g. an equity grid re-anchoring from its
           // nominal $100 p0 to the symbol's real price mid-stream). Only ever
@@ -180,6 +178,14 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
           // and must not regress the live price frame.
           const cur = get().gridEpoch;
           const gridEpoch = cur === null ? ev.epoch : Math.max(cur, ev.epoch);
+          // No-op guard: reconnect snapshots re-send EpochStarts we already hold.
+          // Epoch geometry is immutable per epoch (a re-anchor is a NEW epoch),
+          // so a known epoch whose grid cursor wouldn't advance carries zero new
+          // information — skipping it avoids a fresh Map + set() (and the
+          // re-render of every `epochs` subscriber) for a duplicate.
+          if (get().epochs.has(ev.epoch) && gridEpoch === cur) return;
+          const epochs = new Map(get().epochs);
+          epochs.set(ev.epoch, ev.epoch_params);
           set({ epochs, gridEpoch });
         },
         onStatus: (status) => {
