@@ -545,6 +545,30 @@ class Recorder:
             newest_t0_ns=columns[-1].t0_ns,
         )
 
+    def newest_column_t0(self, market: str, symbol: str) -> int | None:
+        """Newest recorded column ``t0_ns`` on disk — the freshness probe the
+        SessionManager uses to re-validate a parked replay session on
+        re-attach (a replay feed is a snapshot of the recording taken when it
+        was built; growth past its tail means the parked replay is stale).
+
+        Reads at most ONE part file: part names are chronological, so the
+        newest non-empty readable ``*-columns-*`` part holds the globally
+        newest ``t0_ns``. Returns ``None`` when recording is disabled or no
+        readable column data exists — callers must treat "unknown" as
+        not-stale rather than inventing staleness they cannot see.
+        """
+        if not self._enabled:
+            return None
+        d = self._symbol_dir(market, symbol)
+        if not d.is_dir():
+            return None
+        for path in sorted(d.glob("*-columns-*.parquet"), key=_by_name, reverse=True):
+            df = _read_parquet_safe(path)
+            if df is None or df.height == 0:
+                continue  # unreadable (warned) or empty: try the next-older part
+            return int(df["t0_ns"].max())
+        return None
+
     @staticmethod
     def _columns_from_table(
         table: pl.DataFrame, epoch_map: dict[int, EpochParams]

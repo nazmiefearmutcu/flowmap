@@ -120,8 +120,9 @@ def columns_from_candles(
     if rows <= 0 or step <= 0.0 or dt <= 0:
         return None
 
-    # Keep finite candles, sorted by (snapped) t0, deduped so t0 strictly
-    # increases (preload requires it). Newest kept when two snap together.
+    # Keep finite candles, sorted by raw t0. Candles snapping onto the same
+    # dt slot are all KEPT — the later one is forced to prev_t0 + dt so t0
+    # strictly increases (preload requires it). No candle is dropped here.
     clean: list[Candle] = []
     for cd in candles:
         if not _finite(cd.o, cd.h, cd.l, cd.c, cd.volume):

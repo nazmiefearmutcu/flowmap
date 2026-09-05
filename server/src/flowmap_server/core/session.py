@@ -73,7 +73,13 @@ from flowmap_server.feeds.replay import ReplayFeed
 from flowmap_server.feeds.router import build_feed
 from flowmap_server.proto import events, wire
 
-__all__ = ["ClientTx", "Session", "SessionLimitError", "SessionManager"]
+__all__ = [
+    "ClientTx",
+    "ReplayStaleError",
+    "Session",
+    "SessionLimitError",
+    "SessionManager",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +101,13 @@ _STABLE_NS = 5_000_000_000
 _STABLE_EVENTS = 100
 _MARKERS_CAP = 1024  # bounded marker memory for snapshot/history
 _T_MAX = 2**63 - 1
+# Parked-replay freshness policy (handoff §6): a re-attach to an EXISTING
+# replay session re-validates the recording on disk. Growth past the
+# session's tail by more than this much RECORDED time is "stale" — a replay
+# feed can never serve columns recorded after the tail it was built from, so
+# accepting would present an outdated replay as current. 2 s absorbs the
+# one-column flush race (any dt) between ``load_all`` and the attach.
+REPLAY_STALE_TOL_NS = 2_000_000_000
 # big_trades note: HistoryResponse.big_trades stays [] at M1 — the rolling-
 # percentile large-lot threshold that selects them arrives with the feature
 # engines (T10); the wire field and this serving path are already in place.
@@ -349,6 +362,11 @@ class Session:
         self._recorder_root = recorder
         self._wall_clock = wall_clock
         self._rec: SessionRecorder | None = None
+        # Newest t0_ns of the recording this session's replay feed was built
+        # from. None for live sessions; SessionManager sets it when it builds
+        # a replay session and re-checks it on every re-attach to the same
+        # key (parked-replay freshness policy, handoff §6).
+        self.replay_tail_t0: int | None = None
         self._cols_since_flush = 0
         self._boot_done = False
         self._start_lock = asyncio.Lock()
@@ -932,12 +950,16 @@ class Session:
 
     def _norm_seed(self) -> float:
         """Percentile hint for client normalization: p99 of the nonzero
-        densities over the most recent ≤64 columns, or 1.0 when empty."""
+        densities over the most recent ≤64 columns, or 1.0 when empty.
+
+        Non-finite values are filtered before the percentile: a ``+inf``
+        texel rehydrated from a pre-clamp recording would otherwise make the
+        p99 — and with it the wire ``norm_seed`` — infinite."""
         cols = self._grid.history(_T_MAX, 64)
         if not cols:
             return 1.0
         vals = np.concatenate([c.bid for c in cols] + [c.ask for c in cols]).astype(np.float64)
-        vals = vals[vals > 0.0]
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
         if vals.size == 0:
             return 1.0
         return float(np.percentile(vals, 99.0))
@@ -1031,6 +1053,21 @@ class ReplayUnavailableError(RuntimeError):
     (instead of silently serving the LIVE feed under a replay label) is the
     honest behaviour — the client hides its Replay toggle unless a server
     advertises ``capability.replay``."""
+
+
+class ReplayStaleError(ReplayUnavailableError):
+    """Re-attach to an existing replay session whose recording moved on.
+
+    A replay session's feed is a SNAPSHOT of the recording taken when the
+    session was created; it can never serve columns recorded after its tail.
+    When the on-disk recording has grown past that tail by more than
+    :data:`REPLAY_STALE_TOL_NS`, a re-attach to the same key is refused
+    instead of presenting the outdated replay as current (handoff §6).
+
+    Subclasses :class:`ReplayUnavailableError` deliberately: the WS layer's
+    existing honest-replay refusal (``Status{degraded}`` + close 1003) covers
+    it with no new wiring, and the message carries the machine-checkable
+    ``replay_stale`` token plus both tail positions."""
 
 
 # Sim grid shape (mirrors feeds.sim private constants: mid starts at 100.0,
@@ -1251,9 +1288,9 @@ class SessionManager:
                 # The recording-backed replay engine: the recorder IS the data
                 # source, so a replay session opens NO recorder of its own and
                 # runs no backfill (both already gated on mode == "live").
-                feed = self._replay_feed(sub)
+                feed, replay_tail = self._replay_feed(sub)
             else:
-                feed = self._feed_factory(sub)
+                feed, replay_tail = self._feed_factory(sub), None
             session = Session(
                 f"{sub.market}:{sub.symbol}:{sub.mode}:{uuid.uuid4().hex[:12]}",
                 feed=feed,
@@ -1271,7 +1308,14 @@ class SessionManager:
                 else 0,
             )
             session._on_teardown = self._make_remover(key, session)
+            if replay_tail is not None:
+                session.replay_tail_t0 = replay_tail.newest_t0_ns
             self._sessions[key] = session
+        elif sub.mode == "replay":
+            # Parked-replay freshness policy (handoff §6): re-validate the
+            # recording before handing the existing session out again. Raises
+            # ReplayStaleError — refusing leaves the parked session untouched.
+            self._recheck_replay_freshness(session, sub)
         # Unconditional (start() is idempotent/restart-safe): a session whose
         # feed ended normally must not be handed out as a zombie — a new
         # subscriber restarts the run task. First start boots (rehydrates)
@@ -1307,13 +1351,15 @@ class SessionManager:
             client.offer(frame, col_msg=False, t0_ns=None, protected=True)
         return session
 
-    def _replay_feed(self, sub: events.Subscribe) -> ReplayFeed:
+    def _replay_feed(self, sub: events.Subscribe) -> tuple[ReplayFeed, TailData]:
         """Build the recording-backed replay feed for ``sub``, or refuse.
 
-        The recorder is the replay data source: a store-less manager (tests)
-        or a symbol with no recording raises :class:`ReplayUnavailableError`,
-        which the WS layer turns into an explicit refusal — never a live feed
-        under a replay label."""
+        Returns the feed and the tail it was built from (the manager records
+        the tail's newest ``t0_ns`` on the session so re-attaches can detect a
+        recording that has moved on). The recorder is the replay data source:
+        a store-less manager (tests) or a symbol with no recording raises
+        :class:`ReplayUnavailableError`, which the WS layer turns into an
+        explicit refusal — never a live feed under a replay label."""
         if self._recorder is None:
             raise ReplayUnavailableError(
                 "replay needs a recording store; this manager has none"
@@ -1323,7 +1369,38 @@ class SessionManager:
             raise ReplayUnavailableError(
                 f"no recording for {sub.market}:{sub.symbol} — replay unavailable"
             )
-        return ReplayFeed(market=sub.market, symbol=sub.symbol, tail=tail)
+        return ReplayFeed(market=sub.market, symbol=sub.symbol, tail=tail), tail
+
+    def _recheck_replay_freshness(
+        self, session: Session, sub: events.Subscribe
+    ) -> None:
+        """Re-validate an existing replay session's recording on re-attach.
+
+        The replay feed replays the recording AS IT WAS when the session was
+        created; columns recorded after its tail are unreachable from the
+        parked feed. If the recording on disk has grown past the session's
+        tail by more than :data:`REPLAY_STALE_TOL_NS` of recorded time, the
+        subscribe is REFUSED with :class:`ReplayStaleError` instead of
+        accepting (handoff §6: never present a stale replay as valid).
+
+        The refusal touches nothing: the parked session keeps its clients and
+        run task, and once the recording stops growing — or the session
+        retires after its grace and a fresh one is built from the new tail —
+        a re-subscribe succeeds again. An unreadable/absent recording counts
+        as NOT stale: the probe must never invent staleness it cannot see.
+        """
+        tail_t0 = session.replay_tail_t0
+        if self._recorder is None or tail_t0 is None:
+            return
+        disk_t0 = self._recorder.newest_column_t0(sub.market, sub.symbol)
+        if disk_t0 is None or disk_t0 <= tail_t0 + REPLAY_STALE_TOL_NS:
+            return
+        raise ReplayStaleError(
+            f"replay_stale: recording for {sub.market}:{sub.symbol} has grown "
+            f"past the parked session's tail (recorded through {disk_t0}, "
+            f"session tail {tail_t0}, tolerance {REPLAY_STALE_TOL_NS} ns) — "
+            f"re-subscribe once the old session retires"
+        )
 
     def _evict_other_bands(self, key: tuple[str, str, str, str | None, str]) -> None:
         """Tear down sessions that differ from ``key`` ONLY in the band.

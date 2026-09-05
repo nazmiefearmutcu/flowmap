@@ -285,3 +285,22 @@ def _drain(client: ClientTx) -> list[bytes]:
         if not frames:
             return out
         out.extend(frames)
+
+
+def test_same_slot_candles_both_kept_with_forced_t0():
+    """Two candles snapping onto one dt slot are BOTH kept (one column per
+    candle, per the module doc): the later candle is forced onto
+    ``prev_t0 + dt`` so the col_seq/t0 sequence stays strictly increasing for
+    ``Grid.preload`` — nothing is silently dropped."""
+    cs = [
+        Candle(t0_ns=0, o=100.0, h=101.0, l=99.0, c=100.0, volume=10.0),
+        Candle(t0_ns=DT // 2, o=100.0, h=101.0, l=99.0, c=100.5, volume=5.0),
+    ]
+    out = columns_from_candles(cs, _cfg())
+    assert out is not None
+    cols, _epoch = out
+    assert [c.t0_ns for c in cols] == [0, DT]
+    assert [c.col_seq for c in cols] == [0, 1]
+    # The forced slot still carries the second candle's real data.
+    assert cols[1].bar.c == 100.5
+    assert cols[1].bar.vwap_den_cum == 15.0

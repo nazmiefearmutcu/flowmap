@@ -521,7 +521,18 @@ class Grid:
         Never advances intervals or finalizes columns — time advancement is
         driven by :meth:`on_book`. A trade arriving before any book update
         anchors the current interval at ``ts_ns // dt_ns``.
+
+        A malformed print (non-finite or non-positive price, negative size)
+        is ignored ENTIRELY — not even time-anchoring: ``cvd_cum`` and the
+        ``vwap_*`` sums are session-cumulative, so a single NaN or negative
+        print would poison every later bar. Same rationale as the finite
+        filter in ``_map_levels``; the raw print still reaches the tape and
+        the recording via the session, only the DERIVED aggregates are
+        protected. A zero-size print is kept (some venues publish them at the
+        real price; dropping them would skew OHLC away from venue truth).
         """
+        if not (price > 0.0) or not math.isfinite(size) or size < 0.0:
+            return
         if self._cur_idx is None:
             self._cur_idx = ts_ns // self._cfg.dt_ns
             self._prev_ts = ts_ns

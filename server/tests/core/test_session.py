@@ -1163,3 +1163,43 @@ def test_deep_band_degrades_to_linear_when_the_core_already_spans_the_band():
     sz = np.array([1.0, 2.0, 3.0])
     grid.on_book(0, px, sz, px + 0.5, sz)
     assert grid.current_partial() is not None
+
+
+# ---------------------------------------------------------------------------
+# norm_seed: non-finite ring texels must not reach the wire hint
+
+
+def test_norm_seed_ignores_inf_texels():
+    """A +inf texel rehydrated from a PRE-CLAMP recording (finalize saturates
+    now, old recordings may not) would make the p99 — and the wire
+    ``norm_seed`` — infinite. The filter keeps the hint finite."""
+    from flowmap_server.core.grid import FinalizedColumn
+    from flowmap_server.proto.events import EpochParams
+
+    grid = _mk_grid(rows=64, ring_columns=128, p0=84.0)
+
+    def _bar(seq: int) -> BarColumn:
+        return BarColumn(
+            epoch=0, col_seq=seq, t0_ns=seq * DT, o=100.0, h=100.0, l=100.0,
+            c=100.0, vol_buy=0.0, vol_sell=0.0, cvd_cum=0.0,
+            vwap_num_cum=0.0, vwap_den_cum=0.0,
+        )
+
+    cols = [
+        FinalizedColumn(
+            epoch=0, col_seq=i, t0_ns=i * DT,
+            bid=np.full(64, 8.0, dtype=np.float16),
+            ask=np.zeros(64, dtype=np.float16),
+            bar=_bar(i),
+        )
+        for i in range(2)
+    ]
+    cols[1].bid[10] = np.float16(np.inf)
+    grid.preload(
+        cols,
+        [EpochParams(epoch=0, tick=0.5, tick_multiple=1, dt_ns=DT, p0=84.0, rows=64)],
+    )
+    sess = Session("norm-seed", feed=IdleFeed(), grid=grid)
+    seed = sess._norm_seed()
+    assert np.isfinite(seed)
+    assert seed == pytest.approx(8.0)

@@ -711,3 +711,59 @@ def test_unbanded_grid_keeps_the_legacy_central_70_rule():
     ep = g.maybe_reanchor(span * 0.95)  # outside
     assert ep is not None
     assert ep.tick_multiple == 1  # legacy path never touches the multiple
+
+
+# --------------------------------------------------------------------------
+# Malformed trade prints must never poison the derived bar aggregates
+# (the crypto feed passes venue prints through unfiltered; the crypto book
+# path filters in _apply_levels, and this is the grid-side counterpart).
+# --------------------------------------------------------------------------
+
+
+def test_on_trade_ignores_malformed_prints():
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    bad = [
+        (500_000_000, float("nan"), 1.0, SIDE_BUY),
+        (500_000_000, 100.0, float("nan"), SIDE_BUY),
+        (500_000_000, 100.0, float("inf"), SIDE_BUY),
+        (500_000_000, 100.0, -5.0, SIDE_BUY),
+        (500_000_000, 0.0, 1.0, SIDE_BUY),
+        (500_000_000, -1.0, 1.0, SIDE_SELL),
+    ]
+    for ts, px, sz, side in bad:
+        g.on_trade(ts, px, sz, side)
+    g.on_trade(500_000_000, 100.0, 2.0, SIDE_BUY)  # the one good print
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    # OHLC comes from the good print only (a NaN/inf print would poison these).
+    assert col.bar.o == col.bar.h == col.bar.l == col.bar.c == 100.0
+    assert col.bar.vol_buy == 2.0 and col.bar.vol_sell == 0.0
+    assert col.bar.cvd_cum == 2.0
+    assert col.bar.vwap_num_cum == 200.0 and col.bar.vwap_den_cum == 2.0
+    # The session-cumulative sums stay clean into the NEXT interval too: a
+    # single leaked NaN would propagate through every later bar here.
+    g.on_trade(1_500_000_000, 101.0, 3.0, SIDE_SELL)
+    (col2,) = g.on_book(2_000_000_000, *book(100.0, 5.0))
+    assert col2.bar.cvd_cum == -1.0
+    assert col2.bar.vwap_den_cum == 5.0
+    assert math.isfinite(col2.bar.vwap_num_cum)
+
+
+def test_malformed_first_trade_does_not_anchor_time():
+    g = Grid(CFG)
+    g.on_trade(0, float("nan"), 1.0, SIDE_BUY)
+    assert g.current_partial() is None  # time never anchored by a bad print
+    g.on_trade(500_000_000, 100.0, 2.0, SIDE_BUY)
+    p = g.current_partial()
+    assert p is not None and p.t0_ns == 0  # a good print anchors normally
+
+
+def test_on_trade_keeps_zero_size_print_ohlc():
+    """A zero-size print is venue truth at a real price: it paints OHLC but
+    adds nothing to the volume/cvd/vwap sums (dropping it would skew OHLC)."""
+    g = Grid(CFG)
+    g.on_book(0, *book(100.0, 5.0))
+    g.on_trade(500_000_000, 101.0, 0.0, SIDE_BUY)
+    (col,) = g.on_book(1_000_000_000, *book(100.0, 5.0))
+    assert col.bar.h == 101.0 and col.bar.c == 101.0
+    assert col.bar.vol_buy == 0.0 and col.bar.vwap_den_cum == 0.0
