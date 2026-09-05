@@ -65,8 +65,39 @@ no funds, and has no code path that could.
 | Telemetry, analytics, crash reporting | **None.** No SDK, no beacon, no first-run ping |
 | Auto-updater | **None.** The Tauri build enables no updater or shell plugin — an update is a download you initiate |
 | Network listener | `127.0.0.1:8720` only. Any non-loopback `FLOWMAP_HOST` is rejected with `ValueError` at startup ([`server/src/flowmap_server/config.py`](server/src/flowmap_server/config.py)), not silently accepted |
+| Authentication on the local API | **None — by design, today.** See the next section |
 | Browser origins accepted | The local client only (`http://localhost:5173`, `http://127.0.0.1:5173`, `http://tauri.localhost`) |
 | Elevated privileges | None. The Windows `-setup.exe` installs per-user, no admin |
+
+## The local API has no authentication — plainly stated
+
+The sidecar's HTTP and WebSocket endpoints (`/api/*`, `/ws` on `127.0.0.1:8720`, including the
+operational snapshot at `/api/health`) accept **any local process, with no token, no auth, and no
+confirmation**. This is a deliberate trade, not an oversight: FlowMap is a single-user desktop
+app whose only client is the one sitting next to the server, so the trust boundary it enforces is
+the operating system's user account, not a password. Everything the API can do — subscribe to
+public market data, read the symbol directory, drive a replay — is something any process running
+as your user can already do on its own.
+
+Threat model, honestly drawn:
+
+- **In scope:** a malicious *remote* party. The server never binds a non-loopback address
+  (enforced twice, in `Config.from_env` and again at the entrypoint), and the client loads no
+  external origin, so a remote attacker has no route into the API.
+- **Out of scope:** a malicious process already running as your user. It can read this API — and
+  also your browser cookies, SSH keys, and everything else you own. No in-app authentication
+  changes that; adding one would only create a false sense of a boundary that does not exist.
+- **Known residual risks:** any local process can read your session recordings
+  (`~/.flowmap/recordings/`), consume the API, or preempt port 8720. Cross-origin *browser*
+  requests are limited by the CORS allow-list (the vite dev origins and `tauri.localhost`, set in
+  `api/app.py`) — but CORS is browser-enforced only; it is not a defense against non-browser
+  local processes, and it is not a complete DNS-rebinding defense. If this threat model does not
+  fit your environment (e.g. shared or untrusted machines), run from source behind a firewall
+  rule that blocks 8720 for other local users, or do not run FlowMap there.
+
+If a hardening release (loopback auth token, per-origin pinning) is wanted, it will be treated as
+a feature, designed openly, and announced — silently tightening the boundary on existing users is
+worse than the gap.
 
 ## Where it connects
 
@@ -110,6 +141,9 @@ exact git commit (`crocodile` rev in
 used in CI is pinned to a commit SHA rather than a moving tag.
 
 ## Reporting a vulnerability
+
+**Contact (maintainer placeholder — replace with the active handle/email):** open a private
+GitHub security advisory, or reach the maintainer via `@nazmiefearmutcu` on GitHub.
 
 Open a [private security advisory](https://github.com/nazmiefearmutcu/flowmap/security/advisories/new)
 — that keeps the report non-public until there is a fix. Please do not open a public issue for

@@ -1,0 +1,65 @@
+name: CI
+
+# Fast push/PR gate: client typecheck + unit tests, server pytest.
+# The heavier release/packaging pipeline lives in release.yml; the original
+# combined suite job (uv-based) remains in test.yml.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+jobs:
+  client:
+    name: client (tsc + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install
+        working-directory: client
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: client
+        run: npx tsc -b
+
+      - name: Unit tests
+        working-directory: client
+        run: npx vitest run
+
+  server:
+    name: server (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Test deps (matches server/pyproject.toml dev group) plus the runtime
+      # imports the suite exercises directly. crocodile comes from the pinned
+      # git revision in server/pyproject.toml — it is not on PyPI.
+      - name: Install test + runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest pytest-asyncio pytest-timeout httpx websockets \
+            fastapi uvicorn msgspec numpy polars aiohttp certifi \
+            "crocodile[market] @ git+https://github.com/nazmiefearmutcu/Crocodile.git@2e22c901dff7f0b4ec98ef7e66b8a10de4464d9c"
+
+      - name: Run tests
+        run: PYTHONPATH=server/src python -m pytest server/tests -q
