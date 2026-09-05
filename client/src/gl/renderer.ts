@@ -304,6 +304,12 @@ export class Renderer {
   private running = true;
   private rafId = 0;
 
+  /** Last resize() inputs; a ResizeObserver callback that didn't change the CSS
+   *  box or the DPR is a no-op (no refit, no redraw, no backfill probe). */
+  private lastResizeCssW = -1;
+  private lastResizeCssH = -1;
+  private lastResizeDpr = 0;
+
   // Context-loss lifecycle (§8.3): recreate GL + re-fetch on restore.
   private contextLost = false;
   private contextLostCountN = 0;
@@ -1319,10 +1325,18 @@ export class Renderer {
     const ch = Math.max(1, this.canvas.clientHeight);
     const w = Math.max(1, Math.round(cw * dpr));
     const h = Math.max(1, Math.round(ch * dpr));
+    // The ResizeObserver fires on layout churn that leaves the CSS box (and the
+    // backing store) unchanged — skip the refit/redirty/backfill-probe in that
+    // case. First call always runs (sentinels -1 / 0).
+    const changed = cw !== this.lastResizeCssW || ch !== this.lastResizeCssH || dpr !== this.lastResizeDpr;
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
     }
+    this.lastResizeCssW = cw;
+    this.lastResizeCssH = ch;
+    this.lastResizeDpr = dpr;
+    if (!changed) return;
     // Visible-column count depends on CSS width; refit (follow) and repaint.
     this.updateView();
     this.dirty = true;
@@ -1370,7 +1384,12 @@ export class Renderer {
       { lo: rowLo, hi: rowHi },
       level,
     );
-    heatmap.encoding = { decodeScale: this.decodeScale, norm, ramp: this.ramp };
+    // Mutate in place: this runs on EVERY dirty frame, and `encoding` has no
+    // identity holders (all consumers read its fields), so a fresh object here
+    // would be pure per-frame garbage.
+    heatmap.encoding.decodeScale = this.decodeScale;
+    heatmap.encoding.norm = norm;
+    heatmap.encoding.ramp = this.ramp;
     // Note: re-dirtying to keep the EMA gliding is done in frame() AFTER the
     // draw block clears `dirty` — setting it here would be overwritten.
   }

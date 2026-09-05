@@ -50,6 +50,8 @@ export class TextLayer {
   private readonly owned: boolean;
   private cssW = 0;
   private cssH = 0;
+  /** Device-pixel ratio the backing store was last sized for (see syncSize). */
+  private dpr = 1;
 
   constructor(canvas: HTMLCanvasElement, owned = false) {
     const ctx = canvas.getContext('2d');
@@ -94,7 +96,18 @@ export class TextLayer {
     }
     this.cssW = cssW;
     this.cssH = cssH;
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.dpr = dpr > 0 ? dpr : 1;
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+  }
+
+  /**
+   * Snap a CSS-px coordinate onto the center of the nearest DEVICE pixel — the
+   * condition for a 1px stroke to rasterize on one device-pixel row/column
+   * instead of straddling two (the fuzzy-gridline effect at fractional
+   * positions, worst at DPR 1 where the grid is coarsest).
+   */
+  private snap1(v: number): number {
+    return (Math.round(v * this.dpr - 0.5) + 0.5) / this.dpr;
   }
 
   /** Clear the whole layer (call once at the start of a dirty frame). */
@@ -198,7 +211,9 @@ export class TextLayer {
     ctx.restore();
   }
 
-  /** A dashed 1px line (the last-price level marker across the chart). */
+  /** A dashed 1px line (the last-price level marker across the chart). A
+   *  horizontal run at hairline width snaps to the device-pixel grid so the
+   *  dashes stay crisp; thicker or sloped runs keep anti-aliased placement. */
   dashedLine(x0: number, y0: number, x1: number, y1: number, color: string, dash: number[] = [4, 4], width = 1): void {
     const ctx = this.ctx;
     ctx.save();
@@ -206,20 +221,43 @@ export class TextLayer {
     ctx.lineWidth = width;
     ctx.setLineDash(dash);
     ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
+    if (width <= 1 && y0 === y1) {
+      const y = this.snap1(y0);
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x1, y);
+    } else {
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+    }
     ctx.stroke();
     ctx.restore();
   }
 
-  /** A thin 1px CSS-px line (axis ticks / rules on the text layer). */
+  /** A thin 1px CSS-px line (axis ticks / rules on the text layer). Axis-aligned
+   *  hairlines snap onto the device-pixel grid — a 1px stroke drawn at a
+   *  fractional coordinate covers two physical pixel rows at 50% alpha each,
+   *  which is exactly why unaligned gridlines look fuzzy (worst at DPR 1).
+   *  Snapping only the CONSTANT axis of an axis-aligned run keeps every other
+   *  shape's anti-aliasing untouched. */
   line(x0: number, y0: number, x1: number, y1: number, color: string, width = 1): void {
     const ctx = this.ctx;
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
     ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
+    if (width <= 1 && (y0 === y1 || x0 === x1)) {
+      if (y0 === y1) {
+        const y = this.snap1(y0);
+        ctx.moveTo(x0, y);
+        ctx.lineTo(x1, y);
+      } else {
+        const x = this.snap1(x0);
+        ctx.moveTo(x, y0);
+        ctx.lineTo(x, y1);
+      }
+    } else {
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+    }
     ctx.stroke();
   }
 

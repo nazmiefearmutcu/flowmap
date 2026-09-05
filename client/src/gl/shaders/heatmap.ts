@@ -54,7 +54,12 @@ uniform float u_rowScale;
 uniform int u_capacityCols;
 uniform int u_colsPerTile;
 uniform int u_rows;
-uniform int u_residentOldest;
+// First resident col_seq whose slot is KNOWN to hold that column (gl/tileRing
+// Residency.validFromSeq). Equal to the resident window's oldest EXCEPT after a
+// gap forward growth (deep scroll-back releasing on go-live, a reconnect
+// resume), where the slots between the window's oldest and the gap edge still
+// hold PREVIOUS columns — those must paint background, not stale texels.
+uniform int u_validFrom;
 uniform int u_residentNewest;
 
 // Value encoding + normalization (§8.3). intensity = (bid+ask) * decodeScale,
@@ -112,12 +117,19 @@ vec2 fetchLevel(int x, int y, int layer) {
   return texelFetch(u_mip2, ivec3(x, y, layer), 0).rg;
 }
 
-// Clamped level-0 texel fetch (bid, ask) — clamping only affects the half-texel
-// frame around the resident field, where the alternative is a hard edge.
-vec2 fetch0(int x, int y, int layer) {
-  x = clamp(x, 0, u_colsPerTile - 1);
+// One level-0 texel at an ABSOLUTE column, clamped into the VALID resident
+// window. Clamping the absolute column (not the tile-local x) kills both edge
+// artifacts of the old fetch0: a half-texel tap outside the window now
+// edge-replicates the nearest VALID column instead of blending a stale slot
+// (the live edge used to dim against the not-yet-written next column), and a
+// tap straddling a 256-column tile seam resolves through the ring's slot
+// arithmetic into the neighbouring layer instead of duplicating the edge texel
+// (a 1-texel discontinuity every tile boundary).
+vec2 fetchCol(int colAbs, int y) {
+  int c = clamp(colAbs, u_validFrom, u_residentNewest);
+  int slot = c % u_capacityCols;
   y = clamp(y, 0, u_rows - 1);
-  return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
+  return texelFetch(u_tiles, ivec3(slot % u_colsPerTile, y, slot / u_colsPerTile), 0).rg;
 }
 
 // Bilinear sample of the resident density at a CONTINUOUS ABSOLUTE column. The
@@ -129,20 +141,16 @@ vec2 fetch0(int x, int y, int layer) {
 // 256 columns" failure mode. Turns the blocky per-cell staircase into a
 // continuous field when a cell covers several device pixels.
 vec2 bilinear0(float colf, float rowf) {
-  float slotF = mod(colf, float(u_capacityCols));
-  int layer = int(floor(slotF / float(u_colsPerTile)));
-  // Tile-column in [0, colsPerTile); the ±half-texel sample straddling a tile
-  // seam clamps into the tile (a 1-texel discontinuity every 256 columns).
-  float xf = mod(slotF, float(u_colsPerTile)) - 0.5;
-  float yf = rowf - 0.5;
+  float xf = colf - 0.5;
   int x0 = int(floor(xf));
-  int y0 = int(floor(yf));
   float fx = xf - float(x0);
+  float yf = rowf - 0.5;
+  int y0 = int(floor(yf));
   float fy = yf - float(y0);
-  vec2 a = fetch0(x0, y0, layer);
-  vec2 b = fetch0(x0 + 1, y0, layer);
-  vec2 c = fetch0(x0, y0 + 1, layer);
-  vec2 d = fetch0(x0 + 1, y0 + 1, layer);
+  vec2 a = fetchCol(x0, y0);
+  vec2 b = fetchCol(x0 + 1, y0);
+  vec2 c = fetchCol(x0, y0 + 1);
+  vec2 d = fetchCol(x0 + 1, y0 + 1);
   return mix(mix(a, b, fx), mix(c, d, fx), fy);
 }
 
@@ -150,12 +158,12 @@ vec2 bilinear0(float colf, float rowf) {
 // (0.25 / 0.5 / 0.25). Per-interval book noise is exactly ONE column wide, so
 // the blur collapses the confetti while a wall — present in all three columns —
 // keeps its true magnitude. Row resolution is untouched: price structure stays
-// crisp, time gets the smoothing. Blur neighbours that fall outside the RESIDENT
-// window (the live edge's not-yet-written future column, the oldest edge) are
-// dropped and their weight folded into the core, so the newest column paints at
-// full weight instead of blending against an empty slot.
+// crisp, time gets the smoothing. Blur neighbours that fall outside the VALID
+// window (the live edge's not-yet-written future column, the oldest valid
+// edge) are dropped and their weight folded into the core, so the newest column
+// paints at full weight instead of blending against an empty slot.
 vec2 sampleField0(float colf, float rowf) {
-  float wL = colf - 1.0 >= float(u_residentOldest) ? 0.25 : 0.0;
+  float wL = colf - 1.0 >= float(u_validFrom) ? 0.25 : 0.0;
   float wR = colf + 1.0 <= float(u_residentNewest) ? 0.25 : 0.0;
   float wC = 1.0 - wL - wR;
   return bilinear0(colf - 1.0, rowf) * wL
@@ -169,7 +177,7 @@ void main() {
   int col = int(floor(colf));
   int row = int(floor(rowf));
 
-  if (row < 0 || row >= u_rows || col < u_residentOldest || col > u_residentNewest) {
+  if (row < 0 || row >= u_rows || col < u_validFrom || col > u_residentNewest) {
     fragColor = background();
     return;
   }

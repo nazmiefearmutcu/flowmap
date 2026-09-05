@@ -87,6 +87,16 @@ export class Residency {
 
   private oldest = -1;
   private newest = -1;
+  /**
+   * First col_seq of the resident window whose slot is KNOWN to hold that
+   * column. Normally `oldest`, but a forward growth across a GAP (col_seq >
+   * newest+1 — the deep-scroll-back drop gate releasing on go-live, or a
+   * reconnect resume) overwrites only the far slot: every slot in
+   * `[oldest, colSeq)` still holds PREVIOUS data while `range()` claims it.
+   * Consumers that cannot tolerate stale texels (the heatmap's residency
+   * uniform) gate on {@link validFromSeq} instead of `oldest`.
+   */
+  private validFrom = -1;
   private clock = 0;
   /** Last-touched logical clock per tile layer (LRU record; diagnostics). */
   private readonly layerTouch: Float64Array;
@@ -109,17 +119,37 @@ export class Residency {
     if (this.oldest < 0) {
       this.oldest = colSeq;
       this.newest = colSeq;
+      this.validFrom = colSeq;
     } else if (colSeq >= this.oldest && colSeq <= this.newest) {
       // In-place overwrite of a resident column — window unchanged.
     } else if (colSeq >= this.newest) {
+      if (colSeq > this.newest + 1) {
+        // GAP forward growth: the modulo wrap clobbered exactly slot(colSeq);
+        // every slot between the old newest and colSeq still holds whatever it
+        // held before. The valid region restarts at colSeq.
+        this.validFrom = colSeq;
+      }
       // Forward growth (adjacent live append, or a rare capped-gap skip).
       this.newest = colSeq;
       if (this.newest - this.oldest + 1 > cap) this.oldest = this.newest - cap + 1;
     } else {
       // Backward growth (deep scroll-back backfill splicing older columns).
+      // Validity extends down ONLY when the pre-splice window was fully valid
+      // (no gap): a normal scroll-back page is contiguous with the window, so
+      // its not-yet-written slots are zeroed texture — honest background for a
+      // frame. After a gap forward growth the backfill chain descends far
+      // below `validFrom`; the unfetched band between the chain and `validFrom`
+      // still holds previous-window texels and must keep painting background.
+      const fullyValid = this.validFrom === this.oldest;
       this.oldest = colSeq;
+      if (fullyValid) this.validFrom = colSeq;
       if (this.newest - this.oldest + 1 > cap) this.newest = this.oldest + cap - 1;
     }
+    // The valid region can never start before the window it sits in (a budget
+    // clamp may have evicted it forward), nor past its newest (a backward
+    // budget clamp can pull newest below the gap edge).
+    if (this.validFrom < this.oldest) this.validFrom = this.oldest;
+    if (this.validFrom > this.newest) this.validFrom = this.newest;
     // LRU touch for the layer this column landed in.
     const slot = ((colSeq % cap) + cap) % cap;
     const layer = (slot / this.colsPerTile) | 0;
@@ -129,6 +159,16 @@ export class Residency {
   range(): ResidentRange | null {
     if (this.oldest < 0) return null;
     return { oldest: this.oldest, newest: this.newest, count: this.newest - this.oldest + 1 };
+  }
+
+  /**
+   * First resident col_seq whose slot is guaranteed to hold THAT column (equal
+   * to `range().oldest` except after a gap forward growth, where it is the gap's
+   * right edge). -1 before any append. The heatmap gates painting on this so a
+   * post-gap window renders honest background instead of stale texels.
+   */
+  validFromSeq(): number {
+    return this.validFrom;
   }
 
   isResident(colSeq: number): boolean {
@@ -145,6 +185,7 @@ export class Residency {
   reset(): void {
     this.oldest = -1;
     this.newest = -1;
+    this.validFrom = -1;
     this.clock = 0;
     this.layerTouch.fill(0);
   }
@@ -271,6 +312,15 @@ export class TileRing {
   /** Whether `colSeq` is currently resident full-res (in the tile texture). */
   isResidentFullRes(colSeq: number): boolean {
     return this.residency.isResident(colSeq);
+  }
+
+  /**
+   * First resident col_seq whose slot is KNOWN to hold that column (see
+   * {@link Residency.validFromSeq}). The heatmap's `u_validFrom` uniform; -1
+   * before any append.
+   */
+  validFromSeq(): number {
+    return this.residency.validFromSeq();
   }
 
   /** Full-res residency budget in columns (== ring capacity). */

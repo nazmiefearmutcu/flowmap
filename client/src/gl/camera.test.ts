@@ -555,3 +555,73 @@ describe('priceFrame — the pure auto-fit framing rule', () => {
     expect(top.rowBottom + top.rowSpan).toBe(ROWS);
   });
 });
+
+describe('non-finite gesture inputs — poison-proof by construction', () => {
+  /**
+   * A pathological pointer/wheel event can deliver NaN deltas or factors. NaN
+   * survives `clamp` (both comparisons are false), so a single bad event would
+   * permanently poison the camera — every later view becomes NaN and the
+   * heatmap goes blank. The gesture ops must therefore be total: a non-finite
+   * input leaves the state (and its follow flags) EXACTLY as it was.
+   */
+  it('pan ignores NaN deltas entirely', () => {
+    const s = baseState();
+    expect(pan(s, LIMITS, NaN, 10)).toBe(s);
+    expect(pan(s, LIMITS, 10, NaN)).toBe(s);
+    expect(pan(s, LIMITS, Infinity, 0)).toBe(s);
+  });
+
+  it('pan keeps follow flags when a garbage delta is rejected', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'track' };
+    const out = pan(s, LIMITS, NaN, 0, KILL_BOTH);
+    expect(out).toBe(s);
+    expect(out.followTime).toBe(true);
+    expect(out.followPrice).toBe('track');
+  });
+
+  it('zoomTime ignores NaN, zero, negative factors and NaN anchors', () => {
+    const s = baseState();
+    expect(zoomTime(s, LIMITS, NaN, 1000)).toBe(s);
+    expect(zoomTime(s, LIMITS, 0, 1000)).toBe(s);
+    expect(zoomTime(s, LIMITS, -2, 1000)).toBe(s);
+    expect(zoomTime(s, LIMITS, 1.5, NaN)).toBe(s);
+  });
+
+  it('zoomTime does not kill follow when its input is garbage', () => {
+    const s: CameraState = { ...baseState(), followTime: true, followPrice: 'fit' };
+    // A REAL time zoom releases time (and promotes fit->track); a rejected one
+    // must not, or a bad wheel event would silently end auto-follow.
+    const out = zoomTime(s, LIMITS, NaN, 1000);
+    expect(out).toBe(s);
+    expect(out.followTime).toBe(true);
+    expect(out.followPrice).toBe('fit');
+  });
+
+  it('zoomTime still honours the span clamp for a huge (finite) factor', () => {
+    const out = zoomTime(baseState(), LIMITS, 1e12, 1000);
+    expect(out.colSpan).toBe(LIMITS.maxColSpanZoom);
+    expect(Number.isFinite(out.colCenter)).toBe(true);
+  });
+
+  it('zoomPrice ignores NaN, zero, negative factors and NaN anchors', () => {
+    const s = baseState();
+    expect(zoomPrice(s, LIMITS, NaN, 256)).toBe(s);
+    expect(zoomPrice(s, LIMITS, 0, 256)).toBe(s);
+    expect(zoomPrice(s, LIMITS, -0.5, 256)).toBe(s);
+    expect(zoomPrice(s, LIMITS, 1.5, NaN)).toBe(s);
+  });
+
+  it('zoomPrice does not promote fit to track when its input is garbage', () => {
+    const s: CameraState = { ...baseState(), followPrice: 'fit' };
+    const out = zoomPrice(s, LIMITS, NaN, 256);
+    expect(out).toBe(s);
+    expect(out.followPrice).toBe('fit');
+  });
+
+  it('a real zero-anchor zoom (anchor on the centre) stays exact', () => {
+    const s = baseState();
+    const out = zoomPrice(s, LIMITS, 2, 256);
+    expect(out.rowSpan).toBe(240);
+    expect(out.rowCenter).toBe(256); // anchor == centre: centre unchanged
+  });
+});

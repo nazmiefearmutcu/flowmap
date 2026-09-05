@@ -101,5 +101,111 @@ describe('Residency window (T8 LRU)', () => {
     r.note(5);
     r.reset();
     expect(r.range()).toBeNull();
+    expect(r.validFromSeq()).toBe(-1);
+  });
+});
+
+describe('Residency validFrom — the stale-slot gate across a gap', () => {
+  /**
+   * `range()` is a pure interval: after a forward GAP (col_seq > newest+1) it
+   * claims columns whose ring slots still hold PREVIOUS data. `validFromSeq()`
+   * is the first column the GPU may actually paint; the heatmap gates on it so
+   * a go-live after a deep scroll-back cannot paint the stale band as live.
+   */
+  it('equals the window oldest while appends are contiguous', () => {
+    const r = make();
+    r.note(10);
+    r.note(11);
+    r.note(12);
+    expect(r.validFromSeq()).toBe(10);
+    expect(r.range()!.oldest).toBe(10);
+  });
+
+  it('jumps to the gap edge on a forward gap growth (go-live after scroll-back)', () => {
+    const r = make();
+    for (let s = 10; s <= 12; s++) r.note(s);
+    r.note(20); // gap: 13..19 were never written (their slots hold old data)
+    // The window still spans the gap (the budget clamp slid oldest forward), but
+    // validity starts at the first column actually written after the gap.
+    expect(r.range()).toEqual({ oldest: 13, newest: 20, count: 8 });
+    expect(r.validFromSeq()).toBe(20);
+  });
+
+  it('stays at the gap edge while live appends fill forward', () => {
+    const r = make();
+    r.note(20);
+    r.note(40); // gap jump
+    r.note(41);
+    r.note(42); // contiguous live appends
+    expect(r.range()!.newest).toBe(42);
+    expect(r.validFromSeq()).toBe(40);
+  });
+
+  it('extends down for a normal scroll-back page (window had no gap)', () => {
+    const r = make();
+    r.note(10);
+    r.note(11);
+    r.note(12);
+    // A backfill page ascending [7,8,9]: the window grows backward and the
+    // page's not-yet-written slots are zeroed texture, so claiming validity
+    // down to 7 immediately is honest.
+    r.note(7);
+    expect(r.validFromSeq()).toBe(7);
+    r.note(8);
+    r.note(9);
+    expect(r.validFromSeq()).toBe(7);
+    expect(r.range()).toEqual({ oldest: 7, newest: 12, count: 6 });
+  });
+
+  it('never extends across an unfetched band after a gap (chain descends from oldest)', () => {
+    const r = make();
+    r.note(40); // pre-gap live edge
+    r.note(60); // gap forward growth (go-live) → window [53, 60], validFrom 60
+    expect(r.validFromSeq()).toBe(60);
+    // Post-gap backfill descends from the window's oldest (53), far below the
+    // gap edge: the band is unfetched and must not be claimed. The backward
+    // budget clamp pulls newest down to 58, and validity bounds at newest —
+    // at worst a ONE-column claim, never the whole stale band.
+    r.note(51);
+    expect(r.range()).toEqual({ oldest: 51, newest: 58, count: 8 });
+    expect(r.validFromSeq()).toBe(58);
+    r.note(52);
+    expect(r.validFromSeq()).toBe(58);
+  });
+
+  it('never starts before the window oldest after a budget clamp', () => {
+    const r = make();
+    r.note(3);
+    r.note(30); // gap → oldest clamps to 30-8+1 = 23, validFrom 30
+    expect(r.validFromSeq()).toBe(30);
+    // Live appends slide oldest forward; once the clamp evicts the gap edge,
+    // validity clamps up to the window (it cannot precede it).
+    for (let s = 31; s <= 37; s++) r.note(s);
+    expect(r.range()!.oldest).toBe(30);
+    expect(r.validFromSeq()).toBe(30);
+    r.note(38); // oldest slides to 31, past the gap edge 30
+    expect(r.range()!.oldest).toBe(31);
+    expect(r.validFromSeq()).toBe(31);
+  });
+
+  it('never runs past the newest when a backward clamp evicts below the gap edge', () => {
+    const r = make();
+    r.note(20);
+    r.note(40); // gap → window [33, 40], validFrom 40
+    expect(r.validFromSeq()).toBe(40);
+    // A stray backfill page lands below the window: backward growth clamps
+    // newest down to oldest+cap-1 = 37, below the gap edge. The invariant
+    // validFrom ≤ newest must hold (the clamp bounds it at newest).
+    r.note(30);
+    expect(r.range()!.newest).toBe(37);
+    expect(r.validFromSeq()).toBe(37);
+  });
+
+  it('an in-place rewrite inside a gap band does not validate the band', () => {
+    const r = make();
+    r.note(20);
+    r.note(40); // gap → window [33, 40], validFrom 40
+    r.note(35); // one stray backfilled column inside the claimed band
+    expect(r.validFromSeq()).toBe(40);
   });
 });

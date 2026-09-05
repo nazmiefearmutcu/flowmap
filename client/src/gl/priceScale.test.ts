@@ -357,3 +357,75 @@ describe('scaleFromEpoch — the wire compatibility rule', () => {
     expect(scaleFromEpoch({ ...linearEp, scale_kind: SCALE_KIND_HYBRID }).kind).toBe('linear');
   });
 });
+
+describe('deep extrapolation — the camera can overscroll a full viewport past the grid', () => {
+  const s = btc();
+
+  it('round-trips row → price → row thousands of rows past BOTH edges', () => {
+    // rowCenterBounds lets the user pan a full viewport (≤ maxRowSpanZoom rows)
+    // past each edge, and the axis must keep labelling sanely out there — the
+    // wings EXTRAPOLATE geometrically rather than clamping.
+    for (const row of [-1000, -1, 0, s.dnRows, s.dnRows + s.coreRows, s.rows, s.rows + 1000]) {
+      const price = rowToPrice(s, row);
+      expect(Number.isFinite(price)).toBe(true);
+      expect(priceToRow(s, price)).toBeCloseTo(row, 6);
+    }
+  });
+
+  it('stays strictly increasing far past both edges (no wing inversion)', () => {
+    let prev = rowToPrice(s, -10_000);
+    for (let row = -9_999; row <= s.rows + 10_000; row += 997) {
+      const p = rowToPrice(s, row);
+      expect(p).toBeGreaterThan(prev);
+      prev = p;
+    }
+  });
+
+  it('keeps stepAtRow positive and finite across overscroll rows', () => {
+    for (const row of [-5000, -1, 0, s.rows - 1, s.rows, s.rows + 5000]) {
+      const st = stepAtRow(s, row);
+      expect(Number.isFinite(st)).toBe(true);
+      expect(st).toBeGreaterThan(0);
+    }
+  });
+
+  it('never maps a non-positive overscroll price back to a real row', () => {
+    // rowToPrice can produce a positive price anywhere (log wings), but a
+    // caller handing priceToRow an absolute 0 or negative must get NaN —
+    // "off the grid" — never a coerced row 0.
+    expect(priceToRow(s, 0)).toBeNaN();
+    expect(priceToRow(s, -1)).toBeNaN();
+  });
+});
+
+describe('stepAtRow — the LOCAL row height across zone boundaries', () => {
+  const s = btc();
+
+  it('is discontinuous at each join: the wing side is far coarser than the core', () => {
+    // PRICE is continuous at the joins (tested above); the local row HEIGHT is
+    // not — one row below the core is a log-wing row (a large % step), one row
+    // above is a native-tick core row. The readout must use stepAtRow, never a
+    // global step, or wing labels are wrong by orders of magnitude.
+    const inCore = stepAtRow(s, s.dnRows + 1);
+    const inWing = stepAtRow(s, s.dnRows - 1);
+    expect(inCore).toBeCloseTo(s.coreStep, 9);
+    expect(inWing).toBeGreaterThan(inCore * 10);
+    const upInCore = stepAtRow(s, s.dnRows + s.coreRows - 1);
+    const upInWing = stepAtRow(s, s.dnRows + s.coreRows + 1);
+    expect(upInCore).toBeCloseTo(s.coreStep, 9);
+    expect(upInWing).toBeGreaterThan(upInCore * 10);
+  });
+
+  it('scales with PRICE through the wings (constant %-per-row), not with depth', () => {
+    // Equal percentage height per row means the ABSOLUTE row height is
+    // proportional to the price at that row: near loPrice (deep lower wing) the
+    // rows are the finest of the whole grid, near hiPrice the coarsest.
+    const dnDeep = stepAtRow(s, 0); // near loPrice
+    const dnShallow = stepAtRow(s, s.dnRows - 1); // near coreP0 (~×99 the price)
+    expect(dnShallow).toBeGreaterThan(dnDeep);
+    expect(dnShallow / dnDeep).toBeGreaterThan(50); // ≈ the price ratio
+    const upLow = stepAtRow(s, s.dnRows + s.coreRows + 1);
+    const upHigh = stepAtRow(s, s.rows - 1);
+    expect(upHigh).toBeGreaterThan(upLow);
+  });
+});

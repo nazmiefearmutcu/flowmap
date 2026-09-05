@@ -264,6 +264,10 @@ export function pan(
   dRows: number,
   kill: FollowKill = KILL_BOTH,
 ): CameraState {
+  // A non-finite delta (a pathological pointer/wheel event) would poison the
+  // camera permanently — NaN survives every clamp because both clamp branches
+  // compare false. Ignore the whole gesture instead.
+  if (!Number.isFinite(dCols) || !Number.isFinite(dRows)) return s;
   return clampCamera(
     applyKill({ ...s, colCenter: s.colCenter + dCols, rowCenter: s.rowCenter + dRows }, kill),
     limits,
@@ -287,6 +291,10 @@ export function zoomTime(
   factor: number,
   anchorCol: number,
 ): CameraState {
+  // NaN/0/negative factors and non-finite anchors would survive the span clamp
+  // (NaN fails both comparisons) and poison colCenter via the anchor math.
+  // Leave the state — including its follow flags — exactly as it was.
+  if (!Number.isFinite(factor) || factor <= 0 || !Number.isFinite(anchorCol)) return s;
   const newSpan = clamp(s.colSpan * factor, limits.minColSpan, limits.maxColSpanZoom);
   const eff = newSpan / s.colSpan;
   const colCenter = anchorCol + eff * (s.colCenter - anchorCol);
@@ -308,6 +316,8 @@ export function zoomPrice(
   factor: number,
   anchorRow: number,
 ): CameraState {
+  // Same NaN/0/negative guard as zoomTime — poison-proof by construction.
+  if (!Number.isFinite(factor) || factor <= 0 || !Number.isFinite(anchorRow)) return s;
   const newSpan = clamp(s.rowSpan * factor, MIN_ROW_SPAN, limits.maxRowSpanZoom);
   const eff = newSpan / s.rowSpan;
   const rowCenter = anchorRow + eff * (s.rowCenter - anchorRow);

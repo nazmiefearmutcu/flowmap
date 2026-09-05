@@ -184,7 +184,7 @@ type UniformName =
   | 'u_capacityCols'
   | 'u_colsPerTile'
   | 'u_rows'
-  | 'u_residentOldest'
+  | 'u_validFrom'
   | 'u_residentNewest'
   | 'u_decodeScale'
   | 'u_norm'
@@ -272,7 +272,7 @@ export class Heatmap {
       u_capacityCols: loc('u_capacityCols'),
       u_colsPerTile: loc('u_colsPerTile'),
       u_rows: loc('u_rows'),
-      u_residentOldest: loc('u_residentOldest'),
+      u_validFrom: loc('u_validFrom'),
       u_residentNewest: loc('u_residentNewest'),
       u_decodeScale: loc('u_decodeScale'),
       u_norm: loc('u_norm'),
@@ -338,8 +338,14 @@ export class Heatmap {
     gl.uniform1i(this.u.u_capacityCols, this.tileRing.capacityCols);
     gl.uniform1i(this.u.u_colsPerTile, this.tileRing.colsPerTile);
     gl.uniform1i(this.u.u_rows, this.tileRing.rows);
-    gl.uniform1i(this.u.u_residentOldest, range ? range.oldest : 1);
-    // With no residents, oldest(1) > newest(0) makes every column out-of-range.
+    // The painting window is [validFrom, residentNewest]: the resident window's
+    // left edge, advanced past any gap whose slots still hold previous columns
+    // (gl/tileRing validFromSeq). With no residents, validFrom(1) > newest(0)
+    // makes every column out-of-range.
+    gl.uniform1i(
+      this.u.u_validFrom,
+      range ? Math.max(this.tileRing.validFromSeq(), range.oldest) : 1,
+    );
     gl.uniform1i(this.u.u_residentNewest, range ? range.newest : 0);
 
     gl.uniform1f(this.u.u_decodeScale, this.encoding.decodeScale);

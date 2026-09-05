@@ -277,3 +277,54 @@ describe('reset', () => {
     expect(n.current).toBe(DEFAULT_NORM_FLOOR);
   });
 });
+
+describe('histogram bin edges — garbage densities must stay finite', () => {
+  /**
+   * The shader divides intensity by u_norm, so a NaN/Infinity percentile would
+   * blank or saturate the whole heatmap. Densities below HIST_MIN or above
+   * HIST_MAX clamp into the terminal log bins — the percentile stays finite.
+   */
+  it('clamps sub-range and super-range densities into the terminal bins', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    // Far below the log-range low edge and far above its high edge, mixed 50/50.
+    const bid = new Float32Array(4);
+    bid[0] = 1e-9; // below DEFAULT_HIST_MIN (1/64) → bin 0
+    bid[1] = 1e-9;
+    bid[2] = 1e9; // above DEFAULT_HIST_MAX (65536) → top bin
+    bid[3] = 1e9;
+    n.addColumn(0, bid, null);
+    const p50 = n.updateNorm({ oldest: 0, newest: 255 }, ALL_ROWS, 0);
+    expect(Number.isFinite(p50)).toBe(true);
+    expect(p50).toBeGreaterThan(0);
+    // p97 leans to the heavy (super-range) half; p50 lands mid-log-space.
+    const n2 = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, percentile: 50 });
+    n2.addColumn(0, bid, null);
+    expect(n2.viewportPercentile({ oldest: 0, newest: 255 }, ALL_ROWS, 0)).toBeGreaterThan(1);
+  });
+
+  it('ignores a non-positive seed (the first raw value becomes the EMA)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    n.seed(0);
+    n.seed(-5);
+    addConst(n, 0, 100, 100);
+    const first = n.updateNorm({ oldest: 0, newest: 255 }, ALL_ROWS, 0);
+    // Un-seeded: the FIRST update jumps straight to the raw value (no glide
+    // from a bogus seed) rather than blending toward it.
+    expect(n.current).toBe(first);
+  });
+
+  it('floors a tiny seed so a norm_seed bug cannot blow out intensity', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    n.seed(0.001);
+    expect(n.current).toBe(DEFAULT_NORM_FLOOR);
+  });
+
+  it('holds a fractional-col column range (floor handles non-tile-aligned windows)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    addConst(n, 0, 50, 100);
+    addConst(n, COLS_PER_TILE, 50, 100);
+    const p = n.viewportPercentile({ oldest: 10, newest: 300 }, ALL_ROWS, 0);
+    expect(Number.isFinite(p)).toBe(true);
+    expect(p).toBeGreaterThan(1); // both tiles were merged (not just tile 0)
+  });
+});
