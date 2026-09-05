@@ -244,17 +244,22 @@ async def test_session_limit_second_key_gets_status_and_1013(server_one_session)
         await ws1.close()
 
 
-async def test_malformed_frame_closes_1002(server):
+async def test_malformed_frame_does_not_kill_connection(server):
+    """Robustness: a malformed frame is logged and DROPPED (with the rest of
+    that frame — batched bytes cannot be resynced mid-frame), but the
+    connection SURVIVES: a valid Subscribe sent right after still streams."""
     port = server
     async with connect(f"ws://127.0.0.1:{port}/ws") as ws:
         await ws.send(b"\xff" * 7)  # truncated envelope -> ValueError in decode
-        with pytest.raises(ConnectionClosed) as ei:
-            async with asyncio.timeout(5):
-                while True:
-                    await ws.recv()
-    exc = ei.value
-    assert exc.rcvd is not None
-    assert exc.rcvd.code == 1002
+        await ws.send(wire.encode(SUB))
+
+        hello: events.Hello | None = None
+        async with asyncio.timeout(10):
+            while hello is None:
+                for ev in decode_frame(await ws.recv()):
+                    if isinstance(ev, events.Hello):
+                        hello = ev
+        assert hello is not None, "connection died on a malformed frame"
 
 
 async def test_shared_session_two_clients(server):

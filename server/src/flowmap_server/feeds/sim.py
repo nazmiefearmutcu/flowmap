@@ -32,8 +32,8 @@ it does not influence the generated data).
 
 ``generate_history`` reuses the exact same per-interval core but drives a
 private :class:`Grid` with a single book state per interval boundary — the
-relaxation the plan allows for speed — and comfortably builds 10k columns
-(rows=2048) inside the 2 s budget.
+relaxation the plan allows for speed — and builds 10k columns (rows=2048) in
+~2 s on a quiet box; the test's budget carries headroom for loaded machines.
 """
 
 from __future__ import annotations
@@ -266,8 +266,8 @@ class SimFeed:
         as ``events()`` for the same seed, since ``events()`` consumes extra
         rng draws for sub-interval cadence; each path is individually
         deterministic). ``start_ns`` should be a multiple of ``dt_ns`` so ``t0``
-        lands on the boundaries. 10k columns at rows=2048 build in well
-        under 2 s.
+        lands on the boundaries. 10k columns at rows=2048 build in ~2 s on a
+        quiet box (test budget: 8 s, for loaded-machine headroom).
         """
         if n_cols <= 0:
             return []

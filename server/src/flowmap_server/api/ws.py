@@ -5,15 +5,21 @@ subscription. Three concurrent pieces per connection, all torn down together
 in ``finally`` (no task leaks):
 
 - **receive loop** (the endpoint coroutine): decodes batched control
-  messages with the :mod:`wire` loop — unknown types skip via payload_len,
-  ANY malformed input closes the socket with 1002 after sending nothing
-  further;
+  messages with the :mod:`wire` loop — unknown types skip via payload_len;
+  a MALFORMED message (or a text frame on the binary-only protocol) is
+  logged and the remainder of that frame is dropped (batched bytes cannot
+  be resynced mid-frame), but the connection itself SURVIVES — one bad
+  message must never kill a healthy stream. A dispatch error is likewise
+  logged and swallowed; the receive loop only exits on a real disconnect
+  or a deliberate refusal close;
 - **flush loop**: every 50 ms (20 Hz, within §6.2's 10–30 Hz band) drains
   the ClientTx queue up to 256 KiB and sends each drained frame as one
   binary WS message;
 - **ping loop**: ~1 Hz ``Ping{server_send_ns}`` (§6.1 — the only clock/
-  latency mechanism). ``Pong`` updates the connection's latency estimate;
-  at M1 it is only logged (Status wiring uses it in a later task).
+  latency mechanism; the steady 1 Hz cadence doubles as the application-
+  level keepalive that stops intermediate proxies from idling the socket
+  out). ``Pong`` updates the connection's latency estimate; at M1 it is
+  only logged (Status wiring uses it in a later task).
 
 All sends go through one lock so control-plane replies (HistoryResponse,
 refusal Status) never interleave mid-frame with queue flushes or pings.
@@ -55,7 +61,6 @@ SEND_TIMEOUT_S = 10.0
 LIVENESS_TIMEOUT_S = 30.0
 
 # WS close codes
-_CLOSE_PROTOCOL_ERROR = 1002  # malformed client frame
 _CLOSE_UNSUPPORTED = 1003  # market has no feed at this milestone
 _CLOSE_TRY_AGAIN_LATER = 1013  # session limit reached
 
@@ -148,9 +153,14 @@ class _Connection:
             self._last_recv_ns = time.monotonic_ns()
             data = message.get("bytes")
             if data is None:  # text frame on a binary-only protocol
-                logger.warning("text WS frame on binary protocol: closing 1002")
-                await self._ws.close(code=_CLOSE_PROTOCOL_ERROR)
-                return
+                # Robustness, not protocol enforcement: log and keep reading.
+                # The FlowMap client never sends text; a stray text frame is
+                # a broken intermediary, not a peer worth killing the stream
+                # for. (Any bytes present still count as liveness above.)
+                logger.warning(
+                    "text WS frame on binary protocol: frame dropped, connection kept"
+                )
+                continue
             if not await self._handle_frame(data):
                 return
 
@@ -162,19 +172,36 @@ class _Connection:
     # -- dispatch --------------------------------------------------------------
 
     async def _handle_frame(self, data: bytes) -> bool:
-        """Dispatch every message batched in one frame; False = closed."""
+        """Dispatch every message batched in one frame; False = closed.
+
+        Malformed input is LOGGED, not fatal: the offset is unrecoverable
+        mid-frame, so the remainder of THIS frame is dropped and the loop
+        resyncs on the next frame boundary. The connection stays up — a
+        single corrupt frame (or a hostile burst) must not take a healthy
+        subscription down.
+        """
         offset = 0
         while offset < len(data):
             try:
                 ev, offset = wire.decode(data, offset)
             except ValueError as exc:
-                logger.warning("malformed client frame (%s): closing 1002", exc)
-                await self._ws.close(code=_CLOSE_PROTOCOL_ERROR)
-                return False
+                logger.warning(
+                    "malformed client frame (%s): dropping the rest of the "
+                    "frame, connection kept",
+                    exc,
+                )
+                return True
             if ev is None:
                 continue  # unknown msg_type: skipped via payload_len
-            if not await self._dispatch(ev):
-                return False
+            try:
+                if not await self._dispatch(ev):
+                    return False
+            except Exception:  # noqa: BLE001 — one bad message never kills the loop
+                logger.warning(
+                    "dispatch error on %s: message dropped, connection kept",
+                    type(ev).__name__,
+                    exc_info=True,
+                )
         return True
 
     async def _dispatch(self, ev: object) -> bool:

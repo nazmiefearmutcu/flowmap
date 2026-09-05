@@ -33,7 +33,79 @@ async def client(app):
 async def test_health(client):
     r = await client.get("/api/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "version": __version__}
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["version"] == __version__
+
+
+async def test_health_operational_fields(client):
+    """Upgraded /health: uptime, protocol version, recording flag, sessions."""
+    r = await client.get("/api/health")
+    body = r.json()
+    assert body["protocol_version"] == 1  # wire.PROTO_VER
+    assert isinstance(body["uptime_s"], (int, float)) and body["uptime_s"] >= 0.0
+    assert body["recording_enabled"] is True  # Config() default
+    # Fresh app: no session yet.
+    assert body["active_sessions"] == 0
+    assert body["feeds"] == []
+
+
+async def test_health_reports_active_sessions(app, client):
+    """One row per active session with its feed kind and state."""
+
+    class _StubFeed:
+        market = "sim"
+        symbol = "SIM-DEMO"
+
+    class _StubSession:
+        _feed = _StubFeed()
+        _feed_state = "live"
+
+    manager = app.state.manager
+    manager._sessions = {("sim", "SIM-DEMO", "live", None, "0"): _StubSession()}
+    try:
+        r = await client.get("/api/health")
+        body = r.json()
+        assert body["active_sessions"] == 1
+        assert body["feeds"] == [
+            {"market": "sim", "symbol": "SIM-DEMO", "mode": "live", "state": "live"}
+        ]
+    finally:
+        manager._sessions = {}
+
+
+# ---------------------------------------------------------------------------
+# structured JSON error shape: {"error": {"code", "message"}}
+
+
+async def test_error_shape_not_found(client):
+    r = await client.get("/api/definitely-not-a-route")
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"]["code"] == "not_found"
+    assert body["error"]["message"]
+
+
+async def test_error_shape_method_not_allowed(client):
+    r = await client.post("/api/health")
+    assert r.status_code == 405
+    assert r.json()["error"]["code"] == "method_not_allowed"
+
+
+async def test_error_shape_validation_422(client):
+    r = await client.get("/api/movers", params={"limit": "not-a-number"})
+    assert r.status_code == 422  # FastAPI's validation contract preserved
+    body = r.json()
+    assert body["error"]["code"] == "invalid_params"
+    assert "limit" in body["error"]["message"]
+
+
+async def test_error_shape_missing_required_params(client):
+    r = await client.get("/api/quote")  # market+symbol are required
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"]["code"] == "invalid_params"
+    assert "market" in body["error"]["message"]
 
 
 async def test_symbols_sim_capability_from_simfeed(client):

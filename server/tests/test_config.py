@@ -24,7 +24,15 @@ def test_env_overrides_and_loopback_assertion():
         Config.from_env({"FLOWMAP_HOST": "0.0.0.0"})   # refuses non-loopback
 
 def test_data_dir_env_override_expands_user():
+    # A plain path passes through Path().expanduser(), which NORMALIZES
+    # separators per OS: "/tmp/fm-rec" is "\tmp\fm-rec" on Windows. Compare
+    # against the same normalization instead of a POSIX literal so the
+    # assertion is cross-platform.
     cfg = Config.from_env({"FLOWMAP_DATA_DIR": "/tmp/fm-rec"})
-    assert cfg.data_dir == "/tmp/fm-rec"
+    assert cfg.data_dir == str(Path("/tmp/fm-rec").expanduser())
+    assert "~" not in cfg.data_dir
+    # "~" is expanded to the user's home on every platform.
     cfg = Config.from_env({"FLOWMAP_DATA_DIR": "~/custom-rec"})
     assert cfg.data_dir == str(Path("~/custom-rec").expanduser())
+    assert "~" not in cfg.data_dir
+    assert cfg.data_dir.endswith("custom-rec")

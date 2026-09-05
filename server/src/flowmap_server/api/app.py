@@ -12,11 +12,15 @@ or no disk IO inject their own manager.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flowmap_server import __version__
 from flowmap_server.api import discovery, rest, ws
@@ -46,6 +50,51 @@ _ALLOWED_ORIGINS = (
     "tauri://localhost",
     "http://tauri.localhost",
 )
+
+
+def _error_response(code: str, message: str, status_code: int) -> JSONResponse:
+    """One machine-readable error shape for the whole REST surface."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+def _install_error_handlers(app: FastAPI) -> None:
+    """Structured JSON errors: ``{"error": {"code", "message"}}``.
+
+    Replaces the framework defaults (Starlette's ``{"detail": ...}`` and
+    FastAPI's verbose 422 ``detail`` list) so the client parses ONE shape.
+    Status codes are preserved: 404 stays 404, validation stays 422
+    (FastAPI's contract), only the BODY is normalized.
+    """
+    _HTTP_CODES = {
+        400: "bad_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        405: "method_not_allowed",
+        429: "rate_limited",
+    }
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code = _HTTP_CODES.get(exc.status_code, "http_error")
+        return _error_response(code, str(exc.detail), exc.status_code)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        parts = [
+            f"{'.'.join(str(loc) for loc in err.get('loc', ()))}: {err.get('msg', 'invalid')}"
+            for err in exc.errors()
+        ]
+        message = "; ".join(parts) if parts else "invalid request parameters"
+        return _error_response("invalid_params", message, 422)
+
+    @app.exception_handler(Exception)
+    async def _internal_error(request: Request, exc: Exception) -> JSONResponse:
+        # Never leak internals to the wire; the traceback stays in the log.
+        return _error_response("internal_error", "internal server error", 500)
 
 
 def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
@@ -92,6 +141,9 @@ def create_app(
     app.state.cfg = cfg
     app.state.manager = manager
     app.state.market_cache = market_cache
+    # /health uptime anchor (monotonic — immune to wall-clock adjustments).
+    app.state.started_monotonic_ns = time.monotonic_ns()
+    _install_error_handlers(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(_ALLOWED_ORIGINS),

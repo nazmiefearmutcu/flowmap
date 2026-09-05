@@ -46,6 +46,11 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_NS = 15 * 10**9  # 15 s: fresh enough for a mover strip, cheap on providers
+# Bound on cached entries (quotes AND movers lists) so a long-lived server
+# that browses thousands of distinct symbols cannot grow the dicts forever.
+# 512 quotes ~ far more than any real browsing session touches; eviction is
+# oldest-INSERTED-first (see MarketDataCache._evict).
+DEFAULT_MAX_ENTRIES = 512
 SPARK_MAX = 64  # cap sparkline points on the wire
 
 QuoteFn = Callable[[str, str], Awaitable["QuoteData"]]
@@ -109,12 +114,14 @@ class MarketDataCache:
         quote_fn: QuoteFn,
         movers_fn: MoversFn,
         ttl_ns: int = DEFAULT_TTL_NS,
+        max_entries: int = DEFAULT_MAX_ENTRIES,
         clock: Clock = time.monotonic_ns,
         wall_clock: Clock = time.time_ns,
     ) -> None:
         self._quote_fn = quote_fn
         self._movers_fn = movers_fn
         self._ttl_ns = ttl_ns
+        self._max_entries = max(1, int(max_entries))
         self._clock = clock
         self._wall = wall_clock
         self._quotes: dict[tuple[str, str], tuple[int, QuoteData]] = {}
@@ -142,8 +149,20 @@ class MarketDataCache:
                 self._release_lock(self._quote_locks, key, lock)
                 return self._fallback_quote(market, symbol.upper(), cached)
             self._quotes[key] = (self._clock(), q)
+            self._evict(self._quotes)
             self._release_lock(self._quote_locks, key, lock)
             return q
+
+    def _evict(self, store: dict) -> None:
+        """Bound a cache store: drop OLDEST-INSERTED entries while over cap.
+
+        Fresh fetches overwrite in place without reinserting, so dict order
+        stays a faithful insertion-time ordering; oldest-first biases
+        retention toward the RECENTLY browsed working set. Only successful
+        inserts pay this cost — error fallbacks never grow the store.
+        """
+        while len(store) > self._max_entries:
+            store.pop(next(iter(store)))
 
     @staticmethod
     def _release_lock(locks: dict, key, lock: asyncio.Lock) -> None:
@@ -192,6 +211,7 @@ class MarketDataCache:
                 self._release_lock(self._movers_locks, market, lock)
                 return cached[1][:limit] if cached is not None else []
             self._movers[market] = (self._clock(), ranked)
+            self._evict(self._movers)
             self._release_lock(self._movers_locks, market, lock)
             return ranked[:limit]
 
