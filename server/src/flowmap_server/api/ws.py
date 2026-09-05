@@ -211,14 +211,26 @@ class _Connection:
         try:
             self._session = await self._manager.subscribe(sub, self._client)
         except SessionLimitError:
+            logger.warning(
+                "refused subscribe: session limit reached (%s:%s mode=%s) -> 1013",
+                sub.market, sub.symbol, sub.mode,
+            )
             await self._refuse("degraded", _CLOSE_TRY_AGAIN_LATER)
             return False
-        except ReplayUnavailableError:
+        except ReplayUnavailableError as exc:
             # Honest refusal (NOT a live feed under a replay label): the client
             # hides its Replay toggle unless a server advertises the capability.
+            logger.warning(
+                "refused subscribe: no replayable recording (%s:%s: %s) -> 1003",
+                sub.market, sub.symbol, exc,
+            )
             await self._refuse("degraded", _CLOSE_UNSUPPORTED)
             return False
-        except NotImplementedError:
+        except NotImplementedError as exc:
+            logger.warning(
+                "refused subscribe: no feed for market (%s:%s: %s) -> 1003",
+                sub.market, sub.symbol, exc,
+            )
             await self._refuse("closed", _CLOSE_UNSUPPORTED)
             return False
         return True
