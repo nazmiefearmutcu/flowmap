@@ -133,7 +133,9 @@ interface LevelSel {
  */
 export function selectLevel(rowsPerPixel: number, maxLevel: number): LevelSel {
   if (maxLevel <= 0 || rowsPerPixel <= 1) return { level: 0, blk: 1, nRowTaps: 1 };
-  const level = Math.max(0, Math.min(maxLevel, Math.floor(Math.log(rowsPerPixel) / Math.log(4))));
+  // log4 via log2/2: Math.log2 is exact for powers of two on V8, so the
+  // level boundary at exact 4^k footprints no longer rides on log/log rounding.
+  const level = Math.max(0, Math.min(maxLevel, Math.floor(Math.log2(rowsPerPixel) / 2)));
   const blk = 4 ** level;
   const nRowTaps = Math.max(1, Math.min(4, Math.round(rowsPerPixel / blk)));
   return { level, blk, nRowTaps };
@@ -319,8 +321,10 @@ export class Heatmap {
 
     // Bind the SUM-mip levels (T7). With no mip chain the ring texture is bound
     // here as a valid, complete stand-in — the shader never samples it because
-    // level selection is forced to 0 below (u_level == 0 → u_tiles only).
-    const mips = this.mips;
+    // level selection is forced to 0 below (u_level == 0 → u_tiles only). A
+    // chain whose FBO went incomplete (MipChain.usable === false) is treated the
+    // same way: the exact level-0 path instead of sampling broken mips.
+    const mips = this.mips !== null && !this.mips.usable ? null : this.mips;
     const mip1 = mips ? mips.tex1 : this.tileRing.texture;
     const mip2 = mips && mips.tex2 ? mips.tex2 : this.tileRing.texture;
     gl.activeTexture(gl.TEXTURE0 + MIP1_UNIT);
@@ -358,7 +362,8 @@ export class Heatmap {
     // fixed, so this is one selection for the whole frame — a constant the shader
     // branches on coherently. mip *generation* is incremental (append time); mip
     // *sampling* is ≤4 texelFetch per pixel, keeping the draw O(1) in history.
-    const maxLevel = this.mips ? this.mips.maxLevel : 0;
+    // `mips` (not this.mips): an unusable chain must level-select to 0 too.
+    const maxLevel = mips ? mips.maxLevel : 0;
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
     const sel = selectLevel(rowsPerPixel, maxLevel);
     gl.uniform1i(this.u.u_level, sel.level);

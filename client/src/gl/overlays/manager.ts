@@ -16,7 +16,13 @@
 import { drawGridlines, drawPriceAxis, drawTimeAxis } from './axes';
 import { Bbo, type BboState } from './bbo';
 import { Bubbles } from './bubbles';
-import { GridMap, type PriceMap, type SurfaceDims, type TimeMap } from './coords';
+import {
+  GridMap,
+  mapScale,
+  type PriceMap,
+  type SurfaceDims,
+  type TimeMap,
+} from './coords';
 import { DEFAULT_OVERLAY_VISIBILITY, type OverlayFrame, type OverlayVisibility } from './frame';
 import { Markers } from './markers';
 import { OVERLAY } from './palette';
@@ -27,6 +33,7 @@ import { Cvd } from './cvd';
 import { Vwap } from './vwap';
 import { TextLayer } from '../textLayer';
 import type { HeatmapView } from '../heatmap';
+import { rowToPrice as scaleRowToPrice } from '../priceScale';
 import type { BarColumn, BBO, Marker, Trade } from '../../proto/types';
 
 /** Everything one overlay frame needs from the renderer. */
@@ -294,13 +301,17 @@ export class OverlayManager {
 /**
  * Inside quote from an L2 book column: best bid = highest row carrying bid
  * density (closest to the spread), best ask = lowest row carrying ask density.
- * Pure — exact reading of the book the server sent, not a fabricated quote.
+ * Row→price goes through the SCALE accessor (gl/priceScale.ts), never the raw
+ * `p0 + row·step` scalars — on a hybrid (non-uniform) grid a wing row's price
+ * depends on where it sits, which is exactly the coords.ts contract. Pure —
+ * exact reading of the book the server sent, not a fabricated quote.
  */
 export function deriveL2Bbo(
   bid: Float32Array,
   ask: Float32Array | null,
   price: PriceMap,
 ): BboState | null {
+  const scale = mapScale(price);
   let bidRow = -1;
   for (let r = bid.length - 1; r >= 0; r--) {
     if (bid[r] > 0) {
@@ -319,9 +330,9 @@ export function deriveL2Bbo(
   }
   if (bidRow < 0 && askRow < 0) return null;
   return {
-    bidPx: bidRow >= 0 ? price.p0 + bidRow * price.step : Number.NaN,
+    bidPx: bidRow >= 0 ? scaleRowToPrice(scale, bidRow) : Number.NaN,
     bidSz: bidRow >= 0 ? bid[bidRow] : 0,
-    askPx: askRow >= 0 ? price.p0 + askRow * price.step : Number.NaN,
+    askPx: askRow >= 0 ? scaleRowToPrice(scale, askRow) : Number.NaN,
     askSz: askRow >= 0 && ask !== null ? ask[askRow] : 0,
     source: 'l2',
   };

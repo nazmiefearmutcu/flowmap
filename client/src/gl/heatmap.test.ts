@@ -218,4 +218,13 @@ describe('selectLevel (SUM-mip selection) — unchanged by the tolerance work', 
     expect(sel.nRowTaps).toBe(2);
     expect(selectLevel(4096, 2).nRowTaps).toBeLessThanOrEqual(4);
   });
+
+  it('lands EXACTLY on the level boundary at every exact 4^k footprint (log2)', () => {
+    // log2 is exact for powers of two on V8, so the level boundaries must hold
+    // far past where log/log drifting could bite (level 4+ = 256+ rows/px).
+    for (let k = 0; k <= 13; k++) {
+      expect(selectLevel(4 ** k, 16).level).toBe(k);
+      expect(selectLevel(4 ** k - 1, 16).level).toBe(Math.max(0, k - 1));
+    }
+  });
 });

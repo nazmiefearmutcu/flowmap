@@ -140,6 +140,8 @@ export class ViewportNormalizer {
 
   /** Absolute tile index → 256-bin non-zero-density histogram. */
   private readonly tiles = new Map<number, Int32Array>();
+  /** Absolute tile index → highest col_seq folded into it (see foldColumnFinal). */
+  private readonly foldedWatermark = new Map<number, number>();
   /** Scratch merge accumulator (reused; never leaks between calls). */
   private readonly merged: Int32Array;
 
@@ -180,6 +182,16 @@ export class ViewportNormalizer {
   /** Number of per-tile histograms currently retained (bounded ≤ maxTiles). */
   get retainedTiles(): number {
     return this.tiles.size;
+  }
+
+  /** Total non-zero samples folded across all retained tiles (diagnostics/tests:
+   *  the double-count detector for re-sent columns). */
+  get totalSamples(): number {
+    let total = 0;
+    for (const hist of this.tiles.values()) {
+      for (let b = 0; b < this.bins; b++) total += hist[b];
+    }
+    return total;
   }
 
   /** Current EMA-smoothed norm (what was last fed to `u_norm`), floored. */
@@ -224,6 +236,28 @@ export class ViewportNormalizer {
     }
   }
 
+  /**
+   * Fold one FINAL column's densities into its tile histogram, exactly ONCE per
+   * column id. A forming edge column is re-sent every flush and history pages
+   * overlap by design — folding those re-sents inflated the per-tile histogram
+   * (biased white point, contrast wobble). The per-tile watermark makes each
+   * col_seq idempotent: a re-sent (already folded or superseded) column is
+   * skipped, in any order, across tiles.
+   *
+   * Callers MUST pass only `final === true` columns here — a forming column's
+   * partial fold would advance the watermark and its final data would then be
+   * dropped. The documented cost of the watermark is that an OLDER column
+   * finalizing after a newer one was folded is skipped; the wire finalizes
+   * columns in order, so the overwhelmingly common path is exact.
+   */
+  foldColumnFinal(colSeq: number, bid: Float32Array, ask: Float32Array | null): void {
+    const tile = this.tileOf(colSeq);
+    const watermark = this.foldedWatermark.get(tile);
+    if (watermark !== undefined && colSeq <= watermark) return;
+    this.foldedWatermark.set(tile, colSeq);
+    this.addColumn(colSeq, bid, ask);
+  }
+
   /** Evict the retained tile farthest from `nearTile` when the cap is reached. */
   private evictIfFull(nearTile: number): void {
     if (this.tiles.size < this.maxTiles) return;
@@ -236,7 +270,13 @@ export class ViewportNormalizer {
         victim = t;
       }
     }
-    if (victim >= 0) this.tiles.delete(victim);
+    if (victim >= 0) {
+      this.tiles.delete(victim);
+      // The watermark must not outlive its tile: an evicted-then-re-spliced
+      // tile folds again only if its entry is gone, otherwise its histogram
+      // would silently never rebuild.
+      this.foldedWatermark.delete(victim);
+    }
   }
 
   /**
@@ -312,6 +352,7 @@ export class ViewportNormalizer {
 
   reset(): void {
     this.tiles.clear();
+    this.foldedWatermark.clear();
     this.merged.fill(0);
     this.ema = 0;
     this.lastRaw = 0;

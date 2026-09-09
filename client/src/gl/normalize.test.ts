@@ -328,3 +328,42 @@ describe('histogram bin edges — garbage densities must stay finite', () => {
     expect(p).toBeGreaterThan(1); // both tiles were merged (not just tile 0)
   });
 });
+
+describe('foldColumnFinal — final columns fold exactly once (B-1)', () => {
+  /** One column with a single bid + single ask sample at `value`. */
+  function fold(n: ViewportNormalizer, colSeq: number, value = 5): void {
+    n.foldColumnFinal(colSeq, new Float32Array([value]), new Float32Array([value]));
+  }
+
+  it('folds a final column once and never double-counts a re-sent column id', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    fold(n, 5);
+    expect(n.totalSamples).toBe(2); // bid + ask
+    // Re-folding the SAME column id (history page overlap, a re-splice) must
+    // not double-count.
+    fold(n, 5);
+    expect(n.totalSamples).toBe(2);
+    fold(n, 261); // tile 1 — independent watermark
+    expect(n.totalSamples).toBe(4);
+  });
+
+  it('skips a column id at or below a tile watermark (out-of-order finalization safe)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    fold(n, 10);
+    fold(n, 11);
+    expect(n.totalSamples).toBe(4);
+    fold(n, 9); // an older column finalizing after a newer one — skipped
+    expect(n.totalSamples).toBe(4);
+    fold(n, 12); // forward progress still folds
+    expect(n.totalSamples).toBe(6);
+  });
+
+  it('reset clears the watermarks so a fresh session folds from scratch', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    fold(n, 5);
+    n.reset();
+    expect(n.totalSamples).toBe(0);
+    fold(n, 5);
+    expect(n.totalSamples).toBe(2);
+  });
+});

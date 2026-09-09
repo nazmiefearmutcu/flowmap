@@ -18,10 +18,17 @@
  * (profile → vwap → bbo → bubbles → markers), i.e. z-order is honored without a
  * depth buffer. Cost is O(vertices) = O(visible), never O(history).
  *
- * Blending is standard src-alpha over the heatmap; the batch enables it on flush
- * and the heatmap re-disables BLEND at the top of its own draw, so no state
- * leaks. `checkGLError` guards every flush (a GL error throws, matching the
- * heatmap's own discipline and the e2e "no GL errors" gate).
+ * Blending is premultiplied-alpha over the heatmap: the shaders output
+ * `rgb · a, a` and the flushes use `blendFuncSeparate(ONE, ONE_MINUS_SRC_ALPHA,
+ * ONE, ONE_MINUS_SRC_ALPHA)`. Plain `blendFunc(SRC_ALPHA, ...)` leaves the
+ * COLOR alpha term at (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) while dst alpha composes
+ * wrong — with a translucent canvas (alpha:true + page compositing) an overlay
+ * whose destination alpha is < 1 double-composites with the page. Separate
+ * functions with a premultiplied source keep BOTH the rgb and the alpha
+ * channels a correct `over`. The batch enables it on flush and the heatmap
+ * re-disables BLEND at the top of its own draw, so no state leaks.
+ * `checkGLError` guards every flush (a GL error throws, matching the heatmap's
+ * own discipline and the e2e "no GL errors" gate).
  */
 
 import { checkGLError } from '../context';
@@ -42,7 +49,8 @@ precision highp float;
 in vec4 v_color;
 out vec4 o_color;
 void main() {
-  o_color = v_color;
+  // Premultiplied output: blendFuncSeparate(ONE, ONE_MINUS_SRC_ALPHA, ...) below.
+  o_color = vec4(v_color.rgb * v_color.a, v_color.a);
 }`;
 
 const POINT_VERT = `#version 300 es
@@ -66,7 +74,9 @@ void main() {
   float r = dot(d, d);
   if (r > 1.0) discard;
   float edge = smoothstep(1.0, 1.0 - fwidth(r) * 2.0, r);
-  o_color = vec4(v_color.rgb, v_color.a * edge);
+  float a = v_color.a * edge;
+  // Premultiplied output (see SolidBatch's fragment shader).
+  o_color = vec4(v_color.rgb * a, a);
 }`;
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -243,12 +253,17 @@ export class SolidBatch {
     );
   }
 
-  /** Upload + draw the accumulated triangles (alpha-blended). No-op when empty. */
+  /** Upload + draw the accumulated triangles (premultiplied over-composite). No-op when empty. */
   flush(): void {
     if (this.n === 0) return;
     const gl = this.gl;
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(
+      gl.ONE,
+      gl.ONE_MINUS_SRC_ALPHA,
+      gl.ONE,
+      gl.ONE_MINUS_SRC_ALPHA,
+    );
     gl.disable(gl.DEPTH_TEST);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
@@ -336,7 +351,12 @@ export class PointBatch {
     if (this.n === 0) return;
     const gl = this.gl;
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(
+      gl.ONE,
+      gl.ONE_MINUS_SRC_ALPHA,
+      gl.ONE,
+      gl.ONE_MINUS_SRC_ALPHA,
+    );
     gl.disable(gl.DEPTH_TEST);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);

@@ -43,7 +43,7 @@ import {
   TOLERANCE_MAX_FLOOR,
   type HeatmapView,
 } from './heatmap';
-import { createLUTTexture, rampForMode, RAMP_FLOW, type Colormap } from './lut';
+import { clearColorForRamp, createLUTTexture, rampForMode, RAMP_FLOW, type Colormap } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import {
@@ -177,8 +177,6 @@ const MIN_ROW_PAD = 3;
 const NORM_FLOOR = 6;
 /** Keyboard pan step as a fraction of the current viewport span. */
 const KEY_PAN_FRAC = 0.15;
-/** Near-black clear color (matches the CSS --bg so the canvas has no seam). */
-const BG = [0.008, 0.016, 0.027, 1] as const;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -244,8 +242,8 @@ export class Renderer {
   private overlayAnchorSeq = -1;
   private overlayAnchorT0Ns = 0n;
   private overlayAnchorEpoch = 0;
-  /** One-shot guard so a suppressed overlay-ingest error warns at most once. */
-  private overlayIngestWarned = false;
+  /** One-shot guard so a suppressed stream-ingest error warns at most once. */
+  private streamIngestWarned = false;
   /** norm_seed applied once, the first time the server sends it. */
   private normSeeded = false;
   /**
@@ -321,6 +319,8 @@ export class Renderer {
   private drawCountN = 0;
   private lastDrawEndTsN = 0;
   private perf: PerfRun | null = null;
+  /** A frame threw and the failure is already surfaced (report-once guard). */
+  private frameErrored = false;
 
   private readonly unsubscribeStream: () => void;
   private readonly resizeObserver: ResizeObserver;
@@ -352,9 +352,14 @@ export class Renderer {
     this.view = this.camera.toView();
 
     // T9 CPU state (no GL) — histograms + exact column cache survive a context
-    // loss, so they're built once here and kept across ring rebuilds.
+    // loss, so they're built once here and kept across ring rebuilds. The cache
+    // is sized to cover the WHOLE ring: a 2048-column cache under a 16 384-column
+    // ring made the volume profile silently drop resident columns it could not
+    // read (bars under-reported for any window wider than the cache).
     this.normalizer = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
-    this.columnCache = new ColumnCache();
+    this.columnCache = new ColumnCache({
+      capacity: this.ringLayersFor(this.opts.capacityColsTarget) * COLS_PER_TILE,
+    });
 
     // Overlays (T10): own GL batches + a 2D text layer sibling over the canvas.
     this.overlays = new OverlayManager(this.ctx.gl, canvas);
@@ -362,9 +367,7 @@ export class Renderer {
     // Match the backing store to the CSS box, then paint the background once so
     // the pre-data canvas is the terminal near-black, not transparent garbage.
     this.resize();
-    const gl = this.ctx.gl;
-    gl.clearColor(BG[0], BG[1], BG[2], BG[3]);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.clearBackground();
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(canvas);
@@ -698,7 +701,7 @@ export class Renderer {
     this.decodeScale = 1;
     this.ramp = RAMP_FLOW;
     this.lastColMode = null;
-    this.overlayIngestWarned = false;
+    this.streamIngestWarned = false;
 
     // Rewind the per-session cursors used for auto-follow + overlay anchoring so
     // the new session's first (typically lower) col_seq becomes the newest again.
@@ -722,9 +725,7 @@ export class Renderer {
 
     // Wipe the old image now — preserveDrawingBuffer would otherwise keep the
     // stale frame on screen until the first new-session column draws.
-    const gl = this.ctx.gl;
-    gl.clearColor(BG[0], BG[1], BG[2], BG[3]);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.clearBackground();
 
     this.dirty = true;
     this.viewMoved = true;
@@ -845,16 +846,19 @@ export class Renderer {
   // --- stream handling ----------------------------------------------------------
 
   private onMessage = (msg: StreamMsg): void => {
-    if (msg.type === MsgType.DEPTH_COL) {
-      this.onDepthColumn(msg);
-      return;
-    }
-    // Overlays (T10): feed the overlay manager; a redraw is scheduled so the
-    // sprites/lines/glyphs update in lock-step with the heatmap. Cheap — the
-    // manager only stores into bounded rings/maps here (O(1)); drawing is
-    // O(visible) on the next dirty frame. Guarded so a single malformed overlay
-    // event can NEVER break the column stream / renderer (§8.3 lifecycle).
+    // The store's fanout invokes every listener with no isolation, so a throw
+    // here would break WS dispatch for the whole app. Everything below is
+    // guarded: a single malformed message is warned once and dropped while the
+    // renderer (and the stream) continue (§8.3 lifecycle).
     try {
+      if (msg.type === MsgType.DEPTH_COL) {
+        this.onDepthColumn(msg);
+        return;
+      }
+      // Overlays (T10): feed the overlay manager; a redraw is scheduled so the
+      // sprites/lines/glyphs update in lock-step with the heatmap. Cheap — the
+      // manager only stores into bounded rings/maps here (O(1)); drawing is
+      // O(visible) on the next dirty frame.
       switch (msg.type) {
         case MsgType.TRADE:
           this.overlays.onTrade(msg);
@@ -873,9 +877,9 @@ export class Renderer {
       }
       this.dirty = true;
     } catch (err) {
-      if (!this.overlayIngestWarned) {
-        this.overlayIngestWarned = true;
-        console.warn('[flowmap] overlay ingest error (suppressed; stream continues):', err);
+      if (!this.streamIngestWarned) {
+        this.streamIngestWarned = true;
+        console.warn('[flowmap] stream ingest error (suppressed; stream continues):', err);
       }
     }
   };
@@ -1025,7 +1029,12 @@ export class Renderer {
     // histogram (viewport normalization). The DepthColumn arrays are fresh,
     // immutable copies (decode.ts), so the cache holds references directly.
     this.columnCache.put(col.col_seq, col.bid, col.ask, col.t0_ns, col.epoch);
-    this.normalizer.addColumn(col.col_seq, col.bid, col.ask);
+    // Only FINAL columns fold into the histogram: a forming edge column is
+    // re-sent every flush and history pages overlap, so folding every write
+    // inflated the histogram ~2×+ and biased the white point. foldColumnFinal
+    // additionally dedupes by column id so an overlapping history re-splice
+    // folds exactly once.
+    if (col.final) this.normalizer.foldColumnFinal(col.col_seq, col.bid, col.ask);
 
     this.history?.noteColumn(col.col_seq, col.t0_ns);
 
@@ -1045,9 +1054,7 @@ export class Renderer {
         `flowmap/renderer: rows ${rows} exceed MAX_TEXTURE_SIZE ${this.ctx.caps.maxTextureSize}`,
       );
     }
-    const maxLayers = this.ctx.caps.maxArrayTextureLayers;
-    const wantLayers = Math.ceil(this.opts.capacityColsTarget / COLS_PER_TILE);
-    const layers = clamp(wantLayers, 2, maxLayers);
+    const layers = this.ringLayersFor(this.opts.capacityColsTarget);
 
     this.ringRows = rows;
     this.ringLayers = layers;
@@ -1159,6 +1166,15 @@ export class Renderer {
   }
 
   /**
+   * Tile layers the ring gets for a column target — the exact allocation
+   * arithmetic used at ring creation AND for the CPU column-cache sizing, so
+   * the cache always covers the ring it mirrors.
+   */
+  private ringLayersFor(target: number): number {
+    return clamp(Math.ceil(target / COLS_PER_TILE), 2, this.ctx.caps.maxArrayTextureLayers);
+  }
+
+  /**
    * Build the SUM-mip chain when float FBOs are available and the row count
    * supports a 4× downsample. Returns null (single-level, level-0 draw path)
    * otherwise — the heatmap then renders exactly as it did pre-T7.
@@ -1166,6 +1182,19 @@ export class Renderer {
   private createMips(rows: number, layers: number): MipChain | null {
     if (!this.ctx.caps.colorBufferFloat || rows % 4 !== 0) return null;
     return new MipChain(this.ctx, COLS_PER_TILE, rows, layers);
+  }
+
+  /**
+   * Paint the terminal near-black. The color is the ACTIVE ramp's LUT entry 0
+   * (see clearColorForRamp) — the exact value the fragment shader's background()
+   * samples — so a cleared canvas and a zero-density pixel are the same color
+   * and a session reset cannot flash a different black.
+   */
+  private clearBackground(): void {
+    const gl = this.ctx.gl;
+    const [r, g, b, a] = clearColorForRamp(this.ramp);
+    gl.clearColor(r, g, b, a);
+    gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
   // --- view + draw --------------------------------------------------------------
@@ -1346,7 +1375,8 @@ export class Renderer {
   /** SUM-mip level the current view would sample (0/1/2) — drives backfill
    *  suppression on deep zoom-out (§8.3: level-2 renders from mips). */
   private currentLevel(): number {
-    const maxLevel = this.mips ? this.mips.maxLevel : 0;
+    const m = this.mips;
+    const maxLevel = m !== null && m.usable ? m.maxLevel : 0;
     const h = Math.max(1, this.ctx.gl.drawingBufferHeight);
     return selectLevel(this.view.rowScale / h, maxLevel).level;
   }
@@ -1608,8 +1638,7 @@ export class Renderer {
 
     const gl = this.ctx.gl;
     this.resize();
-    gl.clearColor(BG[0], BG[1], BG[2], BG[3]);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.clearBackground();
 
     if (this.ringRows > 0) {
       // Rebuild the ring/heatmap/mips at the same geometry; the ring is empty.
@@ -1645,80 +1674,84 @@ export class Renderer {
 
   private frame = (ts: number): void => {
     if (!this.running) return;
-    // A lost context can't draw; wait for `restored` to rebuild GL.
-    if (this.glLost()) {
-      this.rafId = requestAnimationFrame(this.frame);
-      return;
-    }
+    try {
+      // A lost context can't draw; wait for `restored` to rebuild GL.
+      if (this.glLost()) return;
 
-    const perf = this.perf;
-    if (perf) {
-      if (perf.lastTs > 0) perf.deltas.push(ts - perf.lastTs);
-      perf.lastTs = ts;
-      this.stepPerf(perf);
-      this.dirty = true; // force a redraw every frame while measuring
-    }
-
-    // Price auto-follow glide (O(1): a handful of scalars). No-op unless the
-    // camera is in 'track' mode with the live edge on screen.
-    this.stepPriceFollow(ts);
-
-    // T8: on frames where the view moved, ask the loader to ensure the visible
-    // range is populated. This guard is O(1) (visible-left vs resident-oldest) —
-    // never O(history) — so the §10 perf gate stays green.
-    if (this.viewMoved && this.history !== null && this.ring !== null) {
-      this.viewMoved = false;
-      this.history.ensureVisible({
-        leftCol: Math.floor(this.view.colOffset),
-        span: this.view.colScale,
-        level: this.currentLevel(),
-      });
-    }
-
-    if (this.dirty && this.heatmap !== null) {
-      // T9: refresh u_norm from the visible window before drawing (O(tiles),
-      // outside the measured draw cost; a no-op during the perf preload run).
-      this.updateNormalization();
-      const t0 = performance.now();
-      this.heatmap.draw(this.view);
+      const perf = this.perf;
       if (perf) {
-        // Flush the (software) GL pipeline so the sample is the true frame cost.
-        this.ctx.gl.finish();
-        perf.drawMs.push(performance.now() - t0);
+        if (perf.lastTs > 0) perf.deltas.push(ts - perf.lastTs);
+        perf.lastTs = ts;
+        this.stepPerf(perf);
+        this.dirty = true; // force a redraw every frame while measuring
       }
-      this.dirty = false;
-      this.drawCountN++;
-      this.lastDrawEndTsN = performance.now();
 
-      // Overlays (T10) draw OVER the heatmap, O(visible). Skipped during a perf
-      // run (the measured drawMs is heatmap-only) and when there is no epoch to
-      // map events/prices onto (perf preload) — so the §10 gate is untouched. A
-      // throw here must never freeze the render loop (bookkeeping is already done
-      // above), but IS surfaced asynchronously so a real GL error still fails the
-      // §12 "no GL errors" gate.
-      if (perf === null) {
-        try {
-          this.drawOverlays();
-        } catch (err) {
-          setTimeout(() => {
-            throw err;
-          }, 0);
+      // Price auto-follow glide (O(1): a handful of scalars). No-op unless the
+      // camera is in 'track' mode with the live edge on screen.
+      this.stepPriceFollow(ts);
+
+      // T8: on frames where the view moved, ask the loader to ensure the visible
+      // range is populated. This guard is O(1) (visible-left vs resident-oldest) —
+      // never O(history) — so the §10 perf gate stays green.
+      if (this.viewMoved && this.history !== null && this.ring !== null) {
+        this.viewMoved = false;
+        this.history.ensureVisible({
+          leftCol: Math.floor(this.view.colOffset),
+          span: this.view.colScale,
+          level: this.currentLevel(),
+        });
+      }
+
+      if (this.dirty && this.heatmap !== null) {
+        // T9: refresh u_norm from the visible window before drawing (O(tiles),
+        // outside the measured draw cost; a no-op during the perf preload run).
+        this.updateNormalization();
+        const t0 = performance.now();
+        this.heatmap.draw(this.view);
+        if (perf) {
+          // Flush the (software) GL pipeline so the sample is the true frame cost.
+          this.ctx.gl.finish();
+          perf.drawMs.push(performance.now() - t0);
         }
+        this.dirty = false;
+        this.drawCountN++;
+        this.lastDrawEndTsN = performance.now();
+
+        // Overlays (T10) draw OVER the heatmap, O(visible). Skipped during a perf
+        // run (the measured drawMs is heatmap-only) and when there is no epoch to
+        // map events/prices onto (perf preload) — so the §10 gate is untouched.
+        // A throw here is surfaced once below, like any other frame error.
+        if (perf === null) this.drawOverlays();
+
+        // Keep redrawing until the viewport norm reaches its target so the
+        // contrast glides into a new regime (~0.3 s) instead of snapping.
+        // O(tiles)/frame for the handful of settle frames; a no-op once
+        // converged and in the perf preload path (no histogram data).
+        if (this.normSettling()) this.dirty = true;
       }
 
-      // Keep redrawing until the viewport norm reaches its target so the contrast
-      // glides into a new regime (~0.3 s) instead of snapping. O(tiles)/frame for
-      // the handful of settle frames; a no-op once converged and in the perf
-      // preload path (no histogram data).
-      if (this.normSettling()) this.dirty = true;
-    }
+      if (perf && ts >= perf.deadline) {
+        this.perf = null;
+        perf.resolve({ deltas: perf.deltas, drawMs: perf.drawMs, frames: perf.drawMs.length });
+      }
 
-    if (perf && ts >= perf.deadline) {
-      this.perf = null;
-      perf.resolve({ deltas: perf.deltas, drawMs: perf.drawMs, frames: perf.drawMs.length });
+      // A clean frame re-arms the error surface: a NEW failure episode is
+      // reported, a persistently broken context is not spammed every frame.
+      this.frameErrored = false;
+    } catch (err) {
+      // One GL error must never kill the render loop (§8.3): the finally below
+      // reschedules no matter what, and the failure is surfaced ONCE per episode
+      // (re-thrown async so devtools and the e2e "no GL errors" gate still see
+      // it) instead of silently disabling the heatmap forever.
+      if (!this.frameErrored) {
+        this.frameErrored = true;
+        setTimeout(() => {
+          throw err;
+        }, 0);
+      }
+    } finally {
+      if (this.running) this.rafId = requestAnimationFrame(this.frame);
     }
-
-    this.rafId = requestAnimationFrame(this.frame);
   };
 
   /** Apply this frame's scripted camera op during a perf run. */
@@ -1977,6 +2010,30 @@ export class Renderer {
   /** The EMA-smoothed norm currently fed to u_norm (e2e diagnostics). */
   get currentNorm(): number {
     return this.normalizer.current;
+  }
+
+  /** The CPU viewport normalizer (test/e2e diagnostics: histogram totals). */
+  get normalizerForTest(): ViewportNormalizer {
+    return this.normalizer;
+  }
+
+  /** The exact CPU column cache (test/e2e diagnostics). */
+  get columnCacheForTest(): ColumnCache {
+    return this.columnCache;
+  }
+
+  /**
+   * Force one synchronous full frame (heatmap + overlays) and return the canvas
+   * as a PNG data URL — the snapshot contract a later lane (export/share flows)
+   * builds on. Returns null when the GL context is lost: there is no valid
+   * back buffer to read and the restored context will repaint anyway.
+   */
+  snapshot(): string | null {
+    if (this.glLost()) return null;
+    this.updateNormalization();
+    this.heatmap?.draw(this.view);
+    this.drawOverlays();
+    return this.canvas.toDataURL('image/png');
   }
 
   // --- overlay e2e hooks (driven by tests/e2e/overlays.spec) ---------------------

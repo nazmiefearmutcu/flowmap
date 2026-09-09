@@ -1,0 +1,150 @@
+import { describe, expect, it } from 'vitest';
+
+import { COLS_PER_TILE, TileRing } from './tileRing';
+import { DOWNSAMPLE_FRAG, mipGroupCols, MipChain } from './mips';
+import { GL, makeFakeGL, type FakeGL } from './mockGL';
+import type { GLContext } from './context';
+
+/**
+ * SUM-mip unit tests over the recording fake GL. Pixels stay the browser e2e's
+ * job; these pin the pass PLUMBING (which uniforms the validFrom mask gets for
+ * each level) and the FBO-completeness fallback. The ring's gap behavior is
+ * pinned in tileRing.test.ts — here a col_seq gap is simulated the same way.
+ */
+
+const ROWS = 16;
+const LAYERS = 1;
+
+function makeChain(opts: { incompleteFBO?: boolean } = {}): {
+  chain: MipChain;
+  ring: TileRing;
+  gl: FakeGL;
+} {
+  const gl = makeFakeGL({ colorBufferFloat: true, incompleteFBO: opts.incompleteFBO });
+  const ctx: GLContext = {
+    gl,
+    caps: {
+      maxTextureImageUnits: 16,
+      maxArrayTextureLayers: 2048,
+      maxTextureSize: 8192,
+      colorBufferFloat: true,
+    },
+  };
+  const ring = new TileRing(gl, ROWS, LAYERS);
+  const chain = new MipChain(ctx, COLS_PER_TILE, ROWS, LAYERS);
+  return { chain, ring, gl };
+}
+
+function append(ring: TileRing, seq: number): void {
+  ring.append(seq, 0, new Float32Array(ROWS), new Float32Array(ROWS), ROWS);
+}
+
+/** The u_validFrom / u_groupNewest values of the LAST downsample pass. */
+function lastMaskUniforms(gl: FakeGL): { validFrom: number; groupNewest: number } {
+  const validFromLocs = gl.callsOf('uniform1i').filter((c) => c.args[0] !== null && (c.args[0] as { uniform?: string }).uniform === 'u_validFrom');
+  const groupLocs = gl.callsOf('uniform1i').filter((c) => c.args[0] !== null && (c.args[0] as { uniform?: string }).uniform === 'u_groupNewest');
+  const last = <T,>(a: T[]): T | undefined => a[a.length - 1];
+  return {
+    validFrom: last(validFromLocs)!.args[1] as number,
+    groupNewest: last(groupLocs)!.args[1] as number,
+  };
+}
+
+describe('mipGroupCols (the group the SUM covers)', () => {
+  it('is the 4 consecutive columns ending at groupNewest', () => {
+    expect(mipGroupCols(3)).toEqual([0, 1, 2, 3]);
+    expect(mipGroupCols(19)).toEqual([16, 17, 18, 19]);
+  });
+});
+
+describe('validFrom gating of the downsample (B-2)', () => {
+  it('passes the ring validFrom + the appended group into the level-1 pass', () => {
+    const { chain, ring, gl } = makeChain();
+    for (let s = 0; s <= 3; s++) append(ring, s);
+    // A col_seq GAP forward growth: the slots between 3 and 10 still hold the
+    // previous session's texels (tileRing.test.ts pins the Residency part).
+    for (let s = 10; s <= 11; s++) append(ring, s);
+    expect(ring.validFromSeq()).toBe(10);
+
+    // Column 11 completes the group [8..11]: two of its four source columns
+    // (8, 9) are pre-gap slots the level-0 path masks away — the pass must get
+    // the gate so the SUM masks them too.
+    chain.updateFrom(ring, 11);
+    expect(mipGroupCols(11).filter((c) => c >= ring.validFromSeq())).toEqual([10, 11]);
+
+    const { validFrom, groupNewest } = lastMaskUniforms(gl);
+    expect(validFrom).toBe(10);
+    expect(groupNewest).toBe(11);
+    expect(gl.callsOf('drawArrays').length).toBe(1); // level-1 pass only (11 % 16 !== 15)
+  });
+
+  it('the shader masks each source column against u_validFrom before summing', () => {
+    // The mask itself is GLSL; pin its presence and shape so the sum can never
+    // silently regress to the unguarded fetch.
+    expect(DOWNSAMPLE_FRAG).toContain('u_validFrom');
+    expect(DOWNSAMPLE_FRAG).toContain('u_groupNewest');
+    expect(DOWNSAMPLE_FRAG).toMatch(/u_groupNewest\s*-\s*3\s*\+\s*i\s*>=\s*u_validFrom/);
+  });
+
+  it('disables the mask on the level-1 → level-2 pass (source is pre-masked)', () => {
+    const { chain, ring, gl } = makeChain();
+    for (let s = 0; s <= 15; s++) append(ring, s);
+    expect(ring.validFromSeq()).toBe(0);
+    // In-tile x0 = 15 → both the level-1 group AND the level-2 group complete.
+    chain.updateFrom(ring, 15);
+    expect(gl.callsOf('drawArrays').length).toBe(2);
+    // The LAST pass (level-2) runs with the gate disabled: tex1 columns were
+    // already validFrom-masked when they were built.
+    expect(lastMaskUniforms(gl).validFrom).toBe(-0x7fffffff);
+  });
+
+  it('skips the level-2 bake while the 16-group straddles a gap boundary (R2 H-1)', () => {
+    const { chain, ring, gl } = makeChain();
+    for (let s = 0; s <= 5; s++) append(ring, s);
+    // Gap: slots 6..49 still hold whatever the previous session left there.
+    for (let s = 50; s <= 51; s++) append(ring, s);
+    expect(ring.validFromSeq()).toBe(50);
+
+    // Column 63 completes the level-2 group [48..63] — but 48 and 49 are
+    // pre-gap slots, and the level-1 columns covering them were masked with
+    // the OLD validFrom (0), i.e. they still carry pre-gap data. Baking them
+    // would smear the gap into level-2, so the pass must NOT run.
+    append(ring, 63);
+    chain.updateFrom(ring, 63);
+    expect(gl.callsOf('drawArrays').length).toBe(1); // level-1 only
+
+    // 16 clean appends later the next group [64..79] is fully post-gap and
+    // the level-2 bake resumes.
+    for (let s = 64; s <= 79; s++) append(ring, s);
+    chain.updateFrom(ring, 79);
+    expect(gl.callsOf('drawArrays').length).toBe(3); // level-1 + level-2
+  });
+});
+
+describe('FBO completeness fallback (B-7c)', () => {
+  it('an incomplete FBO disables the chain instead of baking broken mips', () => {
+    const { chain, ring, gl } = makeChain({ incompleteFBO: true });
+    expect(chain.usable).toBe(true);
+    append(ring, 3);
+    chain.updateFrom(ring, 3); // group complete → the pass finds the FBO broken
+    expect(chain.usable).toBe(false);
+    expect(gl.callsOf('drawArrays').length).toBe(0);
+
+    // And it stays disabled — no further passes, no throw.
+    append(ring, 7);
+    expect(() => chain.updateFrom(ring, 7)).not.toThrow();
+    expect(gl.callsOf('drawArrays').length).toBe(0);
+  });
+
+  it('a complete FBO renders the pass and stays usable', () => {
+    const { chain, ring, gl } = makeChain();
+    append(ring, 3);
+    chain.updateFrom(ring, 3);
+    expect(chain.usable).toBe(true);
+    const draws = gl.callsOf('drawArrays');
+    expect(draws.length).toBe(1);
+    expect(draws[0].args[0]).toBe(GL.TRIANGLE_STRIP);
+    // The default framebuffer is restored so the display draw targets the screen.
+    expect(gl.callsOf('bindFramebuffer').at(-1)!.args[1]).toBeNull();
+  });
+});

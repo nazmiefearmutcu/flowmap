@@ -118,6 +118,14 @@ describe('fmtClock', () => {
     expect(fmtClock(0n)).toBe('00:00:00');
     expect(fmtClock(3_661_000_000_000n)).toBe('01:01:01');
   });
+
+  it('formats negative ns with an explicit sign, not garbage fields', () => {
+    // The old per-field mod arithmetic rendered -5 s as "-1:-1:55".
+    expect(fmtClock(-5_000_000_000n)).toBe('-00:00:05');
+    expect(fmtClock(-3_661_000_000_000n)).toBe('-01:01:01');
+    expect(fmtClock(-59_000_000_000n)).toBe('-00:00:59');
+    expect(fmtClockMs(-1_500_000_000n)).toBe('-00:00:01.500');
+  });
 });
 
 describe('logPriceTickModel — the decade ladder for a wide, non-uniform axis', () => {

@@ -163,6 +163,19 @@ const RAMP_STOPS: Record<number, Stop[]> = {
   [RAMP_FLOW]: FLOW_STOPS,
 };
 
+/**
+ * The clearColor matching a ramp's background — LUT entry 0 of `row`, normalized
+ * for `gl.clearColor`. The single source of truth for the terminal near-black:
+ * the fragment shader's `background()` samples the SAME stop, so a cleared
+ * canvas (pre-data, session reset) and a zero-density pixel are bit-identical
+ * instead of the clear flashing rgb(2,4,7) under the ramp's rgb(5,8,14).
+ */
+export function clearColorForRamp(row: number = RAMP_FLOW): [number, number, number, number] {
+  const stops = RAMP_STOPS[row] ?? RAMP_STOPS[RAMP_INFERNO];
+  const [r, g, b] = stops[0].rgb;
+  return [r / 255, g / 255, b / 255, 1];
+}
+
 /** Atlas row for a user colormap choice (real depth only — see rampForMode). */
 export function rampForColormap(colormap: Colormap): number {
   if (colormap === 'classic') return RAMP_CLASSIC;

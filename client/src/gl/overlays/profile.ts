@@ -32,6 +32,12 @@ export interface ProfileResult {
  * Sum exact column density into per-row bins over a column × row window. Pure —
  * `getArrays(col)` returns the column's `{bid, ask}` (or null for uncached).
  *
+ * `out`, when supplied, receives the bins (zeroed first) instead of allocating a
+ * fresh Float64Array per call — the per-frame profile pass reuses one scratch
+ * buffer across dirty frames. It is RETURNED, so `Profile.last.bins` aliases the
+ * live scratch by design: consumers read the result synchronously after the
+ * draw that produced it (see {@link Profile.debug} consumers).
+ *
  * `rowWidth`, when supplied, gives each row's PRICE width and switches the bins
  * to density-per-unit-price. That is not cosmetic: this is a histogram, and on a
  * non-uniform price grid the bins have unequal widths — a log-wing row can cover
@@ -48,9 +54,10 @@ export function accumulateProfile(
   rowHi: number,
   getArrays: (col: number) => { bid: Float32Array; ask: Float32Array | null } | null,
   rowWidth?: (row: number) => number,
+  out?: Float64Array,
 ): ProfileResult {
   const nRows = Math.max(0, rowHi - rowLo + 1);
-  const bins = new Float64Array(nRows);
+  const bins = out !== undefined && out.length >= nRows ? out.fill(0, 0, nRows) : new Float64Array(nRows);
   for (let c = colLo; c <= colHi; c++) {
     const a = getArrays(c);
     if (a === null) continue;
@@ -74,7 +81,10 @@ export function accumulateProfile(
       pocRow = rowLo + i;
     }
   }
-  return { bins, rowLo, max, pocRow };
+  // A view of EXACTLY nRows entries: a reused scratch may be longer than this
+  // frame's window (the previous frame was taller), and callers iterate
+  // `bins.length` when drawing.
+  return { bins: bins.subarray(0, nRows), rowLo, max, pocRow };
 }
 
 export interface ProfileOptions {
@@ -88,8 +98,11 @@ const DEFAULTS: Required<ProfileOptions> = { widthFrac: 0.22, maxCols: 1024 };
 
 export class Profile {
   private opts: Required<ProfileOptions>;
-  /** Last computed result (for tests / readouts). */
+  /** Last computed result (for tests / readouts). Its `bins` is the live
+   *  scratch when the draw supplied one — read synchronously after a draw. */
   last: ProfileResult | null = null;
+  /** Per-frame bin accumulator, reused across dirty frames (no per-frame alloc). */
+  private scratch: Float64Array = new Float64Array(0);
 
   constructor(opts: ProfileOptions = {}) {
     this.opts = { ...DEFAULTS, ...opts };
@@ -118,7 +131,9 @@ export class Profile {
 
     // Unequal-width bins on a non-uniform grid must be normalized by price
     // width, or the wings win the POC on bucket width alone. Uniform grids pass
-    // no width function and keep the raw sums exactly.
+    // no width function and keep the raw sums exactly. The scratch buffer makes
+    // the per-frame pass allocation-free (rows can only grow so much; the
+    // helper regrows internally if the view gets taller).
     const scale = gm.price?.scale;
     const result = accumulateProfile(
       colLo,
@@ -127,7 +142,9 @@ export class Profile {
       rowHi,
       frame.columnArrays,
       scale !== undefined && scale.kind !== 'linear' ? (row) => gm.stepAtRow(row) : undefined,
+      this.scratch,
     );
+    this.scratch = result.bins;
     this.last = result;
     if (result.max <= 0) return;
 

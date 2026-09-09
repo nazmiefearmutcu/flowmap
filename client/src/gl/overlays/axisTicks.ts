@@ -140,15 +140,21 @@ export function timeTicks(tLoNs: bigint, tHiNs: bigint, targetCount: number): bi
   return timeTickModel(tLoNs, tHiNs, targetCount).ticks;
 }
 
-/** ns → HH:MM:SS (UTC; sim columns are session-relative so this reads T+). */
+/** ns → HH:MM:SS (UTC; sim columns are session-relative so this reads T+).
+ *  Negative ns (a session-relative tick before the anchor) formats with an
+ *  explicit '-' sign and the ABSOLUTE duration — the old per-field mod arithmetic
+ *  produced garbage like "-1:-1:55" because Math.floor of a negative lands in
+ *  the previous minute/hour while the seconds field wrapped positive. */
 export function fmtClock(ns: bigint): string {
   const totalSec = Number(ns / 1_000_000_000n);
   if (!Number.isFinite(totalSec)) return '--:--:--';
-  const s = ((totalSec % 60) + 60) % 60;
-  const m = Math.floor(totalSec / 60) % 60;
-  const h = Math.floor(totalSec / 3600) % 24;
+  const sign = totalSec < 0 ? '-' : '';
+  const abs = Math.abs(totalSec);
+  const s = abs % 60;
+  const m = Math.floor(abs / 60) % 60;
+  const h = Math.floor(abs / 3600) % 24;
   const p = (v: number): string => String(v).padStart(2, '0');
-  return `${p(h)}:${p(m)}:${p(s)}`;
+  return `${sign}${p(h)}:${p(m)}:${p(s)}`;
 }
 
 /** ns → HH:MM:SS.mmm when sub-second ticks are in play. */

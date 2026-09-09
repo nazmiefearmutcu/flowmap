@@ -34,7 +34,11 @@ interface Entry {
   t0_ns: bigint;
 }
 
-/** Default cap on retained columns. At 2048 rows ≈ 16 KB/col → ≤ ~32 MB. */
+/** Default cap on retained columns when nothing sizes the cache explicitly.
+ * NOTE: the renderer sizes the cache to the WHOLE ring (renderer.ts
+ * ringLayersFor) so the profile/crosshair see every resident column — that is
+ * ~256 MB of CPU RAM at 2048 rows / 16384 cols (mirrored by the GPU ring), an
+ * intentional correctness-over-memory choice, not a regression to fix. */
 export const DEFAULT_CAPACITY_COLS = 2048;
 
 export class ColumnCache {

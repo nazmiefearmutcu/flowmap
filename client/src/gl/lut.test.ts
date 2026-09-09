@@ -6,6 +6,7 @@ import {
   buildInfernoLUT,
   buildLUTAtlas,
   buildSynthLUT,
+  clearColorForRamp,
   DEFAULT_COLORMAP,
   LUT_ROWS,
   LUT_SIZE,
@@ -371,5 +372,34 @@ describe('rampCssGradient (the legend must not drift from the texture)', () => {
       expect(Math.abs(b - Number(m[3]))).toBeLessThanOrEqual(1);
     }
     expect(seen).toBe(8); // every INFERNO_STOPS entry
+  });
+});
+
+describe('clearColorForRamp — the clear color IS LUT entry 0 (B-6, no reset flash)', () => {
+  it('matches the ramp texture background byte-for-byte, for every ramp', () => {
+    const luts: Record<number, Uint8Array> = {
+      [RAMP_INFERNO]: buildInfernoLUT(),
+      [RAMP_SYNTH]: buildSynthLUT(),
+      [RAMP_CLASSIC]: buildClassicLUT(),
+      [RAMP_FLOW]: buildFlowLUT(),
+    };
+    for (const [row, lut] of Object.entries(luts)) {
+      const clear = clearColorForRamp(Number(row));
+      expect(clear[0]).toBe(lut[0] / 255);
+      expect(clear[1]).toBe(lut[1] / 255);
+      expect(clear[2]).toBe(lut[2] / 255);
+      expect(clear[3]).toBe(1);
+    }
+  });
+
+  it('the DEFAULT (flow) background is the ramp rgb(5,8,14), not the old rgb(2,4,7)', () => {
+    const bg = clearColorForRamp();
+    expect(bg[0]).toBe(5 / 255);
+    expect(bg[1]).toBe(8 / 255);
+    expect(bg[2]).toBe(14 / 255);
+  });
+
+  it('falls back to inferno for an unknown row (never NaN into clearColor)', () => {
+    expect(clearColorForRamp(999)).toEqual(clearColorForRamp(RAMP_INFERNO));
   });
 });
