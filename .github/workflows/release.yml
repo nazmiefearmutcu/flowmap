@@ -98,7 +98,7 @@ jobs:
       # scopes let the run sign a provenance statement binding each installer's
       # digest to this repository, this workflow file and this commit, so the
       # link from readable source to downloaded binary stops being a promise:
-      #   gh attestation verify FlowMap_<version>_aarch64.dmg -R nazmiefearmutcu/flowmap
+      #   gh attestation verify FlowMap_<version>_aarch64.dmg -R nazmiefearmutcu0/FlowMap
       id-token: write
       attestations: write
     strategy:
@@ -345,7 +345,7 @@ jobs:
       # uploaded, so the digest in the attestation is the digest of the file the
       # next step ships. Sigstore-backed and public — anyone can check a download
       # against it without trusting the release page:
-      #   gh attestation verify <file> -R nazmiefearmutcu/flowmap
+      #   gh attestation verify <file> -R nazmiefearmutcu0/FlowMap
       - name: Attest build provenance
         if: needs.prepare.outputs.do_release == 'true'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4

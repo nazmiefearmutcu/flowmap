@@ -66,13 +66,13 @@ when that stamp and the config disagree. Bumping a release means editing
 bash app/scripts/build-dmg.sh
 ```
 
-It is **arch-aware** (`uname -m`): produces `FlowMap_1.3.1_aarch64.dmg` on Apple
-Silicon and `FlowMap_1.3.1_x86_64.dmg` on Intel. Outputs:
+It is **arch-aware** (`uname -m`): produces `FlowMap_1.4.0_aarch64.dmg` on Apple
+Silicon and `FlowMap_1.4.0_x86_64.dmg` on Intel. Outputs:
 
 - `app/src-tauri/target/release/bundle/macos/FlowMap.app`
-- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.3.1_<arch>.dmg`
+- `app/src-tauri/target/release/bundle/dmg/FlowMap_1.4.0_<arch>.dmg`
 
-Note: local builds keep the bundle-version name (`FlowMap_1.3.1_<arch>.dmg`); CI renames installers to match the release tag (e.g. `FlowMap_1.3.1.1_<suffix>`) before uploading.
+Note: local builds keep the bundle-version name (`FlowMap_1.4.0_<arch>.dmg`); CI renames installers to match the release tag (e.g. `FlowMap_v1.4.0_<suffix>`) before uploading.
 
 Requires: `cargo`/`rustc`, `cargo-tauri` (`cargo install tauri-cli --version '^2'
 --locked`), Node/npm, `uv`, and the macOS `codesign`/`hdiutil`/`sips`/`iconutil`

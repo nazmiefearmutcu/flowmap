@@ -1,6 +1,6 @@
 # FlowMap — Kapsamlı Frontend (UI) Review
 
-**Repo:** https://github.com/nazmiefearmutcu/flowmap — commit `7ae45a1` (main, v1.3.1.1, 2026-08-01)
+**Repo:** https://github.com/nazmiefearmutcu0/FlowMap — commit `7ae45a1` (main, v1.3.1.1, 2026-08-01)
 **İnceleyen:** ana ajan (frontend/UX görevası) — paralel code review ajanları ayrıca çalışıyor
 **Yöntem:** (1) tüm UI kaynak dosyalarının statik okuması (App.tsx, 19 ui/ bileşeni, theme.css + App.css ~1.9K satır, index.html), (2) **canlı çalıştırma**: fresh clone server (Desktop pyruntime Python 3.13 üstünden, `FLOWMAP_PORT=8720`, sim feed) + vite 5173 + Playwright/SwiftShader chromium ile 12 durumun ekran görüntüsü + konsol/pageerror yakalama.
 

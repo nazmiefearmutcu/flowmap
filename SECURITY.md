@@ -18,7 +18,7 @@ the release page can forge it.
 
 ```bash
 # needs the GitHub CLI: https://cli.github.com
-gh attestation verify ~/Downloads/<the-file-you-downloaded> -R nazmiefearmutcu/flowmap
+gh attestation verify ~/Downloads/<the-file-you-downloaded> -R nazmiefearmutcu0/FlowMap
 ```
 
 A pass prints the workflow and commit that produced the file. **A failure means the file did
@@ -143,9 +143,9 @@ used in CI is pinned to a commit SHA rather than a moving tag.
 ## Reporting a vulnerability
 
 **Contact (maintainer placeholder — replace with the active handle/email):** open a private
-GitHub security advisory, or reach the maintainer via `@nazmiefearmutcu` on GitHub.
+GitHub security advisory, or reach the maintainer via `@nazmiefearmutcu0` on GitHub.
 
-Open a [private security advisory](https://github.com/nazmiefearmutcu/flowmap/security/advisories/new)
+Open a [private security advisory](https://github.com/nazmiefearmutcu0/FlowMap/security/advisories/new)
 — that keeps the report non-public until there is a fix. Please do not open a public issue for
 a vulnerability. Include what you ran, what you observed, and how to reproduce it.
 

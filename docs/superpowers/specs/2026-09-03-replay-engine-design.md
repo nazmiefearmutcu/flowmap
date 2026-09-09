@@ -1,3 +1,5 @@
+> Historical design note (2026-09-03): superseded — wire depth tiles are f32, see docs/architecture.md.
+
 # Replay Engine — Design (2026-09-03)
 
 Status: implemented (this commit). Owner: review-fix campaign, wave 3.

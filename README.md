@@ -1,7 +1,7 @@
 # FlowMap
 
-[![tests](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/test.yml/badge.svg)](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/test.yml)
-[![CI](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/ci.yml/badge.svg)](https://github.com/nazmiefearmutcu/flowmap/actions/workflows/ci.yml)
+[![tests](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/test.yml/badge.svg)](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/test.yml)
+[![CI](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/ci.yml/badge.svg)](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/ci.yml)
 
 FlowMap is an open-source order-flow depth heatmap for crypto and US equities: a WebGL2 chart
 that renders resting liquidity as a live column heatmap, with a DOM ladder, time &amp; sales tape,
@@ -36,9 +36,13 @@ Anything a session shows can be recorded to parquet on disk and replayed with se
   Replay that would show a stale tail is refused outright instead of being mislabeled live.
 - **Recording-backed replay** — sessions record to parquet under a 20 GB rotating cap;
   replay offers seek, 1–100× speed and pause over exactly what was recorded.
+- **Trader conveniences** — export the chart (heatmap + overlays) as a PNG with `E` or the
+  TopBar button, and highlight outsized tape prints with a configurable notional threshold
+  (`Settings → Big trade size`).
 - **Desktop app** — Tauri 2 shell bundles the client and a relocatable Python sidecar
-  (loopback-only), spawns and reaps it automatically, for macOS (Apple Silicon / Intel),
-  Windows x64 / ARM64, and Linux (deb / AppImage).
+  (loopback-only), spawns it automatically, keeps a health-monitor thread that respawns it
+  if it dies mid-session, and enforces a single running instance, for macOS (Apple Silicon /
+  Intel), Windows x64 / ARM64, and Linux (deb / AppImage).
 
 ## Screenshots
 
@@ -160,6 +164,7 @@ defaults.
 | `FLOWMAP_BACKFILL_ENABLED` | `1` | First-launch candle-history backfill onto the chart |
 | `FLOWMAP_BACKFILL_MAX_COLS` | `512` | Max candle-columns fetched for backfill |
 | `FLOWMAP_BOOK_TOP_N` | `20000` | Book levels per side retained when emitting a crypto book |
+| `FLOWMAP_CRYPTO_TICK` | `0` | Crypto grid tick override (0 = auto); useful for sub-cent coins |
 | `FLOWMAP_LOG_LEVEL` | `info` | Server + uvicorn log level |
 | `FLOWMAP_LOG_FILE` | *(unset)* | Optional extra log file (stderr always receives logs) |
 | `ALPACA_API_KEY` + `ALPACA_API_SECRET` | *(unset)* | Optional: equity L1 top-of-book + tick tape (read-only market-data keys) |
@@ -182,6 +187,7 @@ live overlay.
 | `F` | Toggle time follow (chart focused) |
 | `P` / `Shift+P` | Price track on/off / re-fit price |
 | `R` | Return to the live edge |
+| `E` | Export the chart as a PNG download |
 | `Esc` | Close search / settings / shortcuts |
 | Wheel on chart | Zoom time at the cursor column |
 | `Shift`/`Ctrl` + wheel | Zoom price at the cursor row |
@@ -214,10 +220,10 @@ Installers are self-contained (bundled client + relocatable Python; nothing else
 carry a SLSA build-provenance attestation you can verify locally:
 
 ```bash
-gh attestation verify <downloaded-file> -R nazmiefearmutcu/flowmap
+gh attestation verify <downloaded-file> -R nazmiefearmutcu0/FlowMap
 ```
 
-See the [releases page](https://github.com/nazmiefearmutcu/flowmap/releases/latest) for assets
+See the [releases page](https://github.com/nazmiefearmutcu0/FlowMap/releases/latest) for assets
 and [SECURITY.md](SECURITY.md) for what the app reads, writes, and connects to.
 
 ## Contributing
@@ -230,7 +236,7 @@ Bug reports, feature discussions and PRs are welcome — start with
 The sidecar binds loopback only and there is no authentication by design today; the full
 surface — endpoints contacted, files written, threat-model notes — is in
 [SECURITY.md](SECURITY.md). Please report vulnerabilities via a
-[private security advisory](https://github.com/nazmiefearmutcu/flowmap/security/advisories/new),
+[private security advisory](https://github.com/nazmiefearmutcu0/FlowMap/security/advisories/new),
 not a public issue.
 
 ## License

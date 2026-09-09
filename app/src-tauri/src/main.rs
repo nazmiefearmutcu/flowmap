@@ -11,26 +11,73 @@
 //      JS runs, so the SPA reaches the sidecar (the client falls back to
 //      same-origin only in the vite dev server, where the global is absent);
 //   4. on quit (window close or Cmd-Q) terminate the sidecar — SIGTERM, then
-//      SIGKILL after a grace period — so no orphan server survives.
+//      SIGKILL after a grace period — so no orphan server survives;
+//   5. guard against a second instance via an OS-held advisory lock on a
+//      sentinel file under the app-data dir (two shells would race the
+//      recorder's disk-scan part numbering and corrupt recordings); the OS
+//      releases the lock on exit or crash, so no stale-file takeover exists;
+//   6. watch the sidecar every ~10 s and respawn it once if it dies mid-session.
+//
+// Startup failures are fatal WITHOUT panicking: the Windows GUI subsystem has
+// no console, so a panic (or a `?` in setup) dies silently. Everything that can
+// fail before the window exists goes through `show_error_box` + a clean exit.
 //
 // The webview shows immediately; the client's own WebSocket reconnect/backoff
 // bridges the ~1-3 s the sidecar takes to come up, and a background thread logs
-// when `/api/health` first responds.
+// when `/api/health` first responds. There is no webview event channel in this
+// shell, so monitor status surfaces through the same log.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::path::BaseDirectory;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+// The `windows` crate is already in the tree as a transitive tauri dependency,
+// so the minimal Win32 MessageBox (spawn-failure / already-running dialogs)
+// comes from it instead of a new dependency.
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+};
+
+/// How often the monitor thread checks sidecar liveness.
+const MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Holds the sidecar child so it can be terminated exactly once on exit.
 struct SidecarState(Mutex<Option<Child>>);
+
+/// Set just before teardown begins; the sidecar monitor reads it to stand down
+/// instead of respawning into a dying process.
+struct ShutdownState(AtomicBool);
+
+/// Managed so the exit handlers can release the single-instance sentinel.
+struct InstanceState(Mutex<Option<InstanceGuard>>);
+
+/// The single-instance guard: an advisory-locked file held open for the whole
+/// process lifetime. The OS drops the lock on exit or crash, so there is no
+/// stale-file takeover logic; on a clean exit `release` also removes the file.
+#[derive(Debug)]
+struct InstanceGuard {
+    _file: File,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+enum LockError {
+    /// Another live FlowMap process holds the lock.
+    AlreadyRunning,
+    Io(std::io::Error),
+}
 
 /// Bind :0 on loopback, read the assigned port, drop the listener. A tiny TOCTOU
 /// window remains before the sidecar rebinds it, negligible for a local app.
@@ -39,6 +86,108 @@ fn free_loopback_port() -> std::io::Result<u16> {
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
+}
+
+/// UTF-16 (NUL-terminated) for the Win32 wide-string APIs.
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Surface a fatal error to a user who has no console (the Windows GUI
+/// subsystem detaches stdout/stderr, so a panic would die silently). Never
+/// panics itself; callers exit with a non-zero code afterwards.
+fn show_error_box(title: &str, message: &str) {
+    eprintln!("[flowmap] {title}: {message}");
+    #[cfg(windows)]
+    {
+        let text = wide(&format!("{message}\n\nFlowMap will now exit."));
+        let caption = wide(title);
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(caption.as_ptr()),
+                MB_ICONERROR | MB_OK | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+}
+
+/// Fatal startup failure: show the message box, exit non-zero.
+fn fatal_error(title: &str, message: &str) -> ! {
+    show_error_box(title, message);
+    std::process::exit(1);
+}
+
+/// The sentinel file holds one decimal PID (plus trailing newline). Diagnostic
+/// only — the OS-held lock, not this text, decides liveness.
+#[cfg(test)]
+fn parse_lock_pid(content: &str) -> Option<u32> {
+    content.trim().parse::<u32>().ok()
+}
+
+/// Acquire the single-instance advisory lock on `flowmap.lock`.
+///
+/// The LOCK ITSELF (an OS-held advisory file lock via `File::try_lock`) is the
+/// authority, not the file's existence or contents: the OS releases it
+/// automatically when the holding process exits OR CRASHES, so there is no
+/// stale lockfile to second-guess. PID-liveness probing had two failure modes
+/// ending in the exact two-shell recording corruption this guard exists to
+/// prevent — a recycled PID reading "alive" forever, and an `OpenProcess`
+/// permission failure deleting a LIVE instance's lockfile. The PID inside the
+/// file is diagnostic text only.
+fn acquire_instance_lock(data_dir: &Path) -> Result<InstanceGuard, LockError> {
+    std::fs::create_dir_all(data_dir).map_err(LockError::Io)?;
+    let path = data_dir.join("flowmap.lock");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(LockError::Io)?;
+    match file.try_lock() {
+        Ok(()) => {
+            // Diagnostic content only — never trusted for liveness.
+            let _ = file.set_len(0);
+            let _ = write!(file, "{}", std::process::id());
+            let _ = file.sync_all();
+            Ok(InstanceGuard { _file: file, path })
+        }
+        // Another live FlowMap process holds the lock.
+        Err(std::fs::TryLockError::WouldBlock) => Err(LockError::AlreadyRunning),
+        Err(std::fs::TryLockError::Error(err)) => Err(LockError::Io(err)),
+    }
+}
+
+impl InstanceGuard {
+    /// Remove the sentinel on a clean exit so the next start doesn't have to
+    /// staleness-check it. The handle must close first — Windows refuses to
+    /// delete an open file. Best effort either way.
+    fn release(self) {
+        drop(self._file);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Release the managed sentinel, if this process holds it.
+fn release_instance_lock(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<InstanceState>() {
+        let mut guard = match state.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(instance) = guard.take() {
+            instance.release();
+        }
+    }
+}
+
+/// Whether teardown has begun (the monitor must not respawn into it).
+fn is_shutting_down(app: &tauri::AppHandle) -> bool {
+    app.try_state::<ShutdownState>()
+        .map(|s| s.0.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// Locate the bundled interpreter inside the resource dir (macOS:
@@ -51,7 +200,7 @@ fn free_loopback_port() -> std::io::Result<u16> {
 /// placed by the Tauri `resources` map (→ `<res>/pyruntime`) or the macOS
 /// `ditto` injection in build-dmg.sh (→ `<res>/pyruntime`) — and a defensive
 /// `resources/pyruntime` fallback covers a list-form `resources` layout.
-fn resolve_python(app: &tauri::App) -> Option<PathBuf> {
+fn resolve_python(app: &tauri::AppHandle) -> Option<PathBuf> {
     // Windows candidates FIRST on Windows; unix candidates on macOS/Linux.
     #[cfg(windows)]
     let interpreters: &[&str] = &["python.exe", "python3.13.exe"];
@@ -137,7 +286,7 @@ fn kill_sidecar(state: &SidecarState) {
     }
 }
 
-fn spawn_sidecar(app: &tauri::App, port: u16) -> Result<Child, Box<dyn std::error::Error>> {
+fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Result<Child, Box<dyn std::error::Error>> {
     let python = resolve_python(app)
         .ok_or("bundled pyruntime not found (expected Contents/Resources/pyruntime)")?;
 
@@ -169,21 +318,150 @@ fn spawn_sidecar(app: &tauri::App, port: u16) -> Result<Child, Box<dyn std::erro
     Ok(child)
 }
 
+/// Periodically check the sidecar and respawn it ONCE on the same port if it
+/// dies mid-session (same port so the webview's injected `__FLOWMAP_SERVER__`
+/// URL stays valid). Exits cleanly on shutdown via `ShutdownState`. Status is
+/// surfaced through the log only — this shell has no webview event channel,
+/// so there is nothing else to append to.
+///
+/// Residual race, documented honestly: if teardown begins in the microseconds
+/// between this thread's shutdown re-check and `process::exit`, the freshly
+/// respawned child would outlive the shell. `is_shutting_down` is checked
+/// before spawning AND after re-storing the child, which shrinks that window
+/// to a thread-scheduling step; a full fix needs a condvar handshake that is
+/// not worth the complexity for a local viewer.
+fn spawn_sidecar_monitor(handle: tauri::AppHandle, port: u16) {
+    std::thread::spawn(move || {
+        let mut respawned = false;
+        loop {
+            std::thread::sleep(MONITOR_INTERVAL);
+            if is_shutting_down(&handle) {
+                return;
+            }
+            let Some(state) = handle.try_state::<SidecarState>() else {
+                return; // not managed yet / already torn down
+            };
+            let exited = {
+                let mut guard = match state.0.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match guard.as_mut() {
+                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                    // Taken by the shutdown path — nothing left to watch.
+                    None => true,
+                }
+            };
+            if !exited {
+                continue;
+            }
+            if is_shutting_down(&handle) {
+                return;
+            }
+            if respawned {
+                eprintln!("[flowmap] sidecar exited again after respawn; monitor standing down");
+                return;
+            }
+            respawned = true;
+            eprintln!("[flowmap] sidecar exited unexpectedly; one respawn on :{port}");
+            let child = match spawn_sidecar(&handle, port) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("[flowmap] sidecar respawn failed: {err}; not retrying");
+                    return;
+                }
+            };
+            if is_shutting_down(&handle) {
+                // Shutdown raced the respawn: reap what we just started.
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            let state = handle.state::<SidecarState>();
+            {
+                let mut guard = match state.0.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *guard = Some(child);
+            }
+            eprintln!("[flowmap] sidecar respawned on http://127.0.0.1:{port}");
+            if is_shutting_down(&handle) {
+                // Teardown began while we stored the child; kill_sidecar in the
+                // exit handlers may already have run. Reap the straggler here.
+                kill_sidecar(&state);
+                return;
+            }
+        }
+    });
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let port = free_loopback_port()?;
-            let child = spawn_sidecar(app, port)?;
+            let handle = app.handle().clone();
+
+            // Single-instance guard first: two shells would race the recorder's
+            // disk-scan part numbering and corrupt each other's recordings.
+            let data_dir = match handle.path().app_data_dir() {
+                Ok(dir) => dir,
+                Err(err) => fatal_error(
+                    "FlowMap failed to start",
+                    &format!("could not resolve the app data directory: {err}"),
+                ),
+            };
+            match acquire_instance_lock(&data_dir) {
+                Ok(guard) => {
+                    app.manage(InstanceState(Mutex::new(Some(guard))));
+                }
+                Err(LockError::AlreadyRunning) => {
+                    show_error_box(
+                        "FlowMap",
+                        "FlowMap is already running.\n\nClose the other FlowMap window first. If none is visible, a stuck FlowMap process may still be running — quit it from the task manager.",
+                    );
+                    std::process::exit(0);
+                }
+                // Fail open on unexpected filesystem errors: a broken sentinel
+                // must not brick the app — log loudly instead.
+                Err(LockError::Io(err)) => {
+                    eprintln!(
+                        "[flowmap] instance lock unavailable ({err}); continuing without single-instance protection"
+                    );
+                }
+            }
+
+            let port = match free_loopback_port() {
+                Ok(port) => port,
+                Err(err) => fatal_error(
+                    "FlowMap failed to start",
+                    &format!("could not find a free loopback port: {err}"),
+                ),
+            };
+            let child = match spawn_sidecar(&handle, port) {
+                Ok(child) => child,
+                Err(err) => fatal_error(
+                    "FlowMap failed to start",
+                    &format!("could not launch the bundled FlowMap server: {err}"),
+                ),
+            };
             app.manage(SidecarState(Mutex::new(Some(child))));
+            app.manage(ShutdownState(AtomicBool::new(false)));
 
             // Inject the absolute server origin before the client JS runs.
             let init = format!("window.__FLOWMAP_SERVER__ = \"http://127.0.0.1:{port}\";");
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            if let Err(err) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("FlowMap")
                 .inner_size(1440.0, 900.0)
                 .min_inner_size(900.0, 600.0)
                 .initialization_script(&init)
-                .build()?;
+                .build()
+            {
+                fatal_error(
+                    "FlowMap failed to start",
+                    &format!("could not create the main window: {err}"),
+                );
+            }
 
             // Log first health so verification can confirm the bundled server
             // (not a stray dev server) is what the webview talks to.
@@ -194,25 +472,65 @@ fn main() {
                     eprintln!("[flowmap] sidecar health timed out; client will keep retrying");
                 }
             });
+
+            // Watch the sidecar for the rest of the session (one respawn).
+            spawn_sidecar_monitor(handle, port);
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 // Single-window app: closing the window quits and tears down the
                 // sidecar (the Exit event below performs the actual kill).
-                if let Some(state) = window.app_handle().try_state::<SidecarState>() {
+                let handle = window.app_handle().clone();
+                if let Some(state) = handle.try_state::<ShutdownState>() {
+                    state.0.store(true, Ordering::Relaxed);
+                }
+                if let Some(state) = handle.try_state::<SidecarState>() {
                     kill_sidecar(&state);
                 }
-                window.app_handle().exit(0);
+                release_instance_lock(&handle);
+                handle.exit(0);
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building FlowMap")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<ShutdownState>() {
+                    state.0.store(true, Ordering::Relaxed);
+                }
                 if let Some(state) = app_handle.try_state::<SidecarState>() {
                     kill_sidecar(&state);
                 }
+                release_instance_lock(app_handle);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_pid_parses_decimal_with_newline() {
+        assert_eq!(parse_lock_pid("1234\n"), Some(1234));
+        assert_eq!(parse_lock_pid(" 42 "), Some(42));
+        assert_eq!(parse_lock_pid(""), None);
+        assert_eq!(parse_lock_pid("not-a-pid"), None);
+        assert_eq!(parse_lock_pid("4294967296"), None); // out of u32 range
+    }
+
+    #[test]
+    fn a_second_lock_acquirement_reports_already_running() {
+        // The real two-instance scenario, in-process: the first guard HOLDS the
+        // OS lock, so a second acquirement on the same path must be refused.
+        let dir = std::env::temp_dir().join(format!("flowmap-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _first = acquire_instance_lock(&dir).expect("first acquire");
+        match acquire_instance_lock(&dir) {
+            Err(LockError::AlreadyRunning) => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

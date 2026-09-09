@@ -74,7 +74,7 @@ rebases rather than merge commits if the branch has drifted.
 
 Bug reports: a GitHub issue with what you ran, what you expected, what happened, and the feed
 (`sim:SIM-DEMO` reproduces without network access). Security issues: a
-[private security advisory](https://github.com/nazmiefearmutcu/flowmap/security/advisories/new),
+[private security advisory](https://github.com/nazmiefearmutcu0/FlowMap/security/advisories/new),
 never a public issue — see [SECURITY.md](SECURITY.md).
 
 ## Licensing

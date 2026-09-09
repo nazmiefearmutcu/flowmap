@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build the FlowMap client for production (static bundle in client/dist).
-# The server runs from source via `uv run python -m flowmap_server`. A native
-# desktop shell (Tauri + Python sidecar) is a future option — the web stack keeps
-# that door open; nothing here blocks it.
+# The server runs from source via `uv run python -m flowmap_server`. The native
+# desktop app (Tauri shell + bundled Python sidecar) is real and ships from
+# app/src-tauri via .github/workflows/release.yml — this script builds only the
+# web bundle that the shell embeds.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

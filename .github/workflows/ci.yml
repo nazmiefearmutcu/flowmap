@@ -20,9 +20,11 @@ jobs:
     name: client (tsc + vitest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Every action ref in every workflow is pinned to a full commit SHA
+      # (SECURITY.md's claim); the same pins are used across ci/test/release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -44,22 +46,16 @@ jobs:
     name: server (pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+      # Same pinned action as test.yml and release.yml. uv installs exactly the
+      # versions resolved in server/uv.lock — including the crocodile git
+      # dependency that is not on PyPI and has no meaningful pip pin.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
-      # Test deps (matches server/pyproject.toml dev group) plus the runtime
-      # imports the suite exercises directly. crocodile comes from the pinned
-      # git revision in server/pyproject.toml — it is not on PyPI.
-      - name: Install test + runtime dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install \
-            pytest pytest-asyncio pytest-timeout httpx websockets \
-            fastapi uvicorn msgspec numpy polars aiohttp certifi \
-            "crocodile[market] @ git+https://github.com/nazmiefearmutcu/Crocodile.git@2e22c901dff7f0b4ec98ef7e66b8a10de4464d9c"
-
+      # --frozen: a lockfile that drifted from pyproject.toml fails the build
+      # instead of being silently re-resolved. testpaths/timeout/asyncio config
+      # come from server/pyproject.toml's [tool.pytest.ini_options].
       - name: Run tests
-        run: PYTHONPATH=server/src python -m pytest server/tests -q
+        working-directory: server
+        run: uv sync --frozen && uv run pytest -q

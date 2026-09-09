@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Boot the FlowMap gateway (:8720) + the client dev server (:5173) together.
 # Ctrl-C stops both. Requires: uv (Python 3.13), npm (Node 22).
+# Recording is DISABLED here (the README default) — opt in per boot with
+# FLOWMAP_RECORDING_ENABLED=1 ./scripts/dev.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${FLOWMAP_PORT:-8720}"
+if [ "${FLOWMAP_RECORDING_ENABLED:-0}" = "1" ]; then REC=1; else REC=0; fi
 
-echo "FlowMap — booting server (:$PORT) + client (:5173)"
+echo "FlowMap — booting server (:$PORT, recording=$REC) + client (:5173)"
 
 cleanup() {
   echo; echo "stopping…"
@@ -16,7 +19,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- server ---
-( cd "$ROOT/server" && uv sync -q && FLOWMAP_PORT="$PORT" uv run python -m flowmap_server ) &
+( cd "$ROOT/server" && uv sync -q && FLOWMAP_PORT="$PORT" FLOWMAP_RECORDING_ENABLED="$REC" uv run python -m flowmap_server ) &
 SERVER_PID=$!
 
 # wait for the server to answer /api/health (up to ~30s)

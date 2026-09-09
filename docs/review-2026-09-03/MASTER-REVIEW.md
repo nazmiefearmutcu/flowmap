@@ -1,6 +1,6 @@
 # FlowMap — MASTER-REVIEW (2026-09-03)
 
-**Repo:** github.com/nazmiefearmutcu/flowmap @ `7ae45a1` (main, v1.3.1.1) — fresh clone: `C:\Users\Kullanıcı\.zcode\workspace\default\flowmap`
+**Repo:** github.com/nazmiefearmutcu0/FlowMap @ `7ae45a1` (main, v1.3.1.1) — fresh clone: `C:\Users\Kullanıcı\.zcode\workspace\default\flowmap`
 
 ## Kapsam tablosu
 

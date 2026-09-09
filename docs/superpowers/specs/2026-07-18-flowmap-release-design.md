@@ -89,7 +89,7 @@ make the code publicly installable, and publish (push + GitHub release).
   splits. Regenerate `uv.lock`; verify a **clean clone in a fresh dir** resolves + the server boots
   + the full suite passes (proves no local-path leakage).
 - **Publish (outward-facing — final confirmation before executing):**
-  1. Push `main` to `origin` (`github.com/nazmiefearmutcu/flowmap`, already public) — normal
+  1. Push `main` to `origin` (`github.com/nazmiefearmutcu0/FlowMap`, already public) — normal
      fast-forward, never `--force`.
   2. Tag `v1.0.0`; create a **GitHub Release** (`gh release create v1.0.0`) with the built
      `FlowMap.dmg` attached + notes (what it is, dual-market, the honest keyless-equity + unsigned-

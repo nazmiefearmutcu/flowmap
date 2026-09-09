@@ -1,10 +1,12 @@
+> Historical design note (2026-09-03): superseded — wire depth tiles are f32, see docs/architecture.md.
+
 # FlowMap — Dual-Market Order-Flow Visualizer
 
 **Date:** 2026-07-17
 **Status:** Approved for implementation (autonomous session; user directive: full rebuild, do not
 stop until both markets verified). Revised after a 4-lens adversarial review (GPU renderer,
 protocol/backpressure, equity parity, completeness); all high/medium findings incorporated.
-**Branch:** `v2` in `nazmiefearmutcu/flowmap`
+**Branch:** `v2` in `nazmiefearmutcu0/FlowMap`
 
 ## 1. Why a rebuild
 

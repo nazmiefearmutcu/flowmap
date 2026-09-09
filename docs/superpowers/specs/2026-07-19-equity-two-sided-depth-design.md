@@ -1,3 +1,5 @@
+> Historical design note (2026-09-03): superseded — wire depth tiles are f32, see docs/architecture.md.
+
 # FlowMap — Equity Two-Sided Depth (stockodile 0.2.0) — Design
 
 **Date:** 2026-07-19 · **Status:** In progress (autonomous increment) · **Branch:** `main`
