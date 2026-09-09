@@ -21,10 +21,15 @@ export function sparkPath(values: readonly number[], w: number, h: number, pad =
   const ih = Math.max(1, h - pad * 2);
   const step = n > 1 ? iw / (n - 1) : 0;
   let d = '';
+  let started = false;
   for (let i = 0; i < n; i++) {
+    // A non-finite point (a gap in the quote series) must not print "LNaN" —
+    // skip it and let the path resume from the next good value.
+    if (!Number.isFinite(values[i])) continue;
     const x = pad + i * step;
     const y = pad + (1 - (values[i] - min) / span) * ih;
-    d += `${i === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
+    d += `${started ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`;
+    started = true;
   }
   return d;
 }
@@ -52,5 +57,8 @@ export function fmtPrice(v: number | null | undefined): string {
   if (a >= 1000) return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
   if (a >= 1) return v.toFixed(2);
   if (a >= 0.01) return v.toFixed(4);
-  return v.toPrecision(3);
+  if (a === 0) return '0.00';
+  // Sub-cent quotes: fixed-point with ~3 significant digits. `toPrecision`
+  // would print "1.2e-9" here — exponential notation is not an honest price.
+  return v.toFixed(Math.min(20, Math.ceil(-Math.log10(a)) + 2));
 }

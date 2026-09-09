@@ -24,10 +24,28 @@ describe('routeGlobalKey', () => {
     expect(routeGlobalKey('/', { ...PLAIN, button: true })).toEqual({ type: 'focus-search' });
   });
 
-  it('ignores unrelated keys (canvas keeps arrows / F / R)', () => {
-    for (const k of ['ArrowLeft', 'f', 'R', '+', '-', 'a']) {
+  it('ignores unrelated keys (canvas keeps arrows / F / R / P)', () => {
+    for (const k of ['ArrowLeft', 'f', 'R', 'P', '+', '-', 'a']) {
       expect(routeGlobalKey(k, PLAIN)).toBeNull();
     }
+  });
+
+  it('routes `E` to export-png (bare key; no native button semantics to shadow)', () => {
+    expect(routeGlobalKey('e', PLAIN)).toEqual({ type: 'export-png' });
+    expect(routeGlobalKey('E', PLAIN)).toEqual({ type: 'export-png' });
+  });
+
+  it('`E` still works with the chart canvas focused (a plain target here)', () => {
+    // gestures.ts owns arrows / +- / F / P / R on the canvas and leaves every
+    // other bare key to bubble up to this router — 'e' among them.
+    expect(routeGlobalKey('e', { editable: false, button: false, dialog: false })).toEqual({
+      type: 'export-png',
+    });
+  });
+
+  it('never hijacks `E` while typing or while a dialog owns the keyboard', () => {
+    expect(routeGlobalKey('e', { ...PLAIN, editable: true })).toBeNull();
+    expect(routeGlobalKey('e', { ...PLAIN, dialog: true })).toBeNull();
   });
 
   it('yields bare shortcuts to an open modal dialog (Space must not flip chart state behind it)', () => {
@@ -109,8 +127,9 @@ describe('attachGlobalKeys', () => {
   it('invokes onSpace / onFocusSearch and preventDefaults consumed keys', () => {
     const onSpace = vi.fn();
     const onFocusSearch = vi.fn();
+    const onExportPng = vi.fn();
     const t = fakeTarget();
-    const dispose = attachGlobalKeys({ onSpace, onFocusSearch }, t as never);
+    const dispose = attachGlobalKeys({ onSpace, onFocusSearch, onExportPng }, t as never);
 
     const pd1 = t.fire(' ', { tagName: 'CANVAS', getAttribute: () => null } as never);
     expect(onSpace).toHaveBeenCalledOnce();
@@ -124,14 +143,39 @@ describe('attachGlobalKeys', () => {
     expect(t.handler).toBeNull();
   });
 
+  it('routes the bare `E` key to onExportPng (the TopBar button shares the handler)', () => {
+    const onExportPng = vi.fn();
+    const t = fakeTarget();
+    const dispose = attachGlobalKeys(
+      { onSpace: vi.fn(), onFocusSearch: vi.fn(), onExportPng },
+      t as never,
+    );
+
+    // The canvas is focused: not editable, not a button, no dialog open.
+    const pd = t.fire('e', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(onExportPng).toHaveBeenCalledOnce();
+    expect(pd).toHaveBeenCalledOnce();
+
+    // Shift+"e" is still just the key 'E' to this router.
+    t.fire('E', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(onExportPng).toHaveBeenCalledTimes(2);
+
+    dispose();
+  });
+
   it('does not fire while typing in an input', () => {
     const onSpace = vi.fn();
     const onFocusSearch = vi.fn();
+    const onExportPng = vi.fn();
     const t = fakeTarget();
-    attachGlobalKeys({ onSpace, onFocusSearch }, t as never);
+    attachGlobalKeys({ onSpace, onFocusSearch, onExportPng }, t as never);
 
     const pd = t.fire(' ', { tagName: 'INPUT', getAttribute: () => null } as never);
     expect(onSpace).not.toHaveBeenCalled();
     expect(pd).not.toHaveBeenCalled();
+
+    const pdE = t.fire('e', { tagName: 'INPUT', getAttribute: () => null } as never);
+    expect(onExportPng).not.toHaveBeenCalled();
+    expect(pdE).not.toHaveBeenCalled();
   });
 });

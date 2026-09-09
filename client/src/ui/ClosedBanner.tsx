@@ -39,6 +39,7 @@ export function formatCountdown(remainingMs: number): string {
 export function ClosedBanner(): JSX.Element | null {
   const feedState = useFlowMapStore((s) => s.feedState);
   const nextOpenTs = useFlowMapStore((s) => s.nextOpenTs);
+  const noFeed = useFlowMapStore((s) => s.noFeed);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   const closed = feedState === 'closed';
@@ -51,6 +52,27 @@ export function ClosedBanner(): JSX.Element | null {
     const id = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [closed]);
+
+  // Terminal refusal (server contract: pre-close Status feed_state='closed' +
+  // close 1003): NO feed exists for this market — not an RTH-closed market that
+  // still has a feed. There is no countdown and no reconnection to wait for;
+  // state the truth and stop.
+  if (noFeed) {
+    return (
+      <div
+        className="closed-banner closed-banner--nofeed"
+        role="status"
+        aria-label="No feed for this market"
+        data-testid="no-feed-banner"
+      >
+        <span className="closed-banner__dot" aria-hidden="true" />
+        <span className="closed-banner__label">NO FEED</span>
+        <span className="closed-banner__countdown" data-testid="no-feed-detail">
+          no feed available for this market
+        </span>
+      </div>
+    );
+  }
 
   if (!closed) return null;
 

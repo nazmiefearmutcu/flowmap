@@ -20,6 +20,7 @@ import { create } from 'zustand';
 
 import {
   Connection,
+  type CloseInfo,
   type ConnStatus,
   type ConnectionOptions,
   type StreamMsg,
@@ -84,6 +85,19 @@ export interface FlowMapState {
    * handshake clears it.
    */
   replayUnavailable: boolean;
+  /**
+   * TERMINAL: the server refused this subscription with a pre-close Status
+   * naming feed_state='closed' + close 1003 — NO feed exists for this market at
+   * all (server ws.py NotImplementedError path). Unlike `replayUnavailable`
+   * there is no fallback (live would be refused just the same), so the client
+   * does NOT re-subscribe and the ClosedBanner states the truth. Cleared when a
+   * different stream is subscribed — a new stream is a new question.
+   */
+  noFeed: boolean;
+  /** How the last unexpected socket close happened (reconnect banner reason). */
+  lastClose: CloseInfo | null;
+  /** 1-based reconnect attempts since the last completed handshake. */
+  reconnectAttempts: number;
   /** Replay transport (low-frequency UI state; ignored in live mode). */
   speed: number;
   paused: boolean;
@@ -101,6 +115,8 @@ export interface FlowMapState {
   pause: () => void;
   resume: () => void;
   seek: (t: bigint) => void;
+  /** Skip the reconnect backoff and open the replacement socket now (banner button). */
+  retryNow: () => void;
   disconnect: () => void;
   /** Subscribe to the raw high-frequency stream; returns an unsubscribe fn. */
   onStream: (handler: (msg: StreamMsg) => void) => () => void;
@@ -126,7 +142,14 @@ export function setFlowMapTransport(overrides: Partial<ConnectionOptions>): void
 
 function fanoutStream(msg: StreamMsg): void {
   for (const listener of streamListeners) {
-    listener(msg);
+    try {
+      listener(msg);
+    } catch (err) {
+      // One misbehaving listener must not break the WS dispatch loop for the
+      // others (and must not kill the connection's message pump) — log and
+      // continue with the remaining listeners.
+      console.error('stream listener failed', err);
+    }
   }
 }
 
@@ -144,6 +167,9 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   epochs: new Map(),
   subscription: null,
   replayUnavailable: false,
+  noFeed: false,
+  lastClose: null,
+  reconnectAttempts: 0,
   speed: 1,
   paused: false,
 
@@ -154,6 +180,10 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         // High-frequency stream: straight to the listener Set, never `set()`.
         onStream: fanoutStream,
         onHello: (hello) => {
+          // Captured BEFORE the set() below clears them: they say whether this
+          // Hello is a RECONNECT (the first handshake has no drop behind it).
+          const wasReconnect =
+            get().lastClose !== null || get().reconnectAttempts > 0;
           const epochs = new Map(get().epochs);
           epochs.set(hello.epoch_params.epoch, hello.epoch_params);
           set({
@@ -163,12 +193,28 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
             normSeed: hello.norm_seed,
             gridEpoch: hello.grid_epoch,
             epochs,
+            // The handshake completed: whatever drop the banner was counting
+            // is over, and its close info is stale.
+            reconnectAttempts: 0,
+            lastClose: null,
             // NOTE `replayUnavailable` is deliberately NOT cleared here. The
             // live fallback triggered by the refusal lands its own handshake
             // moments later — clearing on Hello would erase the refusal the
             // instant it is shown. It retires on a NEW replay attempt or a
             // different stream instead (see connectAndSubscribe).
           });
+          // Replay transport state on a RECONNECT: the server reuses the
+          // parked ReplayFeed (GRACE_S=60), whose clock still runs at the
+          // previous speed/pause — a blind reset to "1× playing" would make
+          // the pill describe a transport that doesn't exist. Re-assert the
+          // store's state instead: a reused session confirms it (an echo), a
+          // fresh session gets it re-applied server-side. The socket is up
+          // (Hello arrived), so these commit. A FIRST Hello stays silent.
+          if (wasReconnect && get().subscription?.mode === 'replay') {
+            get().setSpeed(get().speed);
+            if (get().paused) get().pause();
+            else get().resume();
+          }
         },
         onEpochStart: (ev) => {
           // Advance the grid epoch to the newest re-anchored frame so the price
@@ -200,6 +246,19 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
           });
         },
         onConnStatus: (status) => set({ status }),
+        // Every unexpected close updates the banner's reason text (the code /
+        // clean flag is the honest "what happened" the user can act on).
+        onCloseInfo: (info) => set({ lastClose: info }),
+        // Fired on every scheduled reconnect (consecutive ones keep the status
+        // at 'reconnecting', so onConnStatus alone would go stale).
+        onReconnectScheduled: (attempt) => set({ reconnectAttempts: attempt }),
+        // The pre-close Status said feed_state='closed' — NO feed exists for
+        // this market. Terminal: do NOT re-subscribe (a live fallback would be
+        // refused exactly the same); leave the (dead) subscription in place so
+        // the banner can name the market, and let the ClosedBanner's no-feed
+        // variant state the truth. A DIFFERENT subscription from the user is
+        // the only way forward, and it clears the flag in the reset below.
+        onNoFeed: () => set({ noFeed: true }),
         // The server honestly refused the replay subscribe (1003 — no recording
         // for this session). Fall back to LIVE right away so the user is not
         // stranded on a "reconnecting · degraded" loop that can never succeed,
@@ -251,6 +310,11 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         // normalises its entire life against the previous symbol's density
         // scale (a $60k book's p99 against a $180 stock's).
         normSeed: null,
+        // A different stream is a NEW question: a previous stream's terminal
+        // no-feed refusal and its drop/retry history must not shadow it.
+        noFeed: false,
+        lastClose: null,
+        reconnectAttempts: 0,
       });
       // `replayUnavailable` is deliberately NOT in the reset block: the live
       // fallback below (a mode change) passes through here, and wiping the flag
@@ -278,22 +342,26 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   },
 
   setSpeed(x) {
-    conn?.setSpeed(x);
-    set({ speed: x });
+    // Reflect-on-send: the Connection drops control frames while the socket is
+    // down, so an unconditional commit would let the pill claim "50×" the
+    // server never received. Only a frame that actually went out updates state.
+    if (conn?.setSpeed(x)) set({ speed: x });
   },
 
   pause() {
-    conn?.pause();
-    set({ paused: true });
+    if (conn?.pause()) set({ paused: true });
   },
 
   resume() {
-    conn?.resume();
-    set({ paused: false });
+    if (conn?.resume()) set({ paused: false });
   },
 
   seek(t) {
     conn?.seek(t);
+  },
+
+  retryNow() {
+    conn?.reconnectNow();
   },
 
   disconnect() {

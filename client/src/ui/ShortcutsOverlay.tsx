@@ -10,7 +10,9 @@
 import { useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 
-import { KEYSHEET } from './keysheet';
+import { isTopOverlay, pushOverlay } from './overlayStack';
+import { KEYSHEET, isHelpToggle } from './keysheet';
+import { classifyTarget } from '../input/keys';
 
 interface ShortcutsOverlayProps {
   onClose: () => void;
@@ -20,12 +22,22 @@ export function ShortcutsOverlay({ onClose }: ShortcutsOverlayProps): JSX.Elemen
   const panelRef = useRef<HTMLDivElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
-  // Escape closes. Window-level so it works wherever focus sits inside the
-  // overlay; stopPropagation keeps the drawer's own Escape handler out of the way.
+  // The overlay joins the open-overlay registry while mounted: window-level
+  // Escape handlers elsewhere (settings drawer) defer to whichever surface is
+  // topmost, so one Escape closes only this overlay — never both at once.
+  useEffect(() => pushOverlay('shortcuts'), []);
+
+  // Escape closes, and `?` toggles (the footer says so) — window-level so both
+  // work wherever focus sits inside the overlay. Being registry-topmost is what
+  // lets this handler act without also firing the drawer's Escape handler.
+  // `?` shares the App-level predicate (isHelpToggle): a '?' typed into an
+  // editable is a character, not a toggle.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (!isTopOverlay('shortcuts')) return;
+      const ctx = classifyTarget(e.target);
+      if (e.key === 'Escape' || isHelpToggle(e.key, ctx)) {
         e.preventDefault();
         onClose();
       }

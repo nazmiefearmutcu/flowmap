@@ -1,7 +1,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useFlowMapStore } from '../state/store';
 import type { SymbolSearchHandle } from './SymbolSearch';
@@ -29,7 +29,10 @@ function noop() {
   /* no-op */
 }
 
-function topbar(streamClock: string | null = null): JSX.Element {
+function topbar(
+  streamClock: string | null = null,
+  exportProps: { onExportPng?: () => void; exportNotice?: string | null; onDismissExportNotice?: () => void } = {},
+): JSX.Element {
   return (
     <TopBar
       ref={{ current: null } as unknown as React.Ref<SymbolSearchHandle>}
@@ -38,6 +41,9 @@ function topbar(streamClock: string | null = null): JSX.Element {
       railVisible={false}
       onToggleRail={noop}
       onOpenSettings={noop}
+      onExportPng={exportProps.onExportPng ?? noop}
+      exportNotice={exportProps.exportNotice ?? null}
+      onDismissExportNotice={exportProps.onDismissExportNotice ?? noop}
       streamClock={streamClock}
     />
   );
@@ -243,5 +249,40 @@ describe('TopBar settings button a11y', () => {
     // The color-emoji gear (bare U+2699) is gone; the text-presentation form carries U+FE0E.
     expect(btn.textContent).not.toContain('⚙️');
     expect(btn.textContent).toContain('︎');
+  });
+});
+
+describe('TopBar PNG export', () => {
+  it('exposes an Export PNG icon button that fires the shared export handler', () => {
+    const onExportPng = vi.fn();
+    const { container } = render(topbar(null, { onExportPng }));
+    const btn = container.querySelector('[data-testid="export-png"]')!;
+    expect(btn).not.toBeNull();
+    // Honest naming for AT + a hover tooltip that names the shortcut.
+    expect(btn.getAttribute('aria-label')).toBe('Export PNG');
+    expect(btn.getAttribute('title')).toContain('PNG');
+    expect(btn.getAttribute('title')).toContain('E');
+    act(() => {
+      btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onExportPng).toHaveBeenCalledOnce();
+  });
+
+  it('renders the refused-export notice and dismisses it (never a fake success)', () => {
+    const onDismiss = vi.fn();
+    const ok = render(topbar(null, { exportNotice: null }));
+    expect(ok.container.querySelector('[data-testid="export-notice"]')).toBeNull();
+
+    const bad = render(topbar(null, { exportNotice: 'PNG export unavailable', onDismissExportNotice: onDismiss }));
+    const note = bad.container.querySelector('[data-testid="export-notice"]')!;
+    expect(note).not.toBeNull();
+    expect(note.getAttribute('role')).toBe('status');
+    expect(note.textContent).toContain('PNG export unavailable');
+
+    const close = note.querySelector('[data-testid="export-notice-close"]')!;
+    act(() => {
+      close.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onDismiss).toHaveBeenCalledOnce();
   });
 });

@@ -65,6 +65,7 @@ import {
   type VenueOption,
 } from './symbols';
 import { loadRecents, pushRecent, type RecentPick } from './recents';
+import { pushOverlay } from './overlayStack';
 import { fmtPct, fmtPrice, sparkDirection, sparkPath } from './spark';
 
 export interface SymbolSearchHandle {
@@ -360,6 +361,12 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       triggerRef.current?.focus();
     }, []);
 
+    // The palette joins the open-overlay registry while open (ui/overlayStack):
+    // the settings drawer's and shortcuts overlay's window-level Escape handlers
+    // defer to the registry's topmost surface, so a single Escape can never
+    // close this palette AND another modal in the same keystroke.
+    useEffect(() => (open ? pushOverlay('palette') : undefined), [open]);
+
     const commit = useCallback(
       (row: Row | undefined) => {
         if (!row) return;
@@ -437,6 +444,31 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       }
     };
 
+    // Trap Tab / Shift+Tab within the palette (same contract as the settings
+    // drawer and the shortcuts overlay): without it, Tab past the last focusable
+    // lands on the page BEHIND the modal backdrop and focus is lost out of the
+    // dialog.
+    const onTrapKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>): void => {
+      if (e.key !== 'Tab') return;
+      const panel = e.currentTarget;
+      const focusable = panel.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
     // Reset the highlight to the top whenever the query or the mode changes.
     // Shrinking result sets are handled by the render-time clamp on `active`, not
     // a post-commit effect, so no out-of-bounds frame can commit.
@@ -500,7 +532,13 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                 if (e.target === e.currentTarget) close();
               }}
             >
-              <div className="sympal" role="dialog" aria-modal="true" aria-label="Symbol search">
+              <div
+                className="sympal"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Symbol search"
+                onKeyDown={onTrapKeyDown}
+              >
                 <div className="sympal__head">
                   <span className="sympal__icon" aria-hidden="true">
                     ⌕

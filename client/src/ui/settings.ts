@@ -93,6 +93,11 @@ export interface FlowMapSettings {
   tickGrouping: number;
   /** Minimum trade size drawn as a tape bubble overlay. */
   bubbleMinSize: number;
+  /**
+   * Tape "big trade" highlight threshold in USD notional (price × size).
+   * Rows at or above it get the static `is-big` emphasis; `0` is off.
+   */
+  bigTradeUsd: number;
   /** Auto-follow the live right edge — the TIME axis. */
   follow: boolean;
   /** Auto-track price on the PRICE axis (keeps your zoom, recentres on drift). */
@@ -120,6 +125,9 @@ export const DEFAULT_SETTINGS: FlowMapSettings = {
   normPercentile: DEFAULT_PERCENTILE,
   tickGrouping: 1,
   bubbleMinSize: 0,
+  // Off by default: the tape's rolling p90 emphasis already marks relative
+  // giants; the absolute USD highlight is an opt-in the user dials in.
+  bigTradeUsd: 0,
   follow: true,
   followPrice: true,
   // `deep` by default so price is NOT boxed into the ±~1% native linear grid:
@@ -165,6 +173,7 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
     tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 32, DEFAULT_SETTINGS.tickGrouping)),
     bubbleMinSize: clampNumber(o.bubbleMinSize, 0, 1e9, DEFAULT_SETTINGS.bubbleMinSize),
+    bigTradeUsd: clampNumber(o.bigTradeUsd, 0, 1e9, DEFAULT_SETTINGS.bigTradeUsd),
     follow: typeof o.follow === 'boolean' ? o.follow : DEFAULT_SETTINGS.follow,
     followPrice:
       typeof o.followPrice === 'boolean' ? o.followPrice : DEFAULT_SETTINGS.followPrice,

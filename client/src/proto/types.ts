@@ -212,6 +212,8 @@ export interface Subscribe {
   mode: StreamMode;
   source: string | null;
   start_t: bigint | null;
+  /** Server price-grid coverage preset ('native' | 'wide' | 'full' | 'deep'); null = server default. */
+  band: string | null;
 }
 
 export interface Unsubscribe {

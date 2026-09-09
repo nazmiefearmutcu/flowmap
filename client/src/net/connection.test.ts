@@ -732,3 +732,166 @@ describe('Connection — replay refusal (close 1003)', () => {
     expect(refused).toBe(0);
   });
 });
+
+// --- no-feed refusal contract (server ws.py `_refuse`: Status THEN close) -----
+
+describe('Connection — no-feed refusal (Status closed + 1003)', () => {
+  interface NoFeedHarness {
+    conn: Connection;
+    sock: FakeWebSocket;
+    events: { noFeed: number; refused: number; closeInfo: { code: number | null; wasClean: boolean }[]; attempts: number[] };
+  }
+
+  /** Wire a replay connection, open it, and deliver the pre-close Status. */
+  function setup(feedState: 'closed' | 'degraded'): NoFeedHarness {
+    const events = { noFeed: 0, refused: 0, closeInfo: [] as { code: number | null; wasClean: boolean }[], attempts: [] as number[] };
+    let sock: FakeWebSocket | undefined;
+    const conn = new Connection({
+      url: 'wss://test.invalid/ws',
+      wsFactory: (url) => {
+        sock = new FakeWebSocket(url);
+        return sock;
+      },
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
+      onNoFeed: () => {
+        events.noFeed += 1;
+      },
+      onReplayRefused: () => {
+        events.refused += 1;
+      },
+      onCloseInfo: (info) => events.closeInfo.push(info),
+      onReconnectScheduled: (attempt) => events.attempts.push(attempt),
+    });
+    conn.subscribe('crypto', 'BTCUSDT', 'replay');
+    const s = sock as FakeWebSocket;
+    s.open();
+    // The contract: the Status rides the SAME socket immediately before the close.
+    s.deliver(
+      coldFrame(MsgType.STATUS, {
+        feed_state: feedState,
+        capability: {},
+        latency_ms: 0.0,
+        clock_skew_ms: 0.0,
+        next_open_ts: null,
+      }),
+    );
+    return { conn, sock: s, events };
+  }
+
+  it('Status(closed) + 1003 is TERMINAL: fires onNoFeed, never schedules a reconnect', () => {
+    const { conn, sock, events } = setup('closed');
+    sock.drop(1003);
+    expect(events.noFeed).toBe(1);
+    expect(events.refused).toBe(0);
+    // Terminal truth: the status reads 'closed' (not 'reconnecting') and no
+    // reconnect tick was scheduled — nothing will ever chase this refusal.
+    expect(conn.status).toBe('closed');
+    expect(events.attempts).toEqual([]);
+  });
+
+  it('Status(degraded) + 1003 keeps the recoverable replay-unavailable path', () => {
+    const { conn, sock, events } = setup('degraded');
+    sock.drop(1003);
+    expect(events.noFeed).toBe(0);
+    expect(events.refused).toBe(1);
+    expect(conn.status).toBe('reconnecting');
+    expect(events.attempts.length).toBe(1);
+  });
+
+  it('a 1003 with NO pre-close Status behaves exactly as before (backwards compatible)', () => {
+    const events = { noFeed: 0, refused: 0, closeInfo: [] as unknown[], attempts: [] as number[] };
+    let sock: FakeWebSocket | undefined;
+    const conn = new Connection({
+      url: 'wss://test.invalid/ws',
+      wsFactory: (url) => {
+        sock = new FakeWebSocket(url);
+        return sock;
+      },
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
+      onNoFeed: () => {
+        events.noFeed += 1;
+      },
+    });
+    conn.subscribe('crypto', 'BTCUSDT', 'replay');
+    (sock as FakeWebSocket).open();
+    (sock as FakeWebSocket).drop(1003);
+    expect(events.noFeed).toBe(0);
+    expect(conn.status).toBe('reconnecting');
+  });
+});
+
+function sockets_reconnect_scheduled(events: { attempts: number[] }): boolean {
+  return events.attempts.length > 0;
+}
+void sockets_reconnect_scheduled;
+
+// --- close info / attempt counter / retry-now (reconnect banner surface) ------
+
+describe('Connection — closeInfo, attempts, reconnectNow', () => {
+  function setup(extra: Partial<ConnectionOptions> = {}) {
+    const h = harness();
+    const events = { closeInfo: [] as { code: number | null; wasClean: boolean }[], attempts: [] as number[] };
+    const conn = h.makeConn({
+      onCloseInfo: (info) => events.closeInfo.push(info),
+      onReconnectScheduled: (attempt) => events.attempts.push(attempt),
+      ...extra,
+    });
+    conn.subscribe('crypto', 'BTCUSDT');
+    return { h, conn, sock: h.sockets[0], events };
+  }
+
+  it('reports the close info + 1-based attempt to the banner handlers', () => {
+    const { h, conn, sock: first, events } = setup();
+    first.open();
+    first.drop(1001);
+    expect(events.closeInfo).toEqual([{ code: 1001, wasClean: true }]);
+    expect(events.attempts).toEqual([1]);
+    expect(conn.attempts).toBe(1);
+    expect(conn.closeInfo).toEqual({ code: 1001, wasClean: true });
+
+    // Consecutive reconnects keep the status at 'reconnecting', so the dedicated
+    // handler (not onConnStatus) is what keeps the attempt counter truthful.
+    h.clock.advance(500); // jitter=1 → the first backoff tick fires (base 500ms)
+    const sock = h.sockets[1];
+    sock.open();
+    sock.drop(); // abnormal, code-less
+    expect(events.closeInfo[1]).toEqual({ code: null, wasClean: false });
+    expect(events.attempts).toEqual([1, 2]);
+    expect(conn.attempts).toBe(2);
+  });
+
+  it('reconnectNow() opens exactly one replacement socket and cancels the armed tick', () => {
+    const { h, conn, sock } = setup();
+    sock.open();
+    sock.drop(1001);
+    expect(h.sockets).toHaveLength(1);
+    conn.reconnectNow();
+    // Exactly one new socket — and the armed backoff timer was cleared, so the
+    // clock can never open a SECOND one behind it.
+    expect(h.sockets).toHaveLength(2);
+    h.clock.advance(60_000);
+    expect(h.sockets).toHaveLength(2);
+    // While a socket exists, retry is a no-op (never two live sockets).
+    conn.reconnectNow();
+    expect(h.sockets).toHaveLength(2);
+    // The replacement re-sends the same subscribe on open.
+    h.sockets[1].open();
+    expect(decodeFrame(h.sockets[1].sent[0])[0].type).toBe(MsgType.SUBSCRIBE);
+  });
+
+  it('resets the attempt counter once a Hello handshake lands', () => {
+    const { h, conn, sock } = setup();
+    sock.open();
+    sock.drop();
+    expect(conn.attempts).toBe(1);
+    h.clock.advance(60_000); // the reconnect tick fires and opens the replacement
+    const replacement = h.sockets[1];
+    replacement.open();
+    replacement.deliver(goldenU8('cold_hello'));
+    // A completed handshake is a completed session attach: the counter zeroes.
+    expect(conn.attempts).toBe(0);
+    expect(conn.status).toBe('live');
+  });
+});

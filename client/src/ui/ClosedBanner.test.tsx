@@ -28,7 +28,7 @@ afterEach(() => {
     container.remove();
   }
   act(() => {
-    useFlowMapStore.setState({ feedState: null, nextOpenTs: null });
+    useFlowMapStore.setState({ feedState: null, nextOpenTs: null, noFeed: false });
   });
 });
 
@@ -101,5 +101,33 @@ describe('ClosedBanner accessibility (single announcement of closed state)', () 
     expect(countdown).not.toBeNull();
     // aria-live='off' stops the per-second re-announcement of the ticking value.
     expect(countdown?.getAttribute('aria-live')).toBe('off');
+  });
+});
+
+describe('ClosedBanner — terminal no-feed refusal', () => {
+  it('states the truthful NO FEED case instead of "market closed"', () => {
+    // Server contract: pre-close Status feed_state='closed' + 1003 = NO feed
+    // exists for this market. Not an RTH closure — no countdown, no waiting.
+    act(() => {
+      useFlowMapStore.setState({ noFeed: true, feedState: 'closed', nextOpenTs: null });
+    });
+    const { container } = render(<ClosedBanner />);
+    const banner = container.querySelector('[data-testid="no-feed-banner"]');
+    expect(banner).not.toBeNull();
+    expect(banner!.getAttribute('aria-label')).toBe('No feed for this market');
+    expect(banner!.textContent).toContain('NO FEED');
+    expect(banner!.textContent).toContain('no feed available for this market');
+    // The RTH "MARKET CLOSED" banner must NOT also render for this state.
+    expect(container.querySelector('[data-testid="closed-banner"]')).toBeNull();
+    expect(container.querySelector('[data-testid="closed-countdown"]')).toBeNull();
+  });
+
+  it('renders nothing from the noFeed flag alone once a healthy state returns', () => {
+    act(() => {
+      useFlowMapStore.setState({ noFeed: false, feedState: 'live' });
+    });
+    const { container } = render(<ClosedBanner />);
+    expect(container.querySelector('[data-testid="no-feed-banner"]')).toBeNull();
+    expect(container.querySelector('[data-testid="closed-banner"]')).toBeNull();
   });
 });

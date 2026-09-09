@@ -20,6 +20,7 @@ import { Tape } from './ui/Tape';
 import { TimeAxis } from './ui/TimeAxis';
 import { Timeline } from './ui/Timeline';
 import { TopBar } from './ui/TopBar';
+import { runPngExport } from './ui/exportPng';
 import type { SymbolSearchHandle } from './ui/SymbolSearch';
 import {
   historyDepthCols,
@@ -106,6 +107,9 @@ export function App() {
   // The `?` shortcuts overlay (ui/ShortcutsOverlay) — a small modal listing the
   // same keysheet the settings drawer renders.
   const [helpOpen, setHelpOpen] = useState(false);
+  // Non-null while the "export refused" note shows in the TopBar (lost GL
+  // context — never a fake success). Cleared by dismissal or a later success.
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [streamClock, setStreamClock] = useState<string | null>(null);
   // WebGL2 unavailable: the heatmap canvas cannot render, but the DOM panels
   // (ladder, tape, search) can — the app degrades instead of dying (F1).
@@ -354,7 +358,7 @@ export function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  // --- global keyboard (Space / `/`) -------------------------------------------
+  // --- global keyboard (Space / `/` / `E`) -------------------------------------
   useEffect(() => {
     return attachGlobalKeys({
       onSpace: () => {
@@ -367,6 +371,7 @@ export function App() {
         }
       },
       onFocusSearch: () => searchRef.current?.focus(),
+      onExportPng: exportPng,
     });
   }, []);
 
@@ -433,6 +438,28 @@ export function App() {
     [],
   );
 
+  // PNG export (top-bar button AND the bare `E` key route through this one
+  // handler): snapshot the renderer synchronously, download on success, and on
+  // a null snapshot (lost GL context) show the TopBar's dismissible note —
+  // never a fake success. The subscription is read at call time so the filename
+  // always names what is on screen right now.
+  const exportPng = useCallback(() => {
+    const sub = useFlowMapStore.getState().subscription;
+    const filename = runPngExport(
+      rendererRef.current?.snapshot() ?? null,
+      sub?.market ?? SIM_MARKET,
+      sub?.symbol ?? SIM_SYMBOL,
+      new Date(),
+    );
+    setExportNotice(
+      filename
+        ? null
+        : 'PNG export unavailable — the graphics context is lost. The chart will repaint when it recovers.',
+    );
+  }, []);
+
+  const dismissExportNotice = useCallback(() => setExportNotice(null), []);
+
   return (
     <div className="app">
       <TopBar
@@ -442,6 +469,9 @@ export function App() {
         railVisible={settings.railVisible}
         onToggleRail={toggleRail}
         onOpenSettings={() => setSettingsOpen(true)}
+        onExportPng={exportPng}
+        exportNotice={exportNotice}
+        onDismissExportNotice={dismissExportNotice}
         streamClock={streamClock}
       />
 
@@ -482,7 +512,7 @@ export function App() {
         {settings.railVisible && (
           <aside className="right-rail" data-testid="right-rail">
             <DomLadder />
-            <Tape />
+            <Tape bigTradeUsd={settings.bigTradeUsd} />
           </aside>
         )}
       </div>

@@ -8,9 +8,10 @@
  * each column through {@link cvdColToX}, so panning / zooming / scrolling back in
  * time moves CVD in exact lock-step (the "RSI-style aligned sub-panel" behaviour).
  *
- * It re-reads the transform every animation frame but only repaints when the view
- * window, the newest column, the pane size, or the feed capability actually
- * changes — so an idle chart costs nothing.
+ * It checks a cheap signature (view window, newest column, pane size, feed
+ * capability) and repaints only when it actually changes — a changed frame runs
+ * at full frame rate, while an idle pane backs off to a slow poll instead of
+ * spinning rAF at 60 fps with nothing to paint.
  *
  * Honesty (§7): CVD needs a real aggressor side. When the feed reports
  * `capability.cvd === 'na'` (keyless equity), the value would be a meaningless
@@ -46,29 +47,37 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
     if (!ctx) return;
 
     let raf = 0;
+    let pollTimer = 0;
     let lastSig = '';
+    let idleStep = 0;
+    // Idle backoff: a CHANGED frame re-arms at the next animation frame; an
+    // unchanged one doubles its wait (capped) so an idle pane polls a few times
+    // a second instead of spinning rAF at 60 fps with nothing to paint. Any
+    // visible change snaps straight back to the full frame rate.
+    const IDLE_MAX_MS = 250;
+    const scheduleNext = (painted: boolean): void => {
+      idleStep = painted ? 0 : Math.min(idleStep + 1, 8);
+      const wait = painted ? 0 : Math.min(IDLE_MAX_MS, 2 ** idleStep);
+      if (wait === 0) {
+        raf = requestAnimationFrame(draw);
+      } else {
+        pollTimer = window.setTimeout(() => {
+          raf = requestAnimationFrame(draw);
+        }, wait);
+      }
+    };
 
-    const draw = (): void => {
-      raf = requestAnimationFrame(draw);
-      const r = rendererRef.current;
-      const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
-      const cssW = canvas.clientWidth;
-      const cssH = canvas.clientHeight;
-      if (cssW === 0 || cssH === 0) return;
-
-      const tl = r?.timeline() ?? null;
-      const cap = cvdCapRef.current;
-      // The newest (forming) column's CVD mutates while every view field stays
-      // fixed in follow mode, so fold its value into the signature — otherwise the
-      // live tip + readout freeze until the next column is born. O(1) map lookup.
-      const tipCvd = tl && r ? r.cvdValueAt(tl.newestSeq) : Number.NaN;
-      // Signature: repaint only when something visible changed.
-      const sig = tl
-        ? `${cssW}x${cssH}|${dpr}|${cap}|${tl.viewStartCol.toFixed(2)}|${tl.viewEndCol.toFixed(2)}|${tl.newestSeq}|${Number.isFinite(tipCvd) ? tipCvd : ''}`
-        : `${cssW}x${cssH}|${dpr}|${cap}|empty`;
-      if (sig === lastSig) return;
-      lastSig = sig;
-
+    // One repaint of the pane. Split out of `draw` so the signature check (and
+    // the idle scheduling) can wrap it without the paint's own early returns
+    // (`na` capability, no timeline, empty series) skipping the reschedule.
+    const paint = (
+      r: Renderer | null,
+      tl: ReturnType<Renderer['timeline']> | null,
+      cap: string | null,
+      cssW: number,
+      cssH: number,
+      dpr: number,
+    ): void => {
       // Resize the drawing buffer to device pixels (once per size change).
       const wantW = Math.round(cssW * dpr);
       const wantH = Math.round(cssH * dpr);
@@ -97,10 +106,10 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
         return;
       }
 
-      if (!tl) return;
+      if (!tl || !r) return;
       const lo = Math.floor(tl.viewStartCol);
       const hi = Math.ceil(tl.viewEndCol);
-      const pts = r!.cvdSeries(lo, hi);
+      const pts = r.cvdSeries(lo, hi);
       if (pts.length === 0) return;
 
       const bounds = cvdBounds(pts.map((p) => p.cvd));
@@ -159,8 +168,37 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.fillText(fmtCvd(last.cvd), cssW - 6, 4);
     };
 
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
+    const draw = (): void => {
+      const r = rendererRef.current;
+      const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      const cap = cvdCapRef.current;
+      let painted = false;
+      if (cssW !== 0 && cssH !== 0) {
+        const tl = r?.timeline() ?? null;
+        // The newest (forming) column's CVD mutates while every view field stays
+        // fixed in follow mode, so fold its value into the signature — otherwise
+        // the live tip + readout freeze until the next column is born. O(1) map
+        // lookup. Signature: repaint only when something visible changed.
+        const tipCvd = tl && r ? r.cvdValueAt(tl.newestSeq) : Number.NaN;
+        const sig = tl
+          ? `${cssW}x${cssH}|${dpr}|${cap}|${tl.viewStartCol.toFixed(2)}|${tl.viewEndCol.toFixed(2)}|${tl.newestSeq}|${Number.isFinite(tipCvd) ? tipCvd : ''}`
+          : `${cssW}x${cssH}|${dpr}|${cap}|empty`;
+        if (sig !== lastSig) {
+          lastSig = sig;
+          paint(r, tl, cap, cssW, cssH, dpr);
+          painted = true;
+        }
+      }
+      scheduleNext(painted);
+    };
+
+    scheduleNext(true); // first frame at full rate; the signature throttles after
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(pollTimer);
+    };
   }, [rendererRef]);
 
   return (

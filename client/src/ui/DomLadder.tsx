@@ -112,10 +112,15 @@ export function ladderShape(tier: DepthTier | null, bookMode: number | null): La
   return 'book';
 }
 
-/** Decimal places implied by the price step (tick·multiple). */
+/**
+ * Decimal places implied by the price step (tick·multiple). The old hard cap of
+ * 8 printed `0.00000000` for sub-1e-8 prices (a 1e-9 quote is a real thing on
+ * micro-cap chains) — the cap now grows with the magnitude, bounded defensively
+ * so a pathological step cannot print an absurd fixed-point string.
+ */
 export function priceDecimals(step: number): number {
   if (!(step > 0)) return 2;
-  return Math.min(8, Math.max(0, Math.ceil(-Math.log10(step))));
+  return Math.min(12, Math.max(0, Math.ceil(-Math.log10(step))));
 }
 
 function clampRow(r: number, rows: number): number {

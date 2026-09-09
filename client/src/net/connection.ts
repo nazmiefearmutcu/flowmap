@@ -59,6 +59,12 @@ import {
 /** Connection lifecycle state (distinct from the server's Status.feed_state). */
 export type ConnStatus = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'closed';
 
+/** How a socket closed, as the browser reported it. */
+export interface CloseInfo {
+  code: number | null;
+  wasClean: boolean;
+}
+
 /** The high-frequency messages forwarded to the renderer (never React state). */
 export type StreamMsg = DepthColumn | BarColumn | Trade | BBO | Marker;
 
@@ -89,13 +95,32 @@ export interface ConnectionHandlers {
   /** Connection lifecycle transitions. */
   onConnStatus?: (status: ConnStatus) => void;
   /**
-   * The server REFUSED the current subscription with the unsupported close code
+   * The socket closed unexpectedly — carries how (close code / clean flag) for
+   * the reconnect banner's reason text. Fires on every non-intentional close.
+   */
+  onCloseInfo?: (info: CloseInfo) => void;
+  /**
+   * A reconnect backoff tick was scheduled; `attempt` is 1-based. Fired on EVERY
+   * schedule (not gated on status change — consecutive reconnects stay
+   * 'reconnecting') so the banner's attempt counter never goes stale.
+   */
+  onReconnectScheduled?: (attempt: number) => void;
+  /**
+   * The server refused the current subscription with the unsupported close code
    * (1003) — today only mode=replay against a session with no recording (§7:
    * the server refuses honestly instead of steering nothing). The store uses
    * this to surface "replay unavailable" and fall back to live instead of
    * reconnect-looping into the same refusal forever.
    */
   onReplayRefused?: () => void;
+  /**
+   * The server refused the subscription with a pre-close Status naming
+   * feed_state='closed' (server ws.py: NotImplementedError → Status{closed} +
+   * 1003): NO feed exists for this market at all. Terminal — the transport does
+   * NOT schedule a reconnect (the same subscribe would be refused forever); a
+   * NEW subscription from the user is what opens the next socket.
+   */
+  onNoFeed?: () => void;
 }
 
 export interface ConnectionOptions extends ConnectionHandlers {
@@ -180,13 +205,20 @@ export class Connection {
   private backoffAttempt = 0;
   private reconnectTimer: unknown = null;
   /**
+   * feed_state of the last Status frame received on the CURRENT socket. The
+   * server's refusal contract (ws.py `_refuse`) sends Status BEFORE closing:
+   * 'closed' = no feed for this market (terminal), 'degraded' = no replayable
+   * recording (recoverable by re-subscribing live). Reset per socket.
+   */
+  private lastStatusFeedState: Status['feed_state'] | null = null;
+  /**
    * How the LAST socket closed (`null` until one does). `wasClean` distinguishes
    * a server-initiated close frame (1000 normal / 1001 going away — a sidecar
    * shutting down) from an abnormal transport death (no code / 1006-style). Both
    * reconnect with backoff; the flag exists so the stall watchdog / UI can tell
    * "the server said goodbye" from "the wire died" without sniffing events.
    */
-  private lastClose: { code: number | null; wasClean: boolean } | null = null;
+  private lastClose: CloseInfo | null = null;
 
   /** Latest col_seq forwarded per epoch — the (epoch, col_seq) dedup cursor. */
   private readonly lastColSeq = new Map<number, number>();
@@ -213,7 +245,10 @@ export class Connection {
       onEpochStart: options.onEpochStart,
       onStatus: options.onStatus,
       onConnStatus: options.onConnStatus,
+      onCloseInfo: options.onCloseInfo,
+      onReconnectScheduled: options.onReconnectScheduled,
       onReplayRefused: options.onReplayRefused,
+      onNoFeed: options.onNoFeed,
     };
   }
 
@@ -228,8 +263,13 @@ export class Connection {
   }
 
   /** How the last socket closed (see `lastClose`), or null if none has. */
-  get closeInfo(): { code: number | null; wasClean: boolean } | null {
+  get closeInfo(): CloseInfo | null {
     return this.lastClose;
+  }
+
+  /** 1-based reconnect attempts since the last completed handshake. */
+  get attempts(): number {
+    return this.backoffAttempt;
   }
 
   /** Read-only view of the epoch geometry gathered from Hello / EpochStart. */
@@ -285,6 +325,7 @@ export class Connection {
     this.lastColSeq.clear();
     this.epochMap.clear();
     this.sessionId = null;
+    this.lastStatusFeedState = null; // the refused stream's verdict dies with it
     this.failHistoryWaiters(
       new Error('flowmap: history request abandoned — subscription changed'),
     );
@@ -330,36 +371,50 @@ export class Connection {
 
   // --- replay transport control (§9 / §11) -------------------------------------
   // Cold control messages for a replay session: the server owns the replay clock
-  // and honours these live. No-ops (dropped) when the socket is not open — the UI
-  // guards on mode/status, and a closed socket has nothing to steer.
+  // and honours these live. Each returns whether the frame ACTUALLY went out —
+  // a closed socket silently drops the send, and the UI must not claim a state
+  // the server never received. No-ops (false) when the socket is not open — the
+  // UI guards on mode/status, and a closed socket has nothing to steer.
 
   /** Seek the replay clock to absolute ns `t` (server bumps epoch + resnapshots). */
-  seek(t: bigint): void {
-    this.sendControl(encodeSeek(t));
+  seek(t: bigint): boolean {
+    return this.sendControl(encodeSeek(t));
   }
 
   /** Set the replay playback speed multiplier (1–100×). */
-  setSpeed(x: number): void {
-    this.sendControl(encodeSetSpeed(x));
+  setSpeed(x: number): boolean {
+    return this.sendControl(encodeSetSpeed(x));
   }
 
   /** Pause the replay clock. */
-  pause(): void {
-    this.sendControl(encodePause());
+  pause(): boolean {
+    return this.sendControl(encodePause());
   }
 
   /** Resume the replay clock. */
-  resume(): void {
-    this.sendControl(encodeResume());
+  resume(): boolean {
+    return this.sendControl(encodeResume());
   }
 
-  private sendControl(bytes: Uint8Array): void {
-    if (this.socket === null || !this.socketOpen) return;
+  private sendControl(bytes: Uint8Array): boolean {
+    if (this.socket === null || !this.socketOpen) return false;
     try {
       this.rawSend(bytes);
+      return true;
     } catch (err) {
       console.warn('[flowmap] failed to send control message', err);
+      return false;
     }
+  }
+
+  /**
+   * Retry NOW (the reconnect banner's button) instead of waiting out the armed
+   * backoff tick. openSocket clears any pending timer FIRST, so a click can
+   * never double-track with a scheduled tick — exactly one replacement socket.
+   */
+  reconnectNow(): void {
+    if (this.intentionalClose || this.socket !== null) return;
+    this.openSocket('reconnecting');
   }
 
   /** Intentional close: no reconnect; pending history waiters are rejected. */
@@ -416,6 +471,7 @@ export class Connection {
   private onSocketOpen(): void {
     this.socketOpen = true;
     this.activeSub = null; // fresh socket: nothing subscribed yet
+    this.lastStatusFeedState = null; // …and no Status has arrived on it yet
     this.sendSubscribe();
   }
 
@@ -433,6 +489,12 @@ export class Connection {
     // when close() already ran, nothing here may fire callbacks or reconnect.
     const refusedReplay =
       this.activeSub?.mode === 'replay' && code === Connection.CLOSE_UNSUPPORTED;
+    // The refusal contract (ws.py `_refuse`) sends a Status BEFORE the close
+    // frame: feed_state 'closed' = NO FEED EXISTS for this market at all — a
+    // terminal refusal no reconnect can cure. 'degraded' (no replay recording)
+    // stays the recoverable `refusedReplay` path above.
+    const noFeed =
+      code === Connection.CLOSE_UNSUPPORTED && this.lastStatusFeedState === 'closed';
     this.lastClose = {
       code: code ?? null,
       wasClean: code !== undefined && Connection.CLEAN_CLOSE_CODES.has(code),
@@ -440,12 +502,22 @@ export class Connection {
     this.socketOpen = false;
     this.activeSub = null;
     this.socket = null;
+    this.lastStatusFeedState = null;
     // The socket is gone either way: fail in-flight history requests NOW rather
     // than letting them coast to their 10 s timeout, so the HistoryLoader's next
     // pan retries on the replacement socket instead of stalling through the
     // whole backoff window.
     this.failHistoryWaiters(new Error('flowmap: history request abandoned — connection lost'));
     if (this.intentionalClose) {
+      this.setConnStatus('closed');
+      return;
+    }
+    this.handlers.onCloseInfo?.(this.lastClose);
+    if (noFeed) {
+      // Terminal: do NOT schedule a reconnect — re-sending the same subscribe
+      // would be refused forever. Surface the state; a NEW subscription (the
+      // user picking another market) is what may open the next socket.
+      this.handlers.onNoFeed?.();
       this.setConnStatus('closed');
       return;
     }
@@ -463,7 +535,11 @@ export class Connection {
   }
 
   private scheduleReconnect(): void {
-    this.setConnStatus('reconnecting');
+    // A handler (the store's replay-refusal fallback) may have opened the
+    // replacement socket SYNCHRONOUSLY inside onReplayRefused. Scheduling then
+    // would arm a ghost tick that later clobbers that live socket with a second
+    // one — the orphan-socket double-subscribe openSocket's header warns about.
+    if (this.socket !== null) return;
     const exp = Math.min(this.backoffAttempt, 20); // guard 2**n overflow
     // Exponential growth, capped, then FULL JITTER: the delay is a uniform draw
     // from [0, ceiling). Without the draw, every client that dropped together
@@ -471,7 +547,12 @@ export class Connection {
     // ceiling still grows exponentially so a dead endpoint is polled gently.
     const ceiling = Math.min(this.backoffCapMs, this.backoffBaseMs * 2 ** exp);
     const delay = Math.round(this.jitterFn() * ceiling);
+    // Increment BEFORE the status transition so the handlers observe the 1-based
+    // attempt number of the attempt being scheduled (and the dedicated
+    // onReconnectScheduled fires even when the status stays 'reconnecting').
     this.backoffAttempt += 1;
+    this.setConnStatus('reconnecting');
+    this.handlers.onReconnectScheduled?.(this.backoffAttempt);
     this.reconnectTimer = this.setTimeoutFn(() => {
       this.reconnectTimer = null;
       if (this.intentionalClose) return;
@@ -539,6 +620,10 @@ export class Connection {
         this.sendPong(msg);
         return;
       case MsgType.STATUS:
+        // Remember the feed_state on THIS socket: the refusal contract sends a
+        // Status immediately before closing, and the close handler needs it to
+        // tell a terminal no-feed refusal from a recoverable one.
+        this.lastStatusFeedState = msg.feed_state;
         this.handlers.onStatus?.(msg);
         return;
       case MsgType.HISTORY_RESP:

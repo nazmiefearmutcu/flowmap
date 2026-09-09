@@ -141,6 +141,40 @@ describe('priceDecimals', () => {
     expect(priceDecimals(1)).toBe(0);
     expect(priceDecimals(0.0001)).toBe(4);
   });
+
+  it('grows past the old 8-decimal cap for sub-1e-8 steps (honest tiny prices)', () => {
+    // A 1e-9 step used to cap at 8 → every price printed 0.00000000.
+    expect(priceDecimals(1e-8)).toBe(8);
+    expect(priceDecimals(1e-9)).toBe(9);
+    expect(priceDecimals(1.2e-9)).toBe(9);
+    // A 1.2e-9 price at 9 decimals renders a NONZERO honest value.
+    expect((1.2e-9).toFixed(priceDecimals(1.2e-9))).toBe('0.000000001');
+    // Defensive ceiling so a pathological step cannot print an endless string.
+    expect(priceDecimals(1e-15)).toBe(12);
+  });
+
+  it('lets a tiny-price ladder render nonzero rungs', () => {
+    // A micro-priced epoch: step ~1e-9, prices ~1.2e-9. The ladder window must
+    // print real digits, not 0.00000000.
+    const tiny: EpochParams = { epoch: 2, tick: 1e-9, tick_multiple: 1, dt_ns: 1_000_000, p0: 1.2e-9, rows: 200 };
+    const bid = new Float32Array(tiny.rows);
+    const ask = new Float32Array(tiny.rows);
+    bid[100] = 5;
+    ask[101] = 5;
+    const snap: BookSnapshot = {
+      version: 1,
+      book: { epoch: 2, mode: MODE_L2, colSeq: 1, t0Ns: 0n, bid, ask },
+      bbo: null,
+      trades: [],
+    };
+    const model = buildLadder(snap, tiny, 'book', 5, null);
+    expect(model.priceDecimals).toBe(9);
+    const mid = model.rows.find((r) => r.row === 100)!;
+    // Row 100 = p0 + 100·step = 1.2e-9 + 100e-9 = 1.012e-7 — real digits on
+    // screen where the old 8-decimal cap printed 0.00000000.
+    expect(mid.price.toFixed(model.priceDecimals)).not.toBe('0.00000000');
+    expect(mid.price.toFixed(model.priceDecimals)).toBe('0.000000101');
+  });
 });
 
 describe('buildLadder', () => {

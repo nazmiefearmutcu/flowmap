@@ -16,6 +16,11 @@
  * (freezing the list so a row can be read) and resuming snaps to the latest. Trades
  * arrive off the module-scoped {@link bookStore} at ~10 Hz, off the React
  * high-frequency path so the GL loop is untouched.
+ *
+ * On top of the rolling p90 display emphasis, a PERSISTED absolute threshold
+ * (settings.bigTradeUsd, via the `bigTradeUsd` prop) gives rows at or above the
+ * notional a static accent highlight plus an honest header chip (`3 big`); it is
+ * off at 0 (the default) and renders nothing then.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -50,6 +55,19 @@ export function largeThreshold(trades: readonly TapeTrade[]): number {
   return sizes[Math.min(idx, sizes.length - 1)];
 }
 
+/**
+ * The persisted big-trade rule (settings.bigTradeUsd): a trade qualifies when
+ * its notional `price × size` reaches `thresholdUsd`. Pure + strict:
+ *   - a threshold at or below 0 (or non-finite) is OFF — nothing is ever big;
+ *   - a NaN price or size is never big (no honest notional, no highlight);
+ *   - the boundary counts: exactly at the threshold IS big.
+ */
+export function isBigTrade(price: number, qty: number, thresholdUsd: number): boolean {
+  if (!(thresholdUsd > 0)) return false;
+  if (!Number.isFinite(price) || !Number.isFinite(qty)) return false;
+  return price * qty >= thresholdUsd;
+}
+
 export type TapeSide = 'buy' | 'sell' | 'unknown';
 
 export function sideClass(side: number): TapeSide {
@@ -75,7 +93,28 @@ function fmtTapeSize(v: number): string {
   return v.toFixed(2);
 }
 
-export function Tape(): JSX.Element {
+/**
+ * Stable React keys for the tape rows. A trade carries no sequence number, so
+ * the identity is its content (ts + price + size + side) plus an occurrence
+ * index for genuine duplicates. The index is assigned OLDEST-FIRST (right-to-
+ * left over the newest-first array) so prepending a newer trade never renumbers
+ * an older row's key — the old `${tsNs}-${i}` positional key remounted every
+ * visible row ~10 times a second (each append shifts every index by one).
+ */
+export function tapeKeys(trades: readonly TapeTrade[]): string[] {
+  const seen = new Map<string, number>();
+  const keys = new Array<string>(trades.length);
+  for (let i = trades.length - 1; i >= 0; i -= 1) {
+    const t = trades[i];
+    const base = `${t.tsNs}-${t.price}-${t.size}-${t.side}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    keys[i] = `${base}-${n}`;
+  }
+  return keys;
+}
+
+export function Tape({ bigTradeUsd = 0 }: { bigTradeUsd?: number }): JSX.Element {
   const capability = useFlowMapStore((s) => s.capability);
   const epochs = useFlowMapStore((s) => s.epochs);
   const gridEpoch = useFlowMapStore((s) => s.gridEpoch);
@@ -105,7 +144,14 @@ export function Tape(): JSX.Element {
   };
 
   const trades = snap.trades.slice(0, TAPE_MAX);
+  const keys = tapeKeys(trades);
   const threshold = largeThreshold(trades);
+  // Absolute notional highlight (settings.bigTradeUsd; 0 = off). Computed once
+  // per render so the header chip and the row classes always agree.
+  const bigActive = bigTradeUsd > 0;
+  const bigCount = bigActive
+    ? trades.reduce((n, t) => n + (isBigTrade(t.price, t.size, bigTradeUsd) ? 1 : 0), 0)
+    : 0;
   // Price precision from the active epoch's step when known.
   const params = epochs.get(snap.book?.epoch ?? gridEpoch ?? -1);
   const decimals = params ? priceDecimals(params.tick * params.tick_multiple) : 2;
@@ -132,6 +178,15 @@ export function Tape(): JSX.Element {
             HELD
           </span>
         )}
+        {bigActive && (
+          <span
+            className="panel__badge tape__big"
+            data-testid="tape-big"
+            title={`tape rows at or above $${bigTradeUsd.toLocaleString('en-US')} notional`}
+          >
+            {bigCount} big
+          </span>
+        )}
       </header>
       {!collapsed && (
         <div
@@ -147,15 +202,17 @@ export function Tape(): JSX.Element {
               {trades.map((t, i) => {
                 const side = sideClass(t.side);
                 const large = t.size >= threshold;
+                const big = isBigTrade(t.price, t.size, bigTradeUsd);
                 return (
                   <div
-                    key={`${t.tsNs}-${i}`}
-                    className={`tape__row tape__row--${side}${large ? ' is-large' : ''}`}
+                    key={keys[i]}
+                    className={`tape__row tape__row--${side}${large ? ' is-large' : ''}${big ? ' is-big' : ''}`}
                     data-testid="tape-row"
                     data-side={side}
                     data-price={t.price.toFixed(decimals)}
                     data-size={t.size.toFixed(4)}
                     data-large={large ? '1' : '0'}
+                    data-big={big ? '1' : '0'}
                   >
                     <span className="tape__time">{fmtTapeTime(t.tsNs)}</span>
                     <span className="tape__px">{t.price.toFixed(decimals)}</span>

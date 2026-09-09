@@ -147,6 +147,13 @@ export function attachGestures(canvas: HTMLCanvasElement, ctrl: CameraController
 
   const onPointerMove = (e: PointerEvent): void => {
     if (!dragging || e.pointerId !== pointerId) return;
+    // A lost pointer (the pointerup landed outside / capture was broken) keeps
+    // delivering moves with NO button held — end the drag instead of panning
+    // forever under a pointer the user already released.
+    if (e.buttons === 0) {
+      endDrag(e);
+      return;
+    }
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
     lastX = e.clientX;
@@ -191,6 +198,11 @@ export function attachGestures(canvas: HTMLCanvasElement, ctrl: CameraController
   };
 
   const onKeyDown = (e: KeyboardEvent): void => {
+    // Chords belong to the browser / the app-level router (Ctrl+R reload,
+    // Ctrl+F find, Ctrl+P print, ⌘K search — see input/keys.ts). The canvas owns
+    // only BARE keys, so a modified keydown here is always somebody else's:
+    // fall through without consuming it.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     switch (e.key) {
       case 'ArrowLeft':
         ctrl.panTimeSteps(-1);

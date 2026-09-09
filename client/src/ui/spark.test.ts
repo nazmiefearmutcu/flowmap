@@ -18,6 +18,13 @@ describe('sparkPath', () => {
     const ys = d.match(/[ML][\d.]+ ([\d.]+)/g)!.map((s) => Number(s.split(' ')[1]));
     expect(ys[0]).toBeGreaterThan(ys[1]);
   });
+  it('skips non-finite points instead of emitting "LNaN"', () => {
+    const d = sparkPath([1, Number.NaN, 3], 100, 100, 0);
+    expect(d).not.toContain('NaN');
+    expect(d).not.toContain('Infinity');
+    // The two finite points still draw: one M (resume) + one L.
+    expect((d.match(/L/g) ?? []).length).toBe(1);
+  });
 });
 
 describe('sparkDirection', () => {
@@ -40,5 +47,11 @@ describe('fmtPct / fmtPrice', () => {
     expect(fmtPrice(210.5)).toBe('210.50');
     expect(fmtPrice(0.1234)).toBe('0.1234');
     expect(fmtPrice(null)).toBe('—');
+  });
+  it('formats subnormal prices fixed-point, never exponential ("1.2e-9")', () => {
+    // toPrecision(3) printed "1.2e-9" — exponential is not a readable price.
+    expect(fmtPrice(1.2e-9)).toBe('0.00000000120');
+    expect(fmtPrice(0.009)).toBe('0.00900');
+    expect(fmtPrice(0)).toBe('0.00');
   });
 });

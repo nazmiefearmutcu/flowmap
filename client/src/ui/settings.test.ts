@@ -87,6 +87,16 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({ bubbleMinSize: -5 }).bubbleMinSize).toBe(0);
   });
 
+  it('coerces the big-trade USD threshold (default off; 0..1e9; junk → default)', () => {
+    expect(DEFAULT_SETTINGS.bigTradeUsd).toBe(0);
+    expect(normalizeSettings({}).bigTradeUsd).toBe(0); // pre-upgrade payload adopts the default
+    expect(normalizeSettings({ bigTradeUsd: 25_000 }).bigTradeUsd).toBe(25_000);
+    expect(normalizeSettings({ bigTradeUsd: -1 }).bigTradeUsd).toBe(0);
+    expect(normalizeSettings({ bigTradeUsd: 5e9 }).bigTradeUsd).toBe(1e9);
+    expect(normalizeSettings({ bigTradeUsd: 'lots' }).bigTradeUsd).toBe(0);
+    expect(normalizeSettings({ bigTradeUsd: Number.NaN }).bigTradeUsd).toBe(0);
+  });
+
   it('ignores an invalid colormap and non-boolean toggles', () => {
     const n = normalizeSettings({ colormap: 'rainbow', follow: 'yes', railVisible: 0 });
     expect(n.colormap).toBe(DEFAULT_SETTINGS.colormap);

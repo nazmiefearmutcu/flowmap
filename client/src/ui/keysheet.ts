@@ -11,6 +11,7 @@ export type KeysheetEntry = Readonly<{ keys: string; action: string }>;
 export const KEYSHEET: readonly KeysheetEntry[] = [
   { keys: 'Space', action: 'follow live edge · play/pause in replay' },
   { keys: '/', 'action': '⌘K / Ctrl-K — symbol search' },
+  { keys: 'E', action: 'export the chart as a PNG download' },
   { keys: '?', action: 'toggle this shortcuts overlay' },
   { keys: '← → ↑ ↓', action: 'pan time / price (chart focused)' },
   { keys: '+ / −', action: 'zoom time (chart focused)' },

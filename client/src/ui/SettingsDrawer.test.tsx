@@ -133,6 +133,48 @@ describe('SettingsDrawer restore defaults', () => {
   });
 });
 
+describe('SettingsDrawer big-trade threshold', () => {
+  /** React-native value assignment (bypasses the tracked value setter). */
+  function typeNumber(input: HTMLInputElement, value: string): void {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      'value',
+    )!.set!;
+    act(() => {
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+
+  it('announces itself and emits a clamped bigTradeUsd patch on change', () => {
+    const patches: Array<Partial<FlowMapSettings>> = [];
+    const { container } = render(
+      <SettingsDrawer settings={settings({ bigTradeUsd: 0 })} onChange={(p) => patches.push(p)} onClose={() => {}} />,
+    );
+    const num = container.querySelector('[data-testid="setting-bigTradeUsd"]') as HTMLInputElement;
+    expect(num).not.toBeNull();
+    expect(num.getAttribute('aria-label')).toBe('Big trade size (USD, 0 = off)');
+
+    typeNumber(num, '25000');
+    expect(patches).toEqual([{ bigTradeUsd: 25000 }]);
+
+    // Junk / empty clears to 0 — the documented OFF value, never NaN.
+    typeNumber(num, '');
+    expect(patches[1]).toEqual({ bigTradeUsd: 0 });
+  });
+
+  it('labels the value "off" at 0 and shows the notional once set (with the hint)', () => {
+    const off = render(<SettingsDrawer settings={settings({ bigTradeUsd: 0 })} onChange={() => {}} onClose={() => {}} />);
+    const offInput = off.container.querySelector('[data-testid="setting-bigTradeUsd"]')!;
+    expect(offInput.parentElement!.textContent).toContain('off');
+    expect(offInput.parentElement!.textContent).toContain('Highlights tape rows');
+
+    const on = render(<SettingsDrawer settings={settings({ bigTradeUsd: 50000 })} onChange={() => {}} onClose={() => {}} />);
+    const onInput = on.container.querySelector('[data-testid="setting-bigTradeUsd"]')!;
+    expect(onInput.parentElement!.textContent).toContain('≥ $50,000');
+  });
+});
+
 describe('SettingsDrawer sections', () => {
   it('labels the drawer sections', () => {
     const { container } = render(

@@ -10,6 +10,9 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { isHelpToggle, KEYSHEET } from './keysheet';
+import { resetOverlays } from './overlayStack';
+import { SettingsDrawer } from './SettingsDrawer';
+import { DEFAULT_SETTINGS } from './settings';
 import { ShortcutsOverlay } from './ShortcutsOverlay';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -22,6 +25,7 @@ afterEach(() => {
     act(() => root.unmount());
     container.remove();
   }
+  resetOverlays();
 });
 
 function render(): { container: HTMLElement; onClose: () => void } {
@@ -76,6 +80,44 @@ describe('ShortcutsOverlay', () => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("`?` closes it — the toggle works in BOTH directions (the footer says '? toggle')", () => {
+    const { onClose } = render();
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // A chorded keystroke is never the help toggle.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', ctrlKey: true }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('Escape closes ONLY the overlay when it sits above the settings drawer', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const drawerClose = vi.fn();
+    let root!: Root;
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        <SettingsDrawer
+          settings={DEFAULT_SETTINGS}
+          onChange={() => {}}
+          onClose={drawerClose}
+        />,
+      );
+    });
+    mounted.push({ container, root });
+
+    const { onClose } = render(); // opened AFTER the drawer → topmost
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(drawerClose).not.toHaveBeenCalled();
   });
 
   it('traps Tab inside the dialog', () => {

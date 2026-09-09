@@ -331,6 +331,41 @@ body,
   background: var(--accent-dim);
 }
 
+/* PNG export button icon — filled with currentColor like the wordmark, so it
+   follows the button's hover / on states without extra rules. */
+.tbtn__icon {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* Refused-export note (snapshot null — lost GL context): the same calm amber
+   channel as the replay-unavailable chip, dismissible inline, never a toast. */
+.export-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 4px;
+  padding: 2px 4px 2px 7px;
+  white-space: nowrap;
+}
+.export-note__close {
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  line-height: 1;
+  color: var(--warn);
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.export-note__close:hover {
+  color: var(--text);
+}
+
 /* ============================================================================
    SYMBOL SEARCH
    ========================================================================= */
@@ -820,6 +855,19 @@ body,
   letter-spacing: 0.02em;
 }
 
+/* Terminal no-feed refusal (server closed with 1003 — no feed exists for this
+   market at all): the closed banner's shape, but NEUTRAL. Amber says "wait for
+   the next open"; a dead market has nothing to wait for, so the dot is dim
+   slate without the glow and the label steps down from the warn channel. */
+.closed-banner--nofeed {
+  color: var(--text-2);
+  border-color: var(--line-2);
+}
+.closed-banner--nofeed .closed-banner__dot {
+  background: var(--text-3);
+  box-shadow: none;
+}
+
 /* --- in-chart live / follow affordance (§9) — bottom-centre popup --- */
 .livectl {
   position: absolute;
@@ -1259,6 +1307,24 @@ body,
   background: rgba(211, 82, 79, 0.12);
 }
 
+/* Persisted big-trade threshold (settings.bigTradeUsd): a static accent bar in
+   the left gutter (inset shadow — no layout shift) plus weight on an already
+   AA pairing; the side colours of the row text are untouched. One calm
+   transition, no animation — the print itself is the event. */
+.tape__row.is-big {
+  font-weight: 700;
+  box-shadow: inset 2px 0 0 var(--accent);
+  transition: background var(--t-fast);
+}
+
+/* Header chip counting the rows above the threshold ("3 big"). Accent = the
+   buy/live channel, matching the L2 depth badge it sits beside. */
+.tape__big {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ============================================================================
    TIMELINE MINIMAP + REPLAY TRANSPORT (bottom strip)
    ========================================================================= */
@@ -1593,6 +1659,24 @@ body,
   font-size: var(--fs-2xs);
   color: var(--text-3);
   letter-spacing: 0.02em;
+}
+
+/* Free-form numeric setting (big-trade USD threshold): same well the ranges sit
+   in, wide enough for a 7-digit notional. */
+.setting__num {
+  width: 110px;
+  padding: 3px 7px;
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  outline: none;
+  transition: border-color var(--t-fast);
+}
+.setting__num:focus-visible {
+  border-color: var(--accent-line);
 }
 
 /* segmented radio group */
@@ -2096,6 +2180,31 @@ body,
   50% {
     opacity: 0.25;
   }
+}
+
+/* "retry now" — the only interactive thing on an otherwise pointer-events:none
+   banner, so it re-enables the pointer itself. Amber-on-scrim like the banner
+   text; hover lifts to the label colour for a readable AA state. */
+.reconnect-banner__retry {
+  pointer-events: auto;
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.05em;
+  color: var(--warn);
+  background: none;
+  border: 1px solid var(--warn-line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.reconnect-banner__retry:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+}
+.reconnect-banner__retry:focus-visible {
+  outline: 1px solid var(--warn);
+  outline-offset: 1px;
 }
 
 /* --- `?` shortcuts overlay: a small centred dialog reusing the drawer's

@@ -12,6 +12,7 @@
 import { useEffect, useRef } from 'react';
 
 import type { OverlayVisibility } from '../gl/overlays/frame';
+import { isTopOverlay, pushOverlay } from './overlayStack';
 import { OverlayToggles } from './OverlayToggles';
 import { KEYSHEET } from './keysheet';
 import {
@@ -64,16 +65,22 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
   const asideRef = useRef<HTMLElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
-  // Esc closes the drawer.
+  // Esc closes the drawer — but only when the drawer is the TOPMOST open
+  // overlay. If the `?` shortcuts overlay sits above it, that overlay's own
+  // Escape handler owns the keystroke; `stopPropagation` cannot express this
+  // between two listeners on the same window target (see ui/overlayStack.ts).
   useEffect(() => {
+    const off = pushOverlay('settings');
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
+      if (e.key === 'Escape' && isTopOverlay('settings')) {
         onClose();
       }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      off();
+    };
   }, [onClose]);
 
   // Modal focus management: capture the opener, move focus inside on open, and
@@ -291,6 +298,39 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               data-testid="setting-bubble"
               onChange={(e) => onChange({ bubbleMinSize: Number(e.target.value) })}
             />
+          </div>
+
+          {/* big-trade tape highlight — absolute USD notional, 0 = off */}
+          <div className="setting">
+            <span className="setting__label">
+              Big trade size
+              <span className="setting__value">
+                {settings.bigTradeUsd > 0
+                  ? `≥ $${Math.round(settings.bigTradeUsd).toLocaleString('en-US')}`
+                  : 'off'}
+              </span>
+            </span>
+            <input
+              type="number"
+              className="setting__num"
+              min={0}
+              step={1000}
+              value={settings.bigTradeUsd}
+              aria-label="Big trade size (USD, 0 = off)"
+              data-testid="setting-bigTradeUsd"
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                // Same ceiling normalizeSettings applies on load, so the live
+                // value and the next load agree.
+                onChange({
+                  bigTradeUsd: Number.isFinite(n) && n > 0 ? Math.min(n, 1e9) : 0,
+                });
+              }}
+            />
+            <span className="setting__hint">
+              Highlights tape rows at or above this notional (price × size, USD). 0 turns the
+              highlight off.
+            </span>
           </div>
 
           <span className="drawer__section" data-testid="section-view">

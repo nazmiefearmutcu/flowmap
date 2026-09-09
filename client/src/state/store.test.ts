@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { SocketLike } from '../net/connection';
+import type { ConnectionOptions, SocketLike } from '../net/connection';
 import type { StreamMsg } from '../net/connection';
 import { decodeFrame } from '../proto/decode';
 import { MsgType, type Msg } from '../proto/types';
@@ -77,7 +77,7 @@ class FakeWebSocket implements SocketLike {
 
 let sockets: FakeWebSocket[] = [];
 
-function installFakeTransport(): void {
+function installFakeTransport(extra: Partial<ConnectionOptions> = {}): void {
   sockets = [];
   setFlowMapTransport({
     url: 'wss://test.invalid/ws',
@@ -86,6 +86,7 @@ function installFakeTransport(): void {
       sockets.push(s);
       return s;
     },
+    ...extra,
   });
 }
 
@@ -464,5 +465,170 @@ describe('FlowMap store — replay refusal fallback (close 1003)', () => {
     store.setState({ replayUnavailable: true });
     store.getState().connectAndSubscribe('crypto', 'ETHUSDT', 'live');
     expect(store.getState().replayUnavailable).toBe(false);
+  });
+});
+
+// Timers are pinned no-ops for the close/retry tests below so an armed backoff
+// tick can never fire mid-test and open a surprise socket.
+const NO_TIMERS = { setTimeout: () => 0, clearTimeout: () => undefined };
+
+function deliverStatus(sock: FakeWebSocket, feed_state: string): void {
+  sock.deliver(
+    coldFrameBytes(MsgType.STATUS, {
+      feed_state: feed_state,
+      capability: {},
+      latency_ms: 0.0,
+      clock_skew_ms: 0.0,
+      next_open_ts: null,
+    }),
+  );
+}
+
+// Server contract (server ws.py `_refuse`): a refusing subscribe gets a Status
+// naming feed_state on the SAME socket, immediately before the close frame.
+// 'closed' = NO feed for this market (terminal); 'degraded' = no replayable
+// recording (recoverable by the live fallback).
+describe('FlowMap store — server-refusal truthfulness (Status + 1003)', () => {
+  it('Status(closed) + 1003 → terminal noFeed state; the subscribe is NOT re-sent', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('nosuchmarket', 'NOSUCH', 'replay');
+    const sock = sockets[0];
+    sock.open();
+    deliverStatus(sock, 'closed');
+    sock.drop(1003);
+
+    const s = store.getState();
+    expect(s.noFeed).toBe(true);
+    // Terminal, honest: NOT 'reconnecting' — nothing is coming back.
+    expect(s.status).toBe('closed');
+    // The dead subscription is left in place so the banner can name the market.
+    expect(s.subscription).toEqual({ market: 'nosuchmarket', symbol: 'NOSUCH', mode: 'replay', band: 'native' });
+    // No replacement socket was ever scheduled — the same subscribe would be
+    // refused forever.
+    expect(sockets).toHaveLength(1);
+  });
+
+  it('Status(degraded) + 1003 keeps the recoverable replay-unavailable fallback', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'replay');
+    const sock = sockets[0];
+    sock.open();
+    deliverStatus(sock, 'degraded');
+    sock.drop(1003);
+
+    const s = store.getState();
+    expect(s.noFeed).toBe(false);
+    expect(s.replayUnavailable).toBe(true);
+    expect(s.subscription?.mode).toBe('live');
+    // The live fallback rides its own socket and re-subscribes live.
+    const replacement = sockets[1];
+    expect(replacement).not.toBe(sock);
+    replacement.open();
+    const sent = replacement.sent.map(sentMsg).find((m) => m.type === MsgType.SUBSCRIBE);
+    expect(sent).toBeDefined();
+    expect((sent as Extract<Msg, { type: MsgType.SUBSCRIBE }>).mode).toBe('live');
+  });
+
+  it('a different subscription clears the noFeed terminal state (a new stream is a new question)', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+    store.setState({ noFeed: true });
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'live');
+    expect(store.getState().noFeed).toBe(false);
+  });
+});
+
+describe('FlowMap store — reconnect banner inputs (close info + attempts + retryNow)', () => {
+  it('records how the socket closed and the 1-based attempt; Hello clears both', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    expect(store.getState().lastClose).toBeNull();
+    expect(store.getState().reconnectAttempts).toBe(0);
+
+    sockets[0].drop(1001); // server said goodbye
+    const s = store.getState();
+    expect(s.lastClose).toEqual({ code: 1001, wasClean: true });
+    expect(s.reconnectAttempts).toBe(1);
+    expect(s.status).toBe('reconnecting');
+
+    // The banner's retry: exactly ONE replacement socket, and the armed tick
+    // can never double-track behind it (timers are no-ops here, so this IS the
+    // only way a socket can appear).
+    store.getState().retryNow();
+    expect(sockets).toHaveLength(2);
+    store.getState().retryNow();
+    expect(sockets).toHaveLength(2); // a second click with a live socket: no-op
+
+    sockets[1].open();
+    sockets[1].deliver(goldenU8('cold_hello'));
+    expect(store.getState().lastClose).toBeNull();
+    expect(store.getState().reconnectAttempts).toBe(0);
+    expect(store.getState().status).toBe('live');
+  });
+});
+
+describe('FlowMap store — replay state is the server’s (C: honest transport pill)', () => {
+  it('a reconnecting Hello re-asserts speed/paused instead of blind-resetting (R2 M-1: the parked session keeps its clock)', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('sim', 'SIM-DEMO', 'replay');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    store.getState().setSpeed(50);
+    store.getState().pause();
+    expect(store.getState().speed).toBe(50);
+    expect(store.getState().paused).toBe(true);
+
+    sockets[0].drop(1001);
+    store.getState().retryNow(); // the replacement socket the banner offers
+    sockets[1].open();
+    // A FAST reconnect reuses the parked ReplayFeed (GRACE_S=60): its clock is
+    // still 50× / paused. The Hello must NOT claim "1× playing" — the pill
+    // keeps the user's state, and the store re-asserts it server-side.
+    const sentBefore = sockets[1].sent.length;
+    sockets[1].deliver(goldenU8('cold_hello'));
+    expect(store.getState().speed).toBe(50);
+    expect(store.getState().paused).toBe(true);
+    const types = sockets[1].sent.slice(sentBefore).map((b) => sentMsg(b).type);
+    expect(types).toEqual([MsgType.SET_SPEED, MsgType.PAUSE]);
+    const reSpeed = sentMsg(sockets[1].sent[sockets[1].sent.length - 2]);
+    expect((reSpeed as Extract<Msg, { type: MsgType.SET_SPEED }>).x).toBe(50);
+  });
+
+  it('control sends while disconnected never claim applied (reflect-on-send)', () => {
+    installFakeTransport(NO_TIMERS);
+    const store = useFlowMapStore;
+
+    store.getState().connectAndSubscribe('sim', 'SIM-DEMO', 'replay');
+    sockets[0].open();
+    sockets[0].deliver(goldenU8('cold_hello'));
+    store.getState().setSpeed(5);
+    store.getState().pause();
+    expect(store.getState().speed).toBe(5);
+    expect(store.getState().paused).toBe(true);
+
+    // Socket down: the Connection silently drops control frames, so the UI must
+    // NOT show 50× / playing as if the server had received them.
+    sockets[0].drop(1001);
+    store.getState().setSpeed(50);
+    store.getState().resume();
+    expect(store.getState().speed).toBe(5);
+    expect(store.getState().paused).toBe(true);
+
+    // Back online: sends apply again.
+    store.getState().retryNow();
+    sockets[1].open();
+    sockets[1].deliver(goldenU8('cold_hello'));
+    store.getState().setSpeed(7);
+    expect(store.getState().speed).toBe(7);
   });
 });

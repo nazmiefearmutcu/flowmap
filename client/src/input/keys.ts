@@ -1,9 +1,10 @@
 /**
  * Global (app-level) keyboard routing (§9, T12).
  *
- * Two app-wide shortcuts that live ABOVE the canvas gestures:
+ * Three app-wide shortcuts that live ABOVE the canvas gestures:
  *   - `Space` → play/pause in replay mode, toggle follow in live mode.
  *   - `/`     → focus the symbol search.
+ *   - `E`     → export the chart as a PNG download (ui/exportPng).
  *
  * The canvas keeps its own keys (arrows / +- / F / R — see input/gestures) when it
  * is focused; those are NOT re-handled here, so there is no double-handling. The
@@ -11,7 +12,10 @@
  * and a small target classification, so it is unit-tested without a DOM.
  */
 
-export type GlobalKeyAction = { type: 'space' } | { type: 'focus-search' };
+export type GlobalKeyAction =
+  | { type: 'space' }
+  | { type: 'focus-search' }
+  | { type: 'export-png' };
 
 /** How the event target is classified for routing (computed from the DOM by the caller). */
 export interface KeyTargetContext {
@@ -49,6 +53,15 @@ export function routeGlobalKey(
     if (ctx.button) return null; // let a focused button take its own Space
     return { type: 'space' };
   }
+  // `E` exports the chart as a PNG download. `e` carries no native control
+  // semantics (unlike Space on a button), so it is safe to take everywhere the
+  // bare shortcuts reach — including a focused chart canvas (gestures.ts only
+  // owns arrows / +- / F / P / R and leaves every other bare key to bubble).
+  // Chords stay with the browser: Ctrl+E / ⌘E keep their engine semantics,
+  // matching gestures.ts's modifier guard on the canvas side.
+  if ((key === 'e' || key === 'E') && !mods.meta && !mods.ctrl) {
+    return { type: 'export-png' };
+  }
   return null;
 }
 
@@ -73,6 +86,8 @@ export function classifyTarget(target: EventTarget | null): KeyTargetContext {
 export interface GlobalKeyHandlers {
   onSpace: () => void;
   onFocusSearch: () => void;
+  /** `E` — export the chart canvas as a PNG download. */
+  onExportPng: () => void;
 }
 
 /**
@@ -93,6 +108,7 @@ export function attachGlobalKeys(
     if (!action) return;
     e.preventDefault();
     if (action.type === 'space') handlers.onSpace();
+    else if (action.type === 'export-png') handlers.onExportPng();
     else handlers.onFocusSearch();
   };
   target.addEventListener('keydown', onKeyDown);

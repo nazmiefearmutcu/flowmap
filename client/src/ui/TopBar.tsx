@@ -1,8 +1,8 @@
 /**
  * Top bar (§9, T12) — one tidy row: brand, dual-market symbol search, a
  * venue/market indicator, honest capability badges, the live/replay toggle, a
- * clock (wall time + the stream's latest ts), the connection status, and the
- * rail + settings controls.
+ * clock (wall time + the stream's latest ts), the connection status, the PNG
+ * export button, and the rail + settings controls.
  *
  * Everything here is low-frequency: the store slices it reads (status / capability
  * / subscription / paused) update at human rate, the wall clock ticks at 1 Hz, and
@@ -56,12 +56,27 @@ interface TopBarProps {
   railVisible: boolean;
   onToggleRail: () => void;
   onOpenSettings: () => void;
+  /** Export the chart canvas as a PNG download (renderer snapshot; `E` shares it). */
+  onExportPng: () => void;
+  /** Non-null when the last export attempt was refused (lost GL context). */
+  exportNotice: string | null;
+  onDismissExportNotice: () => void;
   /** Formatted latest-stream timestamp from the App's timeline poll (or null). */
   streamClock: string | null;
 }
 
 export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBar(
-  { onSelectSymbol, onSetMode, railVisible, onToggleRail, onOpenSettings, streamClock },
+  {
+    onSelectSymbol,
+    onSetMode,
+    railVisible,
+    onToggleRail,
+    onOpenSettings,
+    onExportPng,
+    exportNotice,
+    onDismissExportNotice,
+    streamClock,
+  },
   searchRef,
 ) {
   const status = useFlowMapStore((s) => s.status);
@@ -205,6 +220,49 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
           {streamClock ? `T ${streamClock}${streamZone}` : '—'}
         </span>
       </span>
+
+      {/* A refused export (renderer snapshot null — lost GL context) says so
+          plainly and stays dismissible; it never fakes a success. */}
+      {exportNotice && (
+        <span className="export-note" data-testid="export-notice" role="status">
+          {exportNotice}
+          <button
+            type="button"
+            className="export-note__close"
+            onClick={onDismissExportNotice}
+            aria-label="dismiss export notice"
+            data-testid="export-notice-close"
+          >
+            ✕
+          </button>
+        </span>
+      )}
+
+      <button
+        type="button"
+        className="tbtn"
+        onClick={onExportPng}
+        data-testid="export-png"
+        aria-label="Export PNG"
+        title="export chart as PNG (E)"
+      >
+        <svg
+          className="tbtn__icon"
+          viewBox="0 0 16 16"
+          width="13"
+          height="13"
+          aria-hidden="true"
+          focusable="false"
+        >
+          {/* Camera body + lens, filled with currentColor like the wordmark. */}
+          <path
+            d="M5.6 2.5 4.8 4H2.6A1.6 1.6 0 0 0 1 5.6v6.3A1.6 1.6 0 0 0 2.6 13.5h10.8a1.6 1.6 0 0 0 1.6-1.6V5.6A1.6 1.6 0 0 0 13.4 4h-2.2l-.8-1.5a.9.9 0 0 0-.8-.5H6.4a.9.9 0 0 0-.8.5Zm2.4 8.2a2.9 2.9 0 1 1 0-5.8 2.9 2.9 0 0 1 0 5.8Zm0-1.4a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"
+            fill="currentColor"
+            fillRule="evenodd"
+          />
+        </svg>
+        PNG
+      </button>
 
       <button
         type="button"
