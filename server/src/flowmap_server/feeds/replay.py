@@ -131,13 +131,16 @@ class ReplayFeed:
     async def events(self) -> AsyncIterator[FeedEvent]:
         """Yield the recorded session, paced. Restart contract: resumes from
         the current cursor; at end-of-recording the feed parks (a Seek
-        rewinds) instead of ending — a normal end would tear the session down."""
-        i = self._cursor
+        rewinds) instead of ending — a normal end would tear the session
+        down. The cursor is RE-READ every iteration, so a Seek issued while
+        the feed is running takes effect immediately: a mid-stream backward
+        seek jumps back at once instead of stalling and then continuing
+        forward from the old position."""
         while True:
+            i = self._cursor
             if i >= len(self._cols):
                 await asyncio.sleep(_PARK_POLL_S)
-                i = self._cursor  # a Seek may have rewound us
-                continue
+                continue  # a Seek may have rewound us
             col = self._cols[i]
             if self._clock.now() < col.t0_ns:
                 # Not due yet (or paused before it): poll — a Pause/Seek may
@@ -153,8 +156,11 @@ class ReplayFeed:
             for ev in self._by_t0.get(col.t0_ns, ()):
                 yield ev
 
-            i += 1
-            self._cursor = i
+            # Advance only if no Seek landed while we were suspended at the
+            # yields above: control() owns the cursor then, and blindly
+            # writing i+1 would silently swallow a mid-stream seek.
+            if self._cursor == i:
+                self._cursor = i + 1
 
     def _snapshot(self, col, scale) -> BookState:
         """Synthesize the column's book snapshot: each nonzero density row is

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import numpy as np
 
@@ -190,13 +191,15 @@ async def test_live_session_records_columns_epochs_trades_with_cadence(
 ):
     monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 8)
     flush_sizes: list[int] = []
-    orig_flush = SessionRecorder.flush
+    orig_flush = SessionRecorder.flush_buffers
 
-    def counting_flush(self):
-        flush_sizes.append(len(self._columns))
-        return orig_flush(self)
+    def counting_flush(self, bufs):
+        # bufs = (columns, trades, markers, epochs) — the snapshot the
+        # cadence flush task hands to the writer thread.
+        flush_sizes.append(len(bufs[0]))
+        return orig_flush(self, bufs)
 
-    monkeypatch.setattr(SessionRecorder, "flush", counting_flush)
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", counting_flush)
 
     root = Recorder(tmp_path / "rec", 20.0)
     feed = CappedFeed(SimFeed(seed=42, dt_ns=DT, start_ns=0), 400)
@@ -213,11 +216,15 @@ async def test_live_session_records_columns_epochs_trades_with_cadence(
     ]
     assert len(finals) >= 16  # enough columns to cross the cadence twice
 
-    # Cadence flushes happened DURING the run (≥2 with ≥8 buffered columns),
-    # plus the feed-end flush from run()'s finally.
+    # Cadence flush happened DURING the run (≥8 buffered columns in one
+    # snapshot), plus the feed-end flush from run()'s finally. With the
+    # off-loop flush an unpaced feed can drain faster than its single
+    # in-flight flush — extra cadence ticks are then skipped by design and
+    # the rows ride the end flush; the round-trip below pins that nothing
+    # is lost or duplicated.
     cadence = [n for n in flush_sizes if n >= 8]
-    assert len(cadence) >= 2
-    assert len(flush_sizes) >= len(cadence) + 1
+    assert len(cadence) >= 1
+    assert len(flush_sizes) >= 2
 
     # Round-trip: everything broadcast is on disk (columns, epoch 0, trades).
     tail = root.load_tail(
@@ -274,8 +281,8 @@ async def test_flush_failure_disables_recording_but_session_continues(
     monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 4)
     monkeypatch.setattr(
         SessionRecorder,
-        "flush",
-        lambda self: (_ for _ in ()).throw(OSError("disk full")),
+        "flush_buffers",
+        lambda self, bufs: (_ for _ in ()).throw(OSError("disk full")),
     )
 
     root = Recorder(tmp_path / "rec", 20.0)
@@ -514,3 +521,126 @@ async def test_feed_marker_is_recorded(tmp_path):
     )
     assert tail is not None
     assert any(m.kind == "liquidation" and m.size == 3.0 for m in tail.markers)
+
+
+# ---------------------------------------------------------------------------
+# h. cadence flush + retention run off the event loop
+
+
+async def test_cadence_flush_runs_off_loop(tmp_path, monkeypatch):
+    """The cadence Parquet write must run in a thread: the synchronous write
+    stalled the event loop for the whole part write, every REC_FLUSH_COLS
+    columns, per session. While the write is in flight a concurrent
+    event-loop task keeps ticking."""
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 4)
+    orig = SessionRecorder.flush_buffers
+
+    def slow_flush(self, bufs):
+        time.sleep(0.3)  # blocking write stand-in
+        return orig(self, bufs)
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", slow_flush)
+
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "off-loop", feed=feed, grid=Grid(_cfg()), recorder=root, timer=FakeTimer()
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    spawner = asyncio.create_task(ticker())
+    try:
+        for i in range(6):  # 5 finalized columns -> crosses the cadence of 4
+            feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+        await _wait_for(
+            lambda: sess._flush_task is not None and not sess._flush_task.done()
+        )
+        ticks_before = ticks
+        await asyncio.sleep(0.2)  # inside the 0.3 s blocking-write window
+        assert ticks - ticks_before >= 10, "event loop stalled during the flush"
+    finally:
+        spawner.cancel()
+
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=10)
+
+
+async def test_rows_recorded_during_flush_land_in_next_flush(tmp_path, monkeypatch):
+    """Buffers are swapped out on the loop before the thread write: rows
+    recorded WHILE a flush is in flight stay buffered and land later —
+    nothing is lost or double-written by the off-loop flush."""
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 2)
+    orig = SessionRecorder.flush_buffers
+    calls = {"n": 0}
+
+    def slow_first_flush(self, bufs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            time.sleep(0.3)  # the first flush is still writing...
+        return orig(self, bufs)
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", slow_first_flush)
+
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "during-flush", feed=feed, grid=Grid(_cfg()), recorder=root, timer=FakeTimer()
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+
+    for i in range(4):  # 3 finalized columns -> the first cadence flush fires
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["n"] >= 1)
+    for i in range(4, 8):  # ...these are recorded while it is in flight
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=10)
+
+    tail = root.load_tail(
+        MARKET, SYMBOL, max_age_ns=10**18, now_ns=10**18, limit_cols=100
+    )
+    assert tail is not None
+    seqs = [c.col_seq for c in tail.columns]
+    # 8 books at t0 = 0..7*DT finalize columns 0..6; every one on disk once.
+    assert sorted(seqs) == list(range(7))
+
+
+async def test_retention_walks_serialize(tmp_path, monkeypatch):
+    """Every flushing session runs its own retention walk in a thread: two
+    overlapping rglob/stat/unlink passes over the shared root must never
+    happen (serialized inside Recorder.enforce_retention)."""
+    root = Recorder(tmp_path / "rec", 20.0)
+    _prerecord_tail(root, _cfg(), n_cols=3)  # something real for the walk
+
+    real = Recorder._enforce_retention_locked
+    state = {"cur": 0, "max": 0}
+
+    def slow(self):
+        state["cur"] += 1
+        state["max"] = max(state["max"], state["cur"])
+        try:
+            time.sleep(0.05)  # widen the race window
+            return real(self)
+        finally:
+            state["cur"] -= 1
+
+    # Patch the CRITICAL SECTION: the public method wraps it in the lock, so
+    # two concurrent walks must enter it one at a time.
+    monkeypatch.setattr(Recorder, "_enforce_retention_locked", slow)
+    await asyncio.gather(
+        asyncio.to_thread(root.enforce_retention),
+        asyncio.to_thread(root.enforce_retention),
+    )
+    assert state["max"] == 1

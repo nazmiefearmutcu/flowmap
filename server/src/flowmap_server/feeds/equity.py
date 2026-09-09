@@ -68,6 +68,7 @@ import contextlib
 import datetime
 import logging
 import math
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 import numpy as np
@@ -79,7 +80,7 @@ from crocodile.core.scheduler.calendar import MARKET_TZ, USMarketCalendar
 from crocodile.equity.depth.vap import reference_price as eq_reference_price
 
 from flowmap_server.config import Config
-from flowmap_server.feeds.base import BookState, FeedEvent
+from flowmap_server.feeds.base import BookState, BoundedFeedQueue, FeedEvent, ts_ns_sane
 from flowmap_server.proto.events import (
     BBO,
     SIDE_BUY,
@@ -115,6 +116,9 @@ PROFILE_PEAK_TARGET = 1000.0
 SYNTH_VENUE = "synthetic"
 # Live keyless bar refresh cadence (spec §7: Yahoo >=60 s/symbol).
 BAR_REFRESH_NS = 60 * 10**9
+# Total timeout for the poller's own aiohttp session (A2-5): a hung scrape must
+# cost one poll, not the feed loop.
+_HTTP_TIMEOUT_S = 10.0
 
 # Provider hard caps (single-symbol here, kept for parity with the reference).
 _ALPACA_CAP = 30
@@ -254,15 +258,39 @@ class _EquitySink:
     """
 
     def __init__(
-        self, emit: Callable[[FeedEvent], None], *, use_quote_rule: bool
+        self,
+        emit: Callable[[FeedEvent], None],
+        *,
+        use_quote_rule: bool,
+        now_ns: Callable[[], int] | None = None,
     ) -> None:
         self._emit = emit
         self._use_quote_rule = use_quote_rule
+        # Live-ingest timestamp sanity gate (A2-2): a provider clock in the
+        # wrong unit or wedged in the far future must not enter the ring or the
+        # recording. Injected for tests; production uses the wall clock.
+        self._now_ns = now_ns or time.time_ns
+        self.dropped_ts = 0
         self._last_px: float | None = None
         self._last_side = SIDE_BUY
         self._bbo: tuple[float, float] | None = None  # (bid_px, ask_px)
 
     async def put(self, record: object) -> None:
+        if isinstance(record, (EqTrade, EqQuote)):
+            ts = _rec_ts(record)
+            if not ts_ns_sane(ts, now_ns=self._now_ns()):
+                self.dropped_ts += 1
+                if self.dropped_ts == 1:
+                    # One warning for the first bad stamp (a provider clock
+                    # that slips back to sane must not be missed); the rest
+                    # only count.
+                    logger.warning(
+                        "equity feed: dropped sample with implausible ts_ns=%r "
+                        "(outside [2010, now+24h]); dropped_ts=%d",
+                        ts,
+                        self.dropped_ts,
+                    )
+                return
         if isinstance(record, EqTrade):
             # The merged record now carries a `side` field, but every US equity
             # provider fills it with Side.UNKNOWN — the consolidated tape does
@@ -377,7 +405,11 @@ class _GooglePricePoller:
             )
         session = self._session
         if session is None or getattr(session, "closed", True):
-            session = aiohttp.ClientSession()
+            # Total timeout (A2-5): the engine's default is aiohttp's 5-minute
+            # client default — one hung scrape must cost a poll, not the loop.
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_S)
+            )
             self._session = session
         self._provider.session = session  # type: ignore[attr-defined]
         recs = await self._provider._scrape_symbol(self._symbol)  # type: ignore[attr-defined]
@@ -483,11 +515,22 @@ class EquityFeed:
         return builder.book_state(last_ts, ref)
 
     def _select_warmup_bars(self, bars: Sequence[EqBar]) -> list[EqBar]:
-        """The most recent session's finite bars (grouped by ET date), sorted
-        by time. Restricting to one session keeps warmup timestamps ~1 m apart
-        so the grid never bridges an overnight/weekend gap into empty columns
-        (spec §7.1)."""
-        finite = sorted((b for b in bars if _bar_finite(b)), key=_bar_ts)
+        """The most recent session's finite, plausibly-stamped bars (grouped by
+        ET date), sorted by time. Restricting to one session keeps warmup
+        timestamps ~1 m apart so the grid never bridges an overnight/weekend
+        gap into empty columns (spec §7.1). Bars with implausible stamps
+        (non-positive, 1970-era — the ms/ns mixup signature — or absurdly
+        future) are dropped at this live-ingestion boundary, never re-gated
+        later from recordings."""
+        now = self._now_ns()
+        finite = sorted(
+            (
+                b
+                for b in bars
+                if _bar_finite(b) and ts_ns_sane(_bar_ts(b), now_ns=now)
+            ),
+            key=_bar_ts,
+        )
         if not finite:
             return []
         last_date = self._et_date(_bar_ts(finite[-1]))
@@ -679,7 +722,8 @@ class EquityFeed:
     # -- keyed (structured; lightly tested — no live keys on this machine) ------
 
     async def _keyed_events(self) -> AsyncIterator[FeedEvent]:
-        queue: asyncio.Queue[FeedEvent | _FeedEnd] = asyncio.Queue()
+        # Bounded fan-in (A2-3): same drop-oldest contract as the crypto bridge.
+        queue = BoundedFeedQueue()
         sink = _EquitySink(queue.put_nowait, use_quote_rule=(self._tier == "alpaca"))
         provider = self._make_provider(sink)
         runner = asyncio.create_task(
@@ -726,7 +770,7 @@ class EquityFeed:
 
     @staticmethod
     async def _drive_keyed(
-        provider: object, sink: _EquitySink, queue: asyncio.Queue[FeedEvent | _FeedEnd]
+        provider: object, sink: _EquitySink, queue: BoundedFeedQueue
     ) -> None:
         from crocodile.equity.client.collect import collect
 

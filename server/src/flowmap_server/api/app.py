@@ -13,7 +13,8 @@ or no disk IO inject their own manager.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -108,6 +109,20 @@ def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
     return feed_factory(cfg, realtime_sim=True)
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Shutdown flush (spec §7): up to REC_FLUSH_COLS buffered columns plus
+    trades per active session used to be lost on every sidecar kill. After
+    uvicorn stops serving (loop still running), every session's buffered
+    recording rows are flushed and awaited; failures inside the flush are
+    logged and contained, never propagated into shutdown."""
+    yield
+    manager = getattr(app.state, "manager", None)
+    flush_all = getattr(manager, "flush_all", None)
+    if flush_all is not None:
+        await flush_all()
+
+
 def create_app(
     cfg: Config,
     manager: SessionManager | None = None,
@@ -137,7 +152,14 @@ def create_app(
         market_cache = MarketDataCache(
             quote_fn=default_quote_fn, movers_fn=default_movers_fn
         )
-    app = FastAPI(title="flowmap-server", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(
+        title="flowmap-server",
+        version=__version__,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=_lifespan,
+    )
     app.state.cfg = cfg
     app.state.manager = manager
     app.state.market_cache = market_cache

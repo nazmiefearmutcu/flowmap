@@ -288,14 +288,19 @@ def test_a_ccxt_venue_with_a_segment_still_gets_no_segment_kwarg() -> None:
 # --- _BridgeSink: snapshot_driven ----------------------------------------------
 
 
+# Plausible ns anchor for the ordinal test stamps (ts is a small ordinal):
+# the sink now gates implausible (1970-era) stamps at ingestion.
+_VENUE_BASE_NS = 1_700_000_000_000_000_000
+
+
 def _snapshot(seq: int, *, ts: int, top_bid: float = 100.0) -> BookSnapshot:
     return BookSnapshot(
         source="test",
         symbol="test:BTCUSDT",
         symbol_raw="BTCUSDT",
         asset_class=AssetClass.CRYPTO,
-        source_ts=ts,
-        local_ts=ts + 1,
+        source_ts=_VENUE_BASE_NS + ts,
+        local_ts=_VENUE_BASE_NS + ts + 1,
         bids=[(top_bid, 1.0), (top_bid - 1.0, 2.0)],
         asks=[(top_bid + 0.1, 1.0), (top_bid + 1.1, 2.0)],
         depth=4,
@@ -309,8 +314,8 @@ def _delta(seq: int, *, ts: int) -> BookDelta:
         symbol="test:BTCUSDT",
         symbol_raw="BTCUSDT",
         asset_class=AssetClass.CRYPTO,
-        source_ts=ts,
-        local_ts=ts + 1,
+        source_ts=_VENUE_BASE_NS + ts,
+        local_ts=_VENUE_BASE_NS + ts + 1,
         bids=[(99.0, 5.0)],
         asks=[],
         seq_id=seq,
@@ -336,7 +341,10 @@ async def test_delta_venue_resnapshot_emits_the_gap_marker() -> None:
     )
     gaps = [e for e in out if isinstance(e, Marker) and e.kind == "gap"]
     assert len(gaps) == 2  # the FIRST snapshot only initializes; the next two resync
-    assert [g.ts_ns for g in gaps] == [20, 30]
+    assert [g.ts_ns for g in gaps] == [
+        _VENUE_BASE_NS + 20,
+        _VENUE_BASE_NS + 30,
+    ]
     assert "seq=2" in gaps[0].text and "resync" in gaps[0].text
     # Each gap is emitted BEFORE the replacing BookState, never after.
     kinds = [type(e).__name__ for e in out]

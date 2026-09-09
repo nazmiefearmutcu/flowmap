@@ -1,5 +1,5 @@
 """REST routes (M1 T8; equity capability M3 T2; universe GOAL 2): health +
-symbol directory (spec §5).
+symbol directory (spec §5) + on-disk recording inventory.
 
 Handlers are pure in-memory lookups — network calls are FORBIDDEN here. The
 directory is now the FULL bundled universe (``data/universe.py``): the sim
@@ -111,6 +111,22 @@ async def health(request: Request) -> dict[str, object]:
         "active_sessions": len(feeds),
         "feeds": feeds,
     }
+
+
+@router.get("/recordings")
+def recordings(request: Request) -> dict[str, list[dict[str, object]]]:
+    """Read-only inventory of on-disk recordings — one row per (market,
+    symbol) with its relative path, total size, part count, and the
+    first/last recorded timestamps (hour resolution, from the filename
+    metadata the recorder already maintains; no Parquet file is opened).
+
+    Sync handler ON PURPOSE: FastAPI serves it from the worker threadpool,
+    so walking a large recordings tree never blocks the event loop. The
+    server is loopback-only and the surface is read-only listing."""
+    manager = getattr(request.app.state, "manager", None)
+    recorder = getattr(manager, "_recorder", None)
+    rows = recorder.inventory() if recorder is not None else []
+    return {"recordings": rows}
 
 
 @router.get("/symbols")

@@ -310,8 +310,13 @@ async def resolve_symbol(market: str, symbol: str) -> str:
             }
         )
         try:
-            markets = await ex.load_markets()
-            unified = CCXTConnector._resolve_symbol(symbol, markets, ex.markets_by_id)
+            # Bounded like the listing path: a hung venue must delay a
+            # subscribe by seconds, not by ccxt's per-request defaults stacked
+            # across pages. Timing out resolves to the input spelling (the
+            # connector's own error beats a guess), same as any failure here.
+            async with asyncio.timeout(LIST_TIMEOUT_S):
+                markets = await ex.load_markets()
+                unified = CCXTConnector._resolve_symbol(symbol, markets, ex.markets_by_id)
             if unified is None:
                 return symbol
             if not native:

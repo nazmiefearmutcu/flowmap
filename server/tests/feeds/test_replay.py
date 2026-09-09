@@ -108,3 +108,42 @@ async def test_end_of_recording_parks_instead_of_ending(tmp_path):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(gen.__anext__(), 0.4)
     await gen.aclose()
+
+
+async def _next_book(gen):
+    while True:
+        ev = await asyncio.wait_for(gen.__anext__(), 5)
+        if ev.__class__.__name__ == "BookState":
+            return ev
+
+
+async def test_mid_stream_backward_seek_replays_from_target(tmp_path):
+    """A Seek issued WHILE streaming rewinds immediately. The old control
+    loop read the cursor once at generator start: a mid-stream rewind
+    stalled while the wall clock caught up with the seeked-back target,
+    then kept playing FORWARD from the old position — the seeked-back
+    columns never replayed."""
+    feed = _make_feed(tmp_path, n_cols=12, speed=1e6)
+    gen = feed.events()
+    books = [await _next_book(gen) for _ in range(5)]
+    assert [b.ts_ns for b in books] == [i * DT_NS for i in range(5)]
+
+    feed.control(events.Seek(t=2 * DT_NS))
+    ev = await _next_book(gen)
+    assert ev.ts_ns == 2 * DT_NS, "backward seek mid-stream must replay from the target"
+    await gen.aclose()
+
+
+async def test_mid_stream_forward_seek_skips_ahead(tmp_path):
+    """Same cursor re-read contract, forward direction: columns between the
+    old position and the seek target are skipped, not streamed first."""
+    feed = _make_feed(tmp_path, n_cols=12, speed=1e6)
+    gen = feed.events()
+    first = await _next_book(gen)
+    second = await _next_book(gen)
+    assert [first.ts_ns, second.ts_ns] == [0, DT_NS]
+
+    feed.control(events.Seek(t=8 * DT_NS))
+    ev = await _next_book(gen)
+    assert ev.ts_ns == 8 * DT_NS
+    await gen.aclose()

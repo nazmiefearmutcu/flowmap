@@ -58,6 +58,13 @@ class Config(msgspec.Struct, frozen=True):
     # binding constraint on how far out the wide/full price bands can ever show
     # resting size.
     book_top_n: int = 20_000
+    # Crypto grid tick override (0 = auto). The default crypto grid tick is the
+    # sim-shaped 0.5, which a re-anchor scales via tick_multiple — correct for
+    # majors, but a sub-cent coin collapses into 1-2 rows. A feed that knows
+    # its venue tick may declare ``preferred_tick``; this env knob
+    # (FLOWMAP_CRYPTO_TICK) overrides both for the whole server when neither
+    # path can answer.
+    crypto_tick: float = 0.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -74,6 +81,14 @@ class Config(msgspec.Struct, frozen=True):
         if not (alpaca_key and alpaca_secret):
             alpaca_key = None
             alpaca_secret = None
+
+        # 0 = auto (feed-declared preferred_tick, else the sim-shaped fallback).
+        crypto_tick = float(env.get("FLOWMAP_CRYPTO_TICK", "0.0"))
+        if not (crypto_tick >= 0.0) or crypto_tick == float("inf"):
+            raise ValueError(
+                f"FLOWMAP_CRYPTO_TICK must be a finite tick size >= 0 "
+                f"(0 = auto); got {env.get('FLOWMAP_CRYPTO_TICK')!r}"
+            )
 
         return cls(
             host=host,
@@ -99,6 +114,7 @@ class Config(msgspec.Struct, frozen=True):
             alpaca_key=alpaca_key,
             alpaca_secret=alpaca_secret,
             book_top_n=max(1, int(env.get("FLOWMAP_BOOK_TOP_N", "20000"))),
+            crypto_tick=crypto_tick,
             finnhub_key=env.get("FINNHUB_API_KEY"),
             backfill_enabled=env.get("FLOWMAP_BACKFILL_ENABLED", "1")
             not in ("0", "false", "False"),

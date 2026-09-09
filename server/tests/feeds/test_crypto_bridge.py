@@ -318,7 +318,9 @@ async def test_bookstate_top_n_cap_and_order() -> None:
             symbol_raw="BTCUSDT",
             asset_class=AssetClass.CRYPTO,
             source_ts=None,
-            local_ts=123,
+            # Plausible ns stamp: the sink now gates implausible (1970-era)
+            # stamps at ingestion, so the receive-clock fallback must be sane.
+            local_ts=1_700_000_000_000_000_000,
             bids=[(50000.0 - 0.1 * i, 1.0) for i in range(n)],
             asks=[(50000.1 + 0.1 * i, 1.0) for i in range(n)],
             depth=2 * n,
@@ -327,7 +329,7 @@ async def test_bookstate_top_n_cap_and_order() -> None:
     )
     (book,) = out
     assert isinstance(book, BookState)
-    assert book.ts_ns == 123  # source_ts None -> local_ts
+    assert book.ts_ns == 1_700_000_000_000_000_000  # source_ts None -> local_ts
     assert len(book.bid_px) == BOOK_TOP_N
     assert len(book.ask_px) == BOOK_TOP_N
     # best-first: bids descending from best bid, asks ascending from best ask

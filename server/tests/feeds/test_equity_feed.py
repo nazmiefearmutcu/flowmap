@@ -569,13 +569,16 @@ def test_symbol_uppercased():
 
 
 def _stk_trade(ts: int, price: float) -> StkTrade:
+    # Anchored on a plausible 2023 UTC-ns stamp: the keyed sink now gates live
+    # records with implausible (e.g. 1970-era) stamps at ingestion, and the old
+    # 1 ns-ordinal stamps would be dropped before the rule under test.
     return StkTrade(
         source="finnhub",
         symbol="AAPL",
         symbol_raw="AAPL",
         asset_class=AssetClass.EQUITY,
-        local_ts=ts,
-        source_ts=ts,
+        local_ts=_EQ_VENUE_NS + ts,
+        source_ts=_EQ_VENUE_NS + ts,
         id="",
         price=price,
         amount=10.0,
@@ -607,8 +610,8 @@ async def test_keyed_sink_quote_rule_alpaca_emits_bbo_and_infers_side():
             symbol="AAPL",
             symbol_raw="AAPL",
             asset_class=AssetClass.EQUITY,
-            local_ts=1,
-            source_ts=1,
+            local_ts=_EQ_VENUE_NS,
+            source_ts=_EQ_VENUE_NS,
             bid_px=100.0,
             bid_sz=5.0,
             ask_px=101.0,
@@ -644,8 +647,8 @@ async def test_keyed_sink_alpaca_skips_zero_price_quote_for_depth():
             symbol="AAPL",
             symbol_raw="AAPL",
             asset_class=AssetClass.EQUITY,
-            local_ts=1,
-            source_ts=1,
+            local_ts=_EQ_VENUE_NS,
+            source_ts=_EQ_VENUE_NS,
             bid_px=0.0,  # "no bid" sentinel
             bid_sz=0.0,
             ask_px=101.0,
@@ -657,7 +660,8 @@ async def test_keyed_sink_alpaca_skips_zero_price_quote_for_depth():
     await sink.put(
         StkQuote(
             source="alpaca", symbol="AAPL", symbol_raw="AAPL",
-            asset_class=AssetClass.EQUITY, local_ts=2, source_ts=2,
+            asset_class=AssetClass.EQUITY,
+            local_ts=_EQ_VENUE_NS + 1, source_ts=_EQ_VENUE_NS + 1,
             bid_px=100.0, bid_sz=5.0, ask_px=101.0, ask_sz=7.0,
         )
     )

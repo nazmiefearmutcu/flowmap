@@ -253,6 +253,16 @@ class _Connection:
             )
             await self._refuse("degraded", _CLOSE_UNSUPPORTED)
             return False
+        except ValueError as exc:
+            # e.g. a recording-path-unsafe symbol (record._safe_component).
+            # The refusal contract is a Status frame + close, never a silent
+            # no-op that leaves the socket open with no session.
+            logger.warning(
+                "refused subscribe: invalid symbol (%s:%s: %s) -> 1003",
+                sub.market, sub.symbol, exc,
+            )
+            await self._refuse("degraded", _CLOSE_UNSUPPORTED)
+            return False
         except NotImplementedError as exc:
             logger.warning(
                 "refused subscribe: no feed for market (%s:%s: %s) -> 1003",

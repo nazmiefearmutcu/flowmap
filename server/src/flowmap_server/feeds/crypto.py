@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 
 import numpy as np
@@ -85,7 +86,7 @@ from crocodile.crypto.exchanges.factory import (
 from crocodile.crypto.instruments.registry import InstrumentRegistry
 
 from flowmap_server.config import Config
-from flowmap_server.feeds.base import BookState, FeedEvent
+from flowmap_server.feeds.base import BookState, BoundedFeedQueue, FeedEvent, ts_ns_sane
 from flowmap_server.proto.events import (
     BBO,
     SIDE_BUY,
@@ -104,6 +105,7 @@ __all__ = [
     "NOT_STREAMABLE",
     "CryptoFeed",
     "is_crypto_market",
+    "resolve_symbol_cached",
     "split_market",
 ]
 
@@ -200,6 +202,61 @@ def is_crypto_market(market: str) -> bool:
         return False
     return not segment or segment in SEGMENTS.get(exchange, frozenset())
 
+
+# -- symbol translation, memoized for the server process lifetime (A2-5) --------
+#
+# `data.venues.resolve_symbol` downloads the venue's full ccxt market table on
+# every miss; before this cache every feed restart and every kline backfill
+# re-downloaded it for the same unchanging symbol. Translation is a pure
+# function of the venue's listing, which is stable on a session timescale, so
+# the successful result is cached forever; a failed/identity result is NOT
+# cached so the next call retries.
+
+_RESOLVED_SYMBOLS: dict[tuple[str, str], str] = {}
+_PENDING_RESOLVES: dict[tuple[str, str], "asyncio.Task[str]"] = {}
+
+
+async def resolve_symbol_cached(market: str, symbol: str) -> str:
+    """:func:`flowmap_server.data.venues.resolve_symbol`, memoized in-process.
+
+    Concurrent misses for the same ``(market, symbol)`` share one in-flight
+    task; only a CHANGED spelling (a real translation) is cached, so a
+    transient venue failure is retried on the next call instead of being
+    pinned for the server lifetime.
+    """
+    key = (market, symbol)
+    hit = _RESOLVED_SYMBOLS.get(key)
+    if hit is not None:
+        return hit
+    task = _PENDING_RESOLVES.get(key)
+    if task is None:
+        task = asyncio.create_task(
+            _resolve_and_cache(market, symbol),
+            name=f"resolve-symbol-{market}:{symbol}",
+        )
+        _PENDING_RESOLVES[key] = task
+    try:
+        out = await task
+    except BaseException:
+        # A failure (or the waiter's own cancellation) must not pin the
+        # in-flight slot — the next caller retries.
+        if _PENDING_RESOLVES.get(key) is task:
+            _PENDING_RESOLVES.pop(key, None)
+        raise
+    if _PENDING_RESOLVES.get(key) is task:
+        _PENDING_RESOLVES.pop(key, None)
+    return out
+
+
+async def _resolve_and_cache(market: str, symbol: str) -> str:
+    from flowmap_server.data.venues import resolve_symbol
+
+    out = await resolve_symbol(market, symbol)
+    if out != symbol:
+        _RESOLVED_SYMBOLS[(market, symbol)] = out
+    return out
+
+
 # Default cap per side on emitted BookState arrays; the closest-to-touch levels
 # win. Overridable via Config.book_top_n / FLOWMAP_BOOK_TOP_N.
 #
@@ -248,9 +305,16 @@ class _BridgeSink(Sink):
         book_top_n: int = BOOK_TOP_N,
         *,
         snapshot_driven: bool = False,
+        now_ns: Callable[[], int] | None = None,
     ) -> None:
         self._emit = emit
         self._book_top_n = max(1, book_top_n)
+        # Live-ingest timestamp sanity gate (A2-2). A venue clock in the wrong
+        # unit (ms/s stamped into the ns field) or wedged far ahead must not
+        # write 1970-era / absurdly-future columns into the ring or the
+        # recording. Injected for tests; production uses the wall clock.
+        self._now_ns = now_ns or time.time_ns
+        self.dropped_ts = 0
         self._bids: dict[float, float] = {}
         self._asks: dict[float, float] = {}
         self._initialized = False
@@ -269,6 +333,18 @@ class _BridgeSink(Sink):
         self._seen_ids: dict[str, None] = {}
 
     async def put(self, record: Record) -> None:
+        if not ts_ns_sane(self._ts(record), now_ns=self._now_ns()):
+            self.dropped_ts += 1
+            if self.dropped_ts == 1:
+                # First bad stamp is worth one warning (a clock that slips
+                # back to sane must not be missed); the rest only count.
+                logger.warning(
+                    "crypto bridge: dropped sample with implausible ts_ns=%r "
+                    "(outside [2010, now+24h]); dropped_ts=%d",
+                    self._ts(record),
+                    self.dropped_ts,
+                )
+            return
         if isinstance(record, BookDelta):
             if not self._initialized:
                 return  # pre-snapshot deltas carry no anchored state
@@ -530,23 +606,27 @@ class CryptoFeed:
         return conn
 
     async def events(self) -> AsyncIterator[FeedEvent]:
-        queue: asyncio.Queue[FeedEvent | _FeedEnd] = asyncio.Queue()
+        # Bounded fan-in (A2-3): a stalled consumer drops OLDEST events (counted
+        # on the queue) instead of growing RSS without limit. The connector's
+        # end sentinel is never the dropped item (see BoundedFeedQueue).
+        queue = BoundedFeedQueue()
         sink = _BridgeSink(
-            queue.put_nowait, self._cfg.book_top_n, snapshot_driven=not self.native
+            queue.put_nowait,
+            self._cfg.book_top_n,
+            snapshot_driven=not self.native,
         )
         if self._owns_connector:
             # A symbol can arrive in either spelling — the venue's own
             # ("ETHBTC") or ccxt's unified ("ETH/BTC") — depending on which
             # enumerator the picker used. Translate once, here, so the same
-            # user-visible symbol works whichever connector serves it. Skipped
-            # when a factory is injected: that caller owns the symbol.
-            # Lazy import: data.venues reads this module's venue sets.
-            from flowmap_server.data.venues import resolve_symbol
-
+            # user-visible symbol works whichever connector serves it. Memoized
+            # for the server lifetime: a feed restart must not re-download the
+            # venue's whole ccxt market table. Skipped when a factory is
+            # injected: that caller owns the symbol.
             # Deliberately NOT `self.symbol`: that is the session's identity
             # (recording path, client-visible label) and must not shift under
             # a mid-session feed restart.
-            self._connector_symbol = await resolve_symbol(self.market, self.symbol)
+            self._connector_symbol = await resolve_symbol_cached(self.market, self.symbol)
         conn = self._connector_factory(sink)
         if conn.transport is None and conn.ws_url:
             # Poll-only connectors (the ccxt path, CoinGecko, the on-chain
@@ -573,7 +653,9 @@ class CryptoFeed:
                 await runner
 
     @staticmethod
-    async def _drive(conn: Connector, queue: asyncio.Queue[FeedEvent | _FeedEnd]) -> None:
+    async def _drive(
+        conn: Connector, queue: BoundedFeedQueue
+    ) -> None:
         try:
             await conn.run()
         except asyncio.CancelledError:

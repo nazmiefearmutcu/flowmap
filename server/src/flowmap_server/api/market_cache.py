@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 import msgspec
 
@@ -52,6 +52,11 @@ DEFAULT_TTL_NS = 15 * 10**9  # 15 s: fresh enough for a mover strip, cheap on pr
 # oldest-INSERTED-first (see MarketDataCache._evict).
 DEFAULT_MAX_ENTRIES = 512
 SPARK_MAX = 64  # cap sparkline points on the wire
+# Wall-clock deadline for ONE movers candidate sweep (A2-5). The sweep is
+# bounded (~40-100 quotes) but gathered concurrently with no deadline of its
+# own, so one hung provider used to hold the whole endpoint. Past the deadline
+# whatever ranked already — partial results, honestly — is served.
+MOVERS_DEADLINE_S = 15.0
 
 QuoteFn = Callable[[str, str], Awaitable["QuoteData"]]
 MoversFn = Callable[[str, int], Awaitable[list["QuoteData"]]]
@@ -248,6 +253,34 @@ async def default_quote_fn(market: str, symbol: str) -> QuoteData:
     return QuoteData(market=market, symbol=symbol, reachable=False, stale=True, as_of_ns=time.time_ns())
 
 
+async def _bounded_quote_sweep(
+    fetch: Callable[[str], Awaitable[QuoteData]],
+    symbols: Sequence[str],
+    deadline_s: float,
+) -> list[QuoteData | None]:
+    """Quote every symbol in *symbols*, bounded by a wall-clock deadline.
+
+    Unlike a bare ``asyncio.gather`` (unbounded: one hung fetch held the whole
+    sweep for its full duration), past ``deadline_s`` pending fetches are
+    cancelled and ``None`` is reported for them — the movers endpoint serves
+    partial, honestly-ranked results instead of hanging. ``_safe_quote``
+    already swallows per-fetch errors, so finished tasks carry results.
+    """
+    if not symbols:
+        return []
+    tasks = [asyncio.ensure_future(_safe_quote(fetch, s)) for s in symbols]
+    try:
+        await asyncio.wait(tasks, timeout=deadline_s)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        raise
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    return [t.result() if t.done() and not t.cancelled() else None for t in tasks]
+
+
 async def default_movers_fn(market: str, limit: int) -> list[QuoteData]:
     """Production movers seam: rank a bounded candidate set by 24 h %change.
 
@@ -264,9 +297,7 @@ async def default_movers_fn(market: str, limit: int) -> list[QuoteData]:
         candidates = CRYPTO_SYMBOLS
         fetch = lambda s: _crypto_quote("binance-spot", s)  # noqa: E731
         mkt = "binance-spot"
-    results = await asyncio.gather(
-        *(_safe_quote(fetch, s) for s in candidates), return_exceptions=False
-    )
+    results = await _bounded_quote_sweep(fetch, candidates, MOVERS_DEADLINE_S)
     quotes = [q for q in results if q is not None and q.change_pct is not None]
     quotes.sort(key=lambda q: abs(q.change_pct or 0.0), reverse=True)
     for q in quotes:

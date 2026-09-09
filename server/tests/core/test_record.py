@@ -17,6 +17,8 @@ clock); files land under pytest ``tmp_path``. The tests pin:
 12. partial flush failure + retry writes no duplicate col_seqs
 13. ranged reads never open files outside the hour window
 14. retention exempts epochs files and the newest columns part per symbol
+15. concurrent writers on one symbol claim disjoint part numbers (no clobber)
+16. traversal names ('.'/'..') refused; separators sanitize (ccxt spellings keep recording)
 """
 
 import logging
@@ -478,3 +480,89 @@ def test_retention_exempts_epochs_and_newest_columns(tmp_path):
                          now_ns=30 * DT_NS, limit_cols=30)
     assert tail is not None
     assert [c.col_seq for c in tail.columns] == list(range(20, 30))
+
+
+# 15. concurrent writers ------------------------------------------------------
+
+
+def test_concurrent_sessions_never_share_part_numbers(tmp_path):
+    """Two live recorders on one (market, symbol) used to scan the same part
+    counter at open: both started at the same number and their atomic
+    renames silently clobbered each other's parts — a whole recording lost.
+    Each writer now claims its numbers exclusively at write time, so parts
+    never collide and nothing is lost."""
+    base = tmp_path / "rec"
+    rec = Recorder(base, 20.0)
+    cols = SimFeed.generate_history(seed=3, n_cols=40)
+    a = rec.open_session(MARKET, SYMBOL)
+    b = rec.open_session(MARKET, SYMBOL)  # opened while a is still live
+    for s in (a, b):
+        s.record_epoch(EPOCH0)
+    a_cols, b_cols = cols[:20], cols[20:]
+    for i in range(4):  # interleaved flushes while the other keeps buffering
+        for c in a_cols[i * 5:(i + 1) * 5]:
+            a.record_column(c)
+        for c in b_cols[i * 5:(i + 1) * 5]:
+            b.record_column(c)
+        a.flush()
+        b.flush()
+    a.close()
+    b.close()
+
+    files = sorted(sym_dir(base).glob("*-columns-*.parquet"), key=lambda p: p.name)
+    assert len(files) == 8  # one part per flush per writer (4 x 2)
+    nums = [int(f.stem.rsplit("-", 1)[-1]) for f in files]
+    assert len(nums) == len(set(nums))  # unique part numbers: no rename clobber
+    on_disk = sorted(
+        seq for f in files for seq in pl.read_parquet(f)["col_seq"].to_list()
+    )
+    assert on_disk == list(range(40))  # every recorded column survived, exactly once
+    # Landed claims are released; a clean double-run leaves no markers.
+    assert not list(sym_dir(base).glob(".claim-*"))
+
+    tail = rec.load_tail(MARKET, SYMBOL, max_age_ns=10**15,
+                         now_ns=40 * DT_NS, limit_cols=40)
+    assert tail is not None
+    assert [c.col_seq for c in tail.columns] == list(range(40))
+
+
+# 16. path-component traversal refusal ----------------------------------------
+
+
+def test_safe_component_refuses_traversal(tmp_path):
+    """'..' used to sanitize to itself and pass straight into the recording
+    layout: base/{market}/.. is one level ABOVE the root. '.' and '..' are
+    refused outright with the same ValueError as every other invalid input.
+    Separators are SANITIZED (not refused): ccxt spellings like 'ETH/BTC'
+    are a legitimate input class and must keep recording."""
+    import flowmap_server.core.record as record_mod
+
+    for bad in ("..", "."):
+        with pytest.raises(ValueError):
+            record_mod._safe_component(bad)
+
+    # Separator-bearing names sanitize to a flat, safe component.
+    assert record_mod._safe_component("a/b") == "a_b"
+    assert record_mod._safe_component("a\\b") == "a_b"
+    assert record_mod._safe_component("a:b") == "a_b"
+    assert record_mod._safe_component("ETH/BTC") == "ETH_BTC"
+    # A traversal can't hide behind a separator: every rewrite lands inside.
+    assert record_mod._safe_component("../x") == ".._x"
+
+    rec = Recorder(tmp_path / "rec", 20.0)
+    with pytest.raises(ValueError):
+        rec.open_session(MARKET, "..")  # the record path
+    with pytest.raises(ValueError):
+        rec.load_tail(MARKET, "..", max_age_ns=10**15,
+                      now_ns=10 * DT_NS, limit_cols=10)  # the read path
+    # Nothing was ever written outside (or inside) the root.
+    assert not (tmp_path / "rec").exists()
+
+
+def test_separator_spelling_still_records(tmp_path):
+    """Regression (review R1 M-2): ccxt unified spellings are legitimate
+    symbols; their separators sanitize instead of disabling recording."""
+    rec = Recorder(tmp_path / "rec", 20.0)
+    session = rec.open_session(MARKET, "XBT/USD")
+    assert session._dir == (tmp_path / "rec" / MARKET / "XBT_USD")
+    assert session._dir.is_dir()

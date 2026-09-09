@@ -19,8 +19,13 @@ with ``kind`` in {columns, trades, markers, epochs}. Load-bearing decisions:
 - **Parquet cannot append.** :class:`SessionRecorder` buffers rows in memory
   and every ``flush()`` writes fresh *part files* with a monotonically
   increasing 6-digit suffix. The counter is shared across kinds/hours within
-  a session and initialized past any parts already on disk, so a restarted
-  session never collides with (or sorts before) its predecessor's files.
+  a session and seeded past any parts (and live claims) already on disk, so a
+  restarted session never collides with (or sorts before) its predecessor's
+  files. CONCURRENT writers on the same (market, symbol) each claim their
+  part numbers atomically at write time (an exclusive ``.claim-{n:06d}``
+  marker; see :meth:`SessionRecorder._claim_part`) — two live sessions used
+  to run independent counters from the same on-disk scan and silently rename
+  over each other's parts.
 - **Flush is exception-safe.** Each part is written to a ``*.tmp`` name and
   atomically renamed into place (``os.replace``, same filesystem), and a
   group's rows leave the buffer the moment its file lands — so a failure on
@@ -67,6 +72,9 @@ with ``kind`` in {columns, trades, markers, epochs}. Load-bearing decisions:
 from __future__ import annotations
 
 import logging
+import os
+import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -142,9 +150,33 @@ def _hour_key(ts_ns: int) -> str:
     return datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=timezone.utc).strftime("%Y%m%d-%H")
 
 
+# Hour buckets this recorder writes; anything else in a ``*-columns-`` name is
+# a stray file the inventory must skip, not crash on (``strptime`` would raise).
+_HOUR_KEY_RE = re.compile(r"\d{8}-\d{2}")
+
+
 def _safe_component(name: str) -> str:
-    """Filesystem-safe path component for market/symbol (e.g. 'BTC/USDT')."""
-    return "".join("_" if ch in "/\\:" else ch for ch in name) or "_"
+    """Filesystem-safe path component for market/symbol.
+
+    Refuses — with ``ValueError``, like every other invalid input — the
+    traversal names ``"."`` and ``".."``. Path separators (``/``, ``\\``,
+    ``:``) are rewritten to ``_`` rather than refused: ccxt spellings like
+    ``"ETH/BTC"`` and ``"BTC/USDC:USDC"`` are a documented, legitimate input
+    class and must keep recording (refusing them would silently disable
+    recording for the whole session). A separator-bearing name cannot become
+    a traversal once its separators are gone."""
+    if name in (".", ".."):
+        raise ValueError(f"invalid recording path component: {name!r}")
+    for ch in "/\\:":
+        name = name.replace(ch, "_")
+    return name or "_"
+
+
+def _hour_start_ns(key: str) -> int:
+    """UTC ns for the START of a ``YYYYMMDD-HH`` hour bucket (the inverse of
+    :func:`_hour_key` at hour resolution)."""
+    dt = datetime.strptime(key, "%Y%m%d-%H").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp()) * 1_000_000_000
 
 
 def _by_name(p: Path) -> tuple[str, str]:
@@ -213,18 +245,71 @@ class SessionRecorder:
         self._markers: list[Marker] = []
         self._epochs: list[EpochParams] = []
         self._max_ts_ns = 0  # newest event timestamp seen (buckets epoch rows)
+        # Serializes part-number allocation between THIS recorder's threads
+        # (the session flushes from an executor thread; close() may run on the
+        # loop while that write is still in flight). Cross-WRITER exclusion is
+        # the exclusive .claim marker, not this lock.
+        self._part_lock = threading.Lock()
         self._part = self._scan_next_part() if self._enabled else 0
 
     def _scan_next_part(self) -> int:
-        """Continue part numbering past anything already on disk so restarts
-        never collide and lexicographic file order stays chronological."""
+        """Seed the part counter past anything already on disk — landed parts
+        AND live ``.claim-*`` markers from concurrent/crashed writers — so a
+        restart never collides and lexicographic file order stays
+        chronological. The first actual claim re-validates exclusively (see
+        :meth:`_claim_part`): a stale scan can never double-allocate."""
         assert self._dir is not None
         newest = -1
         for p in self._dir.glob("*.parquet"):
             tail = p.stem.rsplit("-", 1)[-1]
             if tail.isdigit():
                 newest = max(newest, int(tail))
+        for p in self._dir.glob(".claim-*"):
+            tail = p.name[len(".claim-") :]
+            if tail.isdigit():
+                newest = max(newest, int(tail))
         return newest + 1
+
+    def _claim_part(self, kind: str, hour: str) -> tuple[int, Path, Path, Path]:
+        """Atomically claim this writer's next unused part number.
+
+        Returns ``(n, path, tmp, marker)``. Two live recorders on the same
+        (market, symbol) each scan the same directory at open and would
+        otherwise count from the same number — their ``os.replace`` final
+        writes silently clobber each other and a whole recording is lost.
+        The claim is an exclusive ``O_CREAT|O_EXCL`` marker file, so exactly
+        one writer can hold a number no matter how the open-time scans raced.
+        The caller releases the marker once the part lands (the parquet then
+        guards its own number) or on failure (nothing landed: the number
+        returns to the pool). A crash between claim and rename leaves the
+        tiny marker behind; scanners count it, so the number is never
+        reused.
+        """
+        assert self._dir is not None
+        while True:
+            with self._part_lock:
+                n = self._part
+                path = self._dir / f"{hour}-{kind}-{n:06d}.parquet"
+                marker = self._dir / f".claim-{n:06d}"
+                if path.exists():
+                    self._part = n + 1  # landed elsewhere: number spent
+                    continue
+                try:
+                    fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    self._part = n + 1  # another writer holds the number
+                    continue
+                os.close(fd)
+                if path.exists():
+                    # A raced writer landed this exact part between our two
+                    # checks (its claim release can interleave with our
+                    # marker create): give the number back untouched.
+                    marker.unlink(missing_ok=True)
+                    self._part = n + 1
+                    continue
+                tmp = path.with_name(path.name + ".tmp")  # no glob matches *.tmp
+                self._part = n + 1
+            return n, path, tmp, marker
 
     def _check_open(self) -> None:
         if self._closed:
@@ -294,19 +379,53 @@ class SessionRecorder:
             groups.setdefault(_hour_key(ts_of(r)), []).append(r)
         try:
             for hour in sorted(groups):
-                path = self._dir / f"{hour}-{kind}-{self._part:06d}.parquet"
-                tmp = path.with_name(path.name + ".tmp")  # no glob matches *.tmp
-                self._part += 1
+                _n, path, tmp, marker = self._claim_part(kind, hour)
                 try:
                     to_frame(groups[hour]).write_parquet(tmp)
                     tmp.replace(path)  # atomic os.replace on the same fs
                 except BaseException:
                     tmp.unlink(missing_ok=True)
+                    marker.unlink(missing_ok=True)  # nothing landed: number reusable
                     raise
+                marker.unlink(missing_ok=True)  # landed: the part guards its number
                 groups[hour] = []  # landed: never re-written on a retry
         finally:
             # Keep only the rows of groups that did NOT land.
             rows[:] = [r for group in groups.values() for r in group]
+
+    def take_buffers(self) -> tuple[list, list, list, list] | None:
+        """Detach the buffered rows for one off-loop flush.
+
+        Called on the owner's thread (the asyncio loop): swapping the buffer
+        lists out here means a flush running in an executor thread touches
+        ONLY the snapshot — rows recorded while it writes stay in the live
+        buffers and land in the next flush, with no shared mutable state.
+        Returns ``None`` when every buffer is empty (callers skip the thread
+        hop instead of writing nothing)."""
+        if not (self._columns or self._trades or self._markers or self._epochs):
+            return None
+        bufs = (self._columns, self._trades, self._markers, self._epochs)
+        self._columns, self._trades, self._markers, self._epochs = [], [], [], []
+        return bufs
+
+    def flush_buffers(self, bufs: tuple[list, list, list, list]) -> None:
+        """Write a :meth:`take_buffers` snapshot to part files.
+
+        Same per-(hour, kind) grouping, temp+rename atomicity, part-number
+        progression, and exception-safety as :meth:`flush` — safe to run off
+        the event loop because it touches only the snapshot lists plus the
+        locked part counter. On failure the UNWRITTEN rows stay in the
+        snapshot lists (never restored to the live buffers: the owning
+        session disables recording on any flush failure, so they would never
+        be retried anyway)."""
+        columns, trades, markers, epochs = bufs
+        self._flush_kind("columns", columns, lambda c: c.t0_ns, self._columns_frame)
+        self._flush_kind("trades", trades, lambda t: t.ts_ns, self._trades_frame)
+        self._flush_kind("markers", markers, lambda m: m.ts_ns, self._markers_frame)
+        # Epochs carry no timestamp: bucket into the newest hour seen so far
+        # (hour 0 if nothing timestamped was ever recorded). load_tail reads
+        # every epochs file, so the bucket never affects correctness.
+        self._flush_kind("epochs", epochs, lambda _e: self._max_ts_ns, self._epochs_frame)
 
     @staticmethod
     def _columns_frame(cols: list[FinalizedColumn]) -> pl.DataFrame:
@@ -394,6 +513,10 @@ class Recorder:
         self._base = Path(base_dir)
         self._cap_bytes = int(gb_cap * _GB)
         self._enabled = enabled
+        # Retention walks now run in executor threads (one per flushing
+        # session): the lock keeps two walks from racing each other's
+        # rglob/unlink pass. Works from both loop and worker threads.
+        self._retention_lock = threading.Lock()
 
     def open_session(self, market: str, symbol: str) -> SessionRecorder:
         """Create the append-only writer for one (market, symbol). When
@@ -639,6 +762,60 @@ class Recorder:
             limit_cols=2**31,
         )
 
+    def inventory(self) -> list[dict[str, object]]:
+        """Read-only recording inventory (backs ``GET /api/recordings``).
+
+        One row per (market, symbol) directory holding at least one Parquet
+        part: total size, part count, and the first/last recorded timestamps
+        derived from the columns files' ``YYYYMMDD-HH`` name prefixes — the
+        filename metadata the recorder already maintains, so the walk never
+        opens a Parquet file (a multi-GB recording lists as cheaply as a
+        small one). Timestamps are UTC ns: the first hour bucket's start and
+        the last hour bucket's END (hour resolution is what the names
+        honestly carry; ``None`` when a symbol has no columns parts)."""
+        if not self._enabled or not self._base.is_dir():
+            return []
+        rows: list[dict[str, object]] = []
+        for market_dir in sorted(self._base.iterdir(), key=lambda p: p.name):
+            if not market_dir.is_dir():
+                continue
+            for sym_dir in sorted(market_dir.iterdir(), key=lambda p: p.name):
+                if not sym_dir.is_dir():
+                    continue
+                files = sorted(sym_dir.glob("*.parquet"), key=_by_name)
+                if not files:
+                    continue
+                total = 0
+                for f in files:
+                    try:
+                        total += f.stat().st_size
+                    except FileNotFoundError:
+                        pass  # pruned concurrently: not part of the total
+                hours = sorted(
+                    {
+                        h
+                        for f in files
+                        if "-columns-" in f.name
+                        and _HOUR_KEY_RE.fullmatch(h := _hour_prefix(f))
+                    }
+                )
+                first_ns = last_ns = None
+                if hours:
+                    first_ns = _hour_start_ns(hours[0])
+                    last_ns = _hour_start_ns(hours[-1]) + 3_600 * 1_000_000_000
+                rows.append(
+                    {
+                        "market": market_dir.name,
+                        "symbol": sym_dir.name,
+                        "path": sym_dir.relative_to(self._base).as_posix(),
+                        "size_bytes": total,
+                        "parts": len(files),
+                        "first_ts_ns": first_ns,
+                        "last_ts_ns": last_ns,
+                    }
+                )
+        return rows
+
     def enforce_retention(self) -> list[Path]:
         """Prune recordings until total ``*.parquet`` size fits the cap.
 
@@ -649,9 +826,16 @@ class Recorder:
         The total may therefore remain above the cap when only exempt files
         are left. Never reads clocks or mtimes; tolerates files deleted
         concurrently. Returns the deleted paths in deletion order.
-        """
+
+        Serialized by an internal lock: every flushing session runs its own
+        walk in an executor thread, and two overlapping rglob/unlink passes
+        over the same tree are wasted work at best."""
         if not self._enabled or not self._base.is_dir():
             return []
+        with self._retention_lock:
+            return self._enforce_retention_locked()
+
+    def _enforce_retention_locked(self) -> list[Path]:
         entries: list[tuple[Path, int]] = []
         for f in sorted(self._base.rglob("*.parquet"), key=_by_name):
             try:

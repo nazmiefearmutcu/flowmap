@@ -262,3 +262,58 @@ def test_newest_column_t0_skips_corrupt_newest_part(tmp_path):
     garbage = base / "sim" / SYMBOL / "29991231-23-columns-999999.parquet"
     garbage.write_bytes(b"not parquet at all")
     assert root.newest_column_t0(MARKET, SYMBOL) == (N0 - 1) * DT
+
+
+# ---------------------------------------------------------------------------
+# subscribe-time safety and loop hygiene
+
+
+async def test_replay_refuses_traversal_symbol(tmp_path):
+    """A symbol of '..' must be refused outright at subscribe: the old
+    sanitizer let it through and base/{market}/.. resolves one level ABOVE
+    the recording root."""
+    root = Recorder(tmp_path / "rec", 20.0)
+    _record(root, t0_idx=0, n=N0, start_seq=0)
+    mgr, timer = _manager(root)
+    bad = Subscribe(market=MARKET, symbol="..", mode="replay", source=None, start_t=None)
+    with pytest.raises(ValueError):
+        await mgr.subscribe(bad, ClientTx())
+    assert mgr._sessions == {}  # nothing was registered for the bad key
+
+
+async def test_replay_load_runs_off_the_event_loop(tmp_path, monkeypatch):
+    """subscribe() must not run the whole-recording load on the event loop:
+    ``load_all`` is unbounded (multi-GB for long recordings) and used to run
+    inline in subscribe(). While a deliberately slow load runs in its
+    executor thread, a concurrent event-loop task keeps ticking."""
+    import time as _time
+
+    root = Recorder(tmp_path / "rec", 20.0)
+    _record(root, t0_idx=0, n=N0, start_seq=0)
+    mgr, timer = _manager(root)
+
+    real = Recorder.load_all
+
+    def slow_load_all(self, market, symbol):
+        _time.sleep(0.25)  # blocking IO stand-in
+        return real(self, market, symbol)
+
+    monkeypatch.setattr(Recorder, "load_all", slow_load_all)
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    spawner = asyncio.create_task(ticker())
+    try:
+        await asyncio.sleep(0.05)
+        sess = await mgr.subscribe(_sub(), ClientTx())
+        assert ticks >= 10, "event loop stalled while load_all ran"
+        assert sess.replay_tail_t0 == (N0 - 1) * DT  # behavior unchanged
+    finally:
+        spawner.cancel()
+    await _retire(mgr, timer, sess)

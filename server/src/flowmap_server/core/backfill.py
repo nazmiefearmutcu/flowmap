@@ -70,6 +70,11 @@ logger = logging.getLogger(__name__)
 # between-bucket and cross-side ratios.
 PEAK_TARGET = 1000.0
 _NAN = float("nan")
+# Total wall-clock timeout for every network client this module builds (A2-5):
+# the boot path holds the session's _start_lock while backfilling, so one hung
+# endpoint must cost seconds, not aiohttp's 5-minute default.
+_HTTP_TIMEOUT_S = 15.0
+_HTTP_TIMEOUT_MS = int(_HTTP_TIMEOUT_S * 1000)
 
 
 class Candle(msgspec.Struct):
@@ -288,14 +293,15 @@ async def crypto_klines(
     """
     from crocodile.crypto.client.backfill import SUPPORTED_CHANNELS
 
-    from flowmap_server.data.venues import resolve_symbol
+    from flowmap_server.feeds.crypto import resolve_symbol_cached
 
     exchange, _, seg = market.partition("-")
     seg = seg or "spot"
     # Same translation the live feed does: a symbol in the other venue's
     # spelling must not silently cost us the native path (and with it the taker
-    # split) by failing the venue's REST call.
-    symbol = await resolve_symbol(market, symbol)
+    # split) by failing the venue's REST call. Memoized (A2-5): a re-subscribe
+    # or restart must not re-download the venue's whole ccxt market table.
+    symbol = await resolve_symbol_cached(market, symbol)
     kw = {"interval": interval, "max_bars": max_bars, "now_ns": now_ns}
     if "ohlcv" in SUPPORTED_CHANNELS.get(exchange, frozenset()):
         # Native first: only the venue's own klines carry the taker buy/sell
@@ -393,7 +399,10 @@ def _hardened_backfill(exchange: str, seg: str) -> tuple[object | None, object |
     except Exception:  # noqa: BLE001 — keep engine defaults if anything is absent
         return None, None
     ctx = ssl.create_default_context(cafile=certifi.where())
-    session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx))
+    session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=ctx),
+        timeout=aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_S),
+    )
     try:
         base = _BINANCE_KLINE_BASE.get(seg, _BINANCE_KLINE_BASE["spot"])
         bf = BinanceBackfill(
@@ -433,8 +442,14 @@ async def _ccxt_candles(
     import ccxt.async_support as ccxt_async
 
     default_type = "swap" if seg in _SWAP_SEGMENTS else "spot"
+    # Explicit total timeout (A2-5) instead of relying on ccxt's per-request
+    # default — the backfill runs under the session's boot lock.
     ex = getattr(ccxt_async, exchange)(
-        {"enableRateLimit": True, "options": {"defaultType": default_type}}
+        {
+            "enableRateLimit": True,
+            "timeout": _HTTP_TIMEOUT_MS,
+            "options": {"defaultType": default_type},
+        }
     )
     try:
         if not ex.has.get("fetchOHLCV"):

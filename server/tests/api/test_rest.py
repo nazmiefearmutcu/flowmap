@@ -212,3 +212,56 @@ async def test_cors_preflight_blocks_evil_origin_and_non_get(client):
         },
     )
     assert bad_method.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /api/recordings: read-only on-disk recording inventory
+
+
+async def test_recordings_inventory_lists_symbols_with_metadata(tmp_path):
+    """One read-only row per recorded (market, symbol): relative path, total
+    size, part count, and first/last timestamps at the hour resolution the
+    filename metadata carries — no Parquet file is opened."""
+    from flowmap_server.core.record import Recorder
+    from flowmap_server.feeds.sim import SimFeed
+
+    cfg = Config(data_dir=str(tmp_path), recording_enabled=True)
+    app = create_app(cfg)
+    rec = Recorder(tmp_path, 20.0)
+    for symbol, n_cols in (("SIM-DEMO", 5), ("SIM-OTHER", 3)):
+        s = rec.open_session("sim", symbol)
+        for c in SimFeed.generate_history(seed=3, n_cols=n_cols):
+            s.record_column(c)
+        s.close()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://127.0.0.1:8720"
+    ) as client:
+        r = await client.get("/api/recordings")
+    assert r.status_code == 200
+    rows = r.json()["recordings"]
+    assert [(row["market"], row["symbol"]) for row in rows] == [
+        ("sim", "SIM-DEMO"),
+        ("sim", "SIM-OTHER"),
+    ]
+    row = rows[0]
+    assert row["path"] == "sim/SIM-DEMO"
+    assert row["parts"] == 1
+    assert row["size_bytes"] > 0
+    # generate_history columns start at t0=0 — the epoch's first hour bucket.
+    assert row["first_ts_ns"] == 0
+    assert row["last_ts_ns"] == 3_600 * 1_000_000_000
+    assert rows[1]["parts"] == 1
+
+
+async def test_recordings_empty_root(tmp_path):
+    cfg = Config(data_dir=str(tmp_path / "empty"), recording_enabled=True)
+    app = create_app(cfg)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://127.0.0.1:8720"
+    ) as client:
+        r = await client.get("/api/recordings")
+    assert r.status_code == 200
+    assert r.json() == {"recordings": []}

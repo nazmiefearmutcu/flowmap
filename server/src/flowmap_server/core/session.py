@@ -33,7 +33,12 @@ Design spec §6.3 and §11. The load-bearing semantics:
   (initial + every re-anchor), every finalized column, trades and markers.
   Flush cadence: every ``REC_FLUSH_COLS`` recorded columns, when the feed
   loop exits (server shutdown), and on teardown (``close()``); each flush is
-  followed by ``enforce_retention()``. Every recorder call is wrapped: on
+  followed by ``enforce_retention()``. The cadence Parquet write and the
+  retention walk run in executor threads (buffers are swapped out on the
+  loop first, and only one flush is ever in flight, so order and content
+  are exactly what the synchronous version produced); the teardown close
+  stays synchronous so data is on disk before the session dies. Every
+  recorder call is wrapped: on
   exception it is logged and recording is disabled for the session —
   recording failures NEVER kill the feed loop. Before the feed task starts,
   ``start()`` rehydrates the grid ring from the newest recording via
@@ -54,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from collections import deque
@@ -368,6 +374,7 @@ class Session:
         # key (parked-replay freshness policy, handoff §6).
         self.replay_tail_t0: int | None = None
         self._cols_since_flush = 0
+        self._flush_task: asyncio.Task | None = None
         self._boot_done = False
         self._start_lock = asyncio.Lock()
 
@@ -617,10 +624,37 @@ class Session:
             self._rec = None
 
     def _flush_recording(self) -> None:
+        """Cadence flush (every REC_FLUSH_COLS recorded columns): hand the
+        current buffers to a background flush task.
+
+        The Parquet write runs in a thread (``asyncio.to_thread``) — the
+        synchronous write used to stall the event loop for the whole part
+        write, every 64 columns, per session. Buffers are swapped out HERE,
+        on the loop thread, so rows recorded while the thread writes stay in
+        the live buffers and land in the next flush; only one flush may be
+        in flight (a tick that arrives mid-write is picked up by the next
+        cadence check), so snapshots can never race each other."""
         if self._rec is None:
             return
+        if self._flush_task is not None and not self._flush_task.done():
+            return  # previous flush still writing; next cadence catches up
+        rec, bufs = self._rec, self._rec.take_buffers()
+        if bufs is None:
+            return
+        self._flush_task = asyncio.get_running_loop().create_task(
+            self._flush_buffers_async(rec, bufs)
+        )
+
+    async def _flush_buffers_async(
+        self, rec: SessionRecorder, bufs: tuple[list, list, list, list]
+    ) -> None:
+        """Write one buffer snapshot in a thread (see :meth:`_flush_recording`).
+
+        ``rec`` is captured at snapshot time on purpose: if the session tears
+        down while this task is queued, the snapshot still lands instead of
+        being dropped (teardown's close() can no longer see those rows)."""
         try:
-            self._rec.flush()
+            await asyncio.to_thread(rec.flush_buffers, bufs)
         except Exception:
             logger.exception(
                 "recording flush failed; disabled for session %s", self.session_id
@@ -628,7 +662,39 @@ class Session:
             self._rec = None
             return
         self._cols_since_flush = 0
-        self._enforce_retention()
+        await self._enforce_retention_async()
+
+    async def flush_recording_now(self) -> None:
+        """Flush buffered recording rows and WAIT for the Parquet write.
+
+        Runs on every run-loop exit and from the server-shutdown flush
+        (:meth:`SessionManager.flush_all`): buffered columns/trades must be
+        on disk before the session counts as ended — the §8.1 restart
+        rehydrates from these files. Awaits any in-flight cadence flush
+        first, so two flushes can never touch the recorder concurrently."""
+        task, self._flush_task = self._flush_task, None
+        if task is not None and not task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self._rec is None:
+            return
+        bufs = self._rec.take_buffers()
+        if bufs is None:
+            return
+        try:
+            await asyncio.to_thread(self._rec.flush_buffers, bufs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "recording flush failed; disabled for session %s", self.session_id
+            )
+            self._rec = None
+            return
+        self._cols_since_flush = 0
+        await self._enforce_retention_async()
 
     def _close_recording(self) -> None:
         if self._rec is None:
@@ -645,10 +711,24 @@ class Session:
 
     def _enforce_retention(self) -> None:
         # Retention failure is non-fatal: recording itself stays enabled.
+        # (Synchronous: only the rare teardown path uses this; the cadence
+        # path after every flush is _enforce_retention_async below.)
         if self._recorder_root is None:
             return
         try:
             self._recorder_root.enforce_retention()
+        except Exception:
+            logger.exception("recording retention enforcement failed")
+
+    async def _enforce_retention_async(self) -> None:
+        """Off-loop retention walk. The rglob/stat pass over the whole
+        recording root used to run on the event loop after every cadence
+        flush; concurrent walks serialize inside
+        ``Recorder.enforce_retention``."""
+        if self._recorder_root is None:
+            return
+        try:
+            await asyncio.to_thread(self._recorder_root.enforce_retention)
         except Exception:
             logger.exception("recording retention enforcement failed")
 
@@ -728,8 +808,9 @@ class Session:
 
         On ANY exit (normal end, cancellation — teardown or server shutdown)
         buffered recording rows are flushed so the on-disk tail stays fresh
-        for the next §8.1 rehydration. The flush is synchronous; it only
-        runs when the loop is stopping anyway."""
+        for the next §8.1 rehydration. The final flush is awaited (off-loop
+        Parquet write) so the data is on disk before the run task is
+        considered done."""
         flush_task = asyncio.create_task(
             self._partial_flusher(), name=f"session-{self.session_id}-partial-flush"
         )
@@ -756,10 +837,9 @@ class Session:
                 await flush_task
             except asyncio.CancelledError:
                 pass
+            await self.flush_recording_now()
             if self._closed:
                 self._close_recording()
-            else:
-                self._flush_recording()
 
     async def _partial_flusher(self) -> None:
         """Clock-driven right-edge flush (FLUSH_INTERVAL_NS, 20 Hz default).
@@ -1070,11 +1150,33 @@ class ReplayStaleError(ReplayUnavailableError):
     ``replay_stale`` token plus both tail positions."""
 
 
-# Sim grid shape (mirrors feeds.sim private constants: mid starts at 100.0,
-# tick 0.5; kept local so this module does not reach into sim internals).
+# Crypto grid shape FALLBACK (mirrors feeds.sim private constants: mid starts
+# at 100.0, tick 0.5; kept local so this module does not reach into sim
+# internals). Despite the names this shape prices REAL crypto books too: the
+# first book re-anchors p0 to the real mid and a re-anchor scales via
+# tick_multiple, which is correct for majors — but a sub-cent coin collapses
+# into 1-2 rows at a 0.5 tick. The honest escapes, in priority order, are
+# FLOWMAP_CRYPTO_TICK and a feed-declared ``preferred_tick`` (see
+# :func:`_crypto_tick_for`); wiring venue tick metadata automatically is
+# parked (needs the ccxt markets table at grid-build time).
 _SIM_MID0 = 100.0
 _SIM_TICK = 0.5
 _SIM_ROWS = 2048
+
+
+def _crypto_tick_for(feed: Feed, cfg_tick: float) -> float:
+    """Resolve the crypto grid tick: config override, feed declaration, fallback.
+
+    A venue's true tick is the right quantum for its own prices — the sim-shaped
+    fallback cannot know it. Priority: an explicit server override wins (the
+    operator can see what the venue lists), then a feed that declares
+    ``preferred_tick``, then the fallback. Anything non-positive or non-finite
+    is treated as "no answer" rather than trusted.
+    """
+    for candidate in (cfg_tick, getattr(feed, "preferred_tick", None)):
+        if isinstance(candidate, (int, float)) and math.isfinite(candidate) and candidate > 0:
+            return float(candidate)
+    return _SIM_TICK
 
 # Equity grid shape (spec §7/§7.1): a cent tick (SEC Rule 612, >=$1 stocks),
 # a ~$41 vertical span at 4096 rows, and a nominal $100 p0 that the grid
@@ -1199,8 +1301,9 @@ class SessionManager:
     def _grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         if feed.market in EQUITY_MARKETS:
             return self._equity_grid_for(feed, band)
+        tick = _crypto_tick_for(feed, self._cfg.crypto_tick)
         rows = min(_SIM_ROWS, self._cfg.max_rows)
-        step = _SIM_TICK  # tick_multiple 1
+        step = tick  # tick_multiple 1
         p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
         spec = BANDS.get(band)
         if spec is not None and spec.rows > 0:
@@ -1208,7 +1311,7 @@ class SessionManager:
             p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
         return Grid(
             GridCfg(
-                tick=_SIM_TICK,
+                tick=tick,
                 tick_multiple=1,
                 dt_ns=self._cfg.dt_crypto_ns,
                 p0=p0,
@@ -1288,7 +1391,7 @@ class SessionManager:
                 # The recording-backed replay engine: the recorder IS the data
                 # source, so a replay session opens NO recorder of its own and
                 # runs no backfill (both already gated on mode == "live").
-                feed, replay_tail = self._replay_feed(sub)
+                feed, replay_tail = await self._replay_feed(sub)
             else:
                 feed, replay_tail = self._feed_factory(sub), None
             session = Session(
@@ -1351,7 +1454,7 @@ class SessionManager:
             client.offer(frame, col_msg=False, t0_ns=None, protected=True)
         return session
 
-    def _replay_feed(self, sub: events.Subscribe) -> tuple[ReplayFeed, TailData]:
+    async def _replay_feed(self, sub: events.Subscribe) -> tuple[ReplayFeed, TailData]:
         """Build the recording-backed replay feed for ``sub``, or refuse.
 
         Returns the feed and the tail it was built from (the manager records
@@ -1359,17 +1462,33 @@ class SessionManager:
         recording that has moved on). The recorder is the replay data source:
         a store-less manager (tests) or a symbol with no recording raises
         :class:`ReplayUnavailableError`, which the WS layer turns into an
-        explicit refusal — never a live feed under a replay label."""
+        explicit refusal — never a live feed under a replay label.
+
+        The load runs in the default executor exactly like boot rehydration:
+        ``load_all`` reads the ENTIRE recording (unbounded columns), so doing
+        it inline stalled the event loop — and every other session and
+        client — for the whole multi-GB Parquet read."""
         if self._recorder is None:
             raise ReplayUnavailableError(
                 "replay needs a recording store; this manager has none"
             )
-        tail = self._recorder.load_all(sub.market, sub.symbol)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._replay_feed_blocking, sub.market, sub.symbol
+        )
+
+    def _replay_feed_blocking(
+        self, market: str, symbol: str
+    ) -> tuple[ReplayFeed, TailData]:
+        """Blocking recorder IO + feed construction for :meth:`_replay_feed`
+        (runs in the executor)."""
+        assert self._recorder is not None
+        tail = self._recorder.load_all(market, symbol)
         if tail is None or not tail.columns:
             raise ReplayUnavailableError(
-                f"no recording for {sub.market}:{sub.symbol} — replay unavailable"
+                f"no recording for {market}:{symbol} — replay unavailable"
             )
-        return ReplayFeed(market=sub.market, symbol=sub.symbol, tail=tail), tail
+        return ReplayFeed(market=market, symbol=symbol, tail=tail), tail
 
     def _recheck_replay_freshness(
         self, session: Session, sub: events.Subscribe
@@ -1432,3 +1551,17 @@ class SessionManager:
 
     async def unsubscribe(self, session: Session, client: ClientTx) -> None:
         session.detach(client)
+
+    async def flush_all(self) -> None:
+        """Server-shutdown hook (the api.app lifespan): flush every active
+        session's buffered recording rows to disk. Without it, up to
+        REC_FLUSH_COLS buffered columns plus trades are lost on every
+        sidecar kill. ``return_exceptions`` so one broken session cannot
+        skip the others'; ``flush_recording_now`` already logs and contains
+        its own failures."""
+        sessions = list(self._sessions.values())
+        if sessions:
+            await asyncio.gather(
+                *(s.flush_recording_now() for s in sessions),
+                return_exceptions=True,
+            )
