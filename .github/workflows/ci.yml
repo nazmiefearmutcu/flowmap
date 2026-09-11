@@ -180,6 +180,13 @@ jobs:
       - name: Placeholder pyruntime resource dir
         run: mkdir -p app/src-tauri/resources/pyruntime
 
+      # src-tauri/icons/ is a generated set (app/.gitignore) that generate_context!
+      # embeds at compile time; produce it from the tracked 1024px source exactly
+      # as scripts/build-dmg.sh does (`cargo tauri icon`), via the pinned npm CLI.
+      - name: Generate Tauri icon set
+        working-directory: app/src-tauri
+        run: npx --yes @tauri-apps/cli@2.11.4 icon ../icons/icon-1024.png
+
       # Stable Rust is preinstalled on GitHub runners; no toolchain action is
       # added, keeping the every-action-is-SHA-pinned claim trivially true.
       - name: Shell tests
