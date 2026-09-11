@@ -6,3 +6,4 @@ tests/e2e/__artifacts__/
 *.local
 .vite
 *.tsbuildinfo
+*.log

@@ -1,14 +1,14 @@
 # FlowMap user guide
 
 How to install FlowMap, connect to a market, read the depth heatmap, and use
-replay, measurement, alerts, drawings, indicators and export. For how the
-pieces work inside, see [architecture.md](architecture.md); for build/test
-commands, [development.md](development.md).
+replay, measurement, alerts, the watchlist, drawings, indicators and export. For
+how the pieces work inside, see [architecture.md](architecture.md); for
+build/test commands, [development.md](development.md).
 
 Contents: [Install](#install) · [First run](#first-run) ·
 [Connecting](#connecting--picking-symbols) · [Reading the heatmap](#reading-the-heatmap) ·
 [Replay](#replay--seek) · [Measure tool](#measure-tool) ·
-[Price alerts](#price-alerts) · [Drawings](#drawings) ·
+[Price alerts](#price-alerts) · [Watchlist](#watchlist) · [Drawings](#drawings) ·
 [Indicators & candles](#indicators--candles) · [Themes & language](#themes--language) ·
 [Keyboard reference](#keyboard--pointer-reference) · [Export](#export) ·
 [Health endpoint](#health-endpoint) · [Troubleshooting](#troubleshooting)
@@ -121,6 +121,12 @@ bar; the timeline at the bottom becomes a transport with a minimap:
   request with no usable recording is refused explicitly, a stale recorded
   tail is refused rather than relabeled live, and where a recorded tail meets
   a live edge a gap marker is shown instead of invented continuity.
+- **Bounded loads.** A replay with no explicit window loads the newest bounded
+  window of the recording (the grid ring, or `FLOWMAP_REPLAY_MAX_COLS` if set)
+  and warns if the recording was truncated to fit. The wire and the client
+  already support a `[start_t, end_t)` subscription window (re-subscribed as a
+  distinct session), but there is **no UI to pick a window yet** — the
+  interactive window picker is still on the [roadmap](../ROADMAP.md).
 
 ## Measure tool
 
@@ -144,16 +150,50 @@ last trade) about ten times per second — they never leave your machine.
 
 - Press `A` to create an alert at the crosshair price; the bell button
   (chart's bottom-right) opens the alert list, where you can type an exact
-  level, delete, snooze/re-arm, or clear fired alerts.
+  level, delete, snooze, manually re-arm, or clear fired alerts.
 - Direction (above/below) is derived from the market mid at creation time.
 - When a level crosses: the line marker turns solid red and pulses briefly, a
-  toast appears, and the alert is moved to a fired log. A 60-second snooze
-  prevents re-fire spam while price hovers at the level.
-- Limits: at most 50 alerts per symbol (oldest evicted). There is **no sound
-  yet** — the trigger is visual (marker + toast) only; watch the roadmap.
+  toast names the symbol, an optional chime plays (`Settings → Alerts → Alert
+  sound`, on by default), and the alert moves to a fired log.
+- **Re-arm is price-based, not timer-based.** A fired alert stays latched until
+  the price returns past a re-arm band (~0.1% beyond the level); the next
+  crossing then fires. A price hovering at the level therefore cannot spam.
+  Snooze is a 60-second mute of the alert (it no longer clears the latch);
+  `re-arm` in the popover arms it again immediately while keeping the band.
+- **Non-active symbols keep watching.** A background monitor polls the server's
+  quote endpoint (10 s cadence, paused while the browser tab is hidden) for
+  every symbol you have alerts on, so you still get the toast/chime while
+  another symbol is on the chart. It only evaluates fresh quotes — a stale or
+  unreachable quote never fires an alert.
+- **Replay is honest here too.** While the chart is in replay mode the
+  book-price evaluator pauses (historical prices must not fire a "live" alert);
+  the quote monitor above keeps running on live REST data.
+- Limits: at most 50 alerts per symbol (oldest evicted).
 
 Alerts are edge-triggered per crossing; removing the alert or clearing fired
 entries is immediate and local.
+
+## Watchlist
+
+The watchlist is a small favorites rail above the DOM ladder: a persistent,
+local list of `market:symbol` keys you want at a glance.
+
+- **Add** — the `+ Add current` button adds the symbol on the chart. The list
+  holds up to 30 favorites; adding a 31st is refused (nothing is silently
+  evicted).
+- **Select** — click a row (or press Enter on it) to switch the chart to that
+  symbol; the active row is highlighted.
+- **Remove** — click the star (`★`) toggle or the `×` control on a row; neither
+  selects the row.
+- **Quotes** — every row shows the live price and signed change with a
+  sparkline, refreshed from a shared 10-second poll that pauses while the tab
+  is hidden. Rows dim with a `stale` chip when the venue quote is stale;
+  unreachable symbols show `—` rather than a guessed price.
+- **Empty state** — until you pin something, the panel offers your recent
+  symbols as one-click suggestions (suggestions don't auto-favorite).
+
+The list persists in your browser (`flowmap.watchlist.v1`) per machine and
+never leaves it.
 
 ## Drawings
 
@@ -188,12 +228,13 @@ exactly the column data the server delivered.
 
 ## Themes & language
 
-- **Themes** — press `T` to cycle: `midnight` (the default dark, identical to
-  the original palette), `paper` (light), `swiss` (high-contrast light),
-  `amber` (warm dark terminal), `sea` (deuteranopia-safe: the sell side reads
-  blue, warnings violet). First launch follows your OS light/dark preference;
-  your explicit choice persists. Canvas overlays (grid, axes, markers) follow
-  the theme, not just the chrome.
+- **Themes** — press `T` to cycle seven palettes: `midnight` (the default dark,
+  identical to the original palette), `paper` (light), `swiss` (high-contrast
+  light), `amber` (warm dark terminal), `sea` (deuteranopia-safe: the sell side
+  reads blue, warnings violet), `paper-deut` (light deuteranopia: teal bid /
+  blue ask) and `contrast` (true-black, maximum-contrast ink). First launch
+  follows your OS light/dark preference; your explicit choice persists. Canvas
+  overlays (grid, axes, markers) follow the theme, not just the chrome.
 - **Language** — the interface ships in English with a Turkish translation of
   the shell (top bar, settings drawer, banners, shortcuts overlay, onboarding,
   toasts). The choice persists; missing translations fall back to English
@@ -214,7 +255,7 @@ source of truth as this table — `client/src/ui/keysheet.ts`).
 | `A` | Price alert at the crosshair price (list: bell button on the chart) |
 | `H` | Perf HUD — fps / frame ms / uploads / draws / cache |
 | `C` | Cycle depth channel: sum → bid → ask → imbalance |
-| `T` | Cycle theme (midnight → paper → swiss → amber → sea) |
+| `T` | Cycle theme (midnight → paper → swiss → amber → sea → paper-deut → contrast) |
 | `?` | Toggle the shortcuts overlay |
 | `←` `→` `↑` `↓` | Pan time / price (chart focused) |
 | `+` / `−` | Zoom time (chart focused) |

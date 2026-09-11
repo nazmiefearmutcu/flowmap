@@ -1,12 +1,13 @@
 name: CI
 
 # Fast push/PR gate:
-#   - client typecheck + unit tests (ubuntu + windows)
+#   - client typecheck + lint (eslint) + unit tests (ubuntu + windows)
 #   - client production bundle (tsc -b && vite build) — a broken prod build
 #     no longer ships green
-#   - server pytest (ubuntu + windows; the product is Windows-packaged, so the
-#     server suite is exercised on both OSes)
+#   - server pytest + lint (ruff) (ubuntu + windows; the product is
+#     Windows-packaged, so the server suite is exercised on both OSes)
 #   - Tauri shell `cargo test` (ubuntu, with the Tauri 2 Linux system deps)
+#   - full browser e2e (ubuntu, Playwright chromium via SwiftShader)
 # The heavier release/packaging pipeline lives in release.yml.
 on:
   push:
@@ -27,7 +28,7 @@ concurrency:
 
 jobs:
   client:
-    name: client (tsc + vitest, ubuntu)
+    name: client (tsc + lint + vitest, ubuntu)
     runs-on: ubuntu-latest
     steps:
       # Every action ref in every workflow is pinned to a full commit SHA
@@ -47,6 +48,13 @@ jobs:
       - name: Typecheck
         working-directory: client
         run: npx tsc -b
+
+      # eslint flat config (client/eslint.config.js): typescript-eslint
+      # recommended + react-hooks correctness rules. Curated to pass on the
+      # current tree — warnings are allowed, errors fail the job.
+      - name: Lint (eslint)
+        working-directory: client
+        run: npm run lint
 
       - name: Unit tests
         working-directory: client
@@ -99,7 +107,7 @@ jobs:
         run: npx vitest run
 
   server:
-    name: server (pytest, ubuntu)
+    name: server (pytest + lint, ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -116,6 +124,13 @@ jobs:
       - name: Run tests
         working-directory: server
         run: uv sync --frozen && uv run pytest -q
+
+      # ruff config lives in server/pyproject.toml ([tool.ruff], E4/E7/E9/F;
+      # E741 ignored for the OHLC `l` convention). Sync already happened in the
+      # step above, so this is a pure check.
+      - name: Lint (ruff)
+        working-directory: server
+        run: uv run ruff check .
 
   server-windows:
     name: server (pytest, windows)
@@ -192,3 +207,43 @@ jobs:
       - name: Shell tests
         working-directory: app/src-tauri
         run: cargo test --locked
+
+  # Full browser e2e against the real stack (uv server + vite, recording off).
+  # Playwright's webServer boots both; CI=1 makes it boot fresh (no reuse) and
+  # enables the config's retries: 2. Chromium renders WebGL2 via SwiftShader
+  # (flags in client/playwright.config.ts) — software GL is slow, and the perf
+  # spec's fps gate is the known flake risk on shared runners.
+  e2e:
+    name: e2e (playwright chromium, ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client deps
+        working-directory: client
+        run: npm ci
+
+      - name: Install Playwright chromium (+ system deps)
+        working-directory: client
+        run: npx playwright install --with-deps chromium
+
+      # The webServer in playwright.config.ts runs `uv run python -m
+      # flowmap_server` from ../server, so the frozen env must exist first.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Sync server deps
+        working-directory: server
+        run: uv sync --frozen
+
+      - name: Run e2e suite
+        working-directory: client
+        env:
+          CI: "1"
+        run: npx playwright test

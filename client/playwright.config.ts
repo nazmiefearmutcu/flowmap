@@ -15,10 +15,24 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
+  // Campaign-4: in CI the WebGL specs run on SwiftShader (software GL); two
+  // concurrently-running canvas-heavy specs starve each other's CPU and trip
+  // the perf spec's honest thresholds (its history-independence gate stays
+  // authoritative). Serialize in CI for determinism; local stays parallel.
+  workers: process.env.CI ? 1 : undefined,
   reporter: 'list',
   use: {
     baseURL: 'http://127.0.0.1:5173',
     trace: 'on-first-retry',
+    // Campaign-4: the first-run onboarding card auto-opens on a fresh context
+    // (every Playwright test) and its full-viewport scrim swallows the first
+    // pointer/wheel interaction, turning unrelated specs red. Seed the
+    // ONBOARDING_KEY dismissal centrally for every context; onboarding itself
+    // is covered by its unit tests. The state ALSO pins `flowmap.theme=midnight`
+    // so specs start on the documented dark default instead of the first-run
+    // prefers-color-scheme resolution (headless Chromium reports light → paper),
+    // which would otherwise make color-asserting specs environment-dependent.
+    storageState: fileURLToPath(new URL('./tests/e2e/onboarded-state.json', import.meta.url)),
   },
   projects: [
     {

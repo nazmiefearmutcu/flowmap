@@ -12,19 +12,23 @@ client/    React 18 + TypeScript + WebGL2 renderer. Vite dev server (:5173)
   src/input/   gestures.ts (wheel/drag), keys.ts (global keyboard)
   src/net/     connection.ts (WS), history.ts (paged history), serverBase.ts
   src/proto/   decode.ts / encode.ts — TypeScript mirror of the server wire codec
-  src/state/   stores: book/tape, settings, alerts
-  src/theme/   theme registry (5 CVD-safe palettes), CSS-variable tokens
+  src/state/   stores: book/tape, settings, alerts, quote feed
+  src/theme/   theme registry (7 CVD-safe palettes), CSS-variable tokens
   src/i18n/    EN/TR shell translation (t(), locale persistence)
   src/drawings/  chart annotation model + persistence (2D overlay in src/ui)
   src/indicators/ + src/candles/  indicator kernels, registry, candle synthesis
   src/ui/      top bar, symbol search, DOM ladder, tape, CVD pane, settings,
-               measure tool, price alerts, drawings/indicator canvases, ...
-  tests/e2e/   Playwright specs (heatmap, live-sim, equity, parity, perf gates)
+               measure tool, price alerts, watchlist rail, drawings/indicator
+               canvases, ...
+  tests/e2e/   Playwright specs (32 tests / 16 files: heatmap, live-sim,
+               equity, parity, perf gates, scrollback, tail-columns, axis,
+               overlays, panels, normalize, session-switch, shell, mips,
+               features, gl4)
 server/    Python 3.13 sidecar (FastAPI + uvicorn, asyncio).
   src/flowmap_server/
     api/     REST (/api/health, /api/symbols, /api/venues, /api/universe,
              /api/movers, /api/quote, /api/export) + the binary /ws WebSocket
-             (origin gate + connection cap)
+             (origin gate + connection cap) + _env.py (WS env knobs)
     core/    density grid, sessions, recorder, price scale, backfill, session stats
     data/    bundled symbol universe + venue catalog
     feeds/   sim, crypto (Crocodile), equity, replay, and the router
@@ -34,9 +38,10 @@ docs/       architecture.md, development.md, user-guide.md, design specs
             (superpowers/specs), screenshots (media/)
 scripts/    dev.sh, dev-windows.ps1, dev-unix.sh (dev boot), package.sh
             (client production bundle)
-.github/    workflows: ci.yml (push/PR gate: client tsc+vitest on ubuntu+windows,
-            production bundle build, server pytest on ubuntu+windows, shell cargo
-            test), release.yml (packaged, attested installers)
+.github/    workflows: ci.yml (push/PR gate: client tsc + eslint + vitest on
+            ubuntu+windows, production bundle build, server pytest + ruff on
+            ubuntu+windows, shell cargo test, full Playwright e2e on ubuntu),
+            release.yml (packaged, attested installers)
 ```
 
 ## Dev environment
@@ -54,13 +59,15 @@ scripts/    dev.sh, dev-windows.ps1, dev-unix.sh (dev boot), package.sh
 ## Tests
 
 ```bash
-# client unit tests (vitest + jsdom, 900+ and growing every campaign)
+# client unit tests (vitest + jsdom, ~1243 tests across 85 files)
 cd client && npm test              # = vitest run; npm run test:watch for watch mode
 npx tsc -b                         # strict typecheck across client tsconfig projects
+npm run lint                       # eslint flat config (errors fail; warnings allowed)
 npm run build                      # production bundle proof (tsc -b && vite build)
 
-# server tests (pytest, 550+ and growing)
+# server tests (pytest, ~664 tests)
 cd server && uv sync && uv run pytest -q
+uv run ruff check .                # lint (ruff)
 # without uv, from the repo root:
 PYTHONPATH=server/src pytest server/tests -q
 
@@ -81,14 +88,22 @@ from its pinned git revision).
 ```bash
 cd client
 npx playwright install chromium    # one-time browser download
-npm run e2e
+npm run e2e                        # = npx playwright test
+# Windows PowerShell blocks npx.ps1 — use the cmd shim instead:
+cmd /c "npx playwright test"
 ```
+
+The suite is **32 tests in 16 spec files**: heatmap, live-sim, equity, parity, perf, scrollback,
+tail-columns, axis-scale, overlays, panels, normalize, session-switch, shell, mips, `features`
+(drawings persistence, alert fire, theme/locale flips, watchlist switching, replay refusal) and
+`gl4` (tick grouping, deep time-zoom mips, imbalance pixels, context-loss follow intent).
 
 Prerequisites and behavior (from `client/playwright.config.ts`):
 
-- **The config boots the real stack for you** — two `webServer` entries: the actual
-  `flowmap_server` (via `uv run` in `server/`) and the vite dev server. You need `uv` and npm
-  installed; you do not need to boot anything yourself.
+- **`uv` must be on your PATH** — the config boots the real stack for you via two `webServer`
+  entries: the actual `flowmap_server` (`uv run python -m flowmap_server`, cwd `server/`) and
+  the vite dev server. You do not need to boot anything yourself, but the server entry resolves
+  `uv` from PATH.
 - **Server boot env for e2e**: `FLOWMAP_PORT=8720`, `FLOWMAP_RECORDING_ENABLED=0` (e2e never
   touches disk or rehydrates a stale tail), `FLOWMAP_LOG_LEVEL=warning`, and
   `FLOWMAP_DT_CRYPTO_NS=25000000` — a 25 ms sim cadence (40 columns/s) so scroll-back specs
@@ -96,11 +111,21 @@ Prerequisites and behavior (from `client/playwright.config.ts`):
 - **`reuseExistingServer` is enabled when `CI` is unset**: a manually booted server on `:8720`
   (or vite on `:5173`) will be reused, which speeds up local iteration. In CI it always boots
   fresh servers.
+- **CI serializes the suite**: `workers: process.env.CI ? 1 : undefined` — two concurrent
+  canvas-heavy specs starve each other's CPU on SwiftShader and trip the perf spec's honest
+  thresholds. Locally the suite stays parallel; CI also retries twice (`retries: 2`).
+- **Onboarding/theme storage state** is seeded for every browser context
+  (`tests/e2e/onboarded-state.json`: `flowmap.onboarded=1`, `flowmap.theme=midnight`) — the
+  first-run tour's scrim would otherwise swallow the first pointer/wheel interaction.
 - vite is pinned to `--host 127.0.0.1` (vite otherwise binds `[::1]` only, which the IPv4
   readiness URL cannot reach).
 - Headless WebGL2 works: Chromium is launched with ANGLE→SwiftShader
   (`--use-angle=swiftshader --enable-unsafe-swiftshader`), so heatmap specs render on GPU-less
   CI runners.
+- **CI job**: `e2e` (ubuntu, 30-minute timeout) in `.github/workflows/ci.yml` installs
+  Playwright chromium with system deps, runs `uv sync --frozen` in `server/`, then
+  `npx playwright test` with `CI=1`. The perf gate's fps thresholds are the known flake risk on
+  shared runners (it has a documented software-GL fallback).
 
 ## Release / packaging outline
 

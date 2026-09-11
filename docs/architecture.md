@@ -186,11 +186,11 @@ computed CSS variables (below), so no overlay hardcodes palette literals.
 
 ## Themes and i18n (client shell)
 
-- **Themes** — `client/src/theme/` holds a registry of five CVD-safe palettes (`midnight`
-  default, `paper`, `swiss`, `amber`, `sea`). Each theme re-declares the full CSS-variable
-  token set on `:root[data-theme='<id>']` over the base sheet, so switching is one
-  `data-theme` attribute stamp plus a `localStorage` write; first run seeds from
-  `prefers-color-scheme`. Canvas overlays read live computed variables through
+- **Themes** — `client/src/theme/` holds a registry of seven CVD-safe palettes (`midnight`
+  default, `paper`, `swiss`, `amber`, `sea`, `paper-deut`, `contrast`). Each theme re-declares
+  the full CSS-variable token set on `:root[data-theme='<id>']` over the base sheet, so
+  switching is one `data-theme` attribute stamp plus a `localStorage` write; first run seeds
+  from `prefers-color-scheme`. Canvas overlays read live computed variables through
   `getCanvasPalette()` — DOM and GL stay in one visual language.
 - **i18n** — `client/src/i18n/` is a dependency-free `t(key, vars?)` table (English source of
   truth + Turkish) covering the shell (top bar, settings drawer, banners, shortcuts overlay,

@@ -42,14 +42,21 @@ Anything a session shows can be recorded to parquet on disk and replayed with se
   [`/api/export`](docs/user-guide.md#export) (CSV/JSON), measure Δprice/Δtime/Δdepth on the
   chart (`M`), and highlight outsized tape prints with a configurable notional threshold
   (`Settings → Big trade size`).
+- **Watchlist rail** — pin up to 30 favorites; each row shows a live quote, signed change
+  and a sparkline from a shared 10 s poll that pauses while the tab is hidden. Stale rows
+  dim and unreachable symbols show `—`, never a guessed price. Clicking a row switches the
+  chart; the empty state offers recents.
 - **Annotation & analysis layers** — chart **drawings** (trendline, horizontal ray, rectangle,
   Fibonacci retracement, horizontal line, text) with select/move/resize and per-symbol
   persistence; **indicators** (EMA, SMA, RSI, VWAP, Bollinger, MACD) and synthesized
   **candles** (1m/5m) drawn in sync with the depth columns; **price alerts** (`A`) that are
-  client-local, persisted per symbol, and fire a marker pulse + toast; a **perf HUD** (`H`)
-  with live fps/frame/upload stats from the renderer.
-- **Accessible, honest shell** — five CVD-safe themes (`T` to cycle, OS light/dark honored on
-  first run), English/Turkish interface with graceful fallback, a first-run onboarding tour,
+  client-local, persisted per symbol, and fire a marker pulse + toast + optional WebAudio
+  chime (settings toggle) — a fired alert re-arms only after price returns past its band,
+  and a background monitor keeps alerts on non-active symbols firing via `/api/quote`; a
+  **perf HUD** (`H`) with live fps/frame/upload stats from the renderer.
+- **Accessible, honest shell** — seven CVD-safe themes (`T` to cycle: midnight, paper,
+  swiss, amber, sea, paper-deut, contrast; OS light/dark honored on first run),
+  English/Turkish interface with graceful fallback, a first-run onboarding tour,
   keyboard shortcuts everywhere (`?` for the live cheatsheet), and a polished toast stack.
 - **Desktop app** — Tauri 2 shell bundles the client and a relocatable Python sidecar
   (loopback-only), spawns it automatically, keeps a health-monitor thread that respawns it
@@ -174,8 +181,10 @@ or `AAPL` (keyless SYNTH; real Alpaca L1 + tick tape during market hours with ke
 
 All config is env-first, resolved at startup in
 [`server/src/flowmap_server/config.py`](server/src/flowmap_server/config.py) and
-[`__main__.py`](server/src/flowmap_server/__main__.py). Defaults in the table are the shipped
-defaults.
+[`__main__.py`](server/src/flowmap_server/__main__.py); the `/ws` edge knobs
+(`FLOWMAP_WS_*`) are read per connection in
+[`api/_env.py`](server/src/flowmap_server/api/_env.py). Defaults in the table are the
+shipped defaults.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -183,11 +192,16 @@ defaults.
 | `FLOWMAP_PORT` | `8720` | HTTP + WebSocket port (vite's dev proxy targets this) |
 | `FLOWMAP_RING_COLUMNS` | `32768` | In-memory ring buffer depth (columns) |
 | `FLOWMAP_MAX_SESSIONS` | `4` | Concurrent subscriptions |
+| `FLOWMAP_WS_ALLOWED_ORIGINS` | *(unset)* | Replaces the built-in browser-origin allow-list for `/ws` (comma-separated exact origins; `*` disables the check). Requests without an `Origin` header are always allowed |
+| `FLOWMAP_WS_MAX_CONNECTIONS` | `16` | Per-process `/ws` connection cap; over-limit clients are closed with code `1013` |
+| `FLOWMAP_REPLAY_MAX_COLS` | `0` | Bound on the columns a no-window replay subscribe loads (`0` follows `FLOWMAP_RING_COLUMNS`); an explicit `start_t`/`end_t` window is never trimmed by this knob |
 | `FLOWMAP_DT_CRYPTO_NS` | `250000000` | Grid column cadence for crypto + sim feeds (nanoseconds; 250 ms) |
 | `FLOWMAP_DT_EQUITY_KEYLESS_NS` | `10000000000` | Keyless equity last-price poll cadence (10 s) |
 | `FLOWMAP_DT_EQUITY_KEYLESS_GRID_NS` | `1000000000` | Keyless equity grid column cadence (1 s) |
 | `FLOWMAP_RECORDING_ENABLED` | `1` | `0` / `false` disables all recording writes |
 | `FLOWMAP_RECORDING_GB_CAP` | `20.0` | Recording disk cap; oldest files evicted first |
+| `FLOWMAP_FLUSH_INTERVAL_S` | `10.0` | Time-based recording flush cadence: a hard app-close loses at most this many seconds of buffered recording per session |
+| `FLOWMAP_RETENTION_MIN_INTERVAL_S` | `60.0` | Minimum wall-clock seconds between recording-retention walks per session (`0` = walk after every flush) |
 | `FLOWMAP_DATA_DIR` | `~/.flowmap/recordings` | Recording root directory |
 | `FLOWMAP_BACKFILL_ENABLED` | `1` | First-launch candle-history backfill onto the chart |
 | `FLOWMAP_BACKFILL_MAX_COLS` | `512` | Max candle-columns fetched for backfill |
@@ -233,13 +247,15 @@ live overlay.
 ## Development
 
 ```bash
-# client unit tests (1100+ and growing, vitest + jsdom)
+# client unit tests (1200+ across 85 files and growing, vitest + jsdom)
 cd client && npm install && npm test        # or: npx vitest, npm run test:watch
 npx tsc -b                                  # typecheck
+npm run lint                                # eslint (flat config)
 npm run build                               # production bundle (tsc -b && vite build)
 
-# server tests (630+ and growing, pytest, Python 3.13)
+# server tests (660+ and growing, pytest, Python 3.13)
 cd server && uv sync && uv run pytest -q    # or: PYTHONPATH=server/src pytest server/tests -q
+uv run ruff check .                         # lint (ruff)
 
 # Tauri shell tests (Rust)
 cd app/src-tauri && cargo test              # Linux needs the Tauri system deps — see ci.yml
@@ -250,8 +266,9 @@ cd client && npx playwright install chromium && npm run e2e
 
 E2E prerequisites, repo layout and release/packaging notes: [docs/development.md](docs/development.md).
 Protocol and internals: [docs/architecture.md](docs/architecture.md). Continuous integration
-runs the client suite (ubuntu + windows), the production bundle build, the server suite
-(ubuntu + windows) and the shell `cargo test` on every push/PR:
+runs lint (eslint + ruff), the client suite (ubuntu + windows), the production bundle build,
+the server suite (ubuntu + windows), the full Playwright e2e suite (ubuntu) and the shell
+`cargo test` on every push/PR:
 [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ### Packaged releases

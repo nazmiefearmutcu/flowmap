@@ -110,7 +110,7 @@ test('§10 perf gates: pan/zoom fps + history-independent frame cost @ 10k colum
   );
 
   // --- A) 200-column baseline: preload, then a scripted continuous pan. -------
-  const geom200 = await page.evaluate(
+  await page.evaluate(
     (cfg) =>
       (window as unknown as { __flowmapLive: any }).__flowmapLive.renderer.preloadSynthetic(
         cfg.cols,

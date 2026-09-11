@@ -51,6 +51,11 @@ async function bootLive(page: Page): Promise<string[]> {
     if (m.type() === 'error') consoleErrors.push(m.text());
   });
   page.on('pageerror', (e) => consoleErrors.push(String(e)));
+  // Campaign-4: the first-run onboarding card's full-viewport scrim intercepts
+  // the first pointer click in every fresh Playwright context. Seed the
+  // dismissal flag (ui/OnboardingCard ONBOARDING_KEY) before boot so these
+  // shell specs exercise the shell, not the onboarding card.
+  await page.addInitScript(() => localStorage.setItem('flowmap.onboarded', '1'));
   await page.goto('/?spy=1');
   await page.waitForFunction(
     () => {

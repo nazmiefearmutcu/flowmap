@@ -50,9 +50,11 @@ docs: document FLOWMAP_LOG_FILE
 
 Before opening a PR, please confirm:
 
-- [ ] **Tests green.** `cd client && npm test` (~1116 vitest tests) and
-  `cd server && uv run pytest -q` (~630 pytest tests) both pass locally, and new behavior has
+- [ ] **Tests green.** `cd client && npm test` (~1243 vitest tests across 85 files) and
+  `cd server && uv run pytest -q` (~664 pytest tests) both pass locally, and new behavior has
   tests.
+- [ ] **Lint clean.** `cd client && npm run lint` (eslint) and
+  `cd server && uv run ruff check .` both pass.
 - [ ] **TypeScript clean.** `npx tsc -b` in `client/` reports no errors.
 - [ ] **The honest-data rule holds.** Never render, badge, or replay data that the feed did not
   actually deliver: capability badges (`L2`/`L1`/`SYNTH`, `TAPE TICK`/`TAPE POLL`) must reflect
@@ -67,8 +69,9 @@ Before opening a PR, please confirm:
   security-adjacent).
 - [ ] **No new binary assets** in a PR that doesn't explicitly need them.
 
-CI runs both suites on every push and PR (`.github/workflows/ci.yml`); a maintainer will ask for
-rebases rather than merge commits if the branch has drifted.
+CI runs lint, both test suites and the full Playwright e2e suite on every push and PR
+(`.github/workflows/ci.yml`); a maintainer will ask for rebases rather than merge commits if
+the branch has drifted.
 
 ## Reporting bugs and vulnerabilities
 

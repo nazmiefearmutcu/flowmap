@@ -1,0 +1,12 @@
+{
+  "cookies": [],
+  "origins": [
+    {
+      "origin": "http://127.0.0.1:5173",
+      "localStorage": [
+        { "name": "flowmap.onboarded", "value": "1" },
+        { "name": "flowmap.theme", "value": "midnight" }
+      ]
+    }
+  ]
+}

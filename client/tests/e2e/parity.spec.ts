@@ -52,7 +52,6 @@ const SIDE_SELL = 1;
 const SIDE_UNKNOWN = 2;
 const SIDE_SRC_EXCHANGE = 0;
 const SIDE_SRC_NA = 2;
-const RAMP_INFERNO = 0;
 const RAMP_FLOW = 3;
 const RAMP_SYNTH = 1;
 
