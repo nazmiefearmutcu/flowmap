@@ -26,28 +26,41 @@ Design spec §6.3 and §11. The load-bearing semantics:
   latest-wins is acceptable at M1.
 - **Lifecycle** (§11): sessions are refcounted by subscribers; teardown fires
   after the last detach plus a 60 s grace (injectable timer). A crashed feed
-  restarts with exponential backoff (cap 30 s) and reports transitions via
-  ``Status``; other sessions are unaffected.
+  restarts with exponential backoff (cap 30 s) slept with FULL JITTER (a
+  uniform draw from ``[0, backoff)`` — sessions of a venue that died together
+  no longer restart in lockstep) and reports transitions via ``Status``;
+  other sessions are unaffected.
 - **Recording + rehydration** (§7/§8.1, M1 T11): a live-mode session with a
   :class:`~flowmap_server.core.record.Recorder` self-records epoch params
   (initial + every re-anchor), every finalized column, trades and markers.
-  Flush cadence: every ``REC_FLUSH_COLS`` recorded columns, when the feed
-  loop exits (server shutdown), and on teardown (``close()``); each flush is
-  followed by ``enforce_retention()``. The cadence Parquet write and the
-  retention walk run in executor threads (buffers are swapped out on the
-  loop first, and only one flush is ever in flight, so order and content
-  are exactly what the synchronous version produced); the teardown close
-  stays synchronous so data is on disk before the session dies. Every
-  recorder call is wrapped: on
-  exception it is logged and recording is disabled for the session —
-  recording failures NEVER kill the feed loop. Before the feed task starts,
-  ``start()`` rehydrates the grid ring from the newest recording via
+  Flush cadence: every ``REC_FLUSH_COLS`` recorded columns OR once the
+  time-based cadence (``rec_flush_interval_s``, default 10 s) is reached
+  (a Windows hard close loses at most ~the cadence, not a whole part), when
+  the feed loop exits (server shutdown), and on teardown (``close()``); a
+  successful flush is followed by ``enforce_retention()``, which runs at
+  most once per ``retention_min_interval_s`` (default 60 s) of wall clock.
+  The cadence Parquet write and the retention walk run in executor threads
+  (buffers are swapped out on the loop first, and only one flush is ever in
+  flight, so order and content are exactly what the synchronous version
+  produced); the teardown close stays synchronous so data is on disk before
+  the session dies. Every recorder call is wrapped: recording failures NEVER
+  kill the feed loop. A FAILED cadence flush is no longer permanent: the
+  unwritten rows are restored to the buffers and the flush retries after a
+  cooldown (exponential backoff 5 s → 300 s cap; only a broken recorder that
+  cannot even take its rows back disables recording). Before the feed task
+  starts, ``start()`` rehydrates the grid ring from the newest recording via
   ``load_tail`` (run in the default executor so the event loop — and other
   sessions' attaches — never block on Parquet IO) and emits a
   ``Marker{kind=gap}`` between the recorded tail and live; a stale/absent/
   unusable tail means a cold start. Because rehydration only happens when a
   Recorder is wired in (SessionManager default: none), deterministic sim
   tests never depend on a previous run's recordings.
+- **Telemetry** (campaign C1): every drop/restart/flush-failure counter on
+  this path feeds the shared :class:`~flowmap_server.core.stats.SessionStats`
+  aggregate (mounted as ``SessionManager.stats``); per-connection latency/
+  skew reach Status broadcasts through the ``Session.conn_stats`` hook the
+  WS layer installs. All hooks are optional — a bare ``Session`` (tests)
+  behaves exactly as before.
 
 Everything is asyncio, single-threaded, no locks (the only lock serializes
 ``start()``'s boot phase): attach/snapshot/broadcast never await between
@@ -60,9 +73,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import random
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from typing import Protocol
 
@@ -73,6 +87,7 @@ from flowmap_server.config import Config
 from flowmap_server.core.backfill import BackfillFn, columns_from_candles
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
+from flowmap_server.core.stats import SessionStats
 from flowmap_server.feeds.base import BookState, Feed
 from flowmap_server.feeds.equity import EQUITY_MARKETS
 from flowmap_server.feeds.replay import ReplayFeed
@@ -100,6 +115,13 @@ GRACE_S = 60.0  # teardown grace after last detach
 FLUSH_INTERVAL_NS = 50_000_000  # right-edge partial re-send cadence (20 Hz)
 REC_FLUSH_COLS = 64  # recording flush cadence (finalized columns)
 _BACKOFF_CAP_S = 30.0
+# Recording flush-failure retry (cooldown with exponential backoff). One
+# transient failure (disk full, AV scan lock, USB hiccup) must NOT permanently
+# disable recording: the failed snapshot's rows are restored to the buffers and
+# the next attempt waits base * 2**(consecutive_failures-1) seconds, capped.
+# Success resets the ladder. Failures are counted in stats.flush_failures.
+_REC_RETRY_BASE_S = 5.0
+_REC_RETRY_CAP_S = 300.0
 # Backoff resets to base only once a restarted feed proves stable: it has run
 # for >=5 s (injectable clock) or delivered >=100 events, whichever first. A
 # yield-one-then-crash flapper therefore keeps escalating to the 30 s cap.
@@ -199,6 +221,11 @@ class ClientTx:
         self._noncol_cap = noncol_cap
         self._q: list[_Frame | _Gap] = []
         self._noncol = 0
+        # Telemetry hook (campaign C1), installed by Session.attach: called
+        # with the number of COLUMNs dropped by each lag eviction so the
+        # server-wide stats aggregate can count tx lag drops at the source.
+        # Public and default-None — the WS layer constructs ClientTx bare.
+        self.on_lag_drop: Callable[[int], None] | None = None
 
     def __len__(self) -> int:
         return len(self._q)
@@ -266,6 +293,7 @@ class ClientTx:
         out: list[_Frame | _Gap] = []
         idx = 0
         dropped = False
+        n_cols = 0  # real columns lost (depth+bar pair sharing t0 counts once)
         while idx < len(q):
             e = q[idx]
             if isinstance(e, _Frame):
@@ -282,13 +310,20 @@ class ClientTx:
                         if tail.last_t0_ns != e.t0_ns:  # depth+bar: count once
                             tail.last_t0_ns = e.t0_ns
                             tail.count += 1
+                            n_cols += 1
                     else:
                         out.append(_Gap(e.t0_ns))
+                        n_cols += 1
                     continue
             out.append(e)
             idx += 1
         if dropped:
             self._q = out + q[idx:]
+            if n_cols and self.on_lag_drop is not None:
+                try:
+                    self.on_lag_drop(n_cols)
+                except Exception:  # noqa: BLE001 — telemetry must never kill the queue
+                    pass
 
     def drain(self, max_bytes: int) -> list[bytes]:
         """Pop frames FIFO up to ``max_bytes`` total.
@@ -349,6 +384,9 @@ class Session:
         wall_clock: Clock = time.time_ns,
         backfill_fn: BackfillFn | None = None,
         backfill_max_cols: int = 0,
+        stats: SessionStats | None = None,
+        rec_flush_interval_s: float = 10.0,
+        retention_min_interval_s: float = 60.0,
     ) -> None:
         self.session_id = session_id
         self.run_task: asyncio.Task | None = None
@@ -361,6 +399,12 @@ class Session:
         self._backoff_base_s = restart_backoff_base_s
         self._backoff_s = restart_backoff_base_s
         self._grace_s = grace_s
+        # Server-wide telemetry aggregate (campaign C1). None (bare tests)
+        # simply skips every counter — behavior is identical without it.
+        self._stats = stats
+        # Full-jitter source for restart backoff: all sessions of a venue that
+        # died together used to restart in lockstep every backoff step.
+        self._rng = random.Random()
 
         # Recording (module docstring): the root opens the per-symbol writer
         # and serves load_tail at boot; wall_clock (injectable) is the §8.1
@@ -368,11 +412,36 @@ class Session:
         self._recorder_root = recorder
         self._wall_clock = wall_clock
         self._rec: SessionRecorder | None = None
+        # Flush-failure retry state (see _REC_RETRY_* above): consecutive
+        # failures size the cooldown; the retry is skipped while the cooldown
+        # is active. Both reset on any successful flush.
+        self._rec_failures = 0
+        self._rec_retry_at: int | None = None
+        # Time-based flush cadence (FLOWMAP_FLUSH_INTERVAL_S): buffers are
+        # flushed once they have been accumulating this long even below the
+        # REC_FLUSH_COLS column cadence, so a hard close loses seconds, not a
+        # whole part. _rec_cadence_ns restarts at every successful flush.
+        self._rec_flush_interval_ns = max(0, int(rec_flush_interval_s * 1e9))
+        self._rec_cadence_ns = clock()
+        # Retention walk min-interval (FLOWMAP_RETENTION_MIN_INTERVAL_S): the
+        # rglob+stat pass over the recording root runs at most this often.
+        self._retention_min_interval_ns = max(0, int(retention_min_interval_s * 1e9))
+        self._last_retention_ns: int | None = None
         # Newest t0_ns of the recording this session's replay feed was built
         # from. None for live sessions; SessionManager sets it when it builds
         # a replay session and re-checks it on every re-attach to the same
         # key (parked-replay freshness policy, handoff §6).
         self.replay_tail_t0: int | None = None
+        # Exclusive end of a WINDOWED replay ([start_t, end_t)); None for an
+        # unbounded one. A bounded window is immutable history — growth of the
+        # recording past its end is expected, so the parked-replay freshness
+        # re-check is a no-op for such sessions (see _recheck_replay_freshness).
+        self.replay_window_end_ns: int | None = None
+        # Per-connection stats hook (NEEDS-CORE #1): the WS layer installs a
+        # callable returning {"latency_ms": float, "clock_skew_ms": float}
+        # measured on THIS connection; Status broadcasts consume it for real
+        # values instead of hardcoded 0.0. Default None — never read unset.
+        self.conn_stats: Callable[[], dict] | None = None
         self._cols_since_flush = 0
         self._flush_task: asyncio.Task | None = None
         self._boot_done = False
@@ -390,6 +459,14 @@ class Session:
         self._clients: set[ClientTx] = set()
         self._grace_handle: TimerHandle | None = None
         self._closed = False
+
+        # Pre-encoded finalized columns (col_seq -> joined depth+bar frame
+        # bytes), LRU-capped at the snapshot window. _snapshot_frames serves
+        # attaches from this cache instead of re-encoding up to 512 columns
+        # (~8-16 MB) inline on the event loop per attach; entries are written
+        # ONCE at finalize time by the exact encoder calls the snapshot path
+        # used to make, so the wire bytes are identical.
+        self._enc_cache: OrderedDict[int, bytes] = OrderedDict()
 
         self._last_col_seq: int | None = None  # dedup: grid may re-return a column
         self._last_flush_ns = clock()
@@ -457,6 +534,8 @@ class Session:
                 )
             else:
                 self._rec = rec
+                if self._stats is not None:
+                    self._stats.note_recording(self.session_id, True)
                 if tail is not None:
                     # _apply_tail reports success: a tail that failed preload
                     # (grid shape changed, corrupt arrays) leaves the ring
@@ -622,10 +701,13 @@ class Session:
                 "recording failed; disabled for session %s", self.session_id
             )
             self._rec = None
+            if self._stats is not None:
+                self._stats.note_recording(self.session_id, False)
 
     def _flush_recording(self) -> None:
-        """Cadence flush (every REC_FLUSH_COLS recorded columns): hand the
-        current buffers to a background flush task.
+        """Cadence flush (every REC_FLUSH_COLS recorded columns, or once the
+        time-based cadence is reached): hand the current buffers to a
+        background flush task.
 
         The Parquet write runs in a thread (``asyncio.to_thread``) — the
         synchronous write used to stall the event loop for the whole part
@@ -633,9 +715,15 @@ class Session:
         on the loop thread, so rows recorded while the thread writes stay in
         the live buffers and land in the next flush; only one flush may be
         in flight (a tick that arrives mid-write is picked up by the next
-        cadence check), so snapshots can never race each other."""
+        cadence check), so snapshots can never race each other.
+
+        After a flush FAILURE the retry waits out a cooldown (exponential
+        backoff, see _REC_RETRY_*): rows keep buffering and nothing is lost,
+        so a transient disk/AV hiccup costs a delayed part, not the recording."""
         if self._rec is None:
             return
+        if self._rec_retry_at is not None and self._clock() < self._rec_retry_at:
+            return  # cooldown after a failed flush: keep buffering, retry later
         if self._flush_task is not None and not self._flush_task.done():
             return  # previous flush still writing; next cadence catches up
         rec, bufs = self._rec, self._rec.take_buffers()
@@ -652,16 +740,47 @@ class Session:
 
         ``rec`` is captured at snapshot time on purpose: if the session tears
         down while this task is queued, the snapshot still lands instead of
-        being dropped (teardown's close() can no longer see those rows)."""
+        being dropped (teardown's close() can no longer see those rows).
+
+        On failure the rows are restored to the live buffers (they never
+        landed on disk) and a cooldown is armed — recording is NOT disabled
+        for the session on a transient IO failure anymore; only a failure of
+        the restore itself (a broken recorder) still disables."""
         try:
             await asyncio.to_thread(rec.flush_buffers, bufs)
         except Exception:
-            logger.exception(
-                "recording flush failed; disabled for session %s", self.session_id
+            if self._stats is not None:
+                self._stats.inc_flush_failure()
+            self._rec_failures += 1
+            delay_s = min(
+                _REC_RETRY_BASE_S * 2.0 ** (self._rec_failures - 1),
+                _REC_RETRY_CAP_S,
             )
-            self._rec = None
+            self._rec_retry_at = self._clock() + int(delay_s * 1e9)
+            logger.exception(
+                "recording flush failed; will retry in %.0fs for session %s "
+                "(%d consecutive failures)",
+                delay_s,
+                self.session_id,
+                self._rec_failures,
+            )
+            try:
+                rec.restore_buffers(bufs)
+            except Exception:
+                logger.exception(
+                    "recording buffer restore failed; disabled for session %s",
+                    self.session_id,
+                )
+                self._rec = None
+                if self._stats is not None:
+                    self._stats.note_recording(self.session_id, False)
             return
+        self._rec_failures = 0
+        self._rec_retry_at = None
         self._cols_since_flush = 0
+        self._rec_cadence_ns = self._clock()
+        if self._stats is not None:
+            self._stats.note_flush()
         await self._enforce_retention_async()
 
     async def flush_recording_now(self) -> None:
@@ -671,7 +790,12 @@ class Session:
         (:meth:`SessionManager.flush_all`): buffered columns/trades must be
         on disk before the session counts as ended — the §8.1 restart
         rehydrates from these files. Awaits any in-flight cadence flush
-        first, so two flushes can never touch the recorder concurrently."""
+        first, so two flushes can never touch the recorder concurrently.
+
+        A failure here (shutdown path — no time to wait out a cooldown)
+        counts, restores the rows so the teardown close() retries them, and
+        leaves the recorder open: recording is not permanently disabled by a
+        transient write error."""
         task, self._flush_task = self._flush_task, None
         if task is not None and not task.done():
             try:
@@ -688,12 +812,29 @@ class Session:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if self._stats is not None:
+                self._stats.inc_flush_failure()
             logger.exception(
-                "recording flush failed; disabled for session %s", self.session_id
+                "recording flush failed at close; rows restored for session %s",
+                self.session_id,
             )
-            self._rec = None
+            try:
+                self._rec.restore_buffers(bufs)
+            except Exception:
+                logger.exception(
+                    "recording buffer restore failed; disabled for session %s",
+                    self.session_id,
+                )
+                self._rec = None
+                if self._stats is not None:
+                    self._stats.note_recording(self.session_id, False)
             return
+        self._rec_failures = 0
+        self._rec_retry_at = None
         self._cols_since_flush = 0
+        self._rec_cadence_ns = self._clock()
+        if self._stats is not None:
+            self._stats.note_flush()
         await self._enforce_retention_async()
 
     def _close_recording(self) -> None:
@@ -706,7 +847,11 @@ class Session:
             logger.exception(
                 "recording close failed for session %s", self.session_id
             )
+            if self._stats is not None:
+                self._stats.note_recording(self.session_id, False)
             return
+        if self._stats is not None:
+            self._stats.note_recording(self.session_id, False)
         self._enforce_retention()
 
     def _enforce_retention(self) -> None:
@@ -721,12 +866,25 @@ class Session:
             logger.exception("recording retention enforcement failed")
 
     async def _enforce_retention_async(self) -> None:
-        """Off-loop retention walk. The rglob/stat pass over the whole
-        recording root used to run on the event loop after every cadence
-        flush; concurrent walks serialize inside
+        """Off-loop retention walk, gated by a wall-clock min-interval.
+
+        The rglob/stat pass over the whole recording root used to run after
+        EVERY cadence flush (~every 16 s per active session — continuous disk
+        churn over a tree whose cap moves at GB scales). It now runs at most
+        once per ``retention_min_interval_s`` (default 60, env-tunable; 0
+        restores the walk-after-every-flush behavior), still in an executor
+        thread; concurrent walks serialize inside
         ``Recorder.enforce_retention``."""
         if self._recorder_root is None:
             return
+        now = self._clock()
+        if (
+            self._retention_min_interval_ns > 0
+            and self._last_retention_ns is not None
+            and now - self._last_retention_ns < self._retention_min_interval_ns
+        ):
+            return
+        self._last_retention_ns = now
         try:
             await asyncio.to_thread(self._recorder_root.enforce_retention)
         except Exception:
@@ -744,6 +902,13 @@ class Session:
         if self._grace_handle is not None:
             self._grace_handle.cancel()
             self._grace_handle = None
+        # Route this client's lag drops into the server-wide stats aggregate
+        # (campaign C1). Overwritten on every attach — a resubscribe moves the
+        # client (and its counter) to the new session's stats, which is the
+        # same aggregate for manager-built sessions.
+        client.on_lag_drop = (
+            self._stats.inc_tx_lag_drops if self._stats is not None else None
+        )
         self._clients.add(client)
         return self._snapshot_frames()
 
@@ -823,13 +988,26 @@ class Session:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("feed crashed, restarting in %.1fs", self._backoff_s)
+                    if self._stats is not None:
+                        self._stats.inc_restart()
+                    # Full jitter (AWS-style): sleep a UNIFORM draw from
+                    # [0, backoff) instead of the bare backoff. Sessions of a
+                    # venue that died together used to restart in lockstep
+                    # every step (thundering herd at 1-2-4..30 s); the backoff
+                    # STATE still doubles deterministically below — only the
+                    # sleep is de-synchronized.
+                    delay_s = self._rng.uniform(0.0, self._backoff_s)
+                    logger.exception(
+                        "feed crashed, restarting in %.1fs (backoff %.1fs)",
+                        delay_s,
+                        self._backoff_s,
+                    )
                     try:
                         self._set_feed_state("degraded")
                     except Exception:
                         # A broadcast/encode failure must not kill the restart loop.
                         logger.exception("failed to broadcast degraded Status")
-                    await asyncio.sleep(self._backoff_s)
+                    await asyncio.sleep(delay_s)
                     self._backoff_s = min(self._backoff_s * 2.0, _BACKOFF_CAP_S)
         finally:
             flush_task.cancel()
@@ -867,6 +1045,10 @@ class Session:
 
     async def _consume(self) -> None:
         async for ev in self._feed.events():
+            if self._stats is not None:
+                # Liveness: age of the last feed-event ARRIVAL (wall clock, so
+                # venue stamps can't fake freshness) feeds stats.staleness_ms.
+                self._stats.note_live_sample(self.session_id)
             if self._feed_state != "live":  # first event after a restart
                 self._recovery_start_ns = self._clock()
                 self._recovery_events = 0
@@ -901,6 +1083,17 @@ class Session:
             now = self._clock()
             if now - self._last_flush_ns >= self._flush_interval_ns:
                 self._flush_partial(now)
+            # Time-based recording flush cadence (FLOWMAP_FLUSH_INTERVAL_S):
+            # buffers that have been accumulating longer than the cadence are
+            # flushed even below REC_FLUSH_COLS, so a Windows hard close
+            # (TerminateProcess — no lifespan flush_all) loses at most ~the
+            # cadence in seconds, not a whole 64-column part. A stalled feed
+            # buffers no rows, so per-event checking bounds the loss window.
+            if self._rec is not None and (
+                self._cols_since_flush >= REC_FLUSH_COLS
+                or now - self._rec_cadence_ns >= self._rec_flush_interval_ns
+            ):
+                self._flush_recording()
 
     def _on_book(self, ev: BookState) -> None:
         cols = self._grid.on_book(ev.ts_ns, ev.bid_px, ev.bid_sz, ev.ask_px, ev.ask_sz)
@@ -936,6 +1129,16 @@ class Session:
             return (float(np.min(ev.ask_px)) + float(np.max(ev.ask_px))) / 2.0
         return None
 
+    def _cache_encoded(self, col_seq: int, data: bytes) -> None:
+        """LRU-store one finalized column's joined wire bytes (see
+        ``_enc_cache``); capped at the snapshot window so entries evicted from
+        the ring age out of the cache too."""
+        enc = self._enc_cache
+        enc[col_seq] = data
+        enc.move_to_end(col_seq)
+        while len(enc) > SNAPSHOT_COLS:
+            enc.popitem(last=False)
+
     def _emit_finalized(self, cols: list[FinalizedColumn]) -> None:
         emitted = False
         for col in cols:
@@ -946,8 +1149,15 @@ class Session:
             self._last_col_seq = col.col_seq
             self._record(lambda r, c=col: r.record_column(c))
             self._cols_since_flush += 1
-            self._broadcast(wire.encode(self._grid.to_depth(col)), col=True, t0_ns=col.t0_ns)
-            self._broadcast(wire.encode(col.bar), col=True, t0_ns=col.t0_ns)
+            # Encode ONCE here (finalize time) and reuse the bytes for both
+            # the broadcast and the attach snapshot — the snapshot used to
+            # re-encode every column (~8-16 MB) inline on the event loop per
+            # attach.
+            depth_b = wire.encode(self._grid.to_depth(col))
+            bar_b = wire.encode(col.bar)
+            self._cache_encoded(col.col_seq, depth_b + bar_b)
+            self._broadcast(depth_b, col=True, t0_ns=col.t0_ns)
+            self._broadcast(bar_b, col=True, t0_ns=col.t0_ns)
             emitted = True
         if self._rec is not None and self._cols_since_flush >= REC_FLUSH_COLS:
             self._flush_recording()
@@ -972,6 +1182,31 @@ class Session:
             is_partial=True,
         )
 
+    def _conn_latency_skew(self) -> tuple[float, float]:
+        """Real per-connection latency/skew for Status frames.
+
+        The WS layer installs ``conn_stats`` (campaign NEEDS-CORE #1): a
+        callable returning ``{"latency_ms": float, "clock_skew_ms": float}``
+        measured on THIS connection. Both Status fields used to be hardcoded
+        0.0 while the measurement sat unused in the WS layer. Fully
+        defensive: no hook (bare-core tests) or a raising/malformed hook
+        yields the historical 0.0 values. The latest skew also feeds the
+        manager-wide stats aggregate so /api/health carries it even before
+        the WS layer calls ``record_clock_skew`` itself."""
+        fn = self.conn_stats
+        if fn is None:
+            return 0.0, 0.0
+        try:
+            d = fn()
+            latency = float(d.get("latency_ms", 0.0))
+            skew = float(d.get("clock_skew_ms", 0.0))
+        except Exception:  # noqa: BLE001 — a bad hook must not kill the broadcast
+            logger.debug("conn_stats hook failed", exc_info=True)
+            return 0.0, 0.0
+        if self._stats is not None:
+            self._stats.record_clock_skew(skew)
+        return latency, skew
+
     def _emit_closed_if_needed(self) -> None:
         """After a feed loop ends *normally*, an equity feed may report a
         closed RTH window (``feed.feed_state == 'closed'``; spec §7.1). When it
@@ -994,11 +1229,12 @@ class Session:
         # Direct broadcast (not _set_feed_state) so next_open_ts rides along; a
         # later restart's first event flips _feed_state back to live.
         self._feed_state = "closed"
+        latency_ms, skew_ms = self._conn_latency_skew()
         status = events.Status(
             feed_state="closed",
             capability=self._capability(),
-            latency_ms=0.0,
-            clock_skew_ms=0.0,
+            latency_ms=latency_ms,
+            clock_skew_ms=skew_ms,
             next_open_ts=getattr(self._feed, "next_open_ts", None),
         )
         self._broadcast(wire.encode(status), col=False)
@@ -1007,11 +1243,12 @@ class Session:
         if state == self._feed_state:
             return
         self._feed_state = state
+        latency_ms, skew_ms = self._conn_latency_skew()
         status = events.Status(
             feed_state=state,  # type: ignore[arg-type]
             capability=self._capability(),
-            latency_ms=0.0,
-            clock_skew_ms=0.0,
+            latency_ms=latency_ms,
+            clock_skew_ms=skew_ms,
         )
         self._broadcast(wire.encode(status), col=False)
 
@@ -1073,11 +1310,19 @@ class Session:
         frames = [b"".join([wire.encode(hello), *announce])]
         for i in range(0, len(cols), SNAPSHOT_CHUNK_COLS):
             chunk = cols[i : i + SNAPSHOT_CHUNK_COLS]
-            frames.append(
-                b"".join(
-                    wire.encode(self._grid.to_depth(c)) + wire.encode(c.bar) for c in chunk
-                )
-            )
+            # Served from the finalize-time encode cache where available (the
+            # live path): zero re-encode, byte-identical (the cache holds the
+            # exact bytes this session's finalize step produced). A miss
+            # (rehydrated tail, backfill/replay seed, ring wrap) encodes once
+            # with the SAME encoder calls and warms the cache.
+            parts: list[bytes] = []
+            for c in chunk:
+                enc = self._enc_cache.get(c.col_seq)
+                if enc is None:
+                    enc = wire.encode(self._grid.to_depth(c)) + wire.encode(c.bar)
+                    self._cache_encoded(c.col_seq, enc)
+                parts.append(enc)
+            frames.append(b"".join(parts))
 
         tail: list[bytes] = []
         if cols:
@@ -1288,6 +1533,14 @@ class SessionManager:
         # First-launch history backfill seam (GOAL 1). None disables it — the
         # default for deterministic tests; create_app wires the network seam in.
         self._backfill_fn = backfill_fn
+        # Server-wide telemetry producer (campaign contract C1), mounted at
+        # ``stats`` — the api layer resolves it via ``manager.stats.snapshot()``
+        # and renders the dict verbatim. Always present (cheap); the getattr
+        # guard on the SB side is pure future-proofing. Shares the manager's
+        # injectable wall clock so staleness ages are deterministic in tests.
+        self.stats = SessionStats(
+            wall_clock=wall_clock, active_sessions=lambda: len(self._sessions)
+        )
         # Keyed by (market, symbol, mode, source, band) — the band is part of
         # the grid geometry, so two bands are genuinely two grids.
         self._sessions: dict[tuple[str, str, str, str | None, str], Session] = {}
@@ -1295,8 +1548,9 @@ class SessionManager:
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
         # Test path: the sim feed is unpaced so tests own the clock. Routing
         # itself lives in feeds.router — see the note there about the copy this
-        # replaced.
-        return build_feed(sub, self._cfg, realtime_sim=False)
+        # replaced. The stats aggregate rides along so live feeds count their
+        # drops at the source.
+        return build_feed(sub, self._cfg, realtime_sim=False, stats=self.stats)
 
     def _grid_for(self, feed: Feed, band: str = DEFAULT_BAND) -> Grid:
         if feed.market in EQUITY_MARKETS:
@@ -1366,9 +1620,24 @@ class SessionManager:
         """Attach ``client`` to the session for ``sub``'s key, creating and
         starting the session if needed (≤ ``cfg.max_sessions`` distinct keys).
         The snapshot frames are enqueued into ``client`` before returning, so
-        they precede every live broadcast. ``_retry`` is internal: it bounds
-        the single teardown-during-boot re-subscribe so a pathological teardown
-        that keeps winning surfaces as an error instead of recursing forever."""
+        they precede every live broadcast. Refused subscribes (session limit,
+        replay unavailable/stale, invalid symbol) are counted in the stats
+        aggregate before the error propagates to the WS layer's honest
+        refusal path."""
+        try:
+            return await self._subscribe(sub, client, _retry)
+        except (SessionLimitError, ReplayUnavailableError, ValueError):
+            if self.stats is not None:
+                self.stats.inc_rejected()
+            raise
+
+    async def _subscribe(
+        self, sub: events.Subscribe, client: ClientTx, _retry: bool = True
+    ) -> Session:
+        """The subscribe body (see :meth:`subscribe`). ``_retry`` is internal:
+        it bounds the single teardown-during-boot re-subscribe so a
+        pathological teardown that keeps winning surfaces as an error instead
+        of recursing forever."""
         band = canonical_band(sub.band)
         key = (sub.market, sub.symbol, sub.mode, sub.source, band)
         # The band is part of the key (two clients on the same symbol with
@@ -1409,16 +1678,27 @@ class SessionManager:
                 backfill_max_cols=self._cfg.backfill_max_cols
                 if self._cfg.backfill_enabled
                 else 0,
+                stats=self.stats,
+                rec_flush_interval_s=self._cfg.rec_flush_interval_s,
+                retention_min_interval_s=self._cfg.retention_min_interval_s,
             )
             session._on_teardown = self._make_remover(key, session)
             if replay_tail is not None:
                 session.replay_tail_t0 = replay_tail.newest_t0_ns
+                # A WINDOWED replay ([start_t, end_t)) is immutable history:
+                # record the window end so the parked-replay freshness check
+                # knows growth past it is expected, not staleness.
+                session.replay_window_end_ns = sub.end_t
+            if self.stats is not None:
+                self.stats.note_session(session.session_id)
             self._sessions[key] = session
         elif sub.mode == "replay":
             # Parked-replay freshness policy (handoff §6): re-validate the
             # recording before handing the existing session out again. Raises
             # ReplayStaleError — refusing leaves the parked session untouched.
-            self._recheck_replay_freshness(session, sub)
+            # The disk probe runs off-loop (see the method): it used to parse
+            # the newest part file inline in subscribe, stalling the loop.
+            await self._recheck_replay_freshness(session, sub)
         # Unconditional (start() is idempotent/restart-safe): a session whose
         # feed ended normally must not be handed out as a zombie — a new
         # subscriber restarts the run task. First start boots (rehydrates)
@@ -1464,58 +1744,115 @@ class SessionManager:
         :class:`ReplayUnavailableError`, which the WS layer turns into an
         explicit refusal — never a live feed under a replay label.
 
+        Honoring ``Subscribe.start_t`` / ``end_t`` (NEEDS-CORE #2): a
+        windowed subscription loads only ``[start_t, end_t)`` through the
+        recorder's public ranged read (:meth:`Recorder.load_tail`, capped at
+        the ring) instead of materializing the ENTIRE recording — a user
+        replaying "yesterday 14:00" no longer pays multi-GB RAM and a
+        seconds-long load for data they will never scroll to. Unbounded
+        subscribes keep ``load_all`` exactly as before.
+
         The load runs in the default executor exactly like boot rehydration:
-        ``load_all`` reads the ENTIRE recording (unbounded columns), so doing
-        it inline stalled the event loop — and every other session and
-        client — for the whole multi-GB Parquet read."""
+        doing it inline stalled the event loop — and every other session and
+        client — for the whole Parquet read."""
         if self._recorder is None:
             raise ReplayUnavailableError(
                 "replay needs a recording store; this manager has none"
             )
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, self._replay_feed_blocking, sub.market, sub.symbol
+            None, self._replay_feed_blocking, sub.market, sub.symbol, sub.start_t, sub.end_t
         )
 
     def _replay_feed_blocking(
-        self, market: str, symbol: str
+        self, market: str, symbol: str, start_t: int | None, end_t: int | None
     ) -> tuple[ReplayFeed, TailData]:
         """Blocking recorder IO + feed construction for :meth:`_replay_feed`
         (runs in the executor)."""
         assert self._recorder is not None
-        tail = self._recorder.load_all(market, symbol)
+        if start_t is None and end_t is None:
+            tail = self._recorder.load_all(market, symbol)
+        else:
+            if start_t is not None and end_t is not None and end_t <= start_t:
+                raise ReplayUnavailableError(
+                    f"empty replay window [{start_t}, {end_t}) for "
+                    f"{market}:{symbol} — replay unavailable"
+                )
+            # Ranged read over [start_t, end_t): ``now_ns - max_age_ns`` yields
+            # the window's start cutoff, ``end_ns`` bounds it above, and the
+            # cap is the ring — a window can never serve more than the newest
+            # ring_columns of data anyway. An open-ended start_t uses the
+            # sentinel "now" so the cutoff lands exactly on start_t.
+            now_ns = end_t if end_t is not None else 2**62
+            max_age_ns = now_ns - (start_t if start_t is not None else 0)
+            tail = self._recorder.load_tail(
+                market,
+                symbol,
+                max_age_ns=max_age_ns,
+                now_ns=now_ns,
+                limit_cols=self._cfg.ring_columns,
+                end_ns=end_t,
+            )
         if tail is None or not tail.columns:
             raise ReplayUnavailableError(
                 f"no recording for {market}:{symbol} — replay unavailable"
             )
         return ReplayFeed(market=market, symbol=symbol, tail=tail), tail
 
-    def _recheck_replay_freshness(
+    async def _recheck_replay_freshness(
         self, session: Session, sub: events.Subscribe
     ) -> None:
         """Re-validate an existing replay session's recording on re-attach.
 
         The replay feed replays the recording AS IT WAS when the session was
         created; columns recorded after its tail are unreachable from the
-        parked feed. If the recording on disk has grown past the session's
+        parked feed. When the recording on disk has grown past the session's
         tail by more than :data:`REPLAY_STALE_TOL_NS` of recorded time, the
         subscribe is REFUSED with :class:`ReplayStaleError` instead of
         accepting (handoff §6: never present a stale replay as valid).
+
+        A WINDOWED replay (``replay_window_end_ns`` set) is exempt: its
+        ``[start_t, end_t)`` content is immutable history, so growth of the
+        recording past the window's end is expected — refusing would demand a
+        rebuild that returns the same window. (Growth BEFORE ``start_t`` is
+        equally irrelevant: it can never enter the window.)
 
         The refusal touches nothing: the parked session keeps its clients and
         run task, and once the recording stops growing — or the session
         retires after its grace and a fresh one is built from the new tail —
         a re-subscribe succeeds again. An unreadable/absent recording counts
         as NOT stale: the probe must never invent staleness it cannot see.
-        """
-        tail_t0 = session.replay_tail_t0
-        if self._recorder is None or tail_t0 is None:
+
+        The probe (``newest_column_t0`` — open + parse of one Parquet part,
+        up to ~4 MB) runs in the default executor: it used to run inline in
+        subscribe, re-introducing exactly the event-loop stall the replay
+        load itself was moved off-loop for."""
+        if self._recorder is None or session.replay_tail_t0 is None:
             return
-        disk_t0 = self._recorder.newest_column_t0(sub.market, sub.symbol)
+        if session.replay_window_end_ns is not None:
+            return  # bounded window: immutable history, growth is expected
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self._recheck_replay_freshness_blocking,
+            session,
+            sub.market,
+            sub.symbol,
+        )
+
+    def _recheck_replay_freshness_blocking(
+        self, session: Session, market: str, symbol: str
+    ) -> None:
+        """Blocking probe + staleness verdict for
+        :meth:`_recheck_replay_freshness` (runs in the executor)."""
+        assert self._recorder is not None
+        tail_t0 = session.replay_tail_t0
+        assert tail_t0 is not None
+        disk_t0 = self._recorder.newest_column_t0(market, symbol)
         if disk_t0 is None or disk_t0 <= tail_t0 + REPLAY_STALE_TOL_NS:
             return
         raise ReplayStaleError(
-            f"replay_stale: recording for {sub.market}:{sub.symbol} has grown "
+            f"replay_stale: recording for {market}:{symbol} has grown "
             f"past the parked session's tail (recorded through {disk_t0}, "
             f"session tail {tail_t0}, tolerance {REPLAY_STALE_TOL_NS} ns) — "
             f"re-subscribe once the old session retires"
@@ -1546,6 +1883,10 @@ class SessionManager:
             # must never evict a fresh session that reused the key.
             if self._sessions.get(key) is session:
                 del self._sessions[key]
+                # Drop the session's staleness entry too — a dead session must
+                # not linger in the stats as an "active" staleness subject.
+                if self.stats is not None:
+                    self.stats.forget_session(session.session_id)
 
         return _remove
 

@@ -61,6 +61,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from bisect import bisect_left, insort
 from collections.abc import AsyncIterator, Callable
 
 import numpy as np
@@ -306,9 +307,13 @@ class _BridgeSink(Sink):
         *,
         snapshot_driven: bool = False,
         now_ns: Callable[[], int] | None = None,
+        stats: object | None = None,
     ) -> None:
         self._emit = emit
         self._book_top_n = max(1, book_top_n)
+        # Server-wide telemetry aggregate (campaign C1; duck-typed —
+        # ``SessionStats`` is not imported so feeds stay import-light).
+        self._stats = stats
         # Live-ingest timestamp sanity gate (A2-2). A venue clock in the wrong
         # unit (ms/s stamped into the ns field) or wedged far ahead must not
         # write 1970-era / absurdly-future columns into the ring or the
@@ -317,6 +322,16 @@ class _BridgeSink(Sink):
         self.dropped_ts = 0
         self._bids: dict[float, float] = {}
         self._asks: dict[float, float] = {}
+        # Incrementally-maintained ASCENDING price indexes, one per side. They
+        # are kept in lockstep with the dicts by ``_apply_levels`` — the only
+        # production mutation path — so a book DELTA costs a few O(log N)
+        # bisects + C memmoves instead of the old full O(N log N) Python sort
+        # per delta. ``None`` means "dirty: rebuild at next emit" (snapshot
+        # replace, out-of-band dict mutation). ``_emit_book`` re-checks
+        # ``len()`` so any index/dict divergence degrades to a one-shot
+        # re-sort, never to a stale book.
+        self._bid_px: list[float] | None = None
+        self._ask_px: list[float] | None = None
         self._initialized = False
         # On a delta venue a re-snapshot means the connector lost sequence, so
         # it earns a gap marker. On a snapshot-driven venue (the ccxt path has
@@ -344,12 +359,14 @@ class _BridgeSink(Sink):
                     self._ts(record),
                     self.dropped_ts,
                 )
+            if self._stats is not None:
+                self._stats.inc_snapshot_drops()
             return
         if isinstance(record, BookDelta):
             if not self._initialized:
                 return  # pre-snapshot deltas carry no anchored state
-            self._apply_levels(record.bids, self._bids)
-            self._apply_levels(record.asks, self._asks)
+            self._bid_px = self._apply_levels(record.bids, self._bids, self._bid_px)
+            self._ask_px = self._apply_levels(record.asks, self._asks, self._ask_px)
             self._emit_book(self._ts(record))
         elif isinstance(record, BookSnapshot):
             if self._initialized and not self._snapshot_driven:
@@ -362,8 +379,12 @@ class _BridgeSink(Sink):
                 )
             self._bids.clear()
             self._asks.clear()
-            self._apply_levels(record.bids, self._bids)
-            self._apply_levels(record.asks, self._asks)
+            # Full replace: the incremental indexes are invalid wholesale —
+            # mark dirty and rebuild once at emit (one sort, same as before).
+            self._bid_px = None
+            self._ask_px = None
+            self._apply_levels(record.bids, self._bids, None)
+            self._apply_levels(record.asks, self._asks, None)
             self._initialized = True
             self._emit_book(self._ts(record))
         elif isinstance(record, CTrade):
@@ -432,27 +453,60 @@ class _BridgeSink(Sink):
         ts = record.source_ts
         return ts if ts is not None else record.local_ts
 
-    @staticmethod
-    def _apply_levels(levels: list[Level], side: dict[float, float]) -> None:
+    def _apply_levels(
+        self,
+        levels: list[Level],
+        side: dict[float, float],
+        index: list[float] | None,
+    ) -> list[float] | None:
         """Canonical level semantics (mirrors OrderBook._apply_levels):
         amount==0 removes the price level, amount>0 sets the absolute size.
         Malformed levels are skipped, never raised — one bad level must not
-        DLQ a whole depth message and silently desync the book."""
+        DLQ a whole depth message and silently desync the book.
+
+        When *index* is not ``None`` (the DELTA path) it is maintained
+        incrementally: each inserted price is ``insort``-ed, each removed one
+        bisect-popped — O(log N) search + a C memmove per level instead of
+        re-sorting the whole side. A ``None`` index (snapshot replace) leaves
+        the book dirty; ``_emit_book`` rebuilds the index with one sort."""
         for price, amount in levels:
             if not (price > 0.0) or amount < 0.0 or amount != amount:
                 logger.debug("skipping malformed level (%r, %r)", price, amount)
                 continue
             if amount == 0.0:
-                side.pop(price, None)
+                if side.pop(price, None) is not None and index is not None:
+                    i = bisect_left(index, price)
+                    if i < len(index) and index[i] == price:
+                        del index[i]
             else:
+                if price not in side and index is not None:
+                    insort(index, price)
                 side[price] = amount
+        return index
 
     def _emit_book(self, ts_ns: int) -> None:
-        # Best-first, closest-to-touch BOOK_TOP_N levels per side. Sorting
-        # ~1000-level dicts at ~10 Hz is negligible; no throttling by design.
+        # Best-first, closest-to-touch BOOK_TOP_N levels per side. The price
+        # ORDER comes from the incrementally-maintained indexes (rebuilt by a
+        # single sort here when dirty); sizes are read from the dicts at emit
+        # time, so the emitted arrays are exactly what the old
+        # sort-the-whole-dict-per-delta path produced — at delta rates the
+        # sort (up to BOOK_TOP_N=20000 entries, twice per tick) is gone.
         cap = self._book_top_n
-        bids = sorted(self._bids.items(), key=lambda kv: -kv[0])[:cap]
-        asks = sorted(self._asks.items())[:cap]
+        bid_index = self._bid_px
+        if bid_index is None or len(bid_index) != len(self._bids):
+            bid_index = sorted(self._bids)
+            self._bid_px = bid_index
+        ask_index = self._ask_px
+        if ask_index is None or len(ask_index) != len(self._asks):
+            ask_index = sorted(self._asks)
+            self._ask_px = ask_index
+        # Bids descend (reversed ascending tail = highest price first), asks
+        # ascend — the exact ordering the full sort produced (dict keys are
+        # unique, so no tie-breaking existed to preserve).
+        top_bids = bid_index[-cap:] if cap < len(bid_index) else bid_index
+        top_asks = ask_index[:cap]
+        bids = [(p, self._bids[p]) for p in reversed(top_bids)]
+        asks = [(p, self._asks[p]) for p in top_asks]
         bid = np.array(bids, dtype=np.float64).reshape(-1, 2)
         ask = np.array(asks, dtype=np.float64).reshape(-1, 2)
         self._emit(
@@ -530,6 +584,7 @@ class CryptoFeed:
         *,
         connector_factory: Callable[[Sink], Connector] | None = None,
         transport_factory: Callable[[str], Transport] = AiohttpWsTransport,
+        stats: object | None = None,
     ) -> None:
         self.exchange = exchange
         self.symbol = symbol
@@ -547,6 +602,10 @@ class CryptoFeed:
         # the symbol translation below would silently never run.
         self._owns_connector = connector_factory is None
         self._transport_factory = transport_factory
+        # Server-wide telemetry aggregate (campaign C1; duck-typed). Its drop
+        # counters are fed at the source: queue evictions here, sink ts-gate
+        # drops in the bridge sink.
+        self._stats = stats
         # A venue with no hand-written reader is served by the universal ccxt
         # connector, which has no incremental book diff and no liquidation
         # topic. That is a real capability difference, so it is declared rather
@@ -609,11 +668,14 @@ class CryptoFeed:
         # Bounded fan-in (A2-3): a stalled consumer drops OLDEST events (counted
         # on the queue) instead of growing RSS without limit. The connector's
         # end sentinel is never the dropped item (see BoundedFeedQueue).
-        queue = BoundedFeedQueue()
+        queue = BoundedFeedQueue(
+            on_drop=self._stats.inc_feed_drops if self._stats is not None else None
+        )
         sink = _BridgeSink(
             queue.put_nowait,
             self._cfg.book_top_n,
             snapshot_driven=not self.native,
+            stats=self._stats,
         )
         if self._owns_connector:
             # A symbol can arrive in either spelling — the venue's own

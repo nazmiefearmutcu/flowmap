@@ -75,15 +75,20 @@ def current_directory() -> tuple[dict[str, object], ...]:
 
 @router.get("/health")
 async def health(request: Request) -> dict[str, object]:
-    """Liveness + operational snapshot. No auth, NO sensitive fields.
+    """Liveness + operational snapshot (v3, campaign SB item 1 / contract C1).
 
-    Goes beyond the legacy ``{status, version}`` liveness ping so an operator
-    (or the desktop wrapper) can answer "is the sidecar alive AND is it
-    actually feeding?" in one call: process uptime, wire protocol version,
-    whether recording is enabled, and one row per ACTIVE session with its
-    feed kind and live/degraded state. Reads session state defensively via
-    ``getattr`` — the health probe must never 500 (a missing manager or an
-    unexpected session shape degrades to zeros/empty, still ``status: ok``).
+    No auth, NO sensitive fields. Goes beyond the legacy ``{status, version}``
+    liveness ping so an operator (or the desktop wrapper) can answer "is the
+    sidecar alive AND is it actually feeding?" in one call: process uptime,
+    wire protocol version, whether recording is enabled, one row per ACTIVE
+    session with its feed kind and live/degraded state — and, when the core
+    mounts a stats producer, its ``snapshot()`` dict VERBATIM under ``stats``
+    (contract C1 freezes the field names; this surface must not reshape it).
+
+    Everything reads defensively via ``getattr`` — the health probe must
+    never 500 (a missing manager, a core without ``stats``, or a snapshot
+    that raises degrades to ``stats: null`` + ``stats_available: false``,
+    still ``status: ok``).
     """
     cfg: Config | None = getattr(request.app.state, "cfg", None)
     manager = getattr(request.app.state, "manager", None)
@@ -102,6 +107,17 @@ async def health(request: Request) -> dict[str, object]:
         )
     started = getattr(request.app.state, "started_monotonic_ns", None)
     uptime_s = max(0.0, (time.monotonic_ns() - started) / 1e9) if started else 0.0
+    # C1: the core-owned stats producer (SessionStats). Rendered VERBATIM —
+    # whatever keys snapshot() returns go on the wire untouched.
+    stats: dict[str, object] | None = None
+    snapshot = getattr(getattr(manager, "stats", None), "snapshot", None)
+    if callable(snapshot):
+        try:
+            snap = snapshot()
+            if isinstance(snap, dict):
+                stats = snap
+        except Exception:  # noqa: BLE001 — a broken producer must not 500 health
+            pass
     return {
         "status": "ok",
         "version": __version__,
@@ -110,6 +126,8 @@ async def health(request: Request) -> dict[str, object]:
         "recording_enabled": bool(getattr(cfg, "recording_enabled", False)),
         "active_sessions": len(feeds),
         "feeds": feeds,
+        "stats": stats,
+        "stats_available": stats is not None,
     }
 
 

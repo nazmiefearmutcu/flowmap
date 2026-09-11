@@ -263,9 +263,12 @@ class _EquitySink:
         *,
         use_quote_rule: bool,
         now_ns: Callable[[], int] | None = None,
+        stats: object | None = None,
     ) -> None:
         self._emit = emit
         self._use_quote_rule = use_quote_rule
+        # Server-wide telemetry aggregate (campaign C1; duck-typed).
+        self._stats = stats
         # Live-ingest timestamp sanity gate (A2-2): a provider clock in the
         # wrong unit or wedged in the far future must not enter the ring or the
         # recording. Injected for tests; production uses the wall clock.
@@ -290,6 +293,8 @@ class _EquitySink:
                         ts,
                         self.dropped_ts,
                     )
+                if self._stats is not None:
+                    self._stats.inc_snapshot_drops()
                 return
         if isinstance(record, EqTrade):
             # The merged record now carries a `side` field, but every US equity
@@ -449,6 +454,7 @@ class EquityFeed:
         calendar: USMarketCalendar | None = None,
         profile_tick: float = DEFAULT_PROFILE_TICK,
         bar_refresh_ns: int = BAR_REFRESH_NS,
+        stats: object | None = None,
     ) -> None:
         self.symbol = symbol.upper()
         self._cfg = cfg
@@ -471,6 +477,9 @@ class EquityFeed:
 
         # Lazily-created default keyless price poller (network; never in tests).
         self._poller: _GooglePricePoller | None = None
+        # Server-wide telemetry aggregate (campaign C1; duck-typed). Feeds the
+        # drop counters at the source: queue evictions + ts-gate drops.
+        self._stats = stats
 
     def _select_tier(self) -> str:
         cfg = self._cfg
@@ -723,8 +732,14 @@ class EquityFeed:
 
     async def _keyed_events(self) -> AsyncIterator[FeedEvent]:
         # Bounded fan-in (A2-3): same drop-oldest contract as the crypto bridge.
-        queue = BoundedFeedQueue()
-        sink = _EquitySink(queue.put_nowait, use_quote_rule=(self._tier == "alpaca"))
+        queue = BoundedFeedQueue(
+            on_drop=self._stats.inc_feed_drops if self._stats is not None else None
+        )
+        sink = _EquitySink(
+            queue.put_nowait,
+            use_quote_rule=(self._tier == "alpaca"),
+            stats=self._stats,
+        )
         provider = self._make_provider(sink)
         runner = asyncio.create_task(
             self._drive_keyed(provider, sink, queue),

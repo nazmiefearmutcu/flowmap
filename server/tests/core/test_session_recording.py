@@ -272,18 +272,28 @@ async def test_teardown_closes_recorder_and_flushes_buffered_rows(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# b. flush failure: logged, disabled, feed loop survives
+# b. flush failure: logged, counted, RETRIED after a cooldown; feed survives
 
 
-async def test_flush_failure_disables_recording_but_session_continues(
+async def test_transient_flush_failure_retries_and_session_continues(
     tmp_path, monkeypatch, caplog
 ):
+    """A transient flush failure (disk full, AV scan lock) must NOT end
+    recording: the failed snapshot's rows are restored to the buffers and the
+    flush retries after the cooldown — the rows land on the retry, and the
+    feed loop keeps broadcasting throughout."""
     monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 4)
-    monkeypatch.setattr(
-        SessionRecorder,
-        "flush_buffers",
-        lambda self, bufs: (_ for _ in ()).throw(OSError("disk full")),
-    )
+    monkeypatch.setattr(session_mod, "_REC_RETRY_BASE_S", 0.05)  # fast cooldown
+    orig = SessionRecorder.flush_buffers
+    state = {"n": 0}
+
+    def failing_once(self, bufs):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OSError("disk full")
+        return orig(self, bufs)
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", failing_once)
 
     root = Recorder(tmp_path / "rec", 20.0)
     feed = DrivenFeed()
@@ -296,20 +306,136 @@ async def test_flush_failure_disables_recording_but_session_continues(
         await sess.start()
         for i in range(6):  # 5 finalized columns -> crosses the cadence of 4
             feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
-        await _wait_for(lambda: sess._rec is None)
+        await _wait_for(lambda: state["n"] >= 1)
 
     assert any("recording flush failed" in r.getMessage() for r in caplog.records)
     assert not sess.run_task.done()  # the feed loop survived
+    assert sess._rec is not None  # recording NOT disabled by the transient error
 
-    # Broadcasting continues after the failure.
-    _drain(client)
+    # Let the cooldown elapse, then more events drive the cadence check into
+    # the retry: the restored rows plus the new ones land on disk.
+    await asyncio.sleep(0.1)
     feed.q.put_nowait(BookState(6 * DT, *_book(100.0)))
     feed.q.put_nowait(BookState(7 * DT, *_book(100.0)))
-    later = await _wait_for(
-        lambda: [e for e in _drain(client) if isinstance(e, DepthColumn) and e.final]
-        or None
+
+    async def _wait_flushed():
+        while state["n"] < 2:
+            await asyncio.sleep(0.01)
+        return True
+
+    await asyncio.wait_for(_wait_flushed(), timeout=5)
+    await _wait_for(
+        lambda: bool(list((tmp_path / "rec").rglob("*-columns-*.parquet"))) or None
     )
+    # Retry state reset by the successful flush.
+    assert sess._rec_failures == 0 and sess._rec_retry_at is None
+
+    # Broadcasting continued after the failure the whole time.
+    later = [e for e in _drain(client) if isinstance(e, DepthColumn) and e.final]
     assert later
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+    # Round-trip: every broadcast column is on disk exactly once (nothing was
+    # lost by the failed flush, nothing duplicated by the retry).
+    tail = root.load_tail(
+        MARKET, SYMBOL, max_age_ns=10**18, now_ns=10**18, limit_cols=100
+    )
+    assert tail is not None
+    finals = [
+        e
+        for e in later
+        if isinstance(e, DepthColumn) and e.final
+    ]
+    disk_seqs = sorted(c.col_seq for c in tail.columns)
+    assert disk_seqs == sorted({c.col_seq for c in later})
+
+
+async def test_flush_failure_cooldown_skips_immediate_retry(tmp_path, monkeypatch):
+    """Inside the cooldown the cadence must NOT re-enter the flush (the
+    backoff ladder is why the delay exists); after it expires, the retry
+    proceeds."""
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 2)
+    calls = {"n": 0}
+
+    def failing(self, bufs):
+        calls["n"] += 1
+        raise OSError("still broken")
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", failing)
+
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    clock_ns = {"now": 0}
+
+    def fake_clock():
+        return clock_ns["now"]
+
+    sess = Session(
+        "cooldown",
+        feed=feed,
+        grid=Grid(_cfg()),
+        recorder=root,
+        clock=fake_clock,
+        timer=FakeTimer(),
+    )
+    sess.attach(ClientTx())
+    await sess.start()
+    for i in range(4):  # crosses the cadence of 2 -> first flush attempt
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["n"] >= 1)
+    assert sess._rec_failures == 1
+    cooldown_end = sess._rec_retry_at
+    assert cooldown_end is not None and cooldown_end > clock_ns["now"]
+
+    attempts = calls["n"]
+    # More columns arrive while the cooldown is active: no new flush attempt.
+    for i in range(4, 8):
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await asyncio.sleep(0.05)
+    assert calls["n"] == attempts  # cooldown held
+
+    # Advance the clock past the cooldown: the next cadence crossing retries
+    # (and fails again, escalating the backoff).
+    clock_ns["now"] = cooldown_end + 1
+    feed.q.put_nowait(BookState(8 * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["n"] >= attempts + 1)
+    assert sess._rec_failures == 2  # backoff escalated
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+
+async def test_broken_recorder_still_disables_recording(
+    tmp_path, monkeypatch, caplog
+):
+    """Only a recorder that cannot even take its rows BACK (restore fails)
+    permanently disables recording — the old last-resort contract."""
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 2)
+
+    def failing(self, bufs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", failing)
+    monkeypatch.setattr(
+        SessionRecorder,
+        "restore_buffers",
+        lambda self, bufs: (_ for _ in ()).throw(RuntimeError("recorder wedged")),
+    )
+
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "rec-dead", feed=feed, grid=Grid(_cfg()), recorder=root, timer=FakeTimer()
+    )
+    client = ClientTx()
+    sess.attach(client)
+    caplog.set_level(logging.ERROR, logger="flowmap_server.core.session")
+    await sess.start()
+    for i in range(4):
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: sess._rec is None)
+    assert not sess.run_task.done()  # the feed loop STILL survives
+    _drain(client)
     feed.q.put_nowait(None)
     await asyncio.wait_for(sess.run_task, timeout=5)
 
@@ -644,3 +770,159 @@ async def test_retention_walks_serialize(tmp_path, monkeypatch):
         asyncio.to_thread(root.enforce_retention),
     )
     assert state["max"] == 1
+
+
+# ---------------------------------------------------------------------------
+# i. time-based flush cadence (FLOWMAP_FLUSH_INTERVAL_S; Windows hard close)
+
+
+async def test_time_based_flush_lands_rows_below_column_cadence(tmp_path):
+    """Below REC_FLUSH_COLS, buffered rows must still reach disk once the
+    TIME cadence passes: a hard app close (TerminateProcess - no lifespan
+    flush) loses at most ~the cadence in seconds, not a whole 64-column
+    part. The cadence check rides per consumed event."""
+    clock = {"now": 0}
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "time-flush",
+        feed=feed,
+        grid=Grid(_cfg()),
+        recorder=root,
+        timer=FakeTimer(),
+        clock=lambda: clock["now"],
+        rec_flush_interval_s=0.05,
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+    for i in range(3):  # 2 finalized columns - far below REC_FLUSH_COLS
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: sess._cols_since_flush >= 2)
+    assert not list((tmp_path / "rec").rglob("*-columns-*.parquet"))
+
+    # Advance the (injectable) clock past the cadence: the next event drives
+    # the flush.
+    clock["now"] = int(0.06 * 1e9)
+    feed.q.put_nowait(BookState(3 * DT, *_book(100.0)))
+    await _wait_for(
+        lambda: bool(list((tmp_path / "rec").rglob("*-columns-*.parquet"))) or None
+    )
+    # The cadence anchor restarted at the successful flush.
+    assert sess._rec_cadence_ns == clock["now"] or sess._cols_since_flush == 0
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+    tail = root.load_tail(MARKET, SYMBOL, max_age_ns=10**18, now_ns=10**18, limit_cols=100)
+    assert tail is not None and len(tail.columns) >= 2
+
+
+# ---------------------------------------------------------------------------
+# j. retention walk gated by a wall-clock min-interval
+
+
+async def test_retention_walk_gated_by_min_interval(tmp_path, monkeypatch):
+    """The rglob/stat retention walk runs at most once per
+    ``retention_min_interval_s`` of session clock - not after EVERY cadence
+    flush (per-flush walks over a multi-GB tree were pure disk churn)."""
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 2)
+    calls = {"retention": 0, "flushes": 0}
+    real_ret = Recorder.enforce_retention
+
+    def counting_ret(self):
+        calls["retention"] += 1
+        return real_ret(self)
+
+    monkeypatch.setattr(Recorder, "enforce_retention", counting_ret)
+    real_flush = SessionRecorder.flush_buffers
+
+    def counting_flush(self, bufs):
+        calls["flushes"] += 1
+        return real_flush(self, bufs)
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", counting_flush)
+
+    clock = {"now": 0}
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "ret-gate",
+        feed=feed,
+        grid=Grid(_cfg()),
+        recorder=root,
+        timer=FakeTimer(),
+        clock=lambda: clock["now"],
+        retention_min_interval_s=60.0,
+    )
+    sess.attach(ClientTx())
+    await sess.start()
+
+    # Flush #1 -> retention walk #1 (first ever: never gated).
+    for i in range(3):
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["retention"] >= 1)
+
+    # Flush #2 immediately after (clock unchanged) -> still ONE walk.
+    for i in range(3, 6):
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["flushes"] >= 2)
+    await asyncio.sleep(0.05)  # any ungated walk would have fired by now
+    assert calls["retention"] == 1
+
+    # Clock past the min-interval -> the next flush walks again.
+    clock["now"] += int(61 * 1e9)
+    for i in range(6, 9):
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: calls["retention"] >= 2)
+
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# k. restart backoff: deterministic escalation, jittered sleep
+
+
+async def test_restart_backoff_doubles_with_full_jitter():
+    """Full-jitter backoff: the backoff STATE still doubles deterministically
+    (1 -> 2 -> 4 ... cap 30), and each sleep draws from [0, backoff) via the
+    rng seam (pinned by call ORDER, never by wall timing - campaign rule 6)."""
+    class _FakeRng:
+        def __init__(self):
+            self.calls: list[float] = []
+
+        def uniform(self, lo: float, hi: float) -> float:
+            self.calls.append(hi)
+            return 0.001  # tiny, deterministic sleep
+
+    class CrashTwiceFeed(DrivenFeed):
+        def __init__(self):
+            super().__init__()
+            self.crashes = 0
+
+        async def events(self):
+            if self.crashes < 2:
+                self.crashes += 1
+                raise RuntimeError("venue died")
+            while True:
+                ev = await self.q.get()
+                if ev is None:
+                    return
+                yield ev
+
+    feed = CrashTwiceFeed()
+    sess = Session(
+        "jitter",
+        feed=feed,
+        grid=Grid(_cfg()),
+        timer=FakeTimer(),
+        restart_backoff_base_s=1.0,
+    )
+    rng = _FakeRng()
+    sess._rng = rng
+    sess.attach(ClientTx())
+    await sess.start()
+    await asyncio.sleep(0.05)  # two crashes -> two jittered restarts
+    assert rng.calls == [1.0, 2.0]  # base, then doubled (exact: 1*2, 2*2)
+    assert sess._backoff_s == 4.0
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)

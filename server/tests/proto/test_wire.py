@@ -216,3 +216,24 @@ def test_scale_of_falls_back_to_linear_on_an_unusable_or_unknown_kind():
     # a kind this build does not know
     future = EpochParams(**base, scale_kind=99)
     assert scale_of(future).kind == SCALE_LINEAR
+
+
+def test_subscribe_client_ts_ns_is_backward_compatible():
+    """The OPTIONAL Subscribe.client_ts_ns (campaign SB item 4) must round
+    trip, and a payload from an OLD client (key absent or null) must decode
+    to the default without error."""
+    from flowmap_server.proto.events import Subscribe
+
+    old = b'{"market":"sim","symbol":"S","mode":"live","source":null,' \
+          b'"start_t":null,"band":null}'
+    sub = msgspec.json.decode(old, type=Subscribe)
+    assert sub.client_ts_ns is None
+
+    new = Subscribe(market="sim", symbol="S", mode="live",
+                    client_ts_ns=1_752_710_400_000_000_000)
+    back = msgspec.json.decode(msgspec.json.encode(new), type=Subscribe)
+    assert back.client_ts_ns == 1_752_710_400_000_000_000
+
+    # The full wire path: envelope decode of the new golden vector round trips.
+    ev, _ = wire.decode(wire.encode(new), 0)
+    assert isinstance(ev, Subscribe) and ev.client_ts_ns == new.client_ts_ns

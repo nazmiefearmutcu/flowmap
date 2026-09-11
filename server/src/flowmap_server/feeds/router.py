@@ -36,21 +36,26 @@ SIM_MARKET = "sim"
 
 
 
-def build_feed(sub: events.Subscribe, cfg: Config, *, realtime_sim: bool) -> Feed:
+def build_feed(
+    sub: events.Subscribe, cfg: Config, *, realtime_sim: bool, stats: object | None = None
+) -> Feed:
     """Route one subscription to its feed.
 
     ``realtime_sim`` paces the demo feed to wall time (one column per ``dt_ns``,
     which keeps the event loop live and the stream watchable). Tests want the
-    unpaced variant so they can drive the clock themselves.
+    unpaced variant so they can drive the clock themselves. ``stats`` is the
+    server-wide telemetry aggregate (campaign C1, duck-typed): when set, the
+    live feeds count their queue evictions and ts-gate drops into it at the
+    source instead of leaving them write-only.
     """
     if sub.market == SIM_MARKET:
         return SimFeed(seed=42, dt_ns=cfg.dt_crypto_ns, start_ns=0, realtime=realtime_sim)
     if sub.market in EQUITY_MARKETS:
         # Tier (keyless SYNTH / Alpaca / Finnhub) auto-selected from cfg keys.
-        return EquityFeed(sub.symbol, cfg)
+        return EquityFeed(sub.symbol, cfg, stats=stats)
     if is_crypto_market(sub.market):
         exchange, segment = split_market(sub.market)
-        return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=segment, cfg=cfg)
+        return CryptoFeed(exchange=exchange, symbol=sub.symbol, market=segment, cfg=cfg, stats=stats)
     raise NotImplementedError(
         f"market {sub.market!r} has no feed — expected 'sim', "
         f"{sorted(EQUITY_MARKETS)}, or '<exchange>[-<segment>]' naming a crypto "

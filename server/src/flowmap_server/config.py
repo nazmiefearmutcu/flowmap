@@ -3,6 +3,15 @@
 Single env-first config source (spec §11). The server binds loopback only;
 any ``FLOWMAP_HOST`` outside ``("127.0.0.1", "localhost")`` is rejected with
 ``ValueError`` rather than silently accepted.
+
+Every numeric knob is range-checked in :meth:`Config.from_env` and a violation
+raises ``ValueError`` naming the env var and its allowed range. This is
+load-bearing, not cosmetics: the sidecar runs supervised (auto-restart), so a
+typo'd env value used to become an opaque crash loop — ``np.zeros`` dying
+inside ``Grid.__init__`` for ``FLOWMAP_RING_COLUMNS=1000000`` (~8 GB of ring
+per session), a bind error for ``FLOWMAP_PORT=99999`` — instead of one clear
+boot error. Only ABSURD values are rejected; every default and every
+previously-plausible value parses exactly as before.
 """
 
 from __future__ import annotations
@@ -14,6 +23,51 @@ import msgspec
 
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 _DEFAULT_DATA_DIR = "~/.flowmap/recordings"
+
+# Inclusive ranges for the env-driven numeric knobs (see module docstring).
+# Tuples of (lo, hi) so each message names the range it enforces.
+_PORT_RANGE = (1, 65_535)
+_RING_COLUMNS_RANGE = (256, 65_536)
+_MAX_SESSIONS_RANGE = (1, 16)
+_BOOK_TOP_N_RANGE = (1, 200_000)
+# Column cadences: positive, at most one hour per column (anything larger is
+# a unit mixup — seconds/ms pasted into an ns field — not a cadence).
+_DT_NS_RANGE = (1, 3_600 * 1_000_000_000)
+_RECORDING_GB_CAP_RANGE = (0.0, 1_000_000.0)
+_BACKFILL_MAX_COLS_RANGE = (0, 65_536)
+# Recording flush cadence (time-based, FLOWMAP_FLUSH_INTERVAL_S): a Windows
+# hard-close (TerminateProcess — no lifespan shutdown, no flush_all) loses at
+# most this many seconds of buffered recording per active session. Positive
+# and at most one hour.
+_REC_FLUSH_INTERVAL_S_RANGE = (0.001, 3_600.0)
+# Minimum wall-clock interval between retention walks (per session). Default
+# 60 s: the rglob+stat pass over the whole recording tree used to run after
+# EVERY cadence flush (~every 16 s per session). 0 disables the gating (walk
+# after every flush — the old behavior).
+_RETENTION_MIN_INTERVAL_S_RANGE = (0.0, 86_400.0)
+
+
+def _int_in_range(env: Mapping[str, str], name: str, default: str, lo: int, hi: int) -> int:
+    raw = env.get(name, default)
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer in [{lo}, {hi}]; got {raw!r}") from None
+    if not (lo <= value <= hi):
+        raise ValueError(f"{name} must be in [{lo}, {hi}]; got {raw!r}")
+    return value
+
+
+def _float_in_range(env: Mapping[str, str], name: str, default: str, lo: float, hi: float) -> float:
+    raw = env.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number in [{lo}, {hi}]; got {raw!r}") from None
+    # NaN fails both comparisons; +inf fails the upper bound. Name the var.
+    if not (lo <= value <= hi):
+        raise ValueError(f"{name} must be in [{lo}, {hi}]; got {raw!r}")
+    return value
 
 
 class Config(msgspec.Struct, frozen=True):
@@ -65,6 +119,19 @@ class Config(msgspec.Struct, frozen=True):
     # (FLOWMAP_CRYPTO_TICK) overrides both for the whole server when neither
     # path can answer.
     crypto_tick: float = 0.0
+    # Time-based recording flush cadence in seconds (FLOWMAP_FLUSH_INTERVAL_S,
+    # default 10): in addition to the REC_FLUSH_COLS column-count cadence, a
+    # session flushes whenever its buffers have been accumulating for this
+    # long — a Windows hard app-close (TerminateProcess, no shutdown hooks)
+    # therefore loses at most ~this many seconds of recording, not a whole
+    # 64-column part.
+    rec_flush_interval_s: float = 10.0
+    # Minimum wall-clock seconds between retention walks per session
+    # (FLOWMAP_RETENTION_MIN_INTERVAL_S, default 60). The rglob+stat pass over
+    # the whole recording tree used to run after every cadence flush; the cap
+    # moves at GB scales, so a per-minute re-walk was pure disk churn. 0
+    # restores the walk-after-every-flush behavior.
+    retention_min_interval_s: float = 60.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -90,22 +157,29 @@ class Config(msgspec.Struct, frozen=True):
                 f"(0 = auto); got {env.get('FLOWMAP_CRYPTO_TICK')!r}"
             )
 
+        ring_columns = _int_in_range(env, "FLOWMAP_RING_COLUMNS", "32768", *_RING_COLUMNS_RANGE)
         return cls(
             host=host,
-            port=int(env.get("FLOWMAP_PORT", "8720")),
-            ring_columns=int(env.get("FLOWMAP_RING_COLUMNS", "32768")),
+            port=_int_in_range(env, "FLOWMAP_PORT", "8720", *_PORT_RANGE),
+            ring_columns=ring_columns,
             # Column cadence for the sim + crypto grid. Overridable so the T8
             # scroll-back e2e can drive the sim fast enough to overrun the
             # client's full-res budget in seconds. Default 250 ms (4 cols/s).
-            dt_crypto_ns=int(env.get("FLOWMAP_DT_CRYPTO_NS", str(250_000_000))),
-            dt_equity_keyless_ns=int(
-                env.get("FLOWMAP_DT_EQUITY_KEYLESS_NS", str(10 * 10**9))
+            dt_crypto_ns=_int_in_range(
+                env, "FLOWMAP_DT_CRYPTO_NS", str(250_000_000), *_DT_NS_RANGE
             ),
-            dt_equity_keyless_grid_ns=int(
-                env.get("FLOWMAP_DT_EQUITY_KEYLESS_GRID_NS", str(10**9))
+            dt_equity_keyless_ns=_int_in_range(
+                env, "FLOWMAP_DT_EQUITY_KEYLESS_NS", str(10 * 10**9), *_DT_NS_RANGE
             ),
-            max_sessions=int(env.get("FLOWMAP_MAX_SESSIONS", "4")),
-            recording_gb_cap=float(env.get("FLOWMAP_RECORDING_GB_CAP", "20.0")),
+            dt_equity_keyless_grid_ns=_int_in_range(
+                env, "FLOWMAP_DT_EQUITY_KEYLESS_GRID_NS", str(10**9), *_DT_NS_RANGE
+            ),
+            max_sessions=_int_in_range(
+                env, "FLOWMAP_MAX_SESSIONS", "4", *_MAX_SESSIONS_RANGE
+            ),
+            recording_gb_cap=_float_in_range(
+                env, "FLOWMAP_RECORDING_GB_CAP", "20.0", *_RECORDING_GB_CAP_RANGE
+            ),
             recording_enabled=env.get("FLOWMAP_RECORDING_ENABLED", "1")
             not in ("0", "false", "False"),
             data_dir=str(
@@ -113,10 +187,21 @@ class Config(msgspec.Struct, frozen=True):
             ),
             alpaca_key=alpaca_key,
             alpaca_secret=alpaca_secret,
-            book_top_n=max(1, int(env.get("FLOWMAP_BOOK_TOP_N", "20000"))),
+            book_top_n=_int_in_range(env, "FLOWMAP_BOOK_TOP_N", "20000", *_BOOK_TOP_N_RANGE),
             crypto_tick=crypto_tick,
             finnhub_key=env.get("FINNHUB_API_KEY"),
             backfill_enabled=env.get("FLOWMAP_BACKFILL_ENABLED", "1")
             not in ("0", "false", "False"),
-            backfill_max_cols=max(0, int(env.get("FLOWMAP_BACKFILL_MAX_COLS", "512"))),
+            backfill_max_cols=_int_in_range(
+                env, "FLOWMAP_BACKFILL_MAX_COLS", "512", *_BACKFILL_MAX_COLS_RANGE
+            ),
+            rec_flush_interval_s=_float_in_range(
+                env, "FLOWMAP_FLUSH_INTERVAL_S", "10.0", *_REC_FLUSH_INTERVAL_S_RANGE
+            ),
+            retention_min_interval_s=_float_in_range(
+                env,
+                "FLOWMAP_RETENTION_MIN_INTERVAL_S",
+                "60.0",
+                *_RETENTION_MIN_INTERVAL_S_RANGE,
+            ),
         )

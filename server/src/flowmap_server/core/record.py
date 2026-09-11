@@ -91,6 +91,9 @@ logger = logging.getLogger(__name__)
 
 _GB = 1_000_000_000
 _HOUR_KEY_LEN = 11  # "YYYYMMDD-HH" — fixed width, so string compare == time compare
+# Sentinel "hour key" above every real bucket — the no-upper-bound case of the
+# ranged file prune in ``load_tail``.
+_HOUR_KEY_MAX = "99991231-99"
 
 _COLUMNS_SCHEMA = {
     "epoch": pl.UInt32,
@@ -408,6 +411,26 @@ class SessionRecorder:
         self._columns, self._trades, self._markers, self._epochs = [], [], [], []
         return bufs
 
+    def restore_buffers(self, bufs: tuple[list, list, list, list]) -> None:
+        """Re-attach a FAILED flush's unwritten rows to the live buffers.
+
+        ``flush_buffers`` leaves whatever did not land on disk in the snapshot
+        lists. The owning session now RETRIES transient flush failures after
+        a cooldown (session docstring) instead of disabling recording, so
+        those rows must return to the FRONT of the live buffers — they are
+        the OLDEST rows of the failed snapshot, and prepending keeps buffer
+        order chronological. Without the restore, a retry would silently skip
+        everything the failed flush was holding."""
+        columns, trades, markers, epochs = bufs
+        if columns:
+            self._columns[:0] = columns
+        if trades:
+            self._trades[:0] = trades
+        if markers:
+            self._markers[:0] = markers
+        if epochs:
+            self._epochs[:0] = epochs
+
     def flush_buffers(self, bufs: tuple[list, list, list, list]) -> None:
         """Write a :meth:`take_buffers` snapshot to part files.
 
@@ -415,9 +438,9 @@ class SessionRecorder:
         progression, and exception-safety as :meth:`flush` — safe to run off
         the event loop because it touches only the snapshot lists plus the
         locked part counter. On failure the UNWRITTEN rows stay in the
-        snapshot lists (never restored to the live buffers: the owning
-        session disables recording on any flush failure, so they would never
-        be retried anyway)."""
+        snapshot lists; the owning session restores them to the live buffers
+        (:meth:`restore_buffers`) and retries after a cooldown — a transient
+        IO failure delays a part, it does not end the recording."""
         columns, trades, markers, epochs = bufs
         self._flush_kind("columns", columns, lambda c: c.t0_ns, self._columns_frame)
         self._flush_kind("trades", trades, lambda t: t.ts_ns, self._trades_frame)
@@ -540,10 +563,14 @@ class Recorder:
         max_age_ns: int,
         now_ns: int,
         limit_cols: int,
+        end_ns: int | None = None,
     ) -> TailData | None:
         """The newest recorded columns for (market, symbol) that satisfy
-        ``t0_ns >= now_ns - max_age_ns``, capped at ``limit_cols``, plus every
-        epoch they reference and the trades/markers inside their time range.
+        ``t0_ns >= now_ns - max_age_ns`` (and, when *end_ns* is given,
+        ``t0_ns < end_ns`` — the inclusive-exclusive upper bound a WINDOWED
+        replay needs; default ``None`` keeps the open-ended behavior), capped
+        at ``limit_cols``, plus every epoch they reference and the
+        trades/markers inside their time range.
 
         Returns ``None`` when recording is disabled, nothing fresh exists, or
         the epochs referenced by the surviving columns were pruned (the
@@ -556,22 +583,36 @@ class Recorder:
         if not d.is_dir():
             return None
         cutoff = now_ns - max_age_ns
+        upper = None if end_ns is None else max(0, end_ns)
 
         # Ranged read: a columns file whose hour prefix ends before the
-        # cutoff hour cannot contain fresh rows — never open it.
+        # cutoff hour cannot contain fresh rows — never open it. Symmetric on
+        # the upper side: a file whose hour bucket starts at/after the end
+        # bucket cannot contain ``t0 < end_ns`` rows.
         cut_key = _hour_key(max(cutoff, 0))
+        hi_key = _HOUR_KEY_MAX if upper is None else _hour_key(max(upper - 1, 0))
         candidates = [
-            p for p in d.glob("*-columns-*.parquet") if _hour_prefix(p) >= cut_key
+            p
+            for p in d.glob("*-columns-*.parquet")
+            if cut_key <= _hour_prefix(p) <= hi_key
         ]
         # Newest -> oldest over part files (filename order == chronological);
         # stop as soon as we have limit_cols or hit an entirely-stale file.
+        # A file entirely ABOVE the window (possible with *end_ns*) yields no
+        # fresh rows but must NOT stop the scan — older files can still hold
+        # in-window rows.
+        fresh_expr = (
+            (pl.col("t0_ns") >= cutoff)
+            if upper is None
+            else (pl.col("t0_ns") >= cutoff) & (pl.col("t0_ns") < upper)
+        )
         frames: list[pl.DataFrame] = []
         have = 0
         for path in sorted(candidates, key=_by_name, reverse=True):
             df = _read_parquet_safe(path)
             if df is None or df.height == 0:
                 continue  # unreadable (warned) or empty: try the next-older part
-            fresh = df.filter(pl.col("t0_ns") >= cutoff)
+            fresh = df.filter(fresh_expr)
             if fresh.height:
                 frames.append(fresh)
                 have += fresh.height
@@ -629,10 +670,14 @@ class Recorder:
             logger.warning("recorded column arrays unusable (%s); cold start", exc)
             return None
 
-        # Trades/markers within the loaded column range [t0_min, t0_max + dt).
-        # Ranged read: only open files whose hour prefix intersects the window.
+        # Trades/markers within the loaded column range [t0_min, t_hi), where
+        # t_hi is the last column's interval end clamped by *upper* when a
+        # windowed read asked for one. Ranged read: only open files whose
+        # hour prefix intersects the window.
         t_lo = columns[0].t0_ns
         t_hi = columns[-1].t0_ns + epoch_map[columns[-1].epoch].dt_ns
+        if upper is not None:
+            t_hi = min(t_hi, upper)
         lo_key = _hour_key(max(t_lo, 0))
         hi_key = _hour_key(max(t_hi - 1, 0))
         in_range = (pl.col("ts_ns") >= t_lo) & (pl.col("ts_ns") < t_hi)

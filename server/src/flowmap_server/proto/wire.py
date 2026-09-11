@@ -439,6 +439,26 @@ def golden_fixture_events() -> dict:
     # and prove nothing. Treat the contents as opaque bytes, not documentation.
     subscribe = events.Subscribe(market="crypto", symbol="BTCUSDT", mode="live",
                                  source="crypcodile", start_t=None)
+    # NEW optional field (campaign SB item 4): a Subscribe carrying the client
+    # wall-clock timestamp. Separate fixture so the plain subscribe above stays
+    # the minimal form; the trailing null key in the plain form is what the
+    # field addition adds to this vector's bytes (regenerated in place — the
+    # wire remains backward-compatible in BOTH directions: msgspec decodes a
+    # keyless payload to the default and ignores unknown keys).
+    subscribe_client_ts = events.Subscribe(market="crypto", symbol="BTCUSDT",
+                                           mode="live", source="crypcodile",
+                                           start_t=None, band=None,
+                                           client_ts_ns=1_752_710_400_000_000_000)
+    # NEW optional field (campaign SA / NEEDS-CORE #2): a Subscribe carrying a
+    # replay window end. Separate fixture; the plain subscribe above gains one
+    # more trailing null key ("end_t") from the field addition (regenerated in
+    # place — backward-compatible in BOTH directions, same discipline as
+    # client_ts_ns above).
+    subscribe_end_t = events.Subscribe(market="crypto", symbol="BTCUSDT",
+                                       mode="replay", source=None,
+                                       start_t=1_752_710_400_000_000_000,
+                                       band=None, client_ts_ns=None,
+                                       end_t=1_752_710_400_000_000_000 + 3_600_000_000_000)
 
     return {
         "hot_depth_col_l2": depth_l2,
@@ -453,6 +473,8 @@ def golden_fixture_events() -> dict:
         "hot_history_resp_nested": history,
         "cold_hello": hello,
         "cold_subscribe": subscribe,
+        "cold_subscribe_client_ts": subscribe_client_ts,
+        "cold_subscribe_end_t": subscribe_end_t,
     }
 
 

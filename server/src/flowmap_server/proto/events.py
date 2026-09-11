@@ -119,6 +119,24 @@ class Subscribe(msgspec.Struct):
     # missing values are canonicalized to the default AT THE WS BOUNDARY, before
     # the value can reach the SessionManager key (see api/ws.py).
     band: str | None = None
+    # OPTIONAL wall-clock ns read at the CLIENT when it built this Subscribe
+    # (campaign SB item 4). Appended LAST; old clients omit it (the JSON simply
+    # lacks the key or carries null) and the derived skew stays 0 — fully
+    # backward-compatible in both directions: msgspec decodes a payload without
+    # the key to the default, and an old server ignores the extra key. The WS
+    # layer derives clock_skew_ms = (client_ts_ns - server_wall_ns) / 1e6
+    # (positive = the client clock is ahead) and reports it in Status frames.
+    client_ts_ns: int | None = None
+    # OPTIONAL exclusive window END for replay subscriptions (campaign
+    # NEEDS-CORE #2). Consumed by ``SessionManager._replay_feed``: the replay
+    # feed is built from ``Recorder.load_tail`` over ``[start_t, end_t)``
+    # instead of the whole recording (``start_t`` was previously a dead wire
+    # field). Appended LAST with a default, mirroring the ``client_ts_ns``
+    # addition: msgspec decodes a payload without the key to the default and
+    # an old server ignores the extra key — backward-compatible in BOTH
+    # directions, and the plain golden Subscribe changes only by one trailing
+    # ``"end_t":null``.
+    end_t: int | None = None
 
 
 class Unsubscribe(msgspec.Struct):

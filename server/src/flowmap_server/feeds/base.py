@@ -18,7 +18,7 @@ an ``async def`` generator method presents to callers.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Protocol, runtime_checkable
 
 import msgspec
@@ -97,9 +97,17 @@ class BoundedFeedQueue:
     item dropped — no put follows it — so end-of-stream delivery is intact.
     """
 
-    def __init__(self, maxsize: int = FEED_QUEUE_MAXSIZE) -> None:
+    def __init__(
+        self,
+        maxsize: int = FEED_QUEUE_MAXSIZE,
+        on_drop: Callable[[], None] | None = None,
+    ) -> None:
         self._q: asyncio.Queue[object] = asyncio.Queue(maxsize=max(1, maxsize))
         self.dropped = 0
+        # Optional telemetry hook (campaign C1): fired on every drop-OLDEST
+        # eviction so the server-wide stats aggregate can count feed drops
+        # without polling per-feed counters. Must never raise into the producer.
+        self.on_drop = on_drop
 
     def put_nowait(self, item: object) -> None:
         q = self._q
@@ -109,6 +117,11 @@ class BoundedFeedQueue:
             except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
                 return
             self.dropped += 1
+            if self.on_drop is not None:
+                try:
+                    self.on_drop()
+                except Exception:  # noqa: BLE001 — telemetry must not kill the feed
+                    pass
         q.put_nowait(item)
 
     async def get(self) -> object:

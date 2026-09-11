@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flowmap_server import __version__
-from flowmap_server.api import discovery, rest, ws
+from flowmap_server.api import discovery, export, rest, ws
 from flowmap_server.api.market_cache import (
     MarketDataCache,
     default_movers_fn,
@@ -44,7 +44,9 @@ __all__ = ["create_app"]
 # plus the packaged desktop webview. In the Tauri app the SPA is served from
 # `tauri://localhost` and the REST directory (`/api/symbols`) is fetched
 # cross-origin from the loopback sidecar, so that origin must be allowed too.
-# (The `/ws` stream is not CORS-gated — the WS endpoint accepts unconditionally.)
+# The `/ws` stream has its OWN, stricter gate (this list is REST-CORS only):
+# api/ws.py enforces the same origin family plus a per-process connection cap
+# (api/_env.py; FLOWMAP_WS_ALLOWED_ORIGINS / FLOWMAP_WS_MAX_CONNECTIONS).
 _ALLOWED_ORIGINS = (
     "http://127.0.0.1:5173",
     "http://localhost:5173",
@@ -163,6 +165,9 @@ def create_app(
     app.state.cfg = cfg
     app.state.manager = manager
     app.state.market_cache = market_cache
+    # Per-process WS connection cap counter (api/ws.py; per-app == per-process
+    # under the single-app uvicorn sidecar).
+    app.state.ws_live_connections = 0
     # /health uptime anchor (monotonic — immune to wall-clock adjustments).
     app.state.started_monotonic_ns = time.monotonic_ns()
     _install_error_handlers(app)
@@ -174,5 +179,6 @@ def create_app(
     )
     app.include_router(rest.router)
     app.include_router(discovery.router)
+    app.include_router(export.router)
     app.include_router(ws.router)
     return app
