@@ -516,7 +516,11 @@ export function IndicatorOverlayCanvas({
           : `${snap.timeMap.anchorSeq}:${snap.timeMap.anchorT0Ns}:${snap.timeMap.dtNs}`
       }|${fm.gridEpoch}|${ep ? `${ep.p0}:${ep.rows}:${ep.dt_ns}:${ep.scale_kind ?? 0}` : 'ep0'}|${c0.x},${c0.y},${c1.x},${c1.y}`;
       let painted = false;
-      if (cssW !== 0 && cssH !== 0 && store.active.length > 0 && sig !== lastSig) {
+      // NOTE the gate is the SIGNATURE, not `active.length > 0` (S3 C-1): when
+      // the last indicator is removed the signature must still change (empty
+      // activeSig), and paint()'s first op is a full clearRect — skipping the
+      // empty case left the last EMA/RSI line inked on the canvas forever.
+      if (cssW !== 0 && cssH !== 0 && sig !== lastSig) {
         lastSig = sig;
         paint();
         painted = true;

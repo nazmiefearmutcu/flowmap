@@ -24,9 +24,47 @@ describe('routeGlobalKey', () => {
     expect(routeGlobalKey('/', { ...PLAIN, button: true })).toEqual({ type: 'focus-search' });
   });
 
-  it('ignores unrelated keys (canvas keeps arrows / F / R / P)', () => {
-    for (const k of ['ArrowLeft', 'f', 'R', 'P', '+', '-', 'x', 'q']) {
+  it('ignores unrelated keys', () => {
+    for (const k of ['ArrowLeft', 'ArrowRight', '+', '-', 'x', 'q', 'k']) {
       expect(routeGlobalKey(k, PLAIN)).toBeNull();
+    }
+  });
+
+  it('routes the follow keys globally (S4 D3: they used to be dead when blurred)', () => {
+    expect(routeGlobalKey('f', PLAIN)).toEqual({ type: 'toggle-follow' });
+    expect(routeGlobalKey('F', PLAIN)).toEqual({ type: 'toggle-follow' });
+    expect(routeGlobalKey('p', PLAIN)).toEqual({ type: 'toggle-price-follow' });
+    // Shift+P needs the MODIFIER, not just the shifted character (R2-L1):
+    // CapsLock produces 'P' with no shift and must TOGGLE, not auto-fit.
+    expect(routeGlobalKey('P', PLAIN, { meta: false, ctrl: false, shift: true })).toEqual({
+      type: 'price-auto-fit',
+    });
+    expect(routeGlobalKey('P', PLAIN)).toEqual({ type: 'toggle-price-follow' });
+    expect(routeGlobalKey('r', PLAIN)).toEqual({ type: 'go-live' });
+    expect(routeGlobalKey('R', PLAIN)).toEqual({ type: 'go-live' });
+    // Alt combos belong to the OS/browser.
+    expect(
+      routeGlobalKey('P', PLAIN, { meta: false, ctrl: false, shift: true, alt: true }),
+    ).toBeNull();
+    expect(routeGlobalKey('f', PLAIN, { meta: false, ctrl: false, alt: true })).toBeNull();
+  });
+
+  it('yields the follow keys to the chart canvas (gestures.ts owns F/P/Shift+P/R there)', () => {
+    const onCanvas = { ...PLAIN, canvas: true };
+    for (const k of ['f', 'F', 'p', 'P', 'r', 'R']) {
+      expect(routeGlobalKey(k, onCanvas)).toBeNull();
+    }
+    // Non-follow keys still reach the global router on the canvas: gestures
+    // leaves everything else to bubble (pinned below for `e`).
+    expect(routeGlobalKey('e', onCanvas)).toEqual({ type: 'export-png' });
+  });
+
+  it('never hijacks the follow keys while typing, in a dialog, or with a chord', () => {
+    for (const k of ['f', 'p', 'P', 'r']) {
+      expect(routeGlobalKey(k, { ...PLAIN, editable: true })).toBeNull();
+      expect(routeGlobalKey(k, { ...PLAIN, dialog: true })).toBeNull();
+      expect(routeGlobalKey(k, PLAIN, { meta: true, ctrl: false })).toBeNull();
+      expect(routeGlobalKey(k.toUpperCase(), PLAIN, { meta: false, ctrl: true })).toBeNull();
     }
   });
 
@@ -119,7 +157,17 @@ describe('classifyTarget', () => {
   });
 
   it('tolerates a null / non-element target', () => {
-    expect(classifyTarget(null)).toEqual({ editable: false, button: false, dialog: false });
+    expect(classifyTarget(null)).toEqual({
+      editable: false,
+      button: false,
+      dialog: false,
+      canvas: false,
+    });
+  });
+
+  it('flags the chart canvas (follow keys yield to input/gestures there)', () => {
+    expect(classifyTarget(el('CANVAS')).canvas).toBe(true);
+    expect(classifyTarget(el('DIV')).canvas).toBe(false);
   });
 });
 
@@ -133,9 +181,13 @@ describe('attachGlobalKeys', () => {
       removeEventListener: () => {
         handler = null;
       },
-      fire: (key: string, target: Partial<EventTarget> & { tagName?: string }) => {
+      fire: (
+        key: string,
+        target: Partial<EventTarget> & { tagName?: string },
+        extra: Record<string, unknown> = {},
+      ) => {
         const preventDefault = vi.fn();
-        handler?.({ key, target, preventDefault } as unknown as Event);
+        handler?.({ key, target, preventDefault, ...extra } as unknown as Event);
         return preventDefault;
       },
       get handler() {
@@ -218,6 +270,49 @@ describe('attachGlobalKeys', () => {
     const pdC = t.fire('c', { tagName: 'CANVAS', getAttribute: () => null } as never);
     expect(pdC).toHaveBeenCalledOnce();
     t.fire('a', { tagName: 'CANVAS', getAttribute: () => null } as never);
+
+    dispose();
+  });
+
+  it('dispatches the follow keys (F / P / Shift+P / R) to their handlers from a blurred target', () => {
+    const onToggleFollow = vi.fn();
+    const onTogglePriceFollow = vi.fn();
+    const onPriceAutoFit = vi.fn();
+    const onGoLive = vi.fn();
+    const t = fakeTarget();
+    const dispose = attachGlobalKeys(
+      {
+        onSpace: vi.fn(),
+        onFocusSearch: vi.fn(),
+        onExportPng: vi.fn(),
+        onToggleFollow,
+        onTogglePriceFollow,
+        onPriceAutoFit,
+        onGoLive,
+      },
+      t as never,
+    );
+
+    const body = { tagName: 'BODY', getAttribute: () => null } as never;
+    const pdF = t.fire('f', body);
+    expect(onToggleFollow).toHaveBeenCalledOnce();
+    expect(pdF).toHaveBeenCalledOnce();
+    t.fire('p', body);
+    expect(onTogglePriceFollow).toHaveBeenCalledOnce();
+    // CapsLock 'P' (no shift modifier) toggles; a real Shift+P auto-fits.
+    t.fire('P', body);
+    expect(onTogglePriceFollow).toHaveBeenCalledTimes(2);
+    expect(onPriceAutoFit).not.toHaveBeenCalled();
+    t.fire('P', body, { shiftKey: true });
+    expect(onPriceAutoFit).toHaveBeenCalledOnce();
+    t.fire('r', body);
+    expect(onGoLive).toHaveBeenCalledOnce();
+
+    // On the chart canvas the router yields: the canvas listener owns them, and
+    // a double-handled toggle would cancel itself out.
+    const pdCanvas = t.fire('f', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(onToggleFollow).toHaveBeenCalledOnce();
+    expect(pdCanvas).not.toHaveBeenCalled();
 
     dispose();
   });

@@ -1,0 +1,64 @@
+/* ChartLegend (CP4, campaign 2026-09-11) — compact key for the price-family
+   lines. Pinned INSIDE the always-dark chart viewport, so it uses the FIXED
+   chart-island tokens (--chart-*, ui/theme.css) and never theme ink
+   (fix 2026-09-10 F1-3 dark-island rule). Non-interactive by design: the chart
+   underneath must keep every pointer gesture. */
+
+.chart-legend {
+  position: absolute;
+  top: var(--sp-2, 6px);
+  left: var(--sp-2, 6px);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 8px;
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: var(--r-1, 4px);
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.chart-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chart-legend__label {
+  font-size: var(--fs-2xs, 9px);
+  letter-spacing: 0.04em;
+  color: var(--chart-ink-dim, #93a1b4);
+}
+
+.chart-legend__line {
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.chart-legend__pair {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.chart-legend__pair .chart-legend__line {
+  width: 14px;
+  height: 2px;
+}
+
+.chart-legend__dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.chart-legend__dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}

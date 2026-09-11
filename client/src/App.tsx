@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { floorForTolerance, gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
+import type { PriceFollow } from './gl/camera';
 import { applyOverlayPalette } from './gl/overlays/palette';
 import { attachThemeKey, DEFAULT_THEME_ID, getCanvasPalette, useTheme } from './theme';
 import { attachGlobalKeys, classifyTarget } from './input/keys';
 import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
+import { ChartLegend } from './ui/ChartLegend';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { CvdPane } from './ui/CvdPane';
@@ -62,6 +64,21 @@ import type { SocketLike } from './net/connection';
 
 const SIM_MARKET = 'sim';
 const SIM_SYMBOL = 'SIM-DEMO';
+
+/**
+ * CP1 seam (B2 lane, campaign 2026-09-11): `liveEdgeVisible` and
+ * `resetOverlaysForNewSession` ship with the renderer lane in the same wave.
+ * They are OPTIONAL on this compiled type so the UI lane can land in parallel;
+ * a missing getter is treated as "unknown" (assume the edge is visible) — the
+ * App never forces a goLive it cannot justify.
+ */
+type RendererCp1 = Renderer & {
+  readonly liveEdgeVisible?: boolean;
+  resetOverlaysForNewSession?: (sessionId?: string) => void;
+};
+
+/** ≤4 Hz renderer→settings price-follow reconciliation (survey D4). */
+const FOLLOW_RECONCILE_MS = 250;
 
 /** Format an absolute (session-relative for sim) ns timestamp as HH:MM:SS. */
 function fmtStreamClock(ns: bigint): string | null {
@@ -318,6 +335,35 @@ export function App() {
     prevSettingsRef.current = settings;
   }, [settings]);
 
+  // --- renderer→settings price-follow reconciliation (survey D4) ----------------
+  // The chip and the global follow keys write through App, but the CHART-CANVAS
+  // key path (input/gestures.ts owns P / Shift+P / R there) and a price pan's
+  // release (KILL_PRICE) mutate the camera directly, and a gutter double-click
+  // re-fits it — all renderer-owned. A ≤4 Hz value-diff reconciliation persists
+  // the PRICE axis policy whenever it changes underneath us, so the drawer
+  // switch and the next boot can never claim AUTO while the camera is LOCKed
+  // (the reported bug: reload silently re-enabled tracking). It deliberately
+  // does NOT reconcile `follow`: the camera's TIME-follow flag is false both
+  // when the user toggled the policy off AND while merely scrolled back (the
+  // renderer's want* keeps the policy), so only the pill's honest SCROLLED BACK
+  // readout can describe that axis.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const r = rendererRef.current;
+      if (!r) return;
+      setSettings((prev) => {
+        const followPrice = r.priceFollow !== 'off';
+        // R2-L2: wantedFollowTime is the POLICY (not `following`, which is also
+        // false while merely scrolled back), so canvas F/R now persist too.
+        const follow = r.wantedFollowTime;
+        return prev.followPrice === followPrice && prev.follow === follow
+          ? prev
+          : { ...prev, followPrice, follow };
+      });
+    }, FOLLOW_RECONCILE_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
   // --- reset the heatmap on an actual grid switch ------------------------------
   // The DOM ladder + tape read the live book and switch on their own, but the GL
   // heatmap holds the old symbol's ring + a camera fit to the old price frame, so
@@ -352,10 +398,18 @@ export function App() {
   // on attach, which IS the moment the stream provably swapped, so clear again
   // there. Cheap and self-healing: the attach snapshot re-sends the book and the
   // tape warm-up, so a reconnect refills what this drops.
+  //
+  // CP1/D5: a NEW server session under the SAME reset key (connection drop,
+  // server restart, parked-session expiry) also restarts col_seq at 0 while the
+  // renderer's high-water cursors keep the old value — TRACK/price pill go dead
+  // until a symbol switch. `resetOverlaysForNewSession()` is the cursor-only
+  // rewind (no ring teardown: scrolled-back history survives). Optional-chained
+  // until the renderer lane lands it.
   const sessionId = useFlowMapStore((s) => s.sessionId);
   useEffect(() => {
     if (sessionId === null) return;
     bookStore.resetForSession();
+    (rendererRef.current as RendererCp1 | null)?.resetOverlaysForNewSession?.(sessionId);
   }, [sessionId]);
 
   // --- first-launch history prefetch (once per session) ------------------------
@@ -400,7 +454,7 @@ export function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  // --- global keyboard (Space / `/` / `E`) -------------------------------------
+  // --- global keyboard (Space / `/` / `E` / F / P / Shift+P / R) ----------------
   useEffect(() => {
     return attachGlobalKeys({
       onSpace: () => {
@@ -409,11 +463,24 @@ export function App() {
           if (s.paused) s.resume();
           else s.pause();
         } else {
-          rendererRef.current?.toggleFollow();
+          const r = rendererRef.current;
+          r?.toggleFollow();
+          // D4: Space is a settings-writable global path — persist the policy it
+          // just set, so the drawer switch (and the next boot) agree with the
+          // camera instead of claiming ON after a detach.
+          if (r) {
+            setSettings((prev) =>
+              prev.follow === r.following ? prev : { ...prev, follow: r.following },
+            );
+          }
         }
       },
       onFocusSearch: () => searchRef.current?.focus(),
       onExportPng: exportPng,
+      onToggleFollow: onToggleFollowKey,
+      onTogglePriceFollow: onTogglePriceFollowKey,
+      onPriceAutoFit: onPriceAutoFitKey,
+      onGoLive: onGoLive,
     });
   }, []);
 
@@ -487,18 +554,79 @@ export function App() {
   // the drawer's follow switches still reading ON while the camera was frozen —
   // and the next drawer interaction would fight the camera.
   const onGoLive = useCallback(() => {
-    rendererRef.current?.goLive();
+    const r = rendererRef.current;
+    r?.goLive();
+    // L3: a replay action must not write the LIVE follow policy.
+    if (useFlowMapStore.getState().subscription?.mode === 'replay') return;
+    // R2-M1: GO LIVE re-pins TIME and must PRESERVE a deliberate price LOCK
+    // (survey S1 verified-good). Persist the renderer's post-goLive price mode
+    // instead of forcing tracking back on.
+    const priceOn = r?.priceFollow !== 'off';
     setSettings((prev) =>
-      prev.follow && prev.followPrice ? prev : { ...prev, follow: true, followPrice: true },
+      prev.follow && prev.followPrice === priceOn
+        ? prev
+        : { ...prev, follow: true, followPrice: priceOn },
     );
   }, []);
 
   // Re-enable price tracking WITHOUT re-fitting: 'track' keeps the user's zoom
   // and only recentres on drift (the non-destructive counterpart to GO LIVE).
+  //
+  // CP1 composite (survey S1 D1): while the live edge is off-screen,
+  // `stepPriceFollow` is gated on the newest column being visible, so flipping
+  // the mode alone was a SILENT NO-OP (the chip vanished, the price never
+  // moved). When the renderer reports the edge hidden, the click ALSO re-pins
+  // TIME via goLive() — which keeps the deliberate price lock and the user's
+  // zoom — so tracking can actually act. Both follow policies are persisted.
   const onTrackPrice = useCallback(() => {
-    rendererRef.current?.setPriceFollow('track');
-    setSettings((prev) => (prev.followPrice ? prev : { ...prev, followPrice: true }));
+    const r = rendererRef.current as RendererCp1 | null;
+    if (!r) return;
+    r.setPriceFollow('track');
+    const repin = r.liveEdgeVisible === false;
+    if (repin) r.goLive();
+    setSettings((prev) => {
+      const follow = repin ? true : prev.follow;
+      if (prev.followPrice && prev.follow === follow) return prev;
+      return { ...prev, followPrice: true, follow };
+    });
   }, []);
+
+  // D4 (survey S4 D5): ONE writer for chip / global keys / drawer toggles. It
+  // applies the mode to the renderer AND persists `followPrice`, so the drawer
+  // switch and the next boot can never disagree with the camera (the old chip
+  // wrote the renderer only: drawer read ON while the camera was LOCKed).
+  const onSetPriceFollow = useCallback((mode: PriceFollow) => {
+    rendererRef.current?.setPriceFollow(mode);
+    setSettings((prev) => {
+      const followPrice = mode !== 'off';
+      return prev.followPrice === followPrice ? prev : { ...prev, followPrice };
+    });
+  }, []);
+
+  // `F` (global; survey S4 D3): toggle TIME follow like the canvas key. The
+  // persisted policy is written only in live mode — a replay camera's attach
+  // state has no bearing on the live-follow policy the drawer switch stores.
+  const onToggleFollowKey = useCallback(() => {
+    const r = rendererRef.current;
+    if (!r) return;
+    r.toggleFollow();
+    if (useFlowMapStore.getState().subscription?.mode !== 'replay') {
+      setSettings((prev) => (prev.follow === r.following ? prev : { ...prev, follow: r.following }));
+    }
+  }, []);
+
+  // `P` (global): toggle the price axis off ↔ track. Reuse the one writer so the
+  // persistence semantics match the chip exactly.
+  const onTogglePriceFollowKey = useCallback(() => {
+    const r = rendererRef.current;
+    if (!r) return;
+    onSetPriceFollow(r.priceFollow === 'off' ? 'track' : 'off');
+  }, [onSetPriceFollow]);
+
+  // `Shift+P` (global): restore price AUTO-FIT (same as a gutter double-click).
+  const onPriceAutoFitKey = useCallback(() => {
+    onSetPriceFollow('fit');
+  }, [onSetPriceFollow]);
 
   const toggleRail = useCallback(
     () => setSettings((prev) => ({ ...prev, railVisible: !prev.railVisible })),
@@ -588,6 +716,7 @@ export function App() {
             <MeasureTool containerRef={stageViewportRef} map={chartMap} />
             <PriceAlerts rendererRef={rendererRef} soundEnabled={settings.alertSound} />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
+            {glError === null && <ChartLegend />}
             <HeatLegend colormap={settings.colormap} channel={settings.depthChannel} />
             <PerfHud rendererRef={rendererRef} visible={settings.hudVisible} onToggle={toggleHud} />
             <ClosedBanner />
@@ -596,12 +725,17 @@ export function App() {
               rendererRef={rendererRef}
               onGoLive={onGoLive}
               onTrackPrice={onTrackPrice}
+              mode={subscription?.mode ?? 'live'}
             />
             <DrawToolbar symbol={activeSymbol} />
             <IndicatorPicker />
             <DepthChannelHotkey onCycle={cycleDepthChannel} />
           </div>
-          <PriceAxis canvasRef={priceAxisRef} rendererRef={rendererRef} />
+          <PriceAxis
+            canvasRef={priceAxisRef}
+            rendererRef={rendererRef}
+            onSetPriceFollow={onSetPriceFollow}
+          />
           {settings.overlays.cvd && (
             <>
               <CvdPane rendererRef={rendererRef} />

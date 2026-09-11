@@ -139,7 +139,7 @@ export const tr: Record<string, string> = {
   'keysheet.help': 'bu kısayol penceresini aç-kapat',
   'keysheet.pan': 'zaman / fiyat kaydır (grafik odaklıyken)',
   'keysheet.zoom': 'zamanı yakınlaştır (grafik odaklıyken)',
-  'keysheet.follow': 'zaman takibini aç-kapat (grafik odaklıyken)',
+  'keysheet.follow': 'zaman takibini aç-kapat',
   'keysheet.priceTrack': 'fiyat takibi aç-kapat · Shift+P yeniden sığdır',
   'keysheet.liveEdge': 'canlı kenara dön',
   'keysheet.escape':

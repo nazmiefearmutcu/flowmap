@@ -140,7 +140,7 @@ export const en: Record<string, string> = {
   'keysheet.help': 'toggle this shortcuts overlay',
   'keysheet.pan': 'pan time / price (chart focused)',
   'keysheet.zoom': 'zoom time (chart focused)',
-  'keysheet.follow': 'toggle time follow (chart focused)',
+  'keysheet.follow': 'toggle time follow',
   'keysheet.priceTrack': 'price track on/off · Shift+P re-fit',
   'keysheet.liveEdge': 'return to the live edge',
   'keysheet.escape': 'close dialogs (search · settings · this overlay) · cancel a measure drag · cancel / deselect a drawing',

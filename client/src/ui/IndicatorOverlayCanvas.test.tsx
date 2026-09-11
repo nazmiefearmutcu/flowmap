@@ -241,6 +241,36 @@ describe('IndicatorOverlayCanvas — draw pipeline', () => {
     expect(ctx.__calls.stroke).toBe(strokesAfterPaint); // no repaint storm
   });
 
+  it('clears the canvas when the LAST indicator is removed (S3 C-1 regression)', () => {
+    ingestCandleMsg(depthCol());
+    ingestCandleMsg(trade(0, 0, 100));
+    ingestCandleMsg(trade(0, 30, 102));
+    render(<IndicatorOverlayCanvas chartMap={MAP} />);
+    act(() => {
+      useIndicatorStore.getState().add('vwap');
+    });
+    act(() => {
+      vi.advanceTimersByTime(600);
+    });
+    const clearMock = ctx.clearRect as unknown as { mock: { calls: unknown[] } };
+    const clearsAfterAdd = clearMock.mock.calls.length;
+    expect(clearsAfterAdd).toBeGreaterThanOrEqual(1); // painted at least once
+    const strokesAfterAdd = ctx.__calls.stroke;
+
+    const uid = useIndicatorStore.getState().active[0].uid;
+    act(() => {
+      useIndicatorStore.getState().remove(uid);
+    });
+    act(() => {
+      vi.advanceTimersByTime(600);
+    });
+    // The active->empty transition must repaint (which clears); previously the
+    // `active.length > 0` gate skipped it and the last line stayed inked forever.
+    expect(clearMock.mock.calls.length).toBeGreaterThan(clearsAfterAdd);
+    // Nothing is drawn on the cleared canvas (no stale polyline of the removed one).
+    expect(ctx.__calls.stroke).toBe(strokesAfterAdd);
+  });
+
   it('repaints when the camera moves (chartMap output changes)', () => {
     ingestCandleMsg(depthCol());
     ingestCandleMsg(trade(0, 0, 100));
