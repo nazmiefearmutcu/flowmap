@@ -73,6 +73,16 @@ logger = logging.getLogger(__name__)
 # overflow to inf (max finite 65 504).
 DENSITY_SAFETY_MAX = 60_000.0
 
+# Display gain for reconstructed density. A candle band spreads its volume over
+# EVERY row in [low, high] (median ~30-160 rows on a major), so its per-row
+# value (~0.03-0.11 BTC) sits ~50-100x below a live book cell's resting size
+# (~0.3-7.8 BTC) — a mixed viewport's shared black point then hides the whole
+# reconstructed field. This constant lifts the historical congestion to a
+# live-comparable visual intensity (walls stay a little dimmer than live walls:
+# reconstructed data is coarser, and the gain never moves the live feed's own
+# values). Tuned against a live BTCUSDT measurement; 1 = raw true units.
+BACKFILL_DENSITY_GAIN = 12.0
+
 # How many depth columns each reconstructed candle becomes. The candle's
 # density band is repeated across this many consecutive columns with the t0
 # spread over the candle's span (kept on the dt grid), so scroll-back history
@@ -234,16 +244,18 @@ def columns_from_candles(
             )
         )
 
-    # True size units: a candle band's per-row density is on the same
-    # base-units-per-row scale as live book densities, so a viewport that mixes
-    # reconstructed and live columns normalizes both fairly. Only a pathological
-    # peak (doji: whole volume in one row) is scaled DOWN to stay f16-finite.
+    # True size units scaled by the documented display gain: a candle band's
+    # per-row density (volume / row span) is lifted to a live-comparable
+    # intensity so a viewport that mixes reconstructed and live columns keeps
+    # BOTH legible under one shared black point. The safety scale only pulls a
+    # pathological peak (doji: whole volume in one row) below f16-finite.
     scale = min(1.0, DENSITY_SAFETY_MAX / global_peak) if global_peak > 0.0 else 1.0
+    gain = BACKFILL_DENSITY_GAIN
     k_req = max(1, min(240, int(stretch)))
     columns: list[FinalizedColumn] = []
     next_seq = 0
     for seq_c, (dens, t0, bar) in enumerate(zip(raw, t0s, bars, strict=True)):
-        d16 = (dens * scale).astype(np.float16)
+        d16 = np.minimum(dens * scale * gain, DENSITY_SAFETY_MAX).astype(np.float16)
         # The candle's true span: the next candle's snapped open minus ours,
         # falling back to the nominal 1-minute interval for the last candle.
         # Same-dt-slot candles span only dt, so they stay one column wide.

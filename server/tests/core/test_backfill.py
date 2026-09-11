@@ -21,6 +21,7 @@ import numpy as np
 
 from flowmap_server.config import Config
 from flowmap_server.core.backfill import (
+    BACKFILL_DENSITY_GAIN,
     DEFAULT_BACKFILL_STRETCH,
     DENSITY_SAFETY_MAX,
     Candle,
@@ -114,11 +115,11 @@ def test_density_bounded_peak_and_two_sided_split():
         max(float(c.bid.astype(np.float64).max()), float(c.ask.astype(np.float64).max()))
         for c in cols
     )
-    # TRUE size units: per-row density is candle volume / row span, never the
-    # historical fixed-1000 inflation (which saturated the ramp and crushed the
-    # live field in mixed viewports). These candles carry ~100 volume over a
-    # ~4-row band, so the peak sits near 25.
-    assert 0.0 < combined_peak < 100.0
+    # TRUE size units scaled by the documented display gain (no old fixed-1000
+    # inflation): these candles carry ~100 volume over a ~4-row band, so the raw
+    # per-row value is ~25 and the emitted peak sits at ~25 x gain.
+    expected = 25.0 * BACKFILL_DENSITY_GAIN
+    assert 0.5 * expected < combined_peak < 2.0 * expected
     # split at the candle close leaves mass on BOTH channels for a ranged candle.
     assert any(float(c.ask.astype(np.float64).max()) > 0.0 for c in cols)
     assert any(float(c.bid.astype(np.float64).max()) > 0.0 for c in cols)
