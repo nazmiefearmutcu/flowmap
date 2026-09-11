@@ -1,0 +1,239 @@
+/**
+ * Shell-chrome styles for lane CE components: the toast stack
+ * (ui/Toaster.tsx) and the first-run onboarding card (ui/OnboardingCard.tsx).
+ * LIVES in theme/ because lane CE owns only theme/** css files; both
+ * components import this sheet directly. Uses ONLY the shared tokens from
+ * ui/theme.css, so every registered theme styles it for free.
+ */
+
+/* ------------------------------------------------------------ toast stack */
+
+.toasts {
+  position: fixed;
+  right: var(--sp-4);
+  bottom: calc(var(--timeline-h) + var(--sp-4));
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-2);
+}
+
+/* Elevated chip: hairline border, pop shadow, mono type. The left accent
+   border carries the severity channel — info/success → teal (--accent),
+   warn → amber (--warn), error → red (--sell) — matching the tape's
+   buy/sell hues so the whole shell reads as one instrument. */
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  max-width: 340px;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  box-shadow: var(--shadow-pop);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  animation: fm-toast-in var(--t-fast) both;
+}
+
+.toast--info,
+.toast--success {
+  border-left: 2px solid var(--accent);
+}
+
+.toast--warn {
+  border-left: 2px solid var(--warn);
+}
+
+.toast--error {
+  border-left: 2px solid var(--sell);
+}
+
+.toast__message {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.toast--success .toast__message {
+  color: var(--accent-bright);
+}
+
+.toast--warn .toast__message {
+  color: var(--warn);
+}
+
+.toast--error .toast__message {
+  color: var(--sell-bright);
+}
+
+.toast__close {
+  flex: none;
+  padding: 0 var(--sp-1);
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+
+.toast__close:hover,
+.toast__close:focus-visible {
+  color: var(--text);
+}
+
+@keyframes fm-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+}
+
+/* -------------------------------------------------------- onboarding card */
+
+.onboard__scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: var(--scrim);
+}
+
+.onboard {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 71;
+  width: min(420px, calc(100vw - 2 * var(--sp-6)));
+  transform: translate(-50%, -50%);
+  padding: var(--sp-5);
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  box-shadow: var(--shadow-drop);
+  font-family: var(--font-mono);
+  color: var(--text);
+  animation: fm-onboard-in var(--t-med) both;
+}
+
+.onboard:focus {
+  outline: none;
+}
+
+.onboard:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
+.onboard__title {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+
+.onboard__step {
+  margin: 0 0 var(--sp-3);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.onboard__card-title {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--accent-bright);
+}
+
+.onboard__body {
+  margin: 0 0 var(--sp-4);
+  min-height: 3em;
+  color: var(--text-2);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+}
+
+.onboard__dots {
+  display: flex;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+
+.onboard__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--line-2);
+}
+
+.onboard__dot--on {
+  background: var(--accent);
+}
+
+.onboard__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.onboard__hint {
+  flex: 1;
+  color: var(--text-4);
+  font-size: var(--fs-2xs);
+}
+
+.onboard__btn {
+  padding: var(--sp-1) var(--sp-3);
+  background: var(--bg-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.onboard__btn:hover,
+.onboard__btn:focus-visible {
+  border-color: var(--accent);
+}
+
+.onboard__btn--primary {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--accent-bright);
+}
+
+.onboard__btn--primary:hover,
+.onboard__btn--primary:focus-visible {
+  border-color: var(--accent-bright);
+}
+
+@keyframes fm-onboard-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 6px));
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .onboard {
+    animation: none;
+  }
+}

@@ -16,6 +16,8 @@
 
 import { useEffect, useState } from 'react';
 
+import { useT } from '../i18n/useT';
+
 import { useFlowMapStore } from '../state/store';
 
 /**
@@ -37,6 +39,7 @@ export function formatCountdown(remainingMs: number): string {
 }
 
 export function ClosedBanner(): JSX.Element | null {
+  const t = useT(); // i18n shell pass
   const feedState = useFlowMapStore((s) => s.feedState);
   const nextOpenTs = useFlowMapStore((s) => s.nextOpenTs);
   const noFeed = useFlowMapStore((s) => s.noFeed);
@@ -62,13 +65,13 @@ export function ClosedBanner(): JSX.Element | null {
       <div
         className="closed-banner closed-banner--nofeed"
         role="status"
-        aria-label="No feed for this market"
+        aria-label={t('banner.noFeedDetail')}
         data-testid="no-feed-banner"
       >
         <span className="closed-banner__dot" aria-hidden="true" />
-        <span className="closed-banner__label">NO FEED</span>
+        <span className="closed-banner__label">{t('banner.noFeed')}</span>
         <span className="closed-banner__countdown" data-testid="no-feed-detail">
-          no feed available for this market
+          {t('banner.noFeedDetail')}
         </span>
       </div>
     );
@@ -83,18 +86,18 @@ export function ClosedBanner(): JSX.Element | null {
     <div
       className="closed-banner"
       role="status"
-      aria-label="Market closed"
+      aria-label={t('banner.closed')}
       data-testid="closed-banner"
     >
       <span className="closed-banner__dot" aria-hidden="true" />
-      <span className="closed-banner__label">MARKET CLOSED</span>
+      <span className="closed-banner__label">{t('banner.closed')}</span>
       {showCountdown && (
         <span
           className="closed-banner__countdown"
           aria-live="off"
           data-testid="closed-countdown"
         >
-          opens in {formatCountdown(remainingMs)}
+          {t('banner.opensIn', { time: formatCountdown(remainingMs) })}
         </span>
       )}
     </div>

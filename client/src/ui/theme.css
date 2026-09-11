@@ -51,6 +51,20 @@
   --replay: var(--warn);
   --live: var(--accent);
 
+  /* --- chart island (FIXED dark — never overridden by any theme) ---
+     The GL canvas background is ramp-derived and stays near-black in EVERY
+     theme, so chips pinned INSIDE the chart viewport (perf HUD, measure,
+     crosshair, draw toolbar, alerts bell, heat legend) must not inherit theme
+     ink that flips dark on light themes. These tokens hold the midnight-island
+     values; theme blocks in theme/themes.css deliberately do NOT redeclare
+     them (pinned by theme/registry.test.ts). */
+  --chart-ink: #e6edf3; /* primary chip text (= midnight --text) */
+  --chart-ink-dim: #93a1b4; /* secondary chip text (= midnight --text-2) */
+  --chart-chip-bg: rgba(8, 11, 17, 0.92); /* translucent dark chip plate */
+  --chart-chip-border: #1a2030; /* chip hairline (= midnight --line) */
+  --chart-accent: #33d6c4; /* chip accent (= midnight --accent-bright) */
+  --chart-gutter-bg: #0e121a; /* axis gutters: the renderer paints light ticks into them (= midnight --bg-2) */
+
   /* --- type scale (px) --- */
   --fs-2xs: 9px;
   --fs-xs: 10px;

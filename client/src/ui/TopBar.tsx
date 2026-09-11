@@ -12,6 +12,8 @@
 
 import { forwardRef, useEffect, useState } from 'react';
 
+import { useT } from '../i18n/useT';
+
 import type { StreamMode } from '../proto/types';
 import { useFlowMapStore } from '../state/store';
 import { SymbolSearch, type SymbolSearchHandle } from './SymbolSearch';
@@ -79,6 +81,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
   },
   searchRef,
 ) {
+  const t = useT(); // i18n shell pass — re-renders on locale change
   const status = useFlowMapStore((s) => s.status);
   const feedState = useFlowMapStore((s) => s.feedState);
   const capability = useFlowMapStore((s) => s.capability);
@@ -137,7 +140,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
           <span className="cap cap--pending" aria-hidden="true">—</span>
         ) : chips.length === 0 ? (
           // Received a descriptor that genuinely advertises no capabilities.
-          <span className="cap cap--na">NO CAPS</span>
+          <span className="cap cap--na">{t('topbar.noCaps')}</span>
         ) : (
           chips.map((c) => (
             <span key={c} className={capabilityChipClass(c)} title={capabilityChipTitle(c)}>
@@ -152,7 +155,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
       {/* Replay surfaces ONLY when the server advertises the capability: this
           build's server refuses mode=replay (no engine — the controls would
           steer nothing), so an always-on toggle would be a dead control. */}
-      <div className="modeseg" role="group" aria-label="live or replay" data-testid="mode-toggle">
+      <div className="modeseg" role="group" aria-label={t('topbar.liveOrReplay')} data-testid="mode-toggle">
         <button
           type="button"
           data-mode="live"
@@ -161,7 +164,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
           data-testid="mode-live"
           onClick={() => onSetMode('live')}
         >
-          Live
+          {t('topbar.live')}
         </button>
         {capability?.replay === true && (
           <button
@@ -172,7 +175,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
             data-testid="mode-replay"
             onClick={() => onSetMode('replay')}
           >
-            Replay
+            {t('topbar.replay')}
           </button>
         )}
       </div>
@@ -230,7 +233,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
             type="button"
             className="export-note__close"
             onClick={onDismissExportNotice}
-            aria-label="dismiss export notice"
+            aria-label={t('topbar.dismissNotice')}
             data-testid="export-notice-close"
           >
             ✕
@@ -243,8 +246,8 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         className="tbtn"
         onClick={onExportPng}
         data-testid="export-png"
-        aria-label="Export PNG"
-        title="export chart as PNG (E)"
+        aria-label={t('topbar.exportPng')}
+        title={t('topbar.exportPngHint')}
       >
         <svg
           className="tbtn__icon"
@@ -270,7 +273,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         aria-pressed={railVisible}
         onClick={onToggleRail}
         data-testid="rail-toggle"
-        title="toggle DOM ladder / tape rail"
+        title={t('topbar.toggleRail')}
       >
         Rail
       </button>
@@ -280,7 +283,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         className="tbtn"
         onClick={onOpenSettings}
         data-testid="settings-open"
-        title="settings"
+        title={t('topbar.settings')}
         aria-haspopup="dialog"
       >
         {/* Force text (monochrome) presentation of the gear via U+FE0E, not the color emoji. */}

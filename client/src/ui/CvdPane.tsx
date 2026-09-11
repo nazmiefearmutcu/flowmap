@@ -23,7 +23,7 @@ import { useEffect, useRef, type RefObject } from 'react';
 import type { Renderer } from '../gl/renderer';
 import { OVERLAY } from '../gl/overlays/palette';
 import { useFlowMapStore } from '../state/store';
-import { cvdBounds, cvdColToX, cvdValueToY, fmtCvd } from './cvd';
+import { cvdProject, cvdValueToY, fmtCvd, type ProjectedPoint } from './cvd';
 
 interface CvdPaneProps {
   rendererRef: RefObject<Renderer | null>;
@@ -35,6 +35,9 @@ const BG = 'rgba(9, 12, 16, 1)';
 
 export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Reused projection buffer: one allocation that grows to the widest repaint,
+  // then zero garbage per repaint (see cvd.ts cvdProject).
+  const xyBufRef = useRef<ProjectedPoint[]>([]);
   // Read the honesty flag reactively; everything else is polled off the renderer.
   const cvdCap = useFlowMapStore((s) => (s.capability?.cvd as string | undefined) ?? null);
   const cvdCapRef = useRef<string | null>(cvdCap);
@@ -112,7 +115,12 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       const pts = r.cvdSeries(lo, hi);
       if (pts.length === 0) return;
 
-      const bounds = cvdBounds(pts.map((p) => p.cvd));
+      // Single-pass, zero-allocation projection (bounds + x + y in place over a
+      // reused buffer) — the old per-repaint `pts.map(...)` triple churned three
+      // fresh arrays on every column flush.
+      const proj = cvdProject(pts, tl.viewStartCol, tl.viewEndCol, cssW, cssH, xyBufRef.current);
+      const bounds = proj.bounds;
+      const xy = proj.xy;
       const zeroY = cvdValueToY(0, bounds, cssH);
 
       // Zero baseline (dashed, faint).
@@ -125,11 +133,7 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Build the polyline in the shared x transform.
-      const xy = pts.map((p) => ({
-        x: cvdColToX(p.col, tl.viewStartCol, tl.viewEndCol, cssW),
-        y: cvdValueToY(p.cvd, bounds, cssH),
-      }));
+      // Build the polyline in the shared x transform (already projected above).
 
       // Filled area between the line and the zero baseline — a vertical fade
       // (strongest at the line, gone at the baseline) so the pane reads as one

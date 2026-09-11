@@ -75,8 +75,18 @@ const EMPTY_TRADES: readonly TapeTrade[] = Object.freeze([]);
 
 let book: BookBuffer | null = null;
 let bbo: BboBuffer | null = null;
-/** Newest-LAST ring (push / shift-oldest); snapshot exposes it newest-first. */
-let trades: TapeTrade[] = [];
+/**
+ * Fixed-slot trade ring, NEWEST-LAST with a moving head index: a push is ONE
+ * slot write (no Array.shift memmove, no growth, no per-trade garbage) and the
+ * eviction of the oldest trade falls out of the modulo. The panel-facing
+ * snapshot materializes it newest-FIRST by iterating the ring BACKWARD — the
+ * old `trades.slice().reverse()` per flush allocated TWO arrays at ~10 Hz
+ * (the slice, then the reversed copy); this allocates exactly the one
+ * immutable array the snapshot needs.
+ */
+const tradeRing: (TapeTrade | undefined)[] = new Array(TRADE_RING);
+let tradeHead = -1; // slot index of the newest trade
+let tradeCount = 0; // valid slots (≤ TRADE_RING)
 let version = 0;
 
 let cachedSnapshot: BookSnapshot | null = null;
@@ -119,6 +129,30 @@ function bump(): void {
   cachedSnapshot = null;
   if (listeners.size === 0 || flushTimer !== null) return;
   flushTimer = setTimeout(flush, THROTTLE_MS);
+}
+
+/** Push one trade into the fixed ring — one slot write, oldest evicted by modulo. */
+function pushTrade(t: TapeTrade): void {
+  tradeHead = (tradeHead + 1) % TRADE_RING;
+  tradeRing[tradeHead] = t;
+  if (tradeCount < TRADE_RING) tradeCount += 1;
+}
+
+/**
+ * Materialize the ring NEWEST-FIRST into a fresh immutable array: walk back
+ * from the head slot. O(ring) with exactly one allocation — the old
+ * `slice().reverse()` per flush allocated the slice AND the reversed copy.
+ */
+function tradesNewestFirst(): readonly TapeTrade[] {
+  if (tradeCount === 0) return EMPTY_TRADES;
+  const out: TapeTrade[] = new Array(tradeCount);
+  let idx = tradeHead;
+  for (let i = 0; i < tradeCount; i += 1) {
+    out[i] = tradeRing[idx] as TapeTrade;
+    idx -= 1;
+    if (idx < 0) idx = TRADE_RING - 1;
+  }
+  return out;
 }
 
 function flush(): void {
@@ -186,14 +220,13 @@ function handle(msg: StreamMsg): void {
       // — dropping it keeps the last-good tape instead of a NaN row (and keeps
       // `toBigNs(NaN)` from ever being reached).
       if (!Number.isFinite(t.price) || !Number.isFinite(t.size)) return;
-      trades.push({
+      pushTrade({
         tsNs: toBigNs(t.ts_ns),
         price: t.price,
         size: t.size,
         side: t.side,
         venue: t.venue,
       });
-      if (trades.length > TRADE_RING) trades.shift();
       bump();
       return;
     }
@@ -221,7 +254,7 @@ export function getSnapshot(): BookSnapshot {
       version,
       book,
       bbo,
-      trades: trades.length === 0 ? EMPTY_TRADES : trades.slice().reverse(),
+      trades: tradesNewestFirst(),
     };
   }
   return cachedSnapshot;
@@ -258,7 +291,7 @@ export function subscribe(cb: (s: BookSnapshot) => void): () => void {
 export function resetForSession(): void {
   book = null;
   bbo = null;
-  trades = [];
+  clearTradeRing();
   bump();
 }
 
@@ -278,11 +311,18 @@ export function flushForTest(): void {
   flush();
 }
 
+/** Drop every trade from the ring (session switch / test reset). */
+function clearTradeRing(): void {
+  tradeRing.fill(undefined);
+  tradeHead = -1;
+  tradeCount = 0;
+}
+
 /** Reset all buffer + subscription state. Unit tests only. */
 export function resetForTest(): void {
   book = null;
   bbo = null;
-  trades = [];
+  clearTradeRing();
   version = 0;
   cachedSnapshot = null;
   if (flushTimer !== null) {

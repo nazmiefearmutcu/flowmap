@@ -21,6 +21,7 @@ import { useEffect, useRef, useState, type MutableRefObject, type RefObject } fr
 import type { CrosshairReadout, Renderer } from '../gl/renderer';
 import { getSnapshot } from '../state/bookStore';
 import { useFlowMapStore } from '../state/store';
+import { recordProbeSpot } from './lastProbe';
 import { depthTier } from './DomLadder';
 import './Crosshair.css';
 
@@ -104,7 +105,17 @@ export function Crosshair({ canvasRef, rendererRef }: CrosshairProps): JSX.Eleme
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = 0;
         const renderer = rendererRef.current;
-        setHover({ x, y, readout: renderer ? renderer.probeAt(x, y) : null });
+        const readout = renderer ? renderer.probeAt(x, y) : null;
+        // Share the probe (price under the cursor) with feature components —
+        // the `A` alert key anchors at exactly this price. Cheap, off-render.
+        recordProbeSpot({
+          price: readout?.price ?? null,
+          priceDecimals: readout?.priceDecimals ?? 2,
+          x,
+          y,
+          at: Date.now(),
+        });
+        setHover({ x, y, readout });
       });
     };
     const onLeave = (): void => {

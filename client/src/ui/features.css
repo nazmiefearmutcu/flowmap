@@ -1,0 +1,319 @@
+/* ============================================================================
+   Lane CD feature styles — measure tool, price alerts, perf HUD.
+   Mounted by INT via `import './ui/features.css'` (single import in App.tsx;
+   the components also import it directly so standalone test pages work).
+   Token vocabulary matches ui/theme.css; nothing hardcodes the palette.
+   Chips rendered INSIDE the chart viewport use the FIXED dark-island tokens
+   (--chart-*, ui/theme.css) — the GL canvas is ramp-dark in every theme, so
+   this ink must never follow a light theme (fix 2026-09-10 F1-3).
+   ========================================================================= */
+
+/* --- measure tool (M) ----------------------------------------------------- */
+/* Pure DOM overlay over the GL canvas inside .stage__viewport. Disarmed it is
+   transparent to the pointer so the canvas pan/zoom gestures are untouched. */
+.measure {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+.measure.is-armed {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+.measure__rect {
+  position: absolute;
+  border: 1px dashed var(--chart-accent, #33d6c4);
+  background: rgba(31, 182, 166, 0.08);
+  pointer-events: none;
+}
+.measure__box {
+  position: absolute;
+  z-index: 7;
+  min-width: 150px;
+  padding: 6px 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs, 10px);
+  line-height: 1.55;
+  color: var(--chart-ink, #e6edf3);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 5px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.measure__row {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.measure__row--dim {
+  color: var(--chart-ink-dim, #93a1b4);
+  margin-top: 2px;
+}
+.measure__k {
+  color: var(--chart-ink-dim, #93a1b4);
+  letter-spacing: 0.06em;
+}
+.measure__v {
+  font-variant-numeric: tabular-nums;
+}
+.measure__bid {
+  color: var(--chart-accent, #33d6c4);
+}
+.measure__ask {
+  color: var(--sell-bright, #e8635f);
+}
+.measure__mode {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  padding: 4px 10px;
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--chart-accent, #33d6c4);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+/* --- on-chart price alerts (A) -------------------------------------------- */
+/* Horizontal marker lines rendered as DOM bars across the chart viewport. */
+.alert-lines {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  overflow: hidden;
+}
+.alert-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1px dashed var(--warn, #d6a13a);
+}
+.alert-line__tag {
+  position: absolute;
+  left: 6px;
+  top: -14px;
+  padding: 1px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-2xs, 9px);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  color: var(--warn, #d6a13a);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--warn-line, #3a3016);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.alert-line--triggered {
+  border-top-style: solid;
+  border-top-color: var(--sell-bright, #e8635f);
+}
+.alert-line--triggered .alert-line__tag {
+  color: var(--sell-bright, #e8635f);
+  border-color: var(--sell-line, #3b1f1f);
+}
+/* Fired alerts pulse the marker for a couple of seconds (reduced-motion safe). */
+.alert-line--pulse {
+  animation: alert-pulse 0.9s ease-in-out 2;
+}
+@keyframes alert-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .alert-line--pulse {
+    animation: none;
+  }
+}
+
+/* Bell chip (opens the alerts popover) — bottom-RIGHT (the perf HUD owns the
+   bottom-left corner; the heat legend owns the top-right). */
+.alerts-chip {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--chart-ink-dim, #93a1b4);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color var(--t-fast, 0.12s), color var(--t-fast, 0.12s);
+}
+.alerts-chip:hover,
+.alerts-chip.is-open {
+  color: var(--chart-ink, #e6edf3);
+  border-color: var(--warn-line, #3a3016);
+}
+.alerts-chip__count {
+  color: var(--warn, #d6a13a);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Alerts popover — a compact panel anchored to the bell chip. */
+.alerts-pop {
+  position: absolute;
+  bottom: 40px;
+  right: 12px;
+  z-index: 30;
+  width: 300px;
+  max-height: 46vh;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-xs, 10px);
+  color: var(--text, #e6edf3);
+  background: rgba(10, 13, 19, 0.98);
+  border: 1px solid var(--line-2, #232c3e);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+}
+.alerts-pop__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line, #1a2030);
+}
+.alerts-pop__title {
+  flex: 1;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.alerts-pop__body {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.alerts-pop__empty {
+  padding: 14px 10px;
+  color: var(--text-3, #6f7b8c);
+  text-align: center;
+}
+.alert-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.alert-row:hover {
+  background: var(--bg-3, #141a26);
+}
+.alert-row__px {
+  flex: 1;
+  color: var(--text-money, #f2f6fa);
+}
+.alert-row__state {
+  font-size: var(--fs-2xs, 9px);
+  letter-spacing: 0.05em;
+  color: var(--text-3, #6f7b8c);
+}
+.alert-row__state--fired {
+  color: var(--sell-bright, #e8635f);
+}
+.alert-row__state--muted {
+  color: var(--warn, #d6a13a);
+}
+.alert-row__btn {
+  padding: 2px 7px;
+  font-family: inherit;
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-2, #93a1b4);
+  background: transparent;
+  border: 1px solid var(--line, #1a2030);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.alert-row__btn:hover {
+  color: var(--text, #e6edf3);
+  border-color: var(--line-2, #232c3e);
+}
+.alerts-add {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line, #1a2030);
+}
+.alerts-add__input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-xs, 10px);
+  color: var(--text, #e6edf3);
+  background: var(--bg-inset, #080b11);
+  border: 1px solid var(--line, #1a2030);
+  border-radius: 4px;
+}
+.alerts-add__input:focus-visible {
+  outline: none;
+  border-color: var(--accent-line, #1c3b37);
+}
+.alerts-add__go {
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--accent-bright, #33d6c4);
+  background: transparent;
+  border: 1px solid var(--accent-line, #1c3b37);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.alerts-add__go:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* --- perf HUD chip (H) ----------------------------------------------------- */
+.perfhud {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  z-index: 15;
+  display: flex;
+  gap: 10px;
+  padding: 4px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-2xs, 9px);
+  line-height: 1.6;
+  color: var(--chart-ink-dim, #93a1b4);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 6px;
+  pointer-events: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.perfhud__cell {
+  display: inline-flex;
+  gap: 4px;
+}
+.perfhud__k {
+  color: var(--chart-ink-dim, #93a1b4);
+  letter-spacing: 0.05em;
+}
+.perfhud__v {
+  color: var(--chart-ink, #e6edf3);
+}

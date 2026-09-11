@@ -1,17 +1,28 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { floorForTolerance, gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
+import { applyOverlayPalette } from './gl/overlays/palette';
+import { attachThemeKey, DEFAULT_THEME_ID, getCanvasPalette, useTheme } from './theme';
 import { attachGlobalKeys, classifyTarget } from './input/keys';
 import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
 import { ClosedBanner } from './ui/ClosedBanner';
 import { Crosshair } from './ui/Crosshair';
 import { CvdPane } from './ui/CvdPane';
+import { DepthChannelHotkey } from './ui/DepthChannelHotkey';
+import { DrawingLayer } from './ui/DrawingLayer';
 import { DomLadder } from './ui/DomLadder';
+import { DrawToolbar } from './ui/DrawToolbar';
+import { IndicatorOverlayCanvas } from './ui/IndicatorOverlayCanvas';
+import { IndicatorPicker } from './ui/IndicatorPicker';
 import { isHelpToggle } from './ui/keysheet';
 import { LiveControls } from './ui/LiveControls';
 import { HeatLegend } from './ui/HeatLegend';
+import { MeasureTool, rendererChartMap } from './ui/MeasureTool';
+import { OnboardingCard } from './ui/OnboardingCard';
+import { PerfHud } from './ui/PerfHud';
+import { PriceAlerts } from './ui/PriceAlerts';
 import { PriceAxis } from './ui/PriceAxis';
 import { ReconnectBanner } from './ui/ReconnectBanner';
 import { SettingsDrawer } from './ui/SettingsDrawer';
@@ -19,10 +30,12 @@ import { ShortcutsOverlay } from './ui/ShortcutsOverlay';
 import { Tape } from './ui/Tape';
 import { TimeAxis } from './ui/TimeAxis';
 import { Timeline } from './ui/Timeline';
+import { Toaster } from './ui/Toaster';
 import { TopBar } from './ui/TopBar';
 import { runPngExport } from './ui/exportPng';
 import type { SymbolSearchHandle } from './ui/SymbolSearch';
 import {
+  DEPTH_CHANNELS,
   historyDepthCols,
   loadSettings,
   saveSettings,
@@ -99,6 +112,9 @@ export function App() {
   const timeAxisRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const searchRef = useRef<SymbolSearchHandle>(null);
+  // The chart container every data-space overlay (measure / drawings / indicator
+  // canvas) anchors to — lane CD's mount contract.
+  const stageViewportRef = useRef<HTMLDivElement>(null);
 
   const [settings, setSettings] = useState<FlowMapSettings>(() =>
     loadSettings(typeof window !== 'undefined' ? window.localStorage : null),
@@ -114,6 +130,19 @@ export function App() {
   // WebGL2 unavailable: the heatmap canvas cannot render, but the DOM panels
   // (ladder, tape, search) can — the app degrades instead of dying (F1).
   const [glError, setGlError] = useState<string | null>(null);
+
+  // Theme (lane CE): drives the canvas overlay palette bridge below. App only
+  // re-renders on an actual theme switch (useSyncExternalStore), which is
+  // human-frequency.
+  const { theme } = useTheme();
+
+  // ONE mapping pair for every data-space overlay (CD measure / CF drawings /
+  // CG indicators). `rendererChartMap` closes over the renderer REF, so each
+  // `fromChart`/`toChart` call reads the LIVE camera/cache at call time — the
+  // pair itself never goes stale, and each mounted consumer re-probes on its
+  // own cadence (pointer events, ~10 Hz poll, rAF signature) because the
+  // renderer exposes no view-changed callback in this build.
+  const chartMap = useMemo(() => rendererChartMap(rendererRef), []);
 
   // Keep the latest settings reachable from the mount-only renderer effect.
   const settingsRef = useRef(settings);
@@ -188,6 +217,9 @@ export function App() {
     // in AFTER the user has a scale — the settings toggle and the axis chip enable
     // 'track' (below / PriceAxis.tsx), and a price zoom promotes 'fit'→'track'.
     renderer.setPriceFollow(settingsRef.current.followPrice ? 'fit' : 'off');
+    // Depth display channel (contract C2 — CB's setter, optional-chained so a
+    // build without it keeps the default 'sum' rendering).
+    renderer.setDepthChannel?.(settingsRef.current.depthChannel);
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore
@@ -232,6 +264,7 @@ export function App() {
       r.setTolerance(floorForTolerance(settings.tolerance)); // idempotent
       r.setColormap(settings.colormap); // idempotent
       r.setNormPercentile(settings.normPercentile); // idempotent
+      r.setDepthChannel?.(settings.depthChannel); // C2, idempotent
       // Both follows are edge-triggered so they never fight a manual gesture,
       // and each compares against the renderer's LIVE state (a gesture changes
       // the camera without writing settings, so comparing only against the
@@ -391,6 +424,31 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  // --- theme (lane CE) -----------------------------------------------------------
+  // `T` cycles themes (self-contained binder from the theme module; editable
+  // and dialog guarded, so it yields to the drawer/search like the keys above).
+  useEffect(() => attachThemeKey(), []);
+
+  // Theme → canvas bridge: GL/2D overlay colors follow the shell theme. The
+  // DEFAULT theme (`midnight`) IS the shipped literal palette, so the bridge is
+  // never invoked for it (pixel-identity by construction); switching back to
+  // midnight restores the originals via the null call.
+  useEffect(() => {
+    applyOverlayPalette(theme === DEFAULT_THEME_ID ? null : getCanvasPalette(theme));
+  }, [theme]);
+
+  // The theme STORE owns the value (useTheme resolves stored → prefers →
+  // default); this effect keeps <html data-theme> in lockstep with it, so the
+  // first paint and every later render agree even when the store was resolved
+  // before any setTheme/initTheme ran (fix 2026-09-10 F1-4: no second source
+  // of truth, no first-run flip). setTheme also writes the attribute — this
+  // only heals the pre-init path and is otherwise a no-op.
+  useEffect(() => {
+    if (document.documentElement.dataset.theme !== theme) {
+      document.documentElement.dataset.theme = theme;
+    }
+  }, [theme]);
+
   // --- settings patch (merge → state → effect persists + applies) --------------
   const applyPatch = useCallback((patch: Partial<FlowMapSettings>) => {
     setSettings((prev) => ({ ...prev, ...patch }));
@@ -460,6 +518,23 @@ export function App() {
 
   const dismissExportNotice = useCallback(() => setExportNotice(null), []);
 
+  // --- lane CD: perf-HUD + depth-channel key callbacks ---------------------------
+  const toggleHud = useCallback(
+    () => setSettings((p) => ({ ...p, hudVisible: !p.hudVisible })),
+    [],
+  );
+  const cycleDepthChannel = useCallback(() => {
+    setSettings((p) => ({
+      ...p,
+      depthChannel: DEPTH_CHANNELS[(DEPTH_CHANNELS.indexOf(p.depthChannel) + 1) % DEPTH_CHANNELS.length],
+    }));
+  }, []);
+
+  // Active chart scope for the per-symbol overlays (drawings persistence +
+  // toolbar label). The store's subscription is the source of truth.
+  const activeSymbol = subscription?.symbol ?? SIM_SYMBOL;
+  const activeMarket = subscription?.market ?? SIM_MARKET;
+
   return (
     <div className="app">
       <TopBar
@@ -477,7 +552,7 @@ export function App() {
 
       <div className="workspace">
         <div className={`stage${settings.overlays.cvd ? ' stage--cvd' : ''}`}>
-          <div className="stage__viewport">
+          <div className="stage__viewport" ref={stageViewportRef}>
             <canvas id="gl" ref={canvasRef} className="gl-canvas" />
             {glError && (
               <div className="gl-fallback" role="alert" data-testid="gl-fallback">
@@ -489,8 +564,23 @@ export function App() {
                 </span>
               </div>
             )}
+            {/* Campaign-3 chart overlay stack, bottom → top: GL canvas →
+                indicator overlay → drawings → measure → alert markers →
+                crosshair / HUD. Each layer manages its own pointer-events so
+                none steals chart pan/zoom gestures while disarmed. */}
+            <IndicatorOverlayCanvas chartMap={chartMap} />
+            <DrawingLayer
+              containerRef={stageViewportRef}
+              chartMap={chartMap}
+              symbol={activeSymbol}
+              market={activeMarket}
+              getTimeBase={() => rendererRef.current?.timeline()?.timeBase ?? null}
+            />
+            <MeasureTool containerRef={stageViewportRef} map={chartMap} />
+            <PriceAlerts rendererRef={rendererRef} />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
-            <HeatLegend colormap={settings.colormap} />
+            <HeatLegend colormap={settings.colormap} channel={settings.depthChannel} />
+            <PerfHud rendererRef={rendererRef} visible={settings.hudVisible} onToggle={toggleHud} />
             <ClosedBanner />
             <ReconnectBanner />
             <LiveControls
@@ -498,6 +588,9 @@ export function App() {
               onGoLive={onGoLive}
               onTrackPrice={onTrackPrice}
             />
+            <DrawToolbar symbol={activeSymbol} />
+            <IndicatorPicker />
+            <DepthChannelHotkey onCycle={cycleDepthChannel} />
           </div>
           <PriceAxis canvasRef={priceAxisRef} rendererRef={rendererRef} />
           {settings.overlays.cvd && (
@@ -528,6 +621,10 @@ export function App() {
       )}
 
       {helpOpen && <ShortcutsOverlay onClose={() => setHelpOpen(false)} />}
+
+      {/* lane CE: themeable toast stack + first-run onboarding wizard */}
+      <Toaster />
+      <OnboardingCard />
     </div>
   );
 }

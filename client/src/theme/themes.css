@@ -1,0 +1,427 @@
+/**
+ * Theme registry stylesheets (lane CE).
+ *
+ * Every theme re-declares the FULL variable set owned by `ui/theme.css` on
+ * `:root[data-theme='<id>']` (specificity 0,2,0 — beats the `:root` sheet
+ * regardless of import order). `midnight` re-declares values IDENTICAL to
+ * `:root`, so the default theme is visually byte-identical to today's shell.
+ *
+ * A programmatic test (theme/registry.test.ts) asserts that every variable
+ * declared in ui/theme.css is declared by every theme here — add the new var
+ * to ALL theme blocks when extending ui/theme.css.
+ *
+ * CVD notes per theme live in theme/registry.ts (`ThemeMeta.cvd`); the short
+ * version: bid/ask pairs always differ in lightness, never by hue alone.
+ * `sea` is the explicit deuteranopia-safe variant (blue/violet sell/warn,
+ * ported from the old-branch `theme/palettes.ts` `-deut` tones).
+ *
+ * `--accent-bright` doubles as the canvas-overlay accent (getCanvasPalette):
+ * on dark themes it is a brighter accent, on light themes a deeper one —
+ * whichever reads strongest against that theme's `--bg`.
+ */
+
+/* ---------------------------------------------------------------- midnight */
+/* DEFAULT. Values identical to ui/theme.css :root — do not drift. */
+:root[data-theme='midnight'] {
+  /* --- layered surfaces --- */
+  --bg: #050709;
+  --bg-1: #0a0d13;
+  --bg-2: #0e121a;
+  --bg-3: #141a26;
+  --bg-inset: #080b11;
+  --scrim: rgba(3, 5, 8, 0.66);
+
+  /* --- structure --- */
+  --line: #1a2030;
+  --line-2: #232c3e;
+  --line-soft: rgba(26, 32, 48, 0.55);
+
+  /* --- text --- */
+  --text: #e6edf3;
+  --text-2: #93a1b4;
+  --text-3: #6f7b8c;
+  --text-4: #545e6d;
+  --text-money: #f2f6fa;
+
+  /* --- accent pair --- */
+  --accent: #1fb6a6;
+  --accent-bright: #33d6c4;
+  --accent-dim: #0f2a27;
+  --accent-line: #1c3b37;
+  --accent-glow: rgba(31, 182, 166, 0.5);
+  --sell: #d3524f;
+  --sell-bright: #e8635f;
+  --sell-dim: #2f1a1a;
+  --sell-line: #3b1f1f;
+
+  /* --- semantic channels --- */
+  --warn: #d6a13a;
+  --warn-dim: #33290f;
+  --warn-line: #3a3016;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------------- paper */
+/* Light ink-on-paper: warm off-white sheet, dark ink, deepened accents so
+   text/data keep ≥4.5:1 contrast on the light surfaces. */
+:root[data-theme='paper'] {
+  /* --- layered surfaces --- */
+  --bg: #f3f1ea;
+  --bg-1: #f9f8f3;
+  --bg-2: #fffdf8;
+  --bg-3: #ece9df;
+  --bg-inset: #ebe8dd;
+  --scrim: rgba(28, 26, 18, 0.45);
+
+  /* --- structure --- */
+  --line: #d6d0c0;
+  --line-2: #bfb8a4;
+  --line-soft: rgba(214, 208, 192, 0.55);
+
+  /* --- text --- */
+  --text: #24272d;
+  --text-2: #57606c;
+  --text-3: #6d7683;
+  --text-4: #8d949e;
+  --text-money: #101318;
+
+  /* --- accent pair (deepened for light ground) --- */
+  --accent: #0e7c72;
+  --accent-bright: #0a6158;
+  --accent-dim: #dceeea;
+  --accent-line: #b8ddd7;
+  --accent-glow: rgba(14, 124, 114, 0.35);
+  --sell: #b3383d;
+  --sell-bright: #99272c;
+  --sell-dim: #f4dedd;
+  --sell-line: #e4bcb9;
+
+  /* --- semantic channels --- */
+  --warn: #8a6410;
+  --warn-dim: #f1e7cd;
+  --warn-line: #ddcea0;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(40, 36, 24, 0.18);
+  --shadow-drop: 0 12px 40px rgba(40, 36, 24, 0.22);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: light;
+}
+
+/* ------------------------------------------------------------------- swiss */
+/* High-contrast light: pure white ground, near-black hairlines, true black
+   ink — WCAG AAA-grade separation for daylight / screenshot legibility. */
+:root[data-theme='swiss'] {
+  /* --- layered surfaces --- */
+  --bg: #ffffff;
+  --bg-1: #ffffff;
+  --bg-2: #fafafa;
+  --bg-3: #f0f0f0;
+  --bg-inset: #f0f0f0;
+  --scrim: rgba(0, 0, 0, 0.55);
+
+  /* --- structure --- */
+  --line: #2b2b2b;
+  --line-2: #000000;
+  --line-soft: rgba(43, 43, 43, 0.5);
+
+  /* --- text --- */
+  --text: #000000;
+  --text-2: #1f1f1f;
+  --text-3: #333333;
+  --text-4: #4d4d4d;
+  --text-money: #000000;
+
+  /* --- accent pair (deepened for light ground) --- */
+  --accent: #00695f;
+  --accent-bright: #004d45;
+  --accent-dim: #d6efec;
+  --accent-line: #9edbd4;
+  --accent-glow: rgba(0, 105, 95, 0.4);
+  --sell: #a52a1d;
+  --sell-bright: #7f1a10;
+  --sell-dim: #f6dcd8;
+  --sell-line: #e0a89f;
+
+  /* --- semantic channels --- */
+  --warn: #7a5800;
+  --warn-dim: #f0e3bd;
+  --warn-line: #d3bd7d;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.3);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.35);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: light;
+}
+
+/* ------------------------------------------------------------------- amber */
+/* Dark warm terminal: brown-black surfaces, amber-cream phosphor ink; the
+   teal bid / red ask pair keeps its lightness gap on the warm ground. */
+:root[data-theme='amber'] {
+  /* --- layered surfaces --- */
+  --bg: #0f0c06;
+  --bg-1: #161208;
+  --bg-2: #1c1709;
+  --bg-3: #241d0c;
+  --bg-inset: #120e06;
+  --scrim: rgba(8, 6, 2, 0.66);
+
+  /* --- structure --- */
+  --line: #352b14;
+  --line-2: #46391c;
+  --line-soft: rgba(53, 43, 20, 0.55);
+
+  /* --- text --- */
+  --text: #ede0bd;
+  --text-2: #b3a67f;
+  --text-3: #93876a;
+  --text-4: #776d55;
+  --text-money: #f7ecd0;
+
+  /* --- accent pair --- */
+  --accent: #35c99e;
+  --accent-bright: #5fe3ba;
+  --accent-dim: #123226;
+  --accent-line: #1e4436;
+  --accent-glow: rgba(53, 201, 158, 0.5);
+  --sell: #e06a5a;
+  --sell-bright: #f08577;
+  --sell-dim: #331b14;
+  --sell-line: #43231a;
+
+  /* --- semantic channels --- */
+  --warn: #e0a83e;
+  --warn-dim: #33290f;
+  --warn-line: #3a3016;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: dark;
+}
+
+/* --------------------------------------------------------------------- sea */
+/* Deuteranopia-safe dark (ported from old-branch `-deut` palette): the sell
+   channel swaps red → blue (#4f7fd6) and warn → violet (#b78ce0) — hues that
+   stay distinct from the teal accent and from each other along the red–green
+   confusion axis. Midnight surfaces, so it feels like home to default users. */
+:root[data-theme='sea'] {
+  /* --- layered surfaces --- */
+  --bg: #050709;
+  --bg-1: #0a0d13;
+  --bg-2: #0e121a;
+  --bg-3: #141a26;
+  --bg-inset: #080b11;
+  --scrim: rgba(3, 5, 8, 0.66);
+
+  /* --- structure --- */
+  --line: #1a2030;
+  --line-2: #232c3e;
+  --line-soft: rgba(26, 32, 48, 0.55);
+
+  /* --- text --- */
+  --text: #e6edf3;
+  --text-2: #93a1b4;
+  --text-3: #6f7b8c;
+  --text-4: #545e6d;
+  --text-money: #f2f6fa;
+
+  /* --- accent pair (blue/violet CVD-safe counterweights) --- */
+  --accent: #1fb6a6;
+  --accent-bright: #33d6c4;
+  --accent-dim: #0f2a27;
+  --accent-line: #1c3b37;
+  --accent-glow: rgba(31, 182, 166, 0.5);
+  --sell: #4f7fd6;
+  --sell-bright: #6f9ae2;
+  --sell-dim: #182338;
+  --sell-line: #24344f;
+
+  /* --- semantic channels --- */
+  --warn: #b78ce0;
+  --warn-dim: #2a2140;
+  --warn-line: #322a4a;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: dark;
+}

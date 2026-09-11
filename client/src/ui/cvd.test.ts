@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { cvdBounds, cvdColToX, cvdValueToY, fmtCvd } from './cvd';
+import { cvdBounds, cvdColToX, cvdProject, cvdValueToY, fmtCvd } from './cvd';
 
 describe('cvdBounds — signed value range always spanning zero', () => {
   it('includes 0 even when all values are positive', () => {
@@ -54,5 +54,49 @@ describe('fmtCvd — compact signed magnitude', () => {
   });
   it('handles non-finite input', () => {
     expect(fmtCvd(Number.NaN)).toBe('—');
+  });
+});
+
+describe('cvdProject — single-pass, zero-allocation projection', () => {
+  const pts = [
+    { col: 10, cvd: 100 },
+    { col: 15, cvd: -50 },
+    { col: 19, cvd: 25 },
+  ];
+
+  it('matches the two-pass composition exactly (bounds + per-point x/y)', () => {
+    const ref = cvdBounds(pts.map((p) => p.cvd));
+    const proj = cvdProject(pts, 10, 20, 200, 100);
+    expect(proj.bounds).toEqual(ref);
+    expect(proj.count).toBe(3);
+    pts.forEach((p, i) => {
+      expect(proj.xy[i]!.x).toBeCloseTo(cvdColToX(p.col, 10, 20, 200));
+      expect(proj.xy[i]!.y).toBeCloseTo(cvdValueToY(p.cvd, ref, 100));
+    });
+  });
+
+  it('is index-aligned: the output length equals the input length', () => {
+    const proj = cvdProject(pts, 10, 20, 200, 100);
+    expect(proj.xy).toHaveLength(3);
+    expect(cvdProject([], 10, 20, 200, 100).xy).toHaveLength(0);
+  });
+
+  it('reuses the caller buffer without leaking stale cells from larger repaints', () => {
+    const buf: { x: number; y: number }[] = [];
+    const big = cvdProject(pts, 10, 20, 200, 100, buf);
+    expect(buf).toBe(big.xy); // same array object, no per-repaint allocation
+    const small = cvdProject([pts[0]], 10, 20, 200, 100, buf);
+    expect(small.xy).toHaveLength(1); // truncated, not padded with old cells
+    expect(small.xy[0]!.x).toBeCloseTo(big.xy[0]!.x);
+    // Growing again refills cleanly.
+    const regrown = cvdProject(pts, 10, 20, 200, 100, buf);
+    expect(regrown.xy).toHaveLength(3);
+    expect(Number.isFinite(regrown.xy[2]!.y)).toBe(true);
+  });
+
+  it('includes zero in the projected bounds (signed baseline rule)', () => {
+    const proj = cvdProject([{ col: 0, cvd: 5 }], 0, 10, 100, 100);
+    expect(proj.bounds.min).toBeLessThanOrEqual(0);
+    expect(proj.bounds.max).toBeGreaterThanOrEqual(0);
   });
 });

@@ -136,6 +136,22 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings({}).historyDepth).toBe(DEFAULT_SETTINGS.historyDepth);
   });
 
+  it('coerces the depth-channel field (C2: sum default, junk → default)', () => {
+    expect(DEFAULT_SETTINGS.depthChannel).toBe('sum'); // the bit-identical default
+    expect(normalizeSettings({}).depthChannel).toBe('sum'); // pre-C2 payload adopts it
+    for (const c of ['sum', 'bid', 'ask', 'imbalance'] as const) {
+      expect(normalizeSettings({ depthChannel: c }).depthChannel).toBe(c);
+    }
+    expect(normalizeSettings({ depthChannel: 'theta' }).depthChannel).toBe('sum');
+  });
+
+  it('coerces the hud-visible field (H chip, default off)', () => {
+    expect(DEFAULT_SETTINGS.hudVisible).toBe(false);
+    expect(normalizeSettings({}).hudVisible).toBe(false);
+    expect(normalizeSettings({ hudVisible: true }).hudVisible).toBe(true);
+    expect(normalizeSettings({ hudVisible: 'yes' }).hudVisible).toBe(false);
+  });
+
   it('maps history depth to a column target from the epoch cadence', () => {
     expect(historyDepthCols('off', 250e6)).toBe(0);
     expect(historyDepthCols('max', 250e6)).toBeGreaterThan(100000);

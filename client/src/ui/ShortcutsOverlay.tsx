@@ -13,12 +13,14 @@ import { createPortal } from 'react-dom';
 import { isTopOverlay, pushOverlay } from './overlayStack';
 import { KEYSHEET, isHelpToggle } from './keysheet';
 import { classifyTarget } from '../input/keys';
+import { useT } from '../i18n/useT';
 
 interface ShortcutsOverlayProps {
   onClose: () => void;
 }
 
 export function ShortcutsOverlay({ onClose }: ShortcutsOverlayProps): JSX.Element {
+  const t = useT(); // i18n shell pass
   const panelRef = useRef<HTMLDivElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
 
@@ -90,20 +92,20 @@ export function ShortcutsOverlay({ onClose }: ShortcutsOverlayProps): JSX.Elemen
         className="keyshelp"
         role="dialog"
         aria-modal="true"
-        aria-label="keyboard shortcuts"
+        aria-label={t('shortcuts.title')}
         data-testid="shortcuts-overlay"
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={onTrapKeyDown}
       >
         <header className="keyshelp__head">
-          <span className="keyshelp__title">Keyboard shortcuts</span>
+          <span className="keyshelp__title">{t('shortcuts.title')}</span>
           <button
             ref={closeRef}
             type="button"
             className="keyshelp__close"
             onClick={onClose}
             data-testid="shortcuts-close"
-            aria-label="close shortcuts"
+            aria-label={t('shortcuts.close')}
           >
             ✕
           </button>

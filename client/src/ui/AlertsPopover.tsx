@@ -1,0 +1,194 @@
+/**
+ * Alerts popover (campaign 3, lane CD) — the list surface for the on-chart
+ * price alerts: every alert for the CURRENT symbol with its state (armed /
+ * fired at hh:mm:ss / muted), a snooze button (re-arms + mutes 60 s), a delete
+ * button, and a create form for typing an exact level. Presentational on
+ * purpose: state lives in state/alertsStore.ts, mounting + data wiring in
+ * ui/PriceAlerts.tsx (the only component INT mounts).
+ */
+
+import { useEffect, useRef, useState } from 'react';
+
+import type { PriceAlert } from '../state/alertsStore';
+import { isTopOverlay, pushOverlay } from './overlayStack';
+
+/** hh:mm:ss for a fired-at timestamp (local time — "when your screen showed"). */
+function fmtClock(ms: number): string {
+  try {
+    return new Date(ms).toLocaleTimeString('en-GB', { hour12: false });
+  } catch {
+    return '—';
+  }
+}
+
+/** Seconds left in a snooze, for the muted badge. */
+function mutedFor(snoozedUntil: number | null, now: number): number | null {
+  if (snoozedUntil === null || snoozedUntil <= now) return null;
+  return Math.ceil((snoozedUntil - now) / 1000);
+}
+
+export interface AlertsPopoverProps {
+  alerts: readonly PriceAlert[];
+  /** Live market price — the reference the add-row hint compares against. */
+  refPx: number | null;
+  onClose: () => void;
+  onCreate: (price: number) => void;
+  onDelete: (id: string) => void;
+  onSnooze: (id: string) => void;
+  /** Delete every FIRED alert (they have already done their job). */
+  onClearFired: () => void;
+  /** Now, ms epoch — re-rendered by the parent at its poll cadence. */
+  now: number;
+}
+
+export function AlertsPopover({
+  alerts,
+  refPx,
+  onClose,
+  onCreate,
+  onDelete,
+  onSnooze,
+  onClearFired,
+  now,
+}: AlertsPopoverProps): JSX.Element {
+  const [draft, setDraft] = useState('');
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    closeRef.current?.focus();
+    // Join the open-overlay registry so a single Escape closes only the TOP
+    // surface (the settings drawer defers to whoever pushed later).
+    const off = pushOverlay('alerts');
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape' && isTopOverlay('alerts')) onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      off();
+    };
+  }, [onClose]);
+
+  const firedCount = alerts.filter((a) => a.triggered).length;
+  const decimals = refPx !== null && refPx < 1 ? 6 : refPx !== null && refPx < 1000 ? 2 : 2;
+  const fmtPx = (v: number): string =>
+    v.toLocaleString('en-US', { maximumFractionDigits: 8 });
+
+  const submit = (): void => {
+    const v = Number(draft);
+    if (!Number.isFinite(v)) return;
+    onCreate(v);
+    setDraft('');
+    inputRef.current?.focus();
+  };
+
+  return (
+    <section className="alerts-pop" data-testid="alerts-popover" aria-label="price alerts">
+      <header className="alerts-pop__head">
+        <span className="alerts-pop__title">
+          Price alerts
+          <span className="alerts-chip__count"> · {alerts.length}</span>
+        </span>
+        {firedCount > 0 && (
+          <button
+            type="button"
+            className="alert-row__btn"
+            data-testid="alerts-clear-fired"
+            onClick={onClearFired}
+          >
+            clear fired
+          </button>
+        )}
+        <button
+          ref={closeRef}
+          type="button"
+          className="alert-row__btn"
+          data-testid="alerts-close"
+          aria-label="close alerts"
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      </header>
+
+      <div className="alerts-pop__body">
+        {alerts.length === 0 ? (
+          <div className="alerts-pop__empty" data-testid="alerts-empty">
+            No alerts for this symbol. Press <b>A</b> at the crosshair, or type a level below.
+          </div>
+        ) : (
+          alerts.map((a) => {
+            const muted = mutedFor(a.snoozedUntil, now);
+            const state = a.triggered
+              ? `fired ${a.triggeredAt !== null ? fmtClock(a.triggeredAt) : ''}`
+              : muted !== null
+                ? `muted ${muted}s`
+                : a.above
+                  ? 'armed ↑'
+                  : 'armed ↓';
+            const stateCls = a.triggered
+              ? ' alert-row__state--fired'
+              : muted !== null
+                ? ' alert-row__state--muted'
+                : '';
+            return (
+              <div className="alert-row" key={a.id} data-testid="alert-row">
+                <span className="alert-row__px">
+                  {a.above ? '↑' : '↓'} {fmtPx(a.price)}
+                </span>
+                <span className={`alert-row__state${stateCls}`} data-testid="alert-state">
+                  {state}
+                </span>
+                <button
+                  type="button"
+                  className="alert-row__btn"
+                  data-testid={`alert-snooze-${a.id}`}
+                  onClick={() => onSnooze(a.id)}
+                >
+                  {a.triggered ? 're-arm' : 'snooze'}
+                </button>
+                <button
+                  type="button"
+                  className="alert-row__btn"
+                  data-testid={`alert-delete-${a.id}`}
+                  aria-label={`delete alert at ${fmtPx(a.price)}`}
+                  onClick={() => onDelete(a.id)}
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="alerts-add">
+        <input
+          ref={inputRef}
+          className="alerts-add__input"
+          data-testid="alerts-add-input"
+          type="number"
+          step="any"
+          min="0"
+          placeholder={`level ${refPx !== null ? `(mid ${fmtPx(Number(refPx.toFixed(decimals)))})` : ''}`}
+          aria-label="new alert price"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submit();
+          }}
+        />
+        <button
+          type="button"
+          className="alerts-add__go"
+          data-testid="alerts-add-go"
+          disabled={!Number.isFinite(Number(draft)) || draft === ''}
+          onClick={submit}
+        >
+          add
+        </button>
+      </div>
+    </section>
+  );
+}

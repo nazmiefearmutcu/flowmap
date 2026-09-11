@@ -921,8 +921,8 @@ body,
 
 .price-axis {
   grid-area: price;
-  border-left: 1px solid var(--line);
-  background: var(--bg-2);
+  border-left: 1px solid var(--chart-chip-border);
+  background: var(--chart-gutter-bg);
   /* Control surface (§9): wheel = price zoom, vertical drag = price scale,
      dblclick = re-fit. `position: relative` anchors the AUTO chip; touch-action
      stops a touchpad/touch drag from scrolling the page instead of scaling.
@@ -963,8 +963,8 @@ body,
 
 .time-axis {
   grid-area: time;
-  border-top: 1px solid var(--line);
-  background: var(--bg-2);
+  border-top: 1px solid var(--chart-chip-border);
+  background: var(--chart-gutter-bg);
 }
 
 .stage__corner {
@@ -1918,6 +1918,8 @@ body,
 }
 
 /* --- Heatmap liquidity legend (self-documenting colour scale, §9) --- */
+/* Pinned INSIDE the always-dark chart viewport: uses the FIXED chart-island
+   tokens (--chart-*, ui/theme.css), never theme ink (fix 2026-09-10 F1-3). */
 .heat-legend {
   position: absolute;
   top: var(--sp-3);
@@ -1927,8 +1929,8 @@ body,
   align-items: center;
   gap: 3px;
   padding: var(--sp-1) 3px;
-  background: var(--scrim);
-  border: 1px solid var(--line);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: var(--r-1);
   pointer-events: none;
   user-select: none;
@@ -1944,16 +1946,35 @@ body,
 .heat-legend__cap {
   font-size: var(--fs-2xs);
   letter-spacing: 0.04em;
-  color: var(--text-3);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 .heat-legend__tier {
   margin-top: 2px;
   font-size: var(--fs-2xs);
   letter-spacing: 0.08em;
-  color: var(--text-2);
+  color: var(--chart-ink-dim, #93a1b4);
+}
+/* Depth-channel note ("bid depth" / "ask depth") under the tier tag. */
+.heat-legend__channel {
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.06em;
+  color: var(--chart-ink, #e6edf3);
+  white-space: nowrap;
+}
+/* Divergent (imbalance) legend: the side labels are longer than "more"/"less",
+   so give the column room and keep each cap on one line. */
+.heat-legend--divergent {
+  padding: var(--sp-1) var(--sp-2);
+}
+.heat-legend--divergent .heat-legend__cap {
+  white-space: nowrap;
 }
 .heat-legend--synth .heat-legend__tier {
   color: var(--warn);
+}
+
+.heat-legend--divergent .heat-legend__bar {
+  border: 1px solid var(--chart-chip-border, #1a2030);
 }
 
 /* ==========================================================================

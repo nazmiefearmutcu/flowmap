@@ -35,14 +35,14 @@
   position: absolute;
   min-width: 132px;
   padding: 6px 8px;
-  background: rgba(3, 5, 8, 0.92);
-  border: 1px solid var(--line, #1a1f2b);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: 4px;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
   font-family: var(--font-mono, 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: var(--fs-sm, 11px);
   line-height: 1.35;
-  color: var(--text, #e6edf3);
+  color: var(--chart-ink, #e6edf3);
 }
 
 /* Header row carrying the depth-source provenance tag. */
@@ -53,7 +53,7 @@
 .crosshair__tag {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.06em;
-  color: var(--text-3, #5b6675);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 /* Amber SYNTH tag — synthetic depth must never read as real (§7 honesty). */
@@ -70,18 +70,18 @@
 }
 
 .crosshair__line--dim {
-  color: var(--text-3, #5b6675);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .crosshair__key {
-  color: var(--text-3, #5b6675);
+  color: var(--chart-ink-dim, #93a1b4);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: var(--fs-xs, 10px);
 }
 
 .crosshair__key--bid {
-  color: var(--accent, #1fb6a6);
+  color: var(--chart-accent, #33d6c4);
 }
 
 .crosshair__key--ask {
@@ -94,7 +94,7 @@
 }
 
 .crosshair__val--price {
-  color: var(--text, #e6edf3);
+  color: var(--chart-ink, #e6edf3);
   font-weight: 600;
 }
 

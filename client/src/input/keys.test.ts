@@ -25,8 +25,28 @@ describe('routeGlobalKey', () => {
   });
 
   it('ignores unrelated keys (canvas keeps arrows / F / R / P)', () => {
-    for (const k of ['ArrowLeft', 'f', 'R', 'P', '+', '-', 'a']) {
+    for (const k of ['ArrowLeft', 'f', 'R', 'P', '+', '-', 'x', 'q']) {
       expect(routeGlobalKey(k, PLAIN)).toBeNull();
+    }
+  });
+
+  it('routes the bare feature keys M / A / H / C (campaign 3)', () => {
+    expect(routeGlobalKey('m', PLAIN)).toEqual({ type: 'toggle-measure' });
+    expect(routeGlobalKey('M', PLAIN)).toEqual({ type: 'toggle-measure' });
+    expect(routeGlobalKey('a', PLAIN)).toEqual({ type: 'create-alert' });
+    expect(routeGlobalKey('A', PLAIN)).toEqual({ type: 'create-alert' });
+    expect(routeGlobalKey('h', PLAIN)).toEqual({ type: 'toggle-hud' });
+    expect(routeGlobalKey('H', PLAIN)).toEqual({ type: 'toggle-hud' });
+    expect(routeGlobalKey('c', PLAIN)).toEqual({ type: 'cycle-depth-channel' });
+    expect(routeGlobalKey('C', PLAIN)).toEqual({ type: 'cycle-depth-channel' });
+  });
+
+  it('never hijacks the feature keys while typing or inside a dialog', () => {
+    for (const k of ['m', 'a', 'h', 'c']) {
+      expect(routeGlobalKey(k, { ...PLAIN, editable: true })).toBeNull();
+      expect(routeGlobalKey(k, { ...PLAIN, dialog: true })).toBeNull();
+      expect(routeGlobalKey(k, PLAIN, { meta: true, ctrl: false })).toBeNull();
+      expect(routeGlobalKey(k.toUpperCase(), PLAIN, { meta: false, ctrl: true })).toBeNull();
     }
   });
 
@@ -177,5 +197,28 @@ describe('attachGlobalKeys', () => {
     const pdE = t.fire('e', { tagName: 'INPUT', getAttribute: () => null } as never);
     expect(onExportPng).not.toHaveBeenCalled();
     expect(pdE).not.toHaveBeenCalled();
+  });
+
+  it('routes feature keys to their optional handlers and no-ops when App does not pass them', () => {
+    const onToggleMeasure = vi.fn();
+    const onToggleHud = vi.fn();
+    const t = fakeTarget();
+    const dispose = attachGlobalKeys(
+      { onSpace: vi.fn(), onFocusSearch: vi.fn(), onExportPng: vi.fn(), onToggleMeasure, onToggleHud },
+      t as never,
+    );
+
+    t.fire('m', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(onToggleMeasure).toHaveBeenCalledOnce();
+    t.fire('H', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(onToggleHud).toHaveBeenCalledOnce();
+
+    // `c` and `a` have NO handler here (the owning components self-listen):
+    // the key is consumed (prevented) but dispatches nothing.
+    const pdC = t.fire('c', { tagName: 'CANVAS', getAttribute: () => null } as never);
+    expect(pdC).toHaveBeenCalledOnce();
+    t.fire('a', { tagName: 'CANVAS', getAttribute: () => null } as never);
+
+    dispose();
   });
 });

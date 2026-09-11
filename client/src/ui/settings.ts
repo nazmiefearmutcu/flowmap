@@ -50,6 +50,27 @@ export type PriceBand = 'native' | 'wide' | 'full' | 'deep';
 export const PRICE_BANDS: readonly PriceBand[] = ['native', 'wide', 'full', 'deep'] as const;
 
 /**
+ * Which channel of the two-channel (bid/ask) depth data the heatmap renders
+ * (campaign-3 contract C2). Applied to the renderer via
+ * `renderer.setDepthChannel(mode)` — the setter is contract-owned by the gl
+ * lane, so the UI codes against it defensively (feature-detected; a renderer
+ * build without it simply keeps the default 'sum' view).
+ *   - `sum`       — today's display, bid+ask collapsed into one intensity
+ *                   (the bit-identical default).
+ *   - `bid`/`ask` — one side only.
+ *   - `imbalance` — (bid−ask)/(bid+ask) signed through a divergent ramp:
+ *                   bid-heavy vs ask-heavy liquidity at a glance.
+ */
+export type DepthChannelMode = 'sum' | 'bid' | 'ask' | 'imbalance';
+
+export const DEPTH_CHANNELS: readonly DepthChannelMode[] = [
+  'sum',
+  'bid',
+  'ask',
+  'imbalance',
+] as const;
+
+/**
  * First-launch history depth — how much past data to eagerly pull into the chart
  * on connect (the server seeds a deep tail; this chooses how much of it to load
  * up front for instant scroll-back). A small, plain enum, not a free number.
@@ -110,6 +131,10 @@ export interface FlowMapSettings {
   railVisible: boolean;
   /** Which heatmap overlays are on. */
   overlays: OverlayVisibility;
+  /** Depth display channel (contract C2): sum | bid | ask | imbalance. */
+  depthChannel: DepthChannelMode;
+  /** PerfHud diagnostics chip visibility (H toggles; polled off renderer.stats). */
+  hudVisible: boolean;
 }
 
 export const SETTINGS_KEY = 'flowmap.settings.v1';
@@ -138,6 +163,9 @@ export const DEFAULT_SETTINGS: FlowMapSettings = {
   historyDepth: '1h',
   railVisible: true,
   overlays: { ...DEFAULT_OVERLAY_VISIBILITY },
+  // The default is today's rendering, bit-identical (contract C2).
+  depthChannel: 'sum',
+  hudVisible: false,
 };
 
 /** Minimal structural subset of the Web Storage API these helpers need. */
@@ -185,6 +213,10 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
       : DEFAULT_SETTINGS.historyDepth,
     railVisible: typeof o.railVisible === 'boolean' ? o.railVisible : DEFAULT_SETTINGS.railVisible,
     overlays,
+    depthChannel: DEPTH_CHANNELS.includes(o.depthChannel as DepthChannelMode)
+      ? (o.depthChannel as DepthChannelMode)
+      : DEFAULT_SETTINGS.depthChannel,
+    hudVisible: typeof o.hudVisible === 'boolean' ? o.hudVisible : DEFAULT_SETTINGS.hudVisible,
   };
 }
 

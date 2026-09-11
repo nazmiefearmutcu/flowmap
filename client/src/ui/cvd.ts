@@ -13,6 +13,23 @@ export interface CvdBounds {
   max: number;
 }
 
+/** Raw extremes over the finite values of the series. */
+interface RawBounds {
+  min: number;
+  max: number;
+}
+
+/** Shared pad/fallback arithmetic so {@link cvdBounds} and the single-pass
+ *  {@link cvdProject} can never drift apart. */
+function boundsFromRaw(raw: RawBounds): CvdBounds {
+  let { min, max } = raw;
+  if (min === 0 && max === 0) return { min: -1, max: 1 };
+  const pad = (max - min) * 0.08;
+  min -= pad;
+  max += pad;
+  return { min, max };
+}
+
 /**
  * Value bounds over the visible CVD points, ALWAYS spanning 0 (the baseline a
  * signed cumulative reads against), with a fallback range so a flat/empty series
@@ -27,9 +44,7 @@ export function cvdBounds(values: readonly number[]): CvdBounds {
     if (v < min) min = v;
     if (v > max) max = v;
   }
-  if (min === 0 && max === 0) return { min: -1, max: 1 };
-  const pad = (max - min) * 0.08;
-  return { min: min - pad, max: max + pad };
+  return boundsFromRaw({ min, max });
 }
 
 /**
@@ -64,4 +79,68 @@ export function fmtCvd(v: number): string {
   if (a >= 1e3) return `${sign}${(a / 1e3).toFixed(1)}k`;
   if (a >= 1) return `${sign}${a.toFixed(0)}`;
   return `${sign}${a.toFixed(2)}`;
+}
+
+// --- single-pass projection (the CvdPane repaint path) ---------------------------
+
+export interface CvdPoint {
+  col: number;
+  cvd: number;
+}
+
+export interface ProjectedPoint {
+  x: number;
+  y: number;
+}
+
+export interface CvdProjection {
+  bounds: CvdBounds;
+  /** Screen positions, index-aligned with the input points (length === count). */
+  xy: readonly ProjectedPoint[];
+  count: number;
+}
+
+/**
+ * Project the visible CVD series to screen space with ZERO per-repaint
+ * allocations: `x` never depends on the value bounds, so one walk computes the
+ * extremes AND the x positions, and a second arithmetic walk (no allocations)
+ * fills y in place. The caller owns `out` — the pane reuses one buffer across
+ * repaints (it is consumed synchronously inside the same paint, so reuse is
+ * safe). Output is numerically IDENTICAL to composing
+ * `cvdBounds(values) → cvdColToX / cvdValueToY` per point.
+ */
+export function cvdProject(
+  pts: readonly CvdPoint[],
+  startCol: number,
+  endCol: number,
+  width: number,
+  height: number,
+  out: ProjectedPoint[] = [],
+): CvdProjection {
+  // Match the input length exactly: stale tail cells from a previous, larger
+  // repaint must never leak into the drawing loops.
+  out.length = pts.length;
+  let min = 0;
+  let max = 0;
+  for (let i = 0; i < pts.length; i += 1) {
+    const p = pts[i];
+    const v = p.cvd;
+    if (Number.isFinite(v)) {
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    const x = cvdColToX(p.col, startCol, endCol, width);
+    let cell = out[i];
+    if (cell === undefined) {
+      cell = { x, y: 0 };
+      out[i] = cell;
+    } else {
+      cell.x = x;
+    }
+  }
+  const bounds = boundsFromRaw({ min, max });
+  for (let i = 0; i < pts.length; i += 1) {
+    out[i]!.y = cvdValueToY(pts[i].cvd, bounds, height);
+  }
+  return { bounds, xy: out, count: pts.length };
 }

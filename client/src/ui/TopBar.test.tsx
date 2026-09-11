@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { setLocale } from '../i18n';
 import { useFlowMapStore } from '../state/store';
 import type { SymbolSearchHandle } from './SymbolSearch';
 import { TopBar } from './TopBar';
@@ -54,6 +55,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setLocale('en'); // the TR test flips the shell locale; reset for the rest
   for (const { container, root } of mounted.splice(0)) {
     act(() => root.unmount());
     container.remove();
@@ -284,5 +286,21 @@ describe('TopBar PNG export', () => {
       close.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
     expect(onDismiss).toHaveBeenCalledOnce();
+  });
+});
+
+describe('TopBar i18n shell (C7)', () => {
+  it('switches the live/replay labels when the locale is TR, and back in EN', () => {
+    const { container } = render(topbar());
+    expect(container.querySelector('[data-testid="mode-live"]')!.textContent).toBe('Live');
+
+    act(() => setLocale('tr'));
+    expect(container.querySelector('[data-testid="mode-live"]')!.textContent).toBe('Canlı');
+    expect(container.querySelector('[data-testid="mode-toggle"]')!.getAttribute('aria-label')).toBe(
+      'canlı veya tekrar',
+    );
+
+    act(() => setLocale('en'));
+    expect(container.querySelector('[data-testid="mode-live"]')!.textContent).toBe('Live');
   });
 });

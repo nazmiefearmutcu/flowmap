@@ -1,0 +1,250 @@
+/*
+ * Indicator lane styles (campaign 3, lane CG).
+ *
+ * Default SERIES palette lives in CSS variables so themes own it (override
+ * --indi-c1..c6 anywhere); the canvas resolves them at paint time with literal
+ * fallbacks for hosts without a stylesheet. All UI chrome uses the app's theme
+ * tokens (--bg-*, --line*, --text*, --fs-*, --r-*, --shadow-pop).
+ *
+ * CANVAS RULE (campaign contract): every new canvas lives in a POSITIONED
+ * wrapper. .indi-host is position:absolute (a positioned containing block)
+ * inside the chart viewport and never participates in layout; the canvas is
+ * display:block at 100% of its host.
+ */
+
+:root {
+  --indi-c1: #4cc2b5; /* teal — SMA / MACD line */
+  --indi-c2: #e0a94e; /* amber — EMA / MACD signal */
+  --indi-c3: #9a86e8; /* violet — VWAP / OBV */
+  --indi-c4: #5aa2e0; /* blue — Bollinger bands */
+  --indi-c5: #e8635f; /* red — RSI / MACD histogram */
+  --indi-c6: #67c96a; /* green — ATR */
+}
+
+/* --- chart overlay canvas ----------------------------------------------------- */
+
+.indi-host {
+  position: absolute;
+  inset: 0;
+  z-index: 5; /* above the GL canvas, below banners (z 20) and the crosshair */
+  pointer-events: none;
+}
+
+.indi-canvas {
+  display: block; /* NEVER rely on bare-% sizing outside a positioned host */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* --- IndicatorPicker popover ----------------------------------------------------- */
+
+.indi-picker {
+  position: absolute;
+  left: 10px;
+  bottom: 12px;
+  z-index: 22;
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  max-height: min(430px, calc(100% - 24px));
+  padding: 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3, 6px);
+  background: rgba(10, 13, 19, 0.97);
+  box-shadow: var(--shadow-pop, 0 4px 18px rgba(0, 0, 0, 0.5));
+  color: var(--text, #e6edf3);
+  font-size: var(--fs-md, 12px);
+  pointer-events: auto;
+  gap: 8px;
+}
+
+.indi-picker__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.indi-picker__title {
+  font-size: var(--fs-sm, 11px);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2, #93a1b4);
+}
+
+.indi-picker__close {
+  border: none;
+  background: none;
+  color: var(--text-3, #6f7b8c);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--r-1, 3px);
+  cursor: pointer;
+}
+.indi-picker__close:hover {
+  color: var(--text, #e6edf3);
+  background: var(--bg-3, #141a26);
+}
+
+.indi-picker__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-xs, 10px);
+  color: var(--text-2, #93a1b4);
+}
+
+.indi-picker__select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-2, #0e121a);
+  color: var(--text, #e6edf3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1, 3px);
+  font: inherit;
+  font-size: var(--fs-xs, 10px);
+  padding: 3px 4px;
+}
+
+.indi-picker__scroll {
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.indi-picker__section {
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3, #6f7b8c);
+}
+
+.indi-picker__empty {
+  font-size: var(--fs-xs, 10px);
+  color: var(--text-3, #6f7b8c);
+}
+
+.indi-picker__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.indi-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: var(--r-1, 3px);
+  min-height: 24px;
+}
+.indi-row:hover {
+  background: var(--bg-3, #141a26);
+}
+
+.indi-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.indi-row__add,
+.indi-row__remove {
+  border: 1px solid var(--line);
+  background: none;
+  color: var(--text-2, #93a1b4);
+  border-radius: var(--r-1, 3px);
+  font: inherit;
+  font-size: var(--fs-xs, 10px);
+  line-height: 1;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+.indi-row__add:hover,
+.indi-row__remove:hover {
+  color: var(--text, #e6edf3);
+  border-color: var(--line-2);
+}
+.indi-row__add:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Params + colors of one active indicator. */
+.indi-params {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 6px 14px;
+}
+
+.indi-param {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--fs-2xs, 9px);
+  color: var(--text-3, #6f7b8c);
+}
+
+.indi-param input {
+  width: 52px;
+  background: var(--bg-inset, #080b11);
+  color: var(--text, #e6edf3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1, 3px);
+  font: inherit;
+  font-size: var(--fs-xs, 10px);
+  padding: 2px 4px;
+}
+.indi-param input:focus-visible {
+  outline: 1px solid var(--accent-bright, #33d6c4);
+  outline-offset: 0;
+}
+
+.indi-color {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.indi-color input[type='color'] {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-1, 3px);
+  background: none;
+  cursor: pointer;
+}
+
+.indi-color__reset {
+  border: none;
+  background: none;
+  color: var(--text-3, #6f7b8c);
+  font-size: var(--fs-2xs, 9px);
+  cursor: pointer;
+  padding: 1px 2px;
+}
+.indi-color__reset:hover {
+  color: var(--text, #e6edf3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .indi-picker,
+  .indi-row__add,
+  .indi-row__remove {
+    transition: none;
+  }
+}

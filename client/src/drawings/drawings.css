@@ -1,0 +1,173 @@
+/* ============================================================================
+   Lane CF drawing styles — DrawingLayer canvas overlay + DrawToolbar panel.
+   Mounted by INT via `import './drawings/drawings.css'` (the components also
+   import it directly so standalone test pages work). Token vocabulary matches
+   ui/theme.css; nothing hardcodes the palette except the SWATCH hexes (the
+   drawing palette itself — user-authored canvas content that must survive
+   theme switches; see DrawToolbar.tsx).
+
+   CANVAS RULE (campaign contract §5): every new canvas lives inside a
+   positioned wrapper. .draw-layer is position:absolute; inset:0 — it MUST be
+   mounted inside the stage viewport (position:relative), never bare.
+   ========================================================================= */
+
+/* --- the drawing overlay (inside .stage__viewport) ------------------------- */
+/* Transparent to the pointer while disarmed: chart pan/zoom gestures are
+   untouched. Arming a tool takes the pointer for placement. */
+.draw-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  outline: none;
+}
+.draw-layer.is-armed {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+.draw-layer.has-focus:focus-visible {
+  outline: 1px solid var(--accent-line, #1c3b37);
+  outline-offset: -1px;
+}
+.draw-layer__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none; /* the WRAPPER takes the pointer, never the canvas */
+}
+/* Chip-style surfaces INSIDE the chart viewport use the FIXED dark-island
+   tokens (--chart-*, ui/theme.css): the canvas is ramp-dark in every theme, so
+   their ink/borders must not follow light themes (fix 2026-09-10 F1-3). */
+.draw-layer__mode {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  padding: 4px 10px;
+  font-size: var(--fs-2xs, 9px);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--chart-accent, #33d6c4);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 999px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* --- inline text editor (labels) ------------------------------------------- */
+.draw-layer__text-input {
+  position: absolute;
+  z-index: 8;
+  min-width: 90px;
+  padding: 2px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--fs-sm, 11px);
+  color: var(--chart-ink, #e6edf3);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 4px;
+  outline: none;
+}
+.draw-layer__text-input:focus {
+  border-color: var(--chart-accent, #33d6c4);
+}
+
+/* --- the vertical toolbar (D toggles) -------------------------------------- */
+.draw-toolbar {
+  position: absolute;
+  top: 46px;
+  left: 8px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+.draw-toolbar__btn {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: var(--chart-ink-dim, #93a1b4);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.draw-toolbar__btn:hover:not(:disabled) {
+  color: var(--chart-ink, #e6edf3);
+  background: var(--chart-chip-border, #1a2030);
+}
+.draw-toolbar__btn.is-active {
+  color: var(--chart-accent, #33d6c4);
+  background: transparent;
+  border-color: var(--chart-accent, #33d6c4);
+}
+.draw-toolbar__btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.draw-toolbar__btn--danger:hover:not(:disabled) {
+  color: var(--sell-bright, #e8635f);
+  background: transparent;
+}
+.draw-toolbar__btn svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.draw-toolbar__btn svg .fill,
+.draw-toolbar__btn svg circle {
+  fill: currentColor;
+  stroke: none;
+}
+.draw-toolbar__swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  margin: 4px auto;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.draw-toolbar__swatch.is-active {
+  outline: 2px solid var(--chart-ink, #e6edf3);
+  outline-offset: 1px;
+}
+.draw-toolbar__sep {
+  height: 1px;
+  margin: 3px 2px;
+  background: var(--chart-chip-border, #1a2030);
+}
+
+/* A drawing toolbar in a narrow chart must not fight the price axis: keep it
+   above the axis gutter but below modals (drawer z-index lives in App.css). */
+@media (max-width: 720px) {
+  .draw-toolbar {
+    top: 38px;
+    left: 4px;
+    padding: 3px;
+  }
+}
+
+/* Reduced motion: nothing in this layer animates — pinned for completeness
+   with the app's global reduced-motion policy. */
+@media (prefers-reduced-motion: reduce) {
+  .draw-layer,
+  .draw-toolbar,
+  .draw-layer__text-input {
+    transition: none;
+    animation: none;
+  }
+}

@@ -74,6 +74,18 @@ function buildHistoryResp(reqId: number, epoch = 3): Uint8Array {
   return frameBytes(MsgType.HISTORY_RESP, payload, 0);
 }
 
+/** A cold-JSON Hello for a chosen session + epoch (mirrors server cold_hello). */
+function buildHello(sessionId: string, epoch: number): Uint8Array {
+  return coldFrame(MsgType.HELLO, {
+    protocol_version: 1,
+    session_id: sessionId,
+    grid_epoch: epoch,
+    epoch_params: { epoch, tick: 0.01, tick_multiple: 5, dt_ns: 250_000_000, p0: 100.0, rows: 2048 },
+    capability: {},
+    norm_seed: 1,
+  });
+}
+
 /** A minimal L2 DEPTH_COL (n_rows=1) with a chosen epoch/col_seq/final flag. */
 function buildDepthCol(epoch: number, colSeq: number, final: boolean): Uint8Array {
   const payload = new Uint8Array(24 + 4 + 4); // header + bid f32 + ask f32
@@ -290,6 +302,83 @@ describe('Connection — subscription lifecycle', () => {
     // already finalized, which is exactly what the cursor exists to swallow.
     sockets[1].deliver(buildDepthCol(3, 42, true));
     expect(onStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets the dedup cursor + epoch map when a reconnect lands on a NEW session_id', () => {
+    const { sockets, clock, makeConn } = harness();
+    const onStream = vi.fn();
+    const conn = makeConn({ onStream });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].deliver(buildHello('session-A', 0));
+    sockets[0].deliver(buildEpochStart(7)); // a second, older epoch of session A
+    sockets[0].deliver(buildDepthCol(0, 900, true)); // deep into session A
+    expect(onStream).toHaveBeenCalledTimes(1);
+    expect(conn.session).toBe('session-A');
+
+    // Sidecar crash + respawn: same port, same subscription re-sent on open,
+    // but a brand-new server session whose col_seq restarts at 0. The old
+    // cursor must die with session A, or every finalized column of the
+    // replacement is swallowed as a "reconnect re-send" and the heatmap stays
+    // dead until col_seq crawls past 900 (survey-4 H-1).
+    sockets[0].drop();
+    clock.advance(500);
+    sockets[1].open();
+    sockets[1].deliver(buildHello('session-B', 0));
+    expect(conn.session).toBe('session-B');
+    expect(conn.epochs.has(7)).toBe(false); // old grid geometry gone
+    expect(conn.epochs.get(0)).toMatchObject({ rows: 2048 }); // re-seeded by Hello B
+
+    sockets[1].deliver(buildDepthCol(0, 5, true));
+    expect(onStream).toHaveBeenCalledTimes(2);
+    expect(onStream.mock.calls[1][0]).toMatchObject({ type: MsgType.DEPTH_COL, col_seq: 5 });
+    // The new session's cursor re-arms from scratch: a seq-5 re-send is a dup.
+    sockets[1].deliver(buildDepthCol(0, 5, true));
+    expect(onStream).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails in-flight history waiters when the server session changes', async () => {
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].deliver(buildHello('session-A', 0));
+    const pending = conn.requestHistory(1n, 10);
+    const sent = decodeFrame(sockets[0].lastSent);
+    assertType(sent[0], MsgType.HISTORY_REQ);
+    const reqId = sent[0].req_id;
+    const assertion = expect(pending).rejects.toThrow(/session changed/);
+
+    // A Hello for a DIFFERENT session arrives while the OLD session's page is
+    // still in flight: its columns belong to the old grid and must never
+    // resolve into the new session's ring.
+    sockets[0].deliver(buildHello('session-B', 0));
+    await assertion;
+    // A late response for the abandoned req_id is now unmatched — dropped.
+    expect(() => sockets[0].deliver(buildHistoryResp(reqId))).not.toThrow();
+  });
+
+  it('keeps the dedup cursor across a reconnect when the session_id is UNCHANGED', () => {
+    const { sockets, clock, makeConn } = harness();
+    const onStream = vi.fn();
+    const conn = makeConn({ onStream });
+
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+    sockets[0].deliver(buildHello('session-A', 3));
+    sockets[0].deliver(buildDepthCol(3, 900, true));
+    expect(onStream).toHaveBeenCalledTimes(1);
+
+    sockets[0].drop();
+    clock.advance(500);
+    sockets[1].open();
+    sockets[1].deliver(buildHello('session-A', 3)); // parked-session re-attach
+    sockets[1].deliver(buildDepthCol(3, 900, true)); // snapshot re-send → deduped
+    expect(onStream).toHaveBeenCalledTimes(1);
+    sockets[1].deliver(buildDepthCol(3, 901, true)); // fresh data still flows
+    expect(onStream).toHaveBeenCalledTimes(2);
   });
 
   it('rejects an in-flight history request when the stream changes', async () => {

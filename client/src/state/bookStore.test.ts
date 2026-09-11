@@ -144,6 +144,42 @@ describe('bookStore buffer', () => {
     expect(b).not.toBe(a);
     expect(b.version).toBeGreaterThan(a.version);
   });
+
+  it('keeps the tape newest-first and correct across MANY ring wraps (head-index ring)', () => {
+    // Walk 3 full wraps + change: the materialized window must stay a contiguous
+    // newest-first slice of the last TRADE_RING ingested trades, never reordered
+    // or duplicated by the modulo arithmetic.
+    const total = TRADE_RING * 3 + 7;
+    for (let i = 0; i < total; i += 1) ingestForTest(trade(i, i, 1, SIDE_BUY));
+    const trades = getSnapshot().trades;
+    expect(trades.length).toBe(TRADE_RING);
+    for (let i = 0; i < TRADE_RING; i += 1) {
+      expect(trades[i].price).toBe(total - 1 - i);
+    }
+  });
+
+  it('snapshots are immutable: a later trade never mutates a previously-read tape array', () => {
+    ingestForTest(trade(1, 100, 1, SIDE_BUY));
+    const before = getSnapshot().trades;
+    ingestForTest(trade(2, 101, 1, SIDE_SELL));
+    const after = getSnapshot().trades;
+    expect(before).not.toBe(after);
+    expect(before).toHaveLength(1); // the old array was never shifted/mutated in place
+    expect(before[0].price).toBe(100);
+    expect(after[0].price).toBe(101);
+  });
+
+  it('exposes an EMPTY frozen tape before any trade and after a session reset', () => {
+    expect(getSnapshot().trades).toHaveLength(0);
+    ingestForTest(trade(1, 100, 1, SIDE_BUY));
+    resetForSession();
+    expect(getSnapshot().trades).toHaveLength(0);
+    // And the ring still works after the reset (head/count rewound cleanly).
+    ingestForTest(trade(2, 101, 1, SIDE_SELL));
+    const t = getSnapshot().trades;
+    expect(t).toHaveLength(1);
+    expect(t[0].price).toBe(101);
+  });
 });
 
 describe('bookStore throttling', () => {

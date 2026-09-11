@@ -656,6 +656,26 @@ export class Connection {
   }
 
   private handleHello(hello: Hello): void {
+    // A Hello carrying a DIFFERENT session_id than the one we already
+    // attached to means the process behind the socket was replaced (sidecar
+    // crash + respawn keeps this webview — and this Connection — alive). The
+    // replacement session's column sequence restarts at col_seq 0, so a
+    // surviving lastColSeq cursor would swallow every finalized column of the
+    // new session as a "reconnect re-send" until col_seq crawls past the old
+    // cursor — heatmap/DOM dead for minutes (survey-4 H-1). Per-session dedup
+    // state dies with the session; the attach snapshot re-asserts an
+    // EpochStart for EVERY epoch its columns reference before any column
+    // flows (session.py `_snapshot_frames`/`_epoch_start_msgs`), and history
+    // responses do the same, so clearing the epoch map here is safe. An
+    // in-flight history page belongs to the OLD grid — fail its waiters
+    // rather than splice old-session columns into the new session's ring.
+    if (this.sessionId !== null && this.sessionId !== hello.session_id) {
+      this.lastColSeq.clear();
+      this.epochMap.clear();
+      this.failHistoryWaiters(
+        new Error('flowmap: history request abandoned — server session changed'),
+      );
+    }
     this.backoffAttempt = 0; // a completed handshake resets the backoff
     this.sessionId = hello.session_id;
     this.epochMap.set(hello.epoch_params.epoch, hello.epoch_params);

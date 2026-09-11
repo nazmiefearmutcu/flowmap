@@ -10,6 +10,8 @@
  * so the transition into (and out of) the state is announced.
  */
 
+import { t } from '../i18n';
+import { useT } from '../i18n/useT';
 import type { CloseInfo } from '../net/connection';
 import { useFlowMapStore } from '../state/store';
 
@@ -20,27 +22,33 @@ import { useFlowMapStore } from '../state/store';
  * for load) instead of a raw number dump.
  */
 export function closeReasonText(close: CloseInfo | null): string {
-  if (!close) return 'connection dropped';
+  // i18n shell pass: the mapped reasons go through the shared banner keys
+  // (module-level `t` — EN default keeps every existing string identical).
+  // 1002 / 1003 have no shell key and stay English (transport jargon).
+  if (!close) return t('banner.reasonDropped');
   switch (close.code) {
     case 1000:
-      return 'server closed the session';
+      return t('banner.reasonSession');
     case 1001:
-      return 'server shut down';
+      return t('banner.reasonShutdown');
     case 1002:
       return 'protocol error';
     case 1003:
       return 'subscription refused';
     case 1013:
-      return 'server overloaded';
+      return t('banner.reasonOverloaded');
     case null:
     case 1006:
-      return 'connection dropped';
+      return t('banner.reasonDropped');
     default:
-      return close.wasClean ? `server closed (code ${close.code})` : 'connection dropped';
+      return close.wasClean
+        ? t('banner.reasonCode', { code: close.code })
+        : t('banner.reasonDropped');
   }
 }
 
 export function ReconnectBanner(): JSX.Element | null {
+  useT(); // re-render on locale change
   const status = useFlowMapStore((s) => s.status);
   const subscription = useFlowMapStore((s) => s.subscription);
   const lastClose = useFlowMapStore((s) => s.lastClose);
