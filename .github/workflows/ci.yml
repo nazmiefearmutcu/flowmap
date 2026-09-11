@@ -173,6 +173,13 @@ jobs:
         working-directory: client
         run: npm ci && npm run build
 
+      # tauri.linux.conf.json bundles resources/pyruntime/ (the packaged Python
+      # runtime, produced by scripts/package.sh and gitignored). tauri-build
+      # validates every resource path at compile time, so an empty placeholder
+      # is required for `cargo test` on a bare checkout.
+      - name: Placeholder pyruntime resource dir
+        run: mkdir -p app/src-tauri/resources/pyruntime
+
       # Stable Rust is preinstalled on GitHub runners; no toolchain action is
       # added, keeping the every-action-is-SHA-pinned claim trivially true.
       - name: Shell tests
