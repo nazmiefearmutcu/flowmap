@@ -1,0 +1,257 @@
+/* ============================================================================
+   Watchlist panel (campaign 4, lane C2) — right-rail favorites with live
+   quotes. Imported directly by ui/Watchlist.tsx (the Crosshair.css pattern).
+   Token vocabulary matches ui/theme.css; no hardcoded palette. The panel is
+   `flex: 0 0 auto` so it never steals height from DomLadder/Tape below it —
+   the row body scrolls internally past its max height.
+   ========================================================================= */
+
+.watchlist {
+  flex: 0 0 auto;
+}
+
+.watchlist__header {
+  gap: var(--sp-2);
+}
+
+.watchlist__count {
+  font-variant-numeric: tabular-nums;
+}
+
+.watchlist__add {
+  margin-left: auto;
+  font-family: inherit;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-1);
+  padding: 1px 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.watchlist__add:hover:not(:disabled) {
+  background: var(--accent-dim);
+}
+
+.watchlist__add:disabled {
+  color: var(--text-4);
+  border-color: var(--line);
+  cursor: default;
+}
+
+.watchlist__body {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  max-height: 208px;
+}
+
+.watchlist__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 22px;
+  padding: 0 var(--sp-3);
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+}
+
+.watchlist__row:hover {
+  background: var(--bg-3);
+}
+
+.watchlist__row:focus-visible {
+  background: var(--bg-3);
+  outline: 1px solid var(--accent-line);
+  outline-offset: -1px;
+}
+
+.watchlist__row.is-active {
+  border-left-color: var(--accent);
+  background: var(--bg-3);
+}
+
+.watchlist__row.is-stale {
+  opacity: 0.55;
+}
+
+.watchlist__star {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  line-height: 1;
+  color: var(--warn);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.watchlist__star:hover {
+  color: var(--warn);
+  filter: brightness(1.25);
+}
+
+.watchlist__sym {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  color: var(--text);
+}
+
+.watchlist__row.is-active .watchlist__sym {
+  font-weight: 600;
+}
+
+.watchlist__spark {
+  flex: 0 0 auto;
+  display: block;
+}
+
+.watchlist__spark-path {
+  fill: none;
+  stroke-width: 1.25;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.watchlist__spark-path.is-up {
+  stroke: var(--accent);
+}
+
+.watchlist__spark-path.is-down {
+  stroke: var(--sell);
+}
+
+.watchlist__spark-path.is-flat {
+  stroke: var(--text-3);
+}
+
+.watchlist__px {
+  flex: 0 0 auto;
+  min-width: 52px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-money);
+}
+
+.watchlist__px.is-empty {
+  color: var(--text-4);
+}
+
+.watchlist__chg {
+  flex: 0 0 auto;
+  min-width: 48px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.watchlist__chg.is-up {
+  color: var(--accent);
+}
+
+.watchlist__chg.is-down {
+  color: var(--sell);
+}
+
+.watchlist__chg.is-flat {
+  color: var(--text-3);
+}
+
+.watchlist__chip {
+  flex: 0 0 auto;
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0 4px;
+  border-radius: var(--r-1);
+  border: 1px solid var(--line);
+}
+
+.watchlist__chip--stale {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-dim);
+}
+
+.watchlist__chip--na {
+  color: var(--text-3);
+}
+
+.watchlist__remove {
+  flex: 0 0 auto;
+  font-size: var(--fs-sm);
+  line-height: 1;
+  color: var(--text-3);
+  background: none;
+  border: none;
+  padding: 0 1px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.watchlist__row:hover .watchlist__remove,
+.watchlist__row:focus-within .watchlist__remove {
+  opacity: 1;
+}
+
+.watchlist__remove:hover {
+  color: var(--sell-bright);
+}
+
+/* --- empty state: recents as jump chips (they do NOT auto-favorite) --------- */
+
+.watchlist__empty {
+  padding: var(--sp-3);
+}
+
+.watchlist__empty-copy {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+.watchlist__empty-label {
+  display: block;
+  margin-bottom: var(--sp-1);
+  font-size: var(--fs-2xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+
+.watchlist__suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.watchlist__suggestion {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.watchlist__suggestion:hover {
+  color: var(--text);
+  border-color: var(--line-2);
+  background: var(--bg-3);
+}

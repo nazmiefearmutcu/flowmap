@@ -55,7 +55,7 @@ export function ReconnectBanner(): JSX.Element | null {
   const attempts = useFlowMapStore((s) => s.reconnectAttempts);
   const retryNow = useFlowMapStore((s) => s.retryNow);
   if (status !== 'reconnecting') return null;
-  const target = subscription ? `${subscription.market}:${subscription.symbol}` : 'the feed';
+  const target = subscription ? `${subscription.market}:${subscription.symbol}` : t('banner.theFeed');
   return (
     <div
       className="reconnect-banner"
@@ -65,17 +65,17 @@ export function ReconnectBanner(): JSX.Element | null {
     >
       <span className="reconnect-banner__dot" aria-hidden="true" />
       <span className="reconnect-banner__text">
-        connection lost — reconnecting to {target} · {closeReasonText(lastClose)}
-        {attempts > 0 ? ` · attempt ${attempts}` : ''}
+        {t('banner.lostReconnecting', { target, reason: closeReasonText(lastClose) })}
+        {attempts > 0 ? ` · ${t('banner.attempt', { attempts })}` : ''}
       </span>
       <button
         type="button"
         className="reconnect-banner__retry"
         onClick={retryNow}
         data-testid="reconnect-retry"
-        title="skip the wait and reconnect immediately"
+        title={t('banner.retryNowHint')}
       >
-        retry now
+        {t('banner.retryNow')}
       </button>
     </div>
   );

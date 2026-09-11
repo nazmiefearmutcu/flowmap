@@ -425,3 +425,168 @@
 
   color-scheme: dark;
 }
+
+/* -------------------------------------------------------------- paper-deut */
+/* Deuteranopia-safe LIGHT variant of paper: surfaces identical to `paper`, but
+   the sell channel swaps red → blue (#2f5fc4) and warn → violet (#6d3fa8), so
+   the bid/ask/warn trio is decided off the red–green confusion axis while the
+   data still clears ≥4.5:1 on the paper ground. */
+:root[data-theme='paper-deut'] {
+  /* --- layered surfaces --- */
+  --bg: #f3f1ea;
+  --bg-1: #f9f8f3;
+  --bg-2: #fffdf8;
+  --bg-3: #ece9df;
+  --bg-inset: #ebe8dd;
+  --scrim: rgba(28, 26, 18, 0.45);
+
+  /* --- structure --- */
+  --line: #d6d0c0;
+  --line-2: #bfb8a4;
+  --line-soft: rgba(214, 208, 192, 0.55);
+
+  /* --- text --- */
+  --text: #24272d;
+  --text-2: #57606c;
+  --text-3: #6d7683;
+  --text-4: #8d949e;
+  --text-money: #101318;
+
+  /* --- accent pair (light-ground CVD: teal bid / blue ask) --- */
+  --accent: #0a655c;
+  --accent-bright: #075149;
+  --accent-dim: #d9ece8;
+  --accent-line: #b0d8d2;
+  --accent-glow: rgba(10, 101, 92, 0.35);
+  --sell: #2f5fc4;
+  --sell-bright: #24499c;
+  --sell-dim: #dde4f7;
+  --sell-line: #b6c5ec;
+
+  /* --- semantic channels (violet warn, off the red–green axis) --- */
+  --warn: #6d3fa8;
+  --warn-dim: #e9e0f5;
+  --warn-line: #cfbce8;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(40, 36, 24, 0.18);
+  --shadow-drop: 0 12px 40px rgba(40, 36, 24, 0.22);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: light;
+}
+
+/* ---------------------------------------------------------------- contrast */
+/* High-contrast dark: true-black ground with pure-white ink (21:1 AAA) and
+   bright bid/ask channels (≥7:1 each) for daylight glare and low-vision use.
+   Structural hairlines stay visible (#3d3d3d) instead of vanishing on black. */
+:root[data-theme='contrast'] {
+  /* --- layered surfaces --- */
+  --bg: #000000;
+  --bg-1: #000000;
+  --bg-2: #0a0a0a;
+  --bg-3: #161616;
+  --bg-inset: #000000;
+  --scrim: rgba(0, 0, 0, 0.8);
+
+  /* --- structure --- */
+  --line: #3d3d3d;
+  --line-2: #6e6e6e;
+  --line-soft: rgba(61, 61, 61, 0.6);
+
+  /* --- text --- */
+  --text: #ffffff;
+  --text-2: #d9d9d9;
+  --text-3: #b8b8b8;
+  --text-4: #949494;
+  --text-money: #ffffff;
+
+  /* --- accent pair (brightened for the black ground) --- */
+  --accent: #00e0c0;
+  --accent-bright: #4dffe0;
+  --accent-dim: #00332c;
+  --accent-line: #007a6b;
+  --accent-glow: rgba(0, 224, 192, 0.5);
+  --sell: #ff5f5f;
+  --sell-bright: #ff8a8a;
+  --sell-dim: #3a0d0d;
+  --sell-line: #7a1f1f;
+
+  /* --- semantic channels --- */
+  --warn: #ffcc00;
+  --warn-dim: #332800;
+  --warn-line: #665200;
+  --replay: var(--warn);
+  --live: var(--accent);
+
+  /* --- type scale --- */
+  --fs-2xs: 9px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+
+  /* --- spacing --- */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 24px;
+
+  /* --- radii / elevation / motion --- */
+  --r-1: 3px;
+  --r-2: 4px;
+  --r-3: 6px;
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.8);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.9);
+  --t-fast: 0.12s ease;
+  --t-med: 0.2s ease;
+
+  /* --- layout rails --- */
+  --topbar-h: 44px;
+  --timeline-h: 66px;
+  --rail-w: 260px;
+  --price-axis-w: 62px;
+  --time-axis-h: 22px;
+
+  /* --- fonts --- */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  color-scheme: dark;
+}

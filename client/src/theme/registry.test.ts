@@ -23,6 +23,7 @@ import {
   nextTheme,
   resolveCanvasPalette,
   type CanvasPalette,
+  type ThemeId,
 } from './registry';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -54,12 +55,29 @@ function valueOf(body: string, name: string): string {
   return (m as RegExpMatchArray)[1].replace(/\s+/g, ' ').trim();
 }
 
+/** WCAG relative luminance for a `#rrggbb` literal. */
+function relLum(hex: string): number {
+  const c = hex.replace('#', '');
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(c.slice(i, i + 2), 16) / 255);
+  const lin = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+}
+
+/** WCAG contrast ratio between two `#rrggbb` literals. */
+function contrast(a: string, b: string): number {
+  const [hi, lo] = relLum(a) > relLum(b) ? [relLum(a), relLum(b)] : [relLum(b), relLum(a)];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 describe('theme registry / css coverage', () => {
-  it('ships at least the four contract themes with midnight as default', () => {
-    expect(THEME_IDS.length).toBeGreaterThanOrEqual(4);
+  it('ships the two campaign-4 a11y themes on top of the four contract themes', () => {
     for (const id of ['midnight', 'paper', 'swiss', 'amber'] as const) {
       expect(THEME_IDS).toContain(id);
     }
+    expect(THEME_IDS).toContain('paper-deut');
+    expect(THEME_IDS).toContain('contrast');
+    expect(THEME_IDS.length).toBe(7);
+    expect(new Set(THEME_IDS).size).toBe(THEME_IDS.length);
     expect(DEFAULT_THEME_ID).toBe('midnight');
     expect(THEME_IDS[0]).toBe('midnight');
   });
@@ -131,6 +149,26 @@ describe('theme registry / css coverage', () => {
     }
   });
 
+  it('the two campaign-4 a11y themes meet their numeric contrast claims on their ground', () => {
+    // text ≥ 7:1 (AAA body text), bid/ask/warn ≥ 4.5:1 (AA data channels).
+    const bars: Record<string, { text: number; data: number }> = {
+      'paper-deut': { text: 7, data: 4.5 },
+      contrast: { text: 7, data: 4.5 },
+    };
+    for (const [id, bar] of Object.entries(bars)) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const bg = valueOf(body, '--bg');
+      expect(contrast(valueOf(body, '--text'), bg), `${id} text on bg`).toBeGreaterThanOrEqual(
+        bar.text,
+      );
+      for (const channel of ['--accent', '--sell', '--warn'] as const) {
+        expect(contrast(valueOf(body, channel), bg), `${id} ${channel} on bg`).toBeGreaterThanOrEqual(
+          bar.data,
+        );
+      }
+    }
+  });
+
   it('themes have unique labels and a valid mode', () => {
     const labels = THEME_IDS.map((id) => THEMES[id].label);
     expect(new Set(labels).size).toBe(labels.length);
@@ -145,6 +183,8 @@ describe('registry helpers', () => {
   it('isThemeId narrows only known ids', () => {
     expect(isThemeId('midnight')).toBe(true);
     expect(isThemeId('sea')).toBe(true);
+    expect(isThemeId('paper-deut')).toBe(true);
+    expect(isThemeId('contrast')).toBe(true);
     expect(isThemeId('dark')).toBe(false);
     expect(isThemeId(null)).toBe(false);
     expect(isThemeId(undefined)).toBe(false);
@@ -153,7 +193,18 @@ describe('registry helpers', () => {
   it('nextTheme cycles through registry order and wraps', () => {
     expect(nextTheme('midnight')).toBe('paper');
     expect(nextTheme('amber')).toBe('sea');
-    expect(nextTheme('sea')).toBe('midnight');
+    expect(nextTheme('sea')).toBe('paper-deut');
+    expect(nextTheme('contrast')).toBe('midnight');
+  });
+
+  it('nextTheme walks every id exactly once before wrapping (T covers all themes)', () => {
+    const walked: ThemeId[] = [];
+    let id: ThemeId = DEFAULT_THEME_ID;
+    for (let i = 0; i < THEME_IDS.length; i++) {
+      id = nextTheme(id);
+      walked.push(id);
+    }
+    expect(walked).toEqual([...THEME_IDS.slice(1), THEME_IDS[0]]);
   });
 
   it('resolveCanvasPalette maps computed vars field-by-field', () => {

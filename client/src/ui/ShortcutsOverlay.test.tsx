@@ -9,6 +9,7 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { setLocale } from '../i18n';
 import { isHelpToggle, KEYSHEET } from './keysheet';
 import { resetOverlays } from './overlayStack';
 import { SettingsDrawer } from './SettingsDrawer';
@@ -25,6 +26,7 @@ afterEach(() => {
     act(() => root.unmount());
     container.remove();
   }
+  setLocale('en');
   resetOverlays();
 });
 
@@ -69,6 +71,19 @@ describe('ShortcutsOverlay', () => {
     expect(rows.length).toBe(KEYSHEET.length);
     // The sheet is the SHARED source of truth: it names the `?` toggle itself.
     expect(el!.textContent).toContain('toggle this shortcuts overlay');
+  });
+
+  it('renders the action strings through t() and follows the locale', () => {
+    render();
+    const el = overlay()!;
+    expect(el.textContent).toContain('export the chart as a PNG download');
+
+    act(() => setLocale('tr'));
+    expect(el.textContent).toContain('grafiği PNG olarak indir');
+    expect(el.textContent).toContain('bu kısayol penceresini aç-kapat');
+    // The key label column is locale-independent.
+    expect(el.textContent).toContain('Space');
+    expect(el.textContent).toContain('Ctrl+Z');
   });
 
   it('moves focus to its close button and Escape closes', () => {

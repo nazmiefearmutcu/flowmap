@@ -200,9 +200,9 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
           className="replay-unavailable"
           data-testid="replay-unavailable"
           role="status"
-          title="This session has no recording, so the server refused Replay (close 1003). The chart re-subscribed to LIVE; switch symbols to build a recording, then try Replay again."
+          title={t('topbar.replayUnavailableHint')}
         >
-          no recording — replay unavailable
+          {t('topbar.replayUnavailable')}
         </span>
       )}
 
@@ -264,7 +264,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
             fillRule="evenodd"
           />
         </svg>
-        PNG
+        {t('topbar.png')}
       </button>
 
       <button
@@ -275,7 +275,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         data-testid="rail-toggle"
         title={t('topbar.toggleRail')}
       >
-        Rail
+        {t('topbar.rail')}
       </button>
 
       <button
@@ -287,7 +287,7 @@ export const TopBar = forwardRef<SymbolSearchHandle, TopBarProps>(function TopBa
         aria-haspopup="dialog"
       >
         {/* Force text (monochrome) presentation of the gear via U+FE0E, not the color emoji. */}
-        <span aria-hidden="true">{'⚙︎'}</span> Settings
+        <span aria-hidden="true">{'⚙︎'}</span> {t('topbar.settingsLabel')}
       </button>
     </header>
   );

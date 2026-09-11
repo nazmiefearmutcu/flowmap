@@ -34,42 +34,51 @@ import {
   type PriceBand,
 } from './settings';
 
-/** Human labels + the honest trade-off for each server price band (§8.1). */
-const BAND_LABEL: Record<PriceBand, string> = {
-  native: 'Native',
-  wide: '±50%',
-  full: '−100/+1000%',
-  deep: 'Deep',
+/** i18n key for each server price band label + the honest trade-off (§8.1). */
+const BAND_LABEL_KEY: Record<PriceBand, string> = {
+  native: 'settings.band.native',
+  wide: 'settings.band.wide',
+  full: 'settings.band.full',
+  deep: 'settings.band.deep',
 };
-const BAND_HINT: Record<PriceBand, string> = {
-  native: 'Finest price rows, narrowest coverage — the trading default.',
-  wide: 'About 50× coarser rows; far-out resting size becomes visible.',
-  full: 'Range SCAN only: rows get so coarse the live book collapses to a few of them.',
-  deep: 'Full ladder resolution near the price AND coverage to −99%/+1000%. The frame is fixed for the session, so a sustained move walks the book out into the coarse wings until you reconnect.',
-};
-
-/** Human labels for the depth display channel (contract C2). */
-const CHANNEL_LABEL: Record<DepthChannelMode, string> = {
-  sum: 'Sum',
-  bid: 'Bid',
-  ask: 'Ask',
-  imbalance: 'Imbalance',
-};
-const CHANNEL_HINT: Record<DepthChannelMode, string> = {
-  sum: 'Bid + ask intensity in one view — the default rendering.',
-  bid: 'Resting BID size only — read accumulation and support walls.',
-  ask: 'Resting ASK size only — read supply and resistance walls.',
-  imbalance: 'Signed (bid−ask)/(bid+ask) per cell: one end of the ramp is bid-heavy, the other ask-heavy, so one-sided walls stand out immediately. Cycles with C.',
+const BAND_HINT_KEY: Record<PriceBand, string> = {
+  native: 'settings.bandHint.native',
+  wide: 'settings.bandHint.wide',
+  full: 'settings.bandHint.full',
+  deep: 'settings.bandHint.deep',
 };
 
-/** Human labels for the first-launch history-depth choices. */
-const HISTORY_LABEL: Record<HistoryDepth, string> = {
-  off: 'Off',
-  '1h': '1H',
-  '4h': '4H',
-  '1d': '1D',
-  max: 'Max',
+/** i18n keys for the depth display channel (contract C2). */
+const CHANNEL_LABEL_KEY: Record<DepthChannelMode, string> = {
+  sum: 'settings.channel.sum',
+  bid: 'settings.channel.bid',
+  ask: 'settings.channel.ask',
+  imbalance: 'settings.channel.imbalance',
 };
+const CHANNEL_HINT_KEY: Record<DepthChannelMode, string> = {
+  sum: 'settings.channelHint.sum',
+  bid: 'settings.channelHint.bid',
+  ask: 'settings.channelHint.ask',
+  imbalance: 'settings.channelHint.imbalance',
+};
+
+/** i18n keys for the first-launch history-depth choices. */
+const HISTORY_LABEL_KEY: Record<HistoryDepth, string> = {
+  off: 'settings.history.off',
+  '1h': 'settings.history.1h',
+  '4h': 'settings.history.4h',
+  '1d': 'settings.history.1d',
+  max: 'settings.history.max',
+};
+
+/**
+ * P3 handoff: lane C1 adds `alertSound: boolean` (default true) to
+ * `ui/settings.ts`. Reading/writing through this optional-shaped alias keeps
+ * the drawer compiling AND behaving identically before and after that field
+ * lands: absent → ON (the documented default), and the emitted patch carries
+ * the field the moment `FlowMapSettings` owns it.
+ */
+type AlertSoundPatch = Partial<FlowMapSettings> & { alertSound?: boolean };
 
 /**
  * The keyboard surface lives in ui/keysheet.ts, SHARED with the `?` shortcuts
@@ -149,6 +158,17 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
     onChange({ ...DEFAULT_SETTINGS, overlays: { ...DEFAULT_SETTINGS.overlays } });
   };
 
+  // P3: absent field reads as the documented default (ON).
+  const alertSound = (settings as AlertSoundPatch).alertSound !== false;
+  const toggleAlertSound = (): void => {
+    const patch: AlertSoundPatch = { alertSound: !alertSound };
+    onChange(patch);
+  };
+  const rowsPerCell =
+    settings.tickGrouping === 1
+      ? t('settings.rowsPerCellOne')
+      : t('settings.rowsPerCell', { n: settings.tickGrouping });
+
   return (
     <>
       <div className="drawer-scrim" onMouseDown={onClose} data-testid="settings-scrim" />
@@ -178,7 +198,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
 
         <div className="drawer__body">
           <span className="drawer__section" data-testid="section-appearance">
-            Appearance
+            {t('drawer.sectionAppearance')}
           </span>
 
           {/* theme picker (lane CE registry; T cycles, this pins a choice) */}
@@ -232,7 +252,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-hud"
             onClick={() => onChange({ hudVisible: !settings.hudVisible })}
           >
-            Perf HUD (H)
+            {t('settings.hud')}
             <span className="check__box" aria-hidden="true" />
           </button>
           <button
@@ -243,7 +263,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-draw-toolbar"
             onClick={toggleDrawToolbar}
           >
-            Draw toolbar (D)
+            {t('settings.drawToolbar')}
             <span className="check__box" aria-hidden="true" />
           </button>
           <button
@@ -254,7 +274,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-indicator-picker"
             onClick={toggleIndicatorPicker}
           >
-            Indicator picker (I)
+            {t('settings.indicatorPicker')}
             <span className="check__box" aria-hidden="true" />
           </button>
 
@@ -265,17 +285,17 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="show-onboarding"
             onClick={openOnboarding}
           >
-            Show onboarding tour
+            {t('settings.showOnboarding')}
           </button>
 
           <span className="drawer__section" data-testid="section-display">
-            Display
+            {t('drawer.sectionDisplay')}
           </span>
 
           {/* heatmap contrast (drives the perceptual display gamma; live) */}
           <div className="setting">
             <span className="setting__label">
-              Contrast
+              {t('settings.contrast')}
               <span className="setting__value">{settings.contrast}</span>
             </span>
             <input
@@ -290,9 +310,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               data-testid="setting-contrast"
               onChange={(e) => onChange({ contrast: Number(e.target.value) })}
             />
-            <span className="setting__hint">
-              Lifts the mid-density field vs. the brightest walls — higher is punchier.
-            </span>
+            <span className="setting__hint">{t('settings.contrastHint')}</span>
           </div>
 
           {/* colormap */}
@@ -312,16 +330,12 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                 </button>
               ))}
             </div>
-            <span className="setting__hint">
-              Flow keeps the field dark and lets walls earn warm gold; Inferno
-              separates size by hue (indigo → red → gold); Classic is the legacy
-              blue→cyan→yellow ramp. Synthetic depth always stays amber.
-            </span>
+            <span className="setting__hint">{t('settings.colormapHint')}</span>
           </div>
 
           {/* depth display channel (contract C2) — applied via renderer.setDepthChannel */}
           <div className="setting">
-            <span className="setting__label">Depth channel</span>
+            <span className="setting__label">{t('settings.depthChannel')}</span>
             <div className="segrow" role="group" aria-label="depth channel" data-testid="setting-depthChannel">
               {DEPTH_CHANNELS.map((c) => (
                 <button
@@ -332,17 +346,17 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`depthChannel-${c}`}
                   onClick={() => onChange({ depthChannel: c })}
                 >
-                  {CHANNEL_LABEL[c]}
+                  {t(CHANNEL_LABEL_KEY[c])}
                 </button>
               ))}
             </div>
-            <span className="setting__hint">{CHANNEL_HINT[settings.depthChannel]}</span>
+            <span className="setting__hint">{t(CHANNEL_HINT_KEY[settings.depthChannel])}</span>
           </div>
 
           {/* normalization percentile */}
           <div className="setting">
             <span className="setting__label">
-              Normalization
+              {t('settings.normalization')}
               <span className="setting__value">p{settings.normPercentile}</span>
             </span>
             <input
@@ -357,18 +371,15 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               data-testid="setting-normPercentile"
               onChange={(e) => onChange({ normPercentile: Number(e.target.value) })}
             />
-            <span className="setting__hint">
-              White point: the density percentile mapped to full brightness. Lower (p80) makes
-              the field punchy and saturated; higher (p100) is dim with more headroom.
-            </span>
+            <span className="setting__hint">{t('settings.normalizationHint')}</span>
           </div>
 
           {/* heatmap tolerance — the black point on normalized density (live) */}
           <div className="setting">
             <span className="setting__label">
-              Tolerance
+              {t('settings.tolerance')}
               <span className="setting__value">
-                {settings.tolerance > 0 ? settings.tolerance : 'off'}
+                {settings.tolerance > 0 ? settings.tolerance : t('settings.off')}
               </span>
             </span>
             <input
@@ -379,28 +390,22 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               step={1}
               value={settings.tolerance}
               aria-label={t('settings.tolerance')}
-              aria-valuetext={settings.tolerance > 0 ? `${settings.tolerance}` : 'off'}
+              aria-valuetext={settings.tolerance > 0 ? `${settings.tolerance}` : t('settings.off')}
               data-testid="setting-tolerance"
               onChange={(e) => onChange({ tolerance: Number(e.target.value) })}
             />
-            <span className="setting__hint">
-              Black point: hides cells below this share of the viewport&rsquo;s density
-              percentile, so only liquidity worth reading paints. It is relative to what is
-              on screen, not a fixed lot size.
-            </span>
+            <span className="setting__hint">{t('settings.toleranceHint')}</span>
           </div>
 
           <span className="drawer__section" data-testid="section-trades">
-            Trades
+            {t('drawer.sectionTrades')}
           </span>
 
           {/* tick grouping */}
           <div className="setting">
             <span className="setting__label">
-              Tick grouping
-              <span className="setting__value">
-                {settings.tickGrouping} row{settings.tickGrouping === 1 ? '' : 's'} / cell
-              </span>
+              {t('settings.tickGrouping')}
+              <span className="setting__value">{rowsPerCell}</span>
             </span>
             <input
               type="range"
@@ -410,7 +415,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               step={1}
               value={settings.tickGrouping}
               aria-label={t('settings.tickGrouping')}
-              aria-valuetext={`${settings.tickGrouping} row${settings.tickGrouping === 1 ? '' : 's'} / cell`}
+              aria-valuetext={rowsPerCell}
               data-testid="setting-tickGrouping"
               onChange={(e) => onChange({ tickGrouping: Number(e.target.value) })}
             />
@@ -419,9 +424,9 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
           {/* bubble threshold */}
           <div className="setting">
             <span className="setting__label">
-              Bubble threshold
+              {t('settings.bubble')}
               <span className="setting__value">
-                {settings.bubbleMinSize > 0 ? `≥ ${settings.bubbleMinSize}` : 'all trades'}
+                {settings.bubbleMinSize > 0 ? `≥ ${settings.bubbleMinSize}` : t('settings.allTrades')}
               </span>
             </span>
             <input
@@ -432,7 +437,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
               step={1}
               value={settings.bubbleMinSize}
               aria-label={t('settings.bubbleThreshold')}
-              aria-valuetext={settings.bubbleMinSize > 0 ? `≥ ${settings.bubbleMinSize}` : 'all trades'}
+              aria-valuetext={settings.bubbleMinSize > 0 ? `≥ ${settings.bubbleMinSize}` : t('settings.allTrades')}
               data-testid="setting-bubble"
               onChange={(e) => onChange({ bubbleMinSize: Number(e.target.value) })}
             />
@@ -441,11 +446,11 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
           {/* big-trade tape highlight — absolute USD notional, 0 = off */}
           <div className="setting">
             <span className="setting__label">
-              Big trade size
+              {t('settings.bigTradeLabel')}
               <span className="setting__value">
                 {settings.bigTradeUsd > 0
                   ? `≥ $${Math.round(settings.bigTradeUsd).toLocaleString('en-US')}`
-                  : 'off'}
+                  : t('settings.off')}
               </span>
             </span>
             <input
@@ -465,14 +470,11 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                 });
               }}
             />
-            <span className="setting__hint">
-              Highlights tape rows at or above this notional (price × size, USD). 0 turns the
-              highlight off.
-            </span>
+            <span className="setting__hint">{t('settings.bigTradeHint')}</span>
           </div>
 
           <span className="drawer__section" data-testid="section-view">
-            View
+            {t('drawer.sectionView')}
           </span>
 
           {/* follow mode */}
@@ -484,7 +486,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-follow"
             onClick={() => onChange({ follow: !settings.follow })}
           >
-            Follow live edge (time)
+            {t('settings.followLive')}
             <span className="check__box" aria-hidden="true" />
           </button>
 
@@ -497,7 +499,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-follow-price"
             onClick={() => onChange({ followPrice: !settings.followPrice })}
           >
-            Track price (keeps your zoom)
+            {t('settings.followPrice')}
             <span className="check__box" aria-hidden="true" />
           </button>
 
@@ -514,11 +516,11 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`priceBand-${b}`}
                   onClick={() => onChange({ priceBand: b })}
                 >
-                  {BAND_LABEL[b]}
+                  {t(BAND_LABEL_KEY[b])}
                 </button>
               ))}
             </div>
-            <span className="setting__hint">{BAND_HINT[settings.priceBand]}</span>
+            <span className="setting__hint">{t(BAND_HINT_KEY[settings.priceBand])}</span>
           </div>
 
           {/* first-launch history depth */}
@@ -534,14 +536,11 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`historyDepth-${d}`}
                   onClick={() => onChange({ historyDepth: d })}
                 >
-                  {HISTORY_LABEL[d]}
+                  {t(HISTORY_LABEL_KEY[d])}
                 </button>
               ))}
             </div>
-            <span className="setting__hint">
-              How much past data to pull into the chart when a symbol loads. Applies on the next
-              symbol switch or reload. Bounded by what the server retains.
-            </span>
+            <span className="setting__hint">{t('settings.historyHint')}</span>
           </div>
 
           {/* right rail */}
@@ -553,7 +552,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="toggle-rail"
             onClick={() => onChange({ railVisible: !settings.railVisible })}
           >
-            Right rail (DOM + tape)
+            {t('settings.rightRail')}
             <span className="check__box" aria-hidden="true" />
           </button>
 
@@ -566,15 +565,34 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             <OverlayToggles visibility={settings.overlays} onToggle={toggleOverlay} />
           </div>
 
+          {/* alerts (P3): sound toggle for fired price alerts; lane C1 owns the playback */}
+          <span className="drawer__section" data-testid="section-alerts">
+            {t('drawer.sectionAlerts')}
+          </span>
+          <div className="setting">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={alertSound}
+              className={`check${alertSound ? ' is-on' : ''}`}
+              data-testid="toggle-alert-sound"
+              onClick={toggleAlertSound}
+            >
+              {t('settings.alertSound')}
+              <span className="check__box" aria-hidden="true" />
+            </button>
+            <span className="setting__hint">{t('settings.alertSoundHint')}</span>
+          </div>
+
           {/* keyboard reference — every binding verified against the code */}
           <span className="drawer__section" data-testid="section-keys">
-            Keyboard
+            {t('drawer.sectionKeyboard')}
           </span>
           <div className="keysheet" data-testid="keysheet">
             {KEYSHEET.map((entry) => (
               <div key={entry.keys} className="keysheet__row">
                 <kbd className="keysheet__keys">{entry.keys}</kbd>
-                <span className="keysheet__action">{entry.action}</span>
+                <span className="keysheet__action">{t(entry.actionKey)}</span>
               </div>
             ))}
           </div>
@@ -586,7 +604,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
             data-testid="settings-restore"
             onClick={restoreDefaults}
           >
-            Restore defaults
+            {t('settings.restoreDefaults')}
           </button>
         </div>
       </aside>

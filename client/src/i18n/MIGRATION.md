@@ -90,3 +90,13 @@ follow → `settings.follow`.
 - Locale persists in `flowmap.locale`; boot calls `initLocale()` (see
   MOUNT-SNIPPET-CE in `lane-CE.md`).
 - Feature panes (drawings, indicators, alerts…) stay English per C7.
+
+## Campaign 4 (lane D) — shell migration completed
+The shell surfaces listed above are now fully converted: SettingsDrawer sections
++ every toggle/label/hint, TopBar visible text, ReconnectBanner framing, the
+keysheet (`keysheet.*`) in both the drawer and the `?` overlay, and the overlay
+footer. New key families: `drawer.section*`, `settings.*Hint`,
+`settings.channel.*`, `settings.band*`, `settings.history.*`,
+`settings.alertSound(|Hint)`, `banner.lostReconnecting|theFeed|attempt|retryNow(|Hint)`,
+`topbar.png|rail|settingsLabel|replayUnavailable(|Hint)`, `shortcuts.footer*`.
+`i18n/index.test.ts` pins every lane-D key as present in BOTH tables.

@@ -10,6 +10,7 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { setLocale } from '../i18n';
 import { useFlowMapStore } from '../state/store';
 import { ReconnectBanner, closeReasonText } from './ReconnectBanner';
 
@@ -23,6 +24,7 @@ afterEach(() => {
     act(() => root.unmount());
     container.remove();
   }
+  setLocale('en');
   useFlowMapStore.setState({ status: 'idle', lastClose: null, reconnectAttempts: 0 });
 });
 
@@ -96,5 +98,40 @@ describe('ReconnectBanner', () => {
       btn!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
     expect(retryNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('translates the framing strings in TR while the reason keeps its own translation', () => {
+    setLocale('tr');
+    useFlowMapStore.setState({
+      status: 'reconnecting',
+      lastClose: { code: 1001, wasClean: true },
+      reconnectAttempts: 3,
+      subscription: {
+        market: 'kraken',
+        symbol: 'XBT/USD',
+        mode: 'live',
+      } as unknown as ReturnType<typeof useFlowMapStore.getState>['subscription'],
+    });
+    render();
+    const el = document.body.querySelector('[data-testid="reconnect-banner"]')!;
+    expect(el.textContent).toContain('bağlantı koptu');
+    expect(el.textContent).toContain('kraken:XBT/USD');
+    expect(el.textContent).toContain('için yeniden bağlanılıyor');
+    expect(el.textContent).toContain('sunucu kapatıldı');
+    expect(el.textContent).toContain('deneme 3');
+    const btn = el.querySelector('[data-testid="reconnect-retry"]')!;
+    expect(btn.textContent).toBe('Yeniden dene');
+    expect(btn.getAttribute('title')).toBe('beklemeden hemen yeniden bağlan');
+  });
+
+  it('names the fallback target through the EN table (byte-identical fallback)', () => {
+    useFlowMapStore.setState({
+      status: 'reconnecting',
+      subscription: undefined,
+      reconnectAttempts: 0,
+    });
+    render();
+    const el = document.body.querySelector('[data-testid="reconnect-banner"]')!;
+    expect(el.textContent).toContain('reconnecting to the feed');
   });
 });

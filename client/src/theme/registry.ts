@@ -19,7 +19,14 @@
  * unit-testable without a real stylesheet engine.
  */
 
-export type ThemeId = 'midnight' | 'paper' | 'swiss' | 'amber' | 'sea';
+export type ThemeId =
+  | 'midnight'
+  | 'paper'
+  | 'swiss'
+  | 'amber'
+  | 'sea'
+  | 'paper-deut'
+  | 'contrast';
 
 /** Colors canvas overlay layers need (bg/grid/text/bid/ask/accent). */
 export interface CanvasPalette {
@@ -63,7 +70,15 @@ export interface ThemeMeta {
 }
 
 /** Cycling / picker order. Midnight first = default. */
-export const THEME_IDS: readonly ThemeId[] = ['midnight', 'paper', 'swiss', 'amber', 'sea'];
+export const THEME_IDS: readonly ThemeId[] = [
+  'midnight',
+  'paper',
+  'swiss',
+  'amber',
+  'sea',
+  'paper-deut',
+  'contrast',
+];
 
 export const DEFAULT_THEME_ID: ThemeId = 'midnight';
 
@@ -136,6 +151,34 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       bid: '#1fb6a6',
       ask: '#4f7fd6',
       accent: '#33d6c4',
+    },
+  },
+  'paper-deut': {
+    id: 'paper-deut',
+    label: 'Paper Deut',
+    mode: 'light',
+    cvd: 'deuteranopia-safe light: sell → blue, warn → violet on paper (off the red-green axis)',
+    canvas: {
+      bg: '#f3f1ea',
+      grid: '#d6d0c0',
+      text: '#24272d',
+      bid: '#0a655c',
+      ask: '#2f5fc4',
+      accent: '#075149',
+    },
+  },
+  contrast: {
+    id: 'contrast',
+    label: 'High Contrast',
+    mode: 'dark',
+    cvd: 'high-contrast dark: true-black ground, AAA ink (21:1), bright bid/ask (≥7:1)',
+    canvas: {
+      bg: '#000000',
+      grid: '#3d3d3d',
+      text: '#ffffff',
+      bid: '#00e0c0',
+      ask: '#ff5f5f',
+      accent: '#4dffe0',
     },
   },
 };

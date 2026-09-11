@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { resetDrawingsForTest } from '../drawings/store';
 import { resetIndicatorStoreForTest } from '../indicators/store';
 import { setLocale } from '../i18n';
-import { setTheme } from '../theme';
+import { setTheme, THEME_IDS } from '../theme';
 import { closeOnboarding, isOnboardingOpen } from './OnboardingCard';
 import { SettingsDrawer } from './SettingsDrawer';
 import { DEFAULT_SETTINGS, type FlowMapSettings } from './settings';
@@ -17,6 +17,11 @@ const mounted: Array<{ container: HTMLElement; root: Root }> = [];
 
 function settings(over: Partial<FlowMapSettings> = {}): FlowMapSettings {
   return { ...DEFAULT_SETTINGS, overlays: { ...DEFAULT_SETTINGS.overlays }, ...over };
+}
+
+/** P3: `alertSound` lands in settings.ts via lane C1 — shape-tolerate both states. */
+function withAlertSound(alertSound: boolean): FlowMapSettings {
+  return { ...settings(), alertSound } as FlowMapSettings;
 }
 
 function render(node: JSX.Element): { container: HTMLElement; root: Root } {
@@ -229,7 +234,7 @@ describe('SettingsDrawer depth channel (contract C2)', () => {
       <SettingsDrawer settings={settings({ depthChannel: 'imbalance' })} onChange={() => {}} onClose={() => {}} />,
     );
     const text = container.querySelector('[data-testid="setting-depthChannel"]')
-      ?.parentElement?.textContent!;
+      ?.parentElement?.textContent ?? '';
     expect(text).toContain('bid-heavy');
     expect(text).toContain('ask-heavy');
   });
@@ -247,8 +252,10 @@ describe('SettingsDrawer appearance section (INT mount)', () => {
   it('lists the theme registry and pins a choice through setTheme', () => {
     const { container } = render(<SettingsDrawer settings={settings()} onChange={() => {}} onClose={() => {}} />);
     const row = container.querySelector('[data-testid="setting-theme"]')!;
-    const ids = ['midnight', 'paper', 'swiss', 'amber', 'sea'];
-    for (const id of ids) expect(row.querySelector(`[data-testid="theme-${id}"]`)).not.toBeNull();
+    for (const id of THEME_IDS) expect(row.querySelector(`[data-testid="theme-${id}"]`)).not.toBeNull();
+    // campaign-4 a11y themes are pickable too
+    expect(row.querySelector('[data-testid="theme-paper-deut"]')).not.toBeNull();
+    expect(row.querySelector('[data-testid="theme-contrast"]')).not.toBeNull();
     expect(row.querySelector('[data-testid="theme-midnight"]')!.getAttribute('aria-pressed')).toBe('true');
 
     click(row.querySelector('[data-testid="theme-paper"]')!);
@@ -262,6 +269,43 @@ describe('SettingsDrawer appearance section (INT mount)', () => {
     click(container.querySelector('[data-testid="locale-tr"]')!);
     expect(container.querySelector('[data-testid="section-overlays"]')!.textContent).toBe('Katmanlar');
     expect(container.querySelector('[data-testid="locale-tr"]')!.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('translates the lane-D drawer strings in TR (sections, toggle labels, hints)', () => {
+    const { container } = render(
+      <SettingsDrawer settings={settings({ hudVisible: false })} onChange={() => {}} onClose={() => {}} />,
+    );
+    // EN defaults stay byte-identical for the tests that pin them.
+    expect(container.querySelector('[data-testid="section-appearance"]')!.textContent).toBe(
+      'Appearance',
+    );
+    expect(container.querySelector('[data-testid="toggle-hud"]')!.textContent).toContain(
+      'Perf HUD (H)',
+    );
+    expect(container.querySelector('[data-testid="section-keys"]')!.textContent).toBe('Keyboard');
+    expect(container.querySelector('[data-testid="toggle-alert-sound"]')!.textContent).toContain(
+      'Alert sound',
+    );
+
+    click(container.querySelector('[data-testid="locale-tr"]')!);
+    expect(container.querySelector('[data-testid="section-appearance"]')!.textContent).toBe(
+      'Görünüm',
+    );
+    expect(container.querySelector('[data-testid="section-trades"]')!.textContent).toBe('İşlemler');
+    expect(container.querySelector('[data-testid="section-view"]')!.textContent).toBe('Bakış');
+    expect(container.querySelector('[data-testid="section-keys"]')!.textContent).toBe('Klavye');
+    expect(container.querySelector('[data-testid="toggle-hud"]')!.textContent).toContain(
+      'Performans HUD',
+    );
+    expect(container.querySelector('[data-testid="toggle-follow"]')!.textContent).toContain(
+      'Canlı kenarı takip et',
+    );
+    expect(container.querySelector('[data-testid="toggle-alert-sound"]')!.textContent).toContain(
+      'Alarm sesi',
+    );
+    expect(container.querySelector('[data-testid="settings-restore"]')!.textContent).toBe(
+      'Varsayılanlara dön',
+    );
   });
 
   it('toggles the perf HUD through the settings patch', () => {
@@ -291,5 +335,35 @@ describe('SettingsDrawer appearance section (INT mount)', () => {
     expect(isOnboardingOpen()).toBe(false);
     click(container.querySelector('[data-testid="show-onboarding"]')!);
     expect(isOnboardingOpen()).toBe(true);
+  });
+});
+
+describe('SettingsDrawer alert sound (P3)', () => {
+  it('renders a role=switch row that defaults ON when the field is absent', () => {
+    const { container } = render(
+      <SettingsDrawer settings={settings()} onChange={() => {}} onClose={() => {}} />,
+    );
+    const row = container.querySelector('[data-testid="section-alerts"]')!;
+    expect(row.textContent).toBe('Alerts');
+    const toggle = container.querySelector('[data-testid="toggle-alert-sound"]')!;
+    expect(toggle.tagName).toBe('BUTTON');
+    expect(toggle.getAttribute('role')).toBe('switch');
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    expect(toggle.textContent).toContain('Alert sound');
+  });
+
+  it('flips the persisted alertSound field through the shared onChange', () => {
+    const patches: Array<Partial<FlowMapSettings>> = [];
+    const { container } = render(
+      <SettingsDrawer
+        settings={withAlertSound(false)}
+        onChange={(p) => patches.push(p)}
+        onClose={() => {}}
+      />,
+    );
+    const toggle = container.querySelector('[data-testid="toggle-alert-sound"]')!;
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+    click(toggle);
+    expect(patches).toEqual([{ alertSound: true }]);
   });
 });

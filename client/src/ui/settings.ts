@@ -6,9 +6,9 @@
  * Everything the drawer controls lives here and is written to localStorage on
  * every change, and re-read + applied on boot. Almost all of it is honoured LIVE
  * by the renderer (contrast, tolerance, colormap, normalization, bubble
- * threshold, overlays, both follow axes, rail); `priceBand` is applied by
- * re-subscribing (it changes the SERVER's grid geometry), and `tickGrouping` is
- * persisted-only for now.
+ * threshold, overlays, both follow axes, rail, depth channel, tick grouping);
+ * `priceBand` is applied by re-subscribing (it changes the SERVER's grid
+ * geometry).
  *
  * **Migration policy.** `normalizeSettings` is a total coercion over an
  * arbitrary parsed blob with a per-field default, so a stored payload that
@@ -135,6 +135,8 @@ export interface FlowMapSettings {
   depthChannel: DepthChannelMode;
   /** PerfHud diagnostics chip visibility (H toggles; polled off renderer.stats). */
   hudVisible: boolean;
+  /** Play the alert chime on a fired alert batch (P3). */
+  alertSound: boolean;
 }
 
 export const SETTINGS_KEY = 'flowmap.settings.v1';
@@ -166,6 +168,8 @@ export const DEFAULT_SETTINGS: FlowMapSettings = {
   // The default is today's rendering, bit-identical (contract C2).
   depthChannel: 'sum',
   hudVisible: false,
+  // On by default: an alert is useless when the user looks away (P3).
+  alertSound: true,
 };
 
 /** Minimal structural subset of the Web Storage API these helpers need. */
@@ -199,7 +203,7 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
         ? o.colormap
         : DEFAULT_COLORMAP,
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
-    tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 32, DEFAULT_SETTINGS.tickGrouping)),
+    tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 16, DEFAULT_SETTINGS.tickGrouping)),
     bubbleMinSize: clampNumber(o.bubbleMinSize, 0, 1e9, DEFAULT_SETTINGS.bubbleMinSize),
     bigTradeUsd: clampNumber(o.bigTradeUsd, 0, 1e9, DEFAULT_SETTINGS.bigTradeUsd),
     follow: typeof o.follow === 'boolean' ? o.follow : DEFAULT_SETTINGS.follow,
@@ -217,6 +221,7 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
       ? (o.depthChannel as DepthChannelMode)
       : DEFAULT_SETTINGS.depthChannel,
     hudVisible: typeof o.hudVisible === 'boolean' ? o.hudVisible : DEFAULT_SETTINGS.hudVisible,
+    alertSound: typeof o.alertSound === 'boolean' ? o.alertSound : DEFAULT_SETTINGS.alertSound,
   };
 }
 

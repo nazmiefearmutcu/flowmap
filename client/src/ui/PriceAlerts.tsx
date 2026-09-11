@@ -26,6 +26,7 @@ import {
   alertsFor,
   evaluateAlerts,
   getAlertsSnapshot,
+  rearmAlert,
   removeAlert,
   snoozeAlert,
   subscribeAlerts,
@@ -35,6 +36,8 @@ import { useFlowMapStore } from '../state/store';
 import { classifyTarget, routeGlobalKey } from '../input/keys';
 import { lastProbeSpot } from './lastProbe';
 import { AlertsPopover } from './AlertsPopover';
+import { playAlertSound } from './alertSound';
+import { loadSettings } from './settings';
 import './features.css';
 
 /** Marker-line / evaluation poll cadence (matches the bookStore flush ~10 Hz). */
@@ -56,12 +59,30 @@ export function marketPriceNow(): number | null {
   return null;
 }
 
+/**
+ * The persisted `alertSound` flag, read at FIRE time (rare) so a drawer toggle
+ * takes effect without re-mounting anything. Falls back to on when storage is
+ * unavailable — the settings module itself never throws.
+ */
+function soundEnabledFromSettings(): boolean {
+  try {
+    return loadSettings(typeof window !== 'undefined' ? window.localStorage : null).alertSound;
+  } catch {
+    return true;
+  }
+}
+
 interface PriceAlertsProps {
   /** Renderer ref — marker lines position through `overlayRowCss`. */
   rendererRef: MutableRefObject<Renderer | null>;
+  /**
+   * Override the persisted `alertSound` setting (tests / host wiring). When
+   * omitted, the flag is read from settings at each fired batch.
+   */
+  soundEnabled?: boolean;
 }
 
-export function PriceAlerts({ rendererRef }: PriceAlertsProps): JSX.Element | null {
+export function PriceAlerts({ rendererRef, soundEnabled }: PriceAlertsProps): JSX.Element | null {
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [pulsing, setPulsing] = useState<ReadonlySet<string>>(new Set());
@@ -85,14 +106,22 @@ export function PriceAlerts({ rendererRef }: PriceAlertsProps): JSX.Element | nu
   useEffect(() => {
     if (key === null) return;
     const id = window.setInterval(() => {
+      // P7 honesty: in replay the book carries HISTORICAL prices. Evaluating
+      // alerts against them would fire a "live" alert on replayed data and
+      // latch it against the real crossing later (docs/user-guide.md documents
+      // live-price semantics only). Read the mode live so a replay toggle
+      // takes effect without re-creating the interval.
+      const live = useFlowMapStore.getState().subscription?.mode !== 'replay';
       const px = marketPriceNow();
-      if (px !== null) {
+      if (live && px !== null) {
         const fired = evaluateAlerts(key, px);
         if (fired.length > 0) {
           const ids = new Set(fired.map((e) => e.alertId));
           setPulsing(ids);
           if (pulseTimer.current !== null) clearTimeout(pulseTimer.current);
           pulseTimer.current = setTimeout(() => setPulsing(new Set()), PULSE_MS);
+          // One chime per fired BATCH (alertSound.ts rate-limits bursts besides).
+          if (soundEnabled ?? soundEnabledFromSettings()) playAlertSound();
         }
       }
       setNow(Date.now()); // drives line repositioning + popover badges
@@ -101,7 +130,7 @@ export function PriceAlerts({ rendererRef }: PriceAlertsProps): JSX.Element | nu
       window.clearInterval(id);
       if (pulseTimer.current !== null) clearTimeout(pulseTimer.current);
     };
-  }, [key]);
+  }, [key, soundEnabled]);
 
   const createAt = useCallback(
     (price: number) => {
@@ -185,6 +214,7 @@ export function PriceAlerts({ rendererRef }: PriceAlertsProps): JSX.Element | nu
           onCreate={createAt}
           onDelete={(id) => void removeAlert(id)}
           onSnooze={(id) => void snoozeAlert(id)}
+          onRearm={(id) => void rearmAlert(id)}
           onClearFired={() => {
             for (const a of alerts) {
               if (a.triggered) removeAlert(a.id);

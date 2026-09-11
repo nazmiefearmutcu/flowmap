@@ -125,3 +125,110 @@ describe('locale metadata', () => {
     expect(isLocale('de')).toBe(false);
   });
 });
+
+describe('lane D shell keys (campaign 4)', () => {
+  /**
+   * Every key introduced by the i18n + themes + settings-drawer lane. Pinned
+   * here so a component can never reference a string the tables do not own
+   * (the tables' own completeness test separately guarantees EN→TR coverage).
+   */
+  const LANE_D_KEYS = [
+    // TopBar visible text
+    'topbar.png',
+    'topbar.rail',
+    'topbar.settingsLabel',
+    'topbar.replayUnavailable',
+    'topbar.replayUnavailableHint',
+    // ReconnectBanner framing
+    'banner.lostReconnecting',
+    'banner.theFeed',
+    'banner.attempt',
+    'banner.retryNow',
+    'banner.retryNowHint',
+    // SettingsDrawer sections
+    'drawer.sectionAppearance',
+    'drawer.sectionDisplay',
+    'drawer.sectionTrades',
+    'drawer.sectionView',
+    'drawer.sectionAlerts',
+    'drawer.sectionKeyboard',
+    // SettingsDrawer toggles / labels / hints
+    'settings.colormapHint',
+    'settings.contrastHint',
+    'settings.toleranceHint',
+    'settings.normalizationHint',
+    'settings.rowsPerCell',
+    'settings.rowsPerCellOne',
+    'settings.bubble',
+    'settings.allTrades',
+    'settings.off',
+    'settings.bigTradeLabel',
+    'settings.bigTradeHint',
+    'settings.depthChannel',
+    'settings.channel.sum',
+    'settings.channel.bid',
+    'settings.channel.ask',
+    'settings.channel.imbalance',
+    'settings.channelHint.sum',
+    'settings.channelHint.bid',
+    'settings.channelHint.ask',
+    'settings.channelHint.imbalance',
+    'settings.hud',
+    'settings.drawToolbar',
+    'settings.indicatorPicker',
+    'settings.showOnboarding',
+    'settings.followLive',
+    'settings.followPrice',
+    'settings.rightRail',
+    'settings.band.native',
+    'settings.band.wide',
+    'settings.band.full',
+    'settings.band.deep',
+    'settings.bandHint.native',
+    'settings.bandHint.wide',
+    'settings.bandHint.full',
+    'settings.bandHint.deep',
+    'settings.history.off',
+    'settings.history.1h',
+    'settings.history.4h',
+    'settings.history.1d',
+    'settings.history.max',
+    'settings.historyHint',
+    'settings.restoreDefaults',
+    'settings.alertSound',
+    'settings.alertSoundHint',
+    // keysheet actions
+    'keysheet.space',
+    'keysheet.slash',
+    'keysheet.export',
+    'keysheet.measure',
+    'keysheet.alert',
+    'keysheet.hud',
+    'keysheet.channel',
+    'keysheet.theme',
+    'keysheet.draw',
+    'keysheet.indicator',
+    'keysheet.delete',
+    'keysheet.undo',
+    'keysheet.help',
+    'keysheet.pan',
+    'keysheet.zoom',
+    'keysheet.follow',
+    'keysheet.priceTrack',
+    'keysheet.liveEdge',
+    'keysheet.escape',
+    'keysheet.axis',
+    // shortcuts overlay footer
+    'shortcuts.footerToggle',
+    'shortcuts.footerClose',
+  ] as const;
+
+  it('every lane-D key resolves in BOTH tables (never raw-key garbage)', () => {
+    for (const key of LANE_D_KEYS) {
+      expect(en[key], `en owns ${key}`).toBeDefined();
+      expect(tr[key], `tr owns ${key}`).toBeDefined();
+      expect(tFor('en', key)).not.toBe(key);
+      expect(tFor('tr', key)).not.toBe(key);
+    }
+  });
+});

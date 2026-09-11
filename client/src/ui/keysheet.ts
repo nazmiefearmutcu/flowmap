@@ -8,29 +8,29 @@
  * drawings edit chords) — no aspirational ones.
  */
 
-export type KeysheetEntry = Readonly<{ keys: string; action: string }>;
+export type KeysheetEntry = Readonly<{ keys: string; actionKey: string }>;
 
 export const KEYSHEET: readonly KeysheetEntry[] = [
-  { keys: 'Space', action: 'follow live edge · play/pause in replay' },
-  { keys: '/', 'action': '⌘K / Ctrl-K — symbol search' },
-  { keys: 'E', action: 'export the chart as a PNG download' },
-  { keys: 'M', action: 'measure tool — drag on the chart for Δprice / Δtime / Δdepth' },
-  { keys: 'A', action: 'price alert at the crosshair price (list: bell button on the chart)' },
-  { keys: 'H', action: 'perf HUD — fps / frame ms / uploads / draws / cache' },
-  { keys: 'C', action: 'cycle depth channel: sum → bid → ask → imbalance' },
-  { keys: 'T', action: 'cycle color theme: midnight → paper → swiss → amber → sea' },
-  { keys: 'D', action: 'toggle the draw toolbar (trendline · hline · ray · rect · fib · text)' },
-  { keys: 'I', action: 'toggle the indicator picker' },
-  { keys: 'Del', action: 'delete the selected drawing' },
-  { keys: 'Ctrl+Z', action: 'undo drawings · Ctrl+Shift+Z / Ctrl+Y redo' },
-  { keys: '?', action: 'toggle this shortcuts overlay' },
-  { keys: '← → ↑ ↓', action: 'pan time / price (chart focused)' },
-  { keys: '+ / −', action: 'zoom time (chart focused)' },
-  { keys: 'F', action: 'toggle time follow (chart focused)' },
-  { keys: 'P', action: 'price track on/off · Shift+P re-fit' },
-  { keys: 'R', action: 'return to the live edge' },
-  { keys: 'Esc', action: 'close dialogs (search · settings · this overlay) · cancel a measure drag · cancel / deselect a drawing' },
-  { keys: 'axis wheel / drag', action: 'price zoom / scale · dbl-click re-fit' },
+  { keys: 'Space', actionKey: 'keysheet.space' },
+  { keys: '/', actionKey: 'keysheet.slash' },
+  { keys: 'E', actionKey: 'keysheet.export' },
+  { keys: 'M', actionKey: 'keysheet.measure' },
+  { keys: 'A', actionKey: 'keysheet.alert' },
+  { keys: 'H', actionKey: 'keysheet.hud' },
+  { keys: 'C', actionKey: 'keysheet.channel' },
+  { keys: 'T', actionKey: 'keysheet.theme' },
+  { keys: 'D', actionKey: 'keysheet.draw' },
+  { keys: 'I', actionKey: 'keysheet.indicator' },
+  { keys: 'Del', actionKey: 'keysheet.delete' },
+  { keys: 'Ctrl+Z', actionKey: 'keysheet.undo' },
+  { keys: '?', actionKey: 'keysheet.help' },
+  { keys: '← → ↑ ↓', actionKey: 'keysheet.pan' },
+  { keys: '+ / −', actionKey: 'keysheet.zoom' },
+  { keys: 'F', actionKey: 'keysheet.follow' },
+  { keys: 'P', actionKey: 'keysheet.priceTrack' },
+  { keys: 'R', actionKey: 'keysheet.liveEdge' },
+  { keys: 'Esc', actionKey: 'keysheet.escape' },
+  { keys: 'axis wheel / drag', actionKey: 'keysheet.axis' },
 ] as const;
 
 /** Target classification subset needed to judge a help toggle (mirrors input/keys.ts). */

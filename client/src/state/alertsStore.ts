@@ -12,10 +12,12 @@
  *
  * Trigger semantics: an alert is `above` (fires when price >= alert price) or
  * `below` (fires when price <= alert price), decided at creation from the live
- * reference price. Firing is edge-triggered — a fired alert stays `triggered`
- * (it does not re-fire every tick while price sits beyond it) until the user
- * snoozes/re-arms or deletes it. A snooze mutes for {@link SNOOZE_MS} and re-arms
- * the alert afterwards.
+ * reference price. Firing is edge-triggered with HYSTERESIS: a fired alert
+ * records `rearmPx = level ∓ band` and stays `triggered` (no re-fire while price
+ * sits beyond it) until price returns PAST that band — then the latch clears and
+ * the NEXT crossing fires. `snoozeAlert` is an explicit user mute for
+ * {@link SNOOZE_MS}; `rearmAlert` is the explicit re-arm. The automatic path is
+ * the band, never a timer.
  *
  * Toast delivery goes through the `window.__flowmapToast?.(msg)` hook ONLY —
  * the Toaster component (another lane) binds to that global; this module never
@@ -39,6 +41,13 @@ export interface PriceAlert {
   triggeredAt: number | null;
   /** While set (ms epoch), the alert is muted and will not evaluate. */
   snoozedUntil: number | null;
+  /**
+   * Hysteresis re-arm level, set at fire time to `level ∓ band` (band =
+   * {@link REARM_BAND_FRAC} of the level, floored at {@link REARM_BAND_EPS}).
+   * While price stays beyond it the alert cannot fire again; once price returns
+   * past it, `triggered` clears and the NEXT crossing fires. null while armed.
+   */
+  rearmPx: number | null;
 }
 
 /** One entry in the triggered log (bounded ring, newest LAST). */
@@ -52,6 +61,12 @@ export interface AlertLogEntry {
   crossedAt: number;
   /** Trigger time, ms epoch. */
   at: number;
+  /**
+   * The alert's direction at fire time (true = fires on a rise). Optional for
+   * hand-built fixtures; live entries always carry it so an exact-touch fire
+   * is labeled by its own direction instead of price comparison (R2-L4).
+   */
+  above?: boolean;
 }
 
 /** Immutable whole-store view the overlays read. */
@@ -69,6 +84,20 @@ export const MAX_ALERTS_PER_SYMBOL = 50;
 export const LOG_CAP = 200;
 /** A snoozed alert stays muted this long, then re-arms. */
 export const SNOOZE_MS = 60_000;
+/** Hysteresis re-arm band as a fraction of the alert level (0.1%). */
+export const REARM_BAND_FRAC = 0.001;
+/** Smallest re-arm band, so a near-zero level still gets a usable band. */
+export const REARM_BAND_EPS = 1e-9;
+
+/**
+ * The re-arm level for an alert that just fired: `level ∓ band`, i.e. BELOW the
+ * level for an `above` alert and ABOVE it for a `below` alert. Price must return
+ * past this line before the alert can fire a second time.
+ */
+export function rearmPriceFor(level: number, above: boolean): number {
+  const band = Math.max(Math.abs(level) * REARM_BAND_FRAC, REARM_BAND_EPS);
+  return above ? level - band : level + band;
+}
 
 /** localStorage key prefix; the subscription key is appended (`…:<market>:<symbol>`). */
 export const STORAGE_PREFIX = 'flowmap.alerts.v1:';
@@ -104,6 +133,33 @@ function getStorage(): StorageLike | null {
   return storage;
 }
 
+/**
+ * Enumerate every key in a Storage-shaped backend. `localStorage` exposes
+ * `length` + `key(i)`; the test doubles add a `keys()` enumerator. Browsers and
+ * doubles both go through the same best-effort guard.
+ */
+function storageKeys(s: StorageLike): string[] {
+  const sweep = s as StorageLike & {
+    keys?: () => string[];
+    length?: number;
+    key?: (i: number) => string | null;
+  };
+  try {
+    if (typeof sweep.keys === 'function') return sweep.keys();
+    if (typeof sweep.length === 'number' && typeof sweep.key === 'function') {
+      const out: string[] = [];
+      for (let i = 0; i < sweep.length; i += 1) {
+        const k = sweep.key(i);
+        if (typeof k === 'string') out.push(k);
+      }
+      return out;
+    }
+  } catch {
+    /* enumeration denied — callers degrade to the in-memory set */
+  }
+  return [];
+}
+
 /** Test seam: inject a storage double (or null to disable persistence). */
 export function setAlertsStorage(s: StorageLike | null): void {
   storage = s;
@@ -137,15 +193,27 @@ function normalizeAlerts(key: string, raw: unknown): PriceAlert[] {
     const a = (o ?? {}) as Partial<PriceAlert> & Record<string, unknown>;
     const price = typeof a.price === 'number' ? a.price : Number(a.price);
     if (!Number.isFinite(price)) continue;
+    const above = a.above !== false;
+    const triggered = a.triggered === true;
+    const rearmRaw = typeof a.rearmPx === 'number' ? a.rearmPx : Number(a.rearmPx);
+    // Legacy payloads (pre-hysteresis) carry a latched `triggered` with no band:
+    // adopt the unified re-arm by deriving the band from the level, so an old
+    // alert cannot stay stuck beyond its level forever.
+    const rearmPx = Number.isFinite(rearmRaw)
+      ? rearmRaw
+      : triggered
+        ? rearmPriceFor(price, above)
+        : null;
     out.push({
       id: typeof a.id === 'string' && a.id ? a.id : nextId(),
       key,
       price,
-      above: a.above !== false,
+      above,
       createdAt: typeof a.createdAt === 'number' ? a.createdAt : Date.now(),
-      triggered: a.triggered === true,
+      triggered,
       triggeredAt: typeof a.triggeredAt === 'number' ? a.triggeredAt : null,
       snoozedUntil: typeof a.snoozedUntil === 'number' ? a.snoozedUntil : null,
+      rearmPx,
     });
   }
   return out;
@@ -199,6 +267,27 @@ export function subscribeAlerts(cb: () => void): () => void {
   };
 }
 
+/**
+ * Every alert key known in memory OR persisted under {@link STORAGE_PREFIX}
+ * (persisted lists are loaded into memory as a side effect). The alert monitor
+ * uses this to find symbols it must poll for; the order is stable but
+ * unspecified. Empty-list keys are included — callers filter by `alertsFor`.
+ */
+export function allAlertKeys(): string[] {
+  const keys = new Set<string>(byKey.keys());
+  const s = getStorage();
+  if (s) {
+    for (const k of storageKeys(s)) {
+      if (k.startsWith(STORAGE_PREFIX) && k.length > STORAGE_PREFIX.length) {
+        const key = k.slice(STORAGE_PREFIX.length);
+        keys.add(key);
+        loadKey(key); // materialize so the monitor + popover see the alerts
+      }
+    }
+  }
+  return [...keys];
+}
+
 // --- mutations -------------------------------------------------------------------
 
 /**
@@ -226,6 +315,7 @@ export function addAlert(key: string, price: number, refPx?: number, now = Date.
     triggered: false,
     triggeredAt: null,
     snoozedUntil: null,
+    rearmPx: null,
   };
   list.push(alert);
   persistKey(key);
@@ -249,20 +339,41 @@ export function removeAlert(id: string): boolean {
 }
 
 /**
- * Snooze / re-arm: clears the triggered latch and mutes the alert for
- * {@link SNOOZE_MS}, after which it evaluates (and can fire) again.
+ * Snooze: mute the alert for {@link SNOOZE_MS}, after which it evaluates again.
+ * This is the explicit user mute and does NOT touch the fired latch/re-arm band
+ * — automatic re-arming is the hysteresis band's job (see {@link evaluateAlerts}).
  */
 export function snoozeAlert(id: string, now = Date.now()): boolean {
   for (const [key, list] of byKey) {
     const a = list.find((x) => x.id === id);
     if (a) {
-      a.triggered = false;
-      a.triggeredAt = null;
       a.snoozedUntil = now + SNOOZE_MS;
       persistKey(key);
       bump();
       return true;
     }
+  }
+  return false;
+}
+
+/**
+ * Manual re-arm: clears the mute and, for a FIRED alert, the latch while keeping
+ * its hysteresis band — so it still only fires again after price returns past
+ * the band (no whipsaw re-fire). Re-arming an alert that is already past its
+ * band/armed simply drops the mute. Returns true when the alert existed.
+ */
+export function rearmAlert(id: string): boolean {
+  for (const [key, list] of byKey) {
+    const a = list.find((x) => x.id === id);
+    if (!a) continue;
+    a.snoozedUntil = null;
+    if (a.triggered) {
+      a.triggered = false;
+      if (a.rearmPx === null) a.rearmPx = rearmPriceFor(a.price, a.above);
+    }
+    persistKey(key);
+    bump();
+    return true;
   }
   return false;
 }
@@ -276,12 +387,19 @@ export function clearAlerts(key: string): void {
 }
 
 /**
- * Evaluate the ACTIVE alerts of `key` against the latest market price (last
- * trade, else BBO mid — the caller's choice). Fires every alert whose threshold
- * the price has crossed and that is not already triggered or snoozed; appends
- * one log entry per firing (oldest dropped past {@link LOG_CAP}) and notifies
- * the toast hook. No-op (zero churn, no listener notify) when nothing fires or
- * the price is unusable. Safe to call at the bookStore flush cadence.
+ * Evaluate the alerts of `key` against the latest market price (last trade,
+ * else BBO mid — the caller's choice). Fires every alert whose threshold the
+ * price has crossed and that is not already triggered or snoozed; appends one
+ * log entry per firing (oldest dropped past {@link LOG_CAP}) and notifies the
+ * toast hook.
+ *
+ * Hysteresis: an alert that carries a `rearmPx` never fires — instead the call
+ * checks whether price has returned PAST that band, and if so clears the latch
+ * (and the band) so the NEXT crossing fires. The clearing itself counts as a
+ * change (persisted + listeners notified) but never fires in the same tick.
+ *
+ * No-op (zero churn, no listener notify) when nothing fires and nothing re-arms,
+ * or the price is unusable. Safe to call at the bookStore flush cadence.
  */
 export function evaluateAlerts(
   key: string,
@@ -293,13 +411,27 @@ export function evaluateAlerts(
   const list = loadKey(key);
   if (list.length === 0) return [];
   const fired: AlertLogEntry[] = [];
+  let changed = false;
   for (const a of list) {
-    if (a.triggered) continue;
+    // Pending return-past-band (fired, or manually re-armed while fired): this
+    // alert may only FIRE after the band clears, never in the same tick.
+    if (a.rearmPx !== null) {
+      const returned = a.above ? px <= a.rearmPx : px >= a.rearmPx;
+      if (returned) {
+        a.triggered = false;
+        a.rearmPx = null;
+        changed = true;
+      }
+      continue;
+    }
+    if (a.triggered) continue; // legacy latch without a band — explicit re-arm only
     if (a.snoozedUntil !== null && now < a.snoozedUntil) continue;
     const hit = a.above ? px >= a.price : px <= a.price;
     if (!hit) continue;
     a.triggered = true;
     a.triggeredAt = now;
+    a.rearmPx = rearmPriceFor(a.price, a.above);
+    changed = true;
     fired.push({
       id: nextId(),
       key,
@@ -307,12 +439,13 @@ export function evaluateAlerts(
       price: a.price,
       crossedAt: px,
       at: now,
+      above: a.above,
     });
   }
-  if (fired.length === 0) return [];
-  log = log.concat(fired).slice(-LOG_CAP);
-  // Persist the triggered latch: the stored schema carries `triggered`, and a
-  // reload must not re-fire (toast + log + pulse) an alert whose level the
+  if (!changed) return [];
+  if (fired.length > 0) log = log.concat(fired).slice(-LOG_CAP);
+  // Persist the new latch / re-armed state: the stored schema carries both, and
+  // a reload must not re-fire (toast + log + pulse) an alert whose level the
   // price is still beyond — the store header promises edge-trigger semantics.
   persistKey(key);
   if (toast !== null) {
@@ -332,7 +465,14 @@ export function evaluateAlerts(
 export function alertToastMessage(e: AlertLogEntry): string {
   const fmt = (n: number): string =>
     n.toLocaleString('en-US', { maximumFractionDigits: 8 });
-  return `Alert · crossed ${e.price < e.crossedAt ? 'above' : 'below'} ${fmt(e.price)} (now ${fmt(e.crossedAt)})`;
+  // The log entry owns the full `market:symbol` key; the toast must NAME the
+  // symbol or a walk-away user cannot tell which chart cried (survey 3 #1).
+  // Direction: prefer the entry's own flag (exact-touch fires are unambiguous);
+  // hand-built/legacy fixtures without it fall back to the price comparison.
+  const colon = e.key.indexOf(':');
+  const symbol = colon >= 0 ? e.key.slice(colon + 1) : e.key;
+  const above = e.above ?? e.price < e.crossedAt;
+  return `Alert ${symbol} · crossed ${above ? 'above' : 'below'} ${fmt(e.price)} (now ${fmt(e.crossedAt)})`;
 }
 
 /** The toast hook: `window.__flowmapToast?.(msg)` — bound by the shell lane. */
@@ -360,18 +500,9 @@ export function clearPersistedForTest(): void {
   const s = getStorage();
   if (!s) return;
   try {
-    const doomed: string[] = [];
-    // StorageLike has no enumerate; the test double may add one, else sweep keys.
-    const sweep = s as StorageLike & { keys?: () => string[]; length?: number; key?: (i: number) => string | null };
-    if (typeof sweep.keys === 'function') {
-      for (const k of sweep.keys()) if (k.startsWith(STORAGE_PREFIX)) doomed.push(k);
-    } else if (typeof sweep.length === 'number' && typeof sweep.key === 'function') {
-      for (let i = 0; i < (sweep.length ?? 0); i += 1) {
-        const k = sweep.key(i);
-        if (k && k.startsWith(STORAGE_PREFIX)) doomed.push(k);
-      }
+    for (const k of storageKeys(s)) {
+      if (k.startsWith(STORAGE_PREFIX)) s.removeItem?.(k);
     }
-    for (const k of doomed) s.removeItem?.(k);
   } catch {
     /* best-effort */
   }

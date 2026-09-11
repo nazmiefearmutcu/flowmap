@@ -303,4 +303,32 @@ describe('TopBar i18n shell (C7)', () => {
     act(() => setLocale('en'));
     expect(container.querySelector('[data-testid="mode-live"]')!.textContent).toBe('Live');
   });
+
+  it('translates the visible PNG / Rail / Settings / replay-unavailable strings in TR (lane D)', () => {
+    act(() =>
+      useFlowMapStore.setState({
+        subscription: { market: 'binance-spot', symbol: 'BTCUSDT', mode: 'live', band: 'deep' },
+        replayUnavailable: true,
+      }),
+    );
+    const { container } = render(topbar());
+    // EN defaults first — byte-identical to the pre-i18n shell.
+    expect(container.querySelector('[data-testid="export-png"]')!.textContent).toContain('PNG');
+    expect(container.querySelector('[data-testid="rail-toggle"]')!.textContent).toBe('Rail');
+    expect(container.querySelector('[data-testid="settings-open"]')!.textContent).toContain(
+      'Settings',
+    );
+    expect(container.querySelector('[data-testid="replay-unavailable"]')!.textContent).toBe(
+      'no recording — replay unavailable',
+    );
+
+    act(() => setLocale('tr'));
+    expect(container.querySelector('[data-testid="rail-toggle"]')!.textContent).toBe('Şerit');
+    expect(container.querySelector('[data-testid="settings-open"]')!.textContent).toContain(
+      'Ayarlar',
+    );
+    expect(container.querySelector('[data-testid="replay-unavailable"]')!.textContent).toBe(
+      'Kayıt yok — tekrar oynatma kullanılamıyor',
+    );
+  });
 });

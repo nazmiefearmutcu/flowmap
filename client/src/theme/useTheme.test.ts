@@ -188,7 +188,7 @@ describe('ONE theme store — lazy resolution, single writer (fix 2026-09-10 F1-
   /** Mounts a probe that records every useTheme() value it renders with. */
   function mountProbe(): { seen: ThemeId[]; unmount: () => void } {
     const seen: ThemeId[] = [];
-    const probe = (props: { onValue: (t: ThemeId) => void }): null => {
+    const Probe = (props: { onValue: (t: ThemeId) => void }): null => {
       const { theme } = useTheme();
       props.onValue(theme);
       return null;
@@ -198,7 +198,7 @@ describe('ONE theme store — lazy resolution, single writer (fix 2026-09-10 F1-
     let root!: Root;
     act(() => {
       root = createRoot(container);
-      root.render(createElement(probe, { onValue: (t: ThemeId) => seen.push(t) }));
+      root.render(createElement(Probe, { onValue: (t: ThemeId) => seen.push(t) }));
     });
     return {
       seen,
@@ -231,14 +231,14 @@ describe('ONE theme store — lazy resolution, single writer (fix 2026-09-10 F1-
     unmount();
   });
 
-  it('setTheme("sea") then cycleTheme() wraps to midnight (store read, not a stale default)', () => {
+  it('setTheme("sea") then cycleTheme() advances in registry order (store read, not a stale default)', () => {
     mockPrefersLight(false);
     localStorage.clear();
     resetThemeStoreForTest();
     setTheme('sea');
-    expect(cycleTheme()).toBe('midnight');
-    expect(getTheme()).toBe('midnight');
-    expect(document.documentElement.dataset.theme).toBe('midnight');
+    expect(cycleTheme()).toBe('paper-deut');
+    expect(getTheme()).toBe('paper-deut');
+    expect(document.documentElement.dataset.theme).toBe('paper-deut');
   });
 
   it('cycle continues from the resolved first-run seed: paper → swiss (the 3-press desync regression)', () => {

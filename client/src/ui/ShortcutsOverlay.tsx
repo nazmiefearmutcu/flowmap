@@ -114,13 +114,14 @@ export function ShortcutsOverlay({ onClose }: ShortcutsOverlayProps): JSX.Elemen
           {KEYSHEET.map((entry) => (
             <div key={entry.keys} className="keysheet__row">
               <kbd className="keysheet__keys">{entry.keys}</kbd>
-              <span className="keysheet__action">{entry.action}</span>
+              <span className="keysheet__action">{t(entry.actionKey)}</span>
             </div>
           ))}
         </div>
         <div className="keyshelp__foot">
           <span>
-            <kbd>?</kbd> toggle · <kbd>esc</kbd> close
+            <kbd>?</kbd> {t('shortcuts.footerToggle')} · <kbd>esc</kbd>{' '}
+            {t('shortcuts.footerClose')}
           </span>
         </div>
       </div>

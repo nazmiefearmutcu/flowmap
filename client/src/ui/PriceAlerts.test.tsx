@@ -16,6 +16,16 @@ import { useFlowMapStore } from '../state/store';
 import { resetProbeSpotForTest, recordProbeSpot } from './lastProbe';
 import { PriceAlerts, marketPriceNow } from './PriceAlerts';
 
+vi.mock('./alertSound', () => ({
+  playAlertSound: vi.fn(() => true),
+  resetAlertSoundForTest: vi.fn(),
+  BEEP_MIN_GAP_MS: 150,
+}));
+
+import { playAlertSound } from './alertSound';
+
+const playMock = vi.mocked(playAlertSound);
+
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mounted: Array<{ container: HTMLElement; root: Root }> = [];
@@ -72,6 +82,7 @@ beforeEach(() => {
   resetAlertsForTest();
   setAlertsStorage(memStorage());
   clearPersistedForTest();
+  playMock.mockClear();
   useFlowMapStore.setState({
     subscription: { market: 'sim', symbol: 'SIM-DEMO', mode: 'live', band: 'native' },
     gridEpoch: 0,
@@ -172,6 +183,8 @@ describe('PriceAlerts', () => {
     expect(fired!.className).toContain('alert-line--pulse');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toContain('105');
+    expect(toasts[0]).toContain('SIM-DEMO'); // P7: the toast names the symbol
+    expect(playMock).toHaveBeenCalledTimes(1); // one chime per fired batch
 
     // Pulse is transient; the triggered state persists.
     await act(async () => {
@@ -245,5 +258,65 @@ describe('PriceAlerts', () => {
       addAlert('binance:BTCUSDT', 60000, 59000);
     });
     expect(container.querySelectorAll('.alert-line')).toHaveLength(1);
+  });
+
+  it('chimes once per fired BATCH (several crossings in one tick = one beep)', async () => {
+    vi.useFakeTimers();
+    addAlert('sim:SIM-DEMO', 102, 101)!; // both cross on a 105/107 book
+    addAlert('sim:SIM-DEMO', 103, 101)!;
+    const { container } = render(
+      <PriceAlerts rendererRef={fakeRenderer((row) => row * 10)} soundEnabled />,
+    );
+    installBook(105, 107);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(container.querySelectorAll('.alert-line--triggered')).toHaveLength(2);
+    expect(playMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never chimes when the alertSound setting is off', async () => {
+    vi.useFakeTimers();
+    addAlert('sim:SIM-DEMO', 105, 101)!;
+    const { container } = render(
+      <PriceAlerts rendererRef={fakeRenderer((row) => row * 10)} soundEnabled={false} />,
+    );
+    installBook(105, 107);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(container.querySelector('.alert-line--triggered')).not.toBeNull();
+    expect(playMock).not.toHaveBeenCalled();
+  });
+
+  it('P7: replay mode never evaluates (or latches) alerts on historical prices', async () => {
+    vi.useFakeTimers();
+    const toasts: string[] = [];
+    (window as { __flowmapToast?: unknown }).__flowmapToast = (msg: string) => toasts.push(msg);
+    addAlert('sim:SIM-DEMO', 105, 101)!; // above → a live book crossing would fire
+    useFlowMapStore.setState({
+      subscription: { market: 'sim', symbol: 'SIM-DEMO', mode: 'replay', band: 'native' },
+    });
+    const { container } = render(<PriceAlerts rendererRef={fakeRenderer((row) => row * 10)} />);
+    installBook(105, 107);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(toasts).toHaveLength(0);
+    expect(alertsFor('sim:SIM-DEMO')[0].triggered).toBe(false); // latch NOT burned by replay
+    expect(playMock).not.toHaveBeenCalled();
+
+    // Back to LIVE: the real crossing fires immediately.
+    act(() => {
+      useFlowMapStore.setState({
+        subscription: { market: 'sim', symbol: 'SIM-DEMO', mode: 'live', band: 'native' },
+      });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(alertsFor('sim:SIM-DEMO')[0].triggered).toBe(true);
+    expect(toasts).toHaveLength(1);
+    expect(container.querySelector('.alert-line--triggered')).not.toBeNull();
   });
 });

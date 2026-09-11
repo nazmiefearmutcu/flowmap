@@ -32,6 +32,7 @@ import { TimeAxis } from './ui/TimeAxis';
 import { Timeline } from './ui/Timeline';
 import { Toaster } from './ui/Toaster';
 import { TopBar } from './ui/TopBar';
+import { Watchlist } from './ui/Watchlist';
 import { runPngExport } from './ui/exportPng';
 import type { SymbolSearchHandle } from './ui/SymbolSearch';
 import {
@@ -41,6 +42,7 @@ import {
   saveSettings,
   type FlowMapSettings,
 } from './ui/settings';
+import { useAlertMonitor } from './state/alertMonitor';
 import { bookStore } from './state/bookStore';
 import { sessionResetKey, setFlowMapTransport, useFlowMapStore } from './state/store';
 import type { SocketLike } from './net/connection';
@@ -136,6 +138,10 @@ export function App() {
   // human-frequency.
   const { theme } = useTheme();
 
+  // Campaign-4 P4: evaluates armed alerts for NON-active symbols by polling
+  // `/api/quote` through the shared quoteFeed (visibility-gated, stale-skipping).
+  useAlertMonitor();
+
   // ONE mapping pair for every data-space overlay (CD measure / CF drawings /
   // CG indicators). `rendererChartMap` closes over the renderer REF, so each
   // `fromChart`/`toChart` call reads the LIVE camera/cache at call time — the
@@ -220,6 +226,8 @@ export function App() {
     // Depth display channel (contract C2 — CB's setter, optional-chained so a
     // build without it keeps the default 'sum' rendering).
     renderer.setDepthChannel?.(settingsRef.current.depthChannel);
+    // Tick grouping (campaign-4 P1 — optional-chained for the same reason).
+    renderer.setTickGrouping?.(settingsRef.current.tickGrouping);
 
     if (!perfMode && !normalizeMode && !overlaysMode && !panelsMode) {
       useFlowMapStore
@@ -265,6 +273,7 @@ export function App() {
       r.setColormap(settings.colormap); // idempotent
       r.setNormPercentile(settings.normPercentile); // idempotent
       r.setDepthChannel?.(settings.depthChannel); // C2, idempotent
+      r.setTickGrouping?.(settings.tickGrouping); // P1, idempotent
       // Both follows are edge-triggered so they never fight a manual gesture,
       // and each compares against the renderer's LIVE state (a gesture changes
       // the camera without writing settings, so comparing only against the
@@ -577,7 +586,7 @@ export function App() {
               getTimeBase={() => rendererRef.current?.timeline()?.timeBase ?? null}
             />
             <MeasureTool containerRef={stageViewportRef} map={chartMap} />
-            <PriceAlerts rendererRef={rendererRef} />
+            <PriceAlerts rendererRef={rendererRef} soundEnabled={settings.alertSound} />
             <Crosshair canvasRef={canvasRef} rendererRef={rendererRef} />
             <HeatLegend colormap={settings.colormap} channel={settings.depthChannel} />
             <PerfHud rendererRef={rendererRef} visible={settings.hudVisible} onToggle={toggleHud} />
@@ -604,6 +613,13 @@ export function App() {
         </div>
         {settings.railVisible && (
           <aside className="right-rail" data-testid="right-rail">
+            <Watchlist
+              activeKey={`${activeMarket}:${activeSymbol}`}
+              onSelect={(key) => {
+                const i = key.indexOf(':');
+                if (i > 0) onSelectSymbol(key.slice(0, i), key.slice(i + 1));
+              }}
+            />
             <DomLadder />
             <Tape bigTradeUsd={settings.bigTradeUsd} />
           </aside>

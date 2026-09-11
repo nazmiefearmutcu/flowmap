@@ -17,7 +17,7 @@ import type { SocketLike } from './net/connection';
 import { resetDrawingsForTest } from './drawings/store';
 import { resetIndicatorStoreForTest } from './indicators/store';
 import { setLocale } from './i18n';
-import { getTheme, resetThemeStoreForTest, setTheme } from './theme';
+import { getTheme, resetThemeStoreForTest, setTheme, THEME_IDS } from './theme';
 import { markOnboarded, ONBOARDING_KEY } from './ui/OnboardingCard';
 import { resetToasts } from './ui/Toaster';
 
@@ -179,10 +179,9 @@ describe('App integration smoke', () => {
     fireKey('t');
     expect(document.documentElement.dataset.theme).toBe('paper');
     expect(container.querySelector('[data-testid="mode-toggle"]')).not.toBeNull();
-    fireKey('t');
-    fireKey('t');
-    fireKey('t');
-    fireKey('t'); // wraps back to midnight
+    // campaign-4: the registry grew — walk the FULL cycle back home. One press
+    // was already consumed above, so length-1 more wraps around.
+    for (let i = 0; i < THEME_IDS.length - 1; i++) fireKey('t');
     expect(document.documentElement.dataset.theme).toBe('midnight');
   });
 
