@@ -324,11 +324,11 @@ async def test_transient_flush_failure_retries_and_session_continues(
         return True
 
     await asyncio.wait_for(_wait_flushed(), timeout=5)
-    await _wait_for(
-        lambda: bool(list((tmp_path / "rec").rglob("*-columns-*.parquet"))) or None
-    )
-    # Retry state reset by the successful flush.
-    assert sess._rec_failures == 0 and sess._rec_retry_at is None
+    # Wait on the RESET STATE, not the parquet file: the flush thread writes the
+    # file before the loop resumes the coroutine that clears the retry counters
+    # (races on slower runners — pin order on the event loop's own state).
+    await _wait_for(lambda: sess._rec_failures == 0 and sess._rec_retry_at is None)
+    assert list((tmp_path / "rec").rglob("*-columns-*.parquet"))
 
     # Broadcasting continued after the failure the whole time.
     later = [e for e in _drain(client) if isinstance(e, DepthColumn) and e.final]
@@ -383,10 +383,9 @@ async def test_flush_failure_cooldown_skips_immediate_retry(tmp_path, monkeypatc
     await sess.start()
     for i in range(4):  # crosses the cadence of 2 -> first flush attempt
         feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
-    await _wait_for(lambda: calls["n"] >= 1)
-    assert sess._rec_failures == 1
+    await _wait_for(lambda: sess._rec_failures == 1 and sess._rec_retry_at is not None)
     cooldown_end = sess._rec_retry_at
-    assert cooldown_end is not None and cooldown_end > clock_ns["now"]
+    assert cooldown_end > clock_ns["now"]
 
     attempts = calls["n"]
     # More columns arrive while the cooldown is active: no new flush attempt.
@@ -399,8 +398,7 @@ async def test_flush_failure_cooldown_skips_immediate_retry(tmp_path, monkeypatc
     # (and fails again, escalating the backoff).
     clock_ns["now"] = cooldown_end + 1
     feed.q.put_nowait(BookState(8 * DT, *_book(100.0)))
-    await _wait_for(lambda: calls["n"] >= attempts + 1)
-    assert sess._rec_failures == 2  # backoff escalated
+    await _wait_for(lambda: sess._rec_failures == 2)  # backoff escalated
     feed.q.put_nowait(None)
     await asyncio.wait_for(sess.run_task, timeout=5)
 
