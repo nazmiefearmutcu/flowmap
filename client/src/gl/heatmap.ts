@@ -33,6 +33,24 @@ export interface HeatmapEncoding {
   ramp: number;
 }
 
+/** The depth channel a user can view (contract C2; `Renderer.setDepthChannel`). */
+export type DepthChannel = 'sum' | 'bid' | 'ask' | 'imbalance';
+
+/** `DepthChannel` → the shader's `u_channel` code. */
+export const DEPTH_CHANNEL_CODE: Record<DepthChannel, number> = {
+  sum: 0,
+  bid: 1,
+  ask: 2,
+  imbalance: 3,
+};
+
+export const DEFAULT_DEPTH_CHANNEL: DepthChannel = 'sum';
+
+/** Clamp an arbitrary (settings-persisted) value to a valid channel. */
+export function depthChannelOf(value: unknown): DepthChannel {
+  return value === 'bid' || value === 'ask' || value === 'imbalance' ? value : 'sum';
+}
+
 const TILE_UNIT = 0;
 const LUT_UNIT = 1;
 const MIP1_UNIT = 2;
@@ -125,19 +143,43 @@ interface LevelSel {
 }
 
 /**
- * Choose the SUM-mip level from how many price rows collapse into one device
- * pixel (`rowsPerPixel`). Level L's texels sum a 4^L×4^L block, so the coarsest
- * level whose block is ≤ the pixel footprint is picked; the leftover is covered
- * by 1..4 finer-level taps summed in the shader (the "in-between zoom" case).
- * With no mips (`maxLevel === 0`) this is the identity: level 0, one tap.
+ * Choose the SUM-mip level from the pixel's footprint on BOTH axes.
+ *
+ * `rowsPerPixel` (price axis): how many price rows collapse into one device
+ * pixel. `colPerPixel` (time axis): how many columns a device pixel spans when
+ * the user zooms OUT in time — historically ignored, which made a time-zoomed-out
+ * + price-zoomed-in view sample hundreds of columns per pixel through the 3-tap
+ * level-0 blur (temporal aliasing: walls strobe while panning, thin events
+ * vanish). Level L's texels sum a 4^L×4^L block, so the level picked is the
+ * COARSER of the two axes' needs (`max`), clamped to `maxLevel`; the leftover row
+ * footprint is covered by 1..4 finer-level taps summed in the shader.
+ *
+ * Per-level intensity/floor semantics are UNCHANGED: intensity sums
+ * `nRowTaps` row-blocks and divides the column dimension by blk, so a view at a
+ * given (level, taps) reads the same whether that level was chosen by the row or
+ * the column axis — a col-driven level behaves exactly like a price zoom to the
+ * same blk, and the black point keeps scaling by `nRowTaps·blk` (the row
+ * footprint at that level). With no mips (`maxLevel === 0`) this is the
+ * identity: level 0, one tap.
+ *
+ * `colPerPixel` defaults to 1 so every historical 2-arg call — and every
+ * row-driven selection — produces EXACTLY the pre-axis output.
  */
-export function selectLevel(rowsPerPixel: number, maxLevel: number): LevelSel {
-  if (maxLevel <= 0 || rowsPerPixel <= 1) return { level: 0, blk: 1, nRowTaps: 1 };
+export function selectLevel(
+  rowsPerPixel: number,
+  maxLevel: number,
+  colPerPixel = 1,
+): LevelSel {
+  if (maxLevel <= 0) return { level: 0, blk: 1, nRowTaps: 1 };
+  const rpp = Number.isFinite(rowsPerPixel) ? rowsPerPixel : 1;
+  const cpp = Number.isFinite(colPerPixel) ? colPerPixel : 1;
   // log4 via log2/2: Math.log2 is exact for powers of two on V8, so the
   // level boundary at exact 4^k footprints no longer rides on log/log rounding.
-  const level = Math.max(0, Math.min(maxLevel, Math.floor(Math.log2(rowsPerPixel) / 2)));
+  const rowLevel = rpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(rpp) / 2)) : 0;
+  const colLevel = cpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(cpp) / 2)) : 0;
+  const level = Math.max(0, Math.max(rowLevel, colLevel));
   const blk = 4 ** level;
-  const nRowTaps = Math.max(1, Math.min(4, Math.round(rowsPerPixel / blk)));
+  const nRowTaps = Math.max(1, Math.min(4, Math.round(rpp / blk)));
   return { level, blk, nRowTaps };
 }
 
@@ -194,6 +236,7 @@ type UniformName =
   | 'u_floor'
   | 'u_floorScale'
   | 'u_ramp'
+  | 'u_channel'
   | 'u_level'
   | 'u_blk'
   | 'u_nRowTaps';
@@ -226,6 +269,17 @@ export class Heatmap {
    * reassignment of that object cannot clobber it, exactly like {@link gamma}.
    */
   floor = 0;
+
+  /**
+   * Depth channel mode (§9, contract C2): the `u_channel` code fed to the
+   * fragment shader — 0 sum (the default, bit-identical to pre-channel
+   * releases), 1 bid, 2 ask, 3 imbalance (divergent row). Kept outside
+   * {@link encoding} like {@link gamma}: the renderer owns the setting
+   * (`setDepthChannel`) and re-applies it after every Heatmap re-creation,
+   * forcing 'sum' whenever the honesty ramp is SYNTH (§7 — fabricated equity
+   * depth never wears the directional bid/ask colors).
+   */
+  channel = DEPTH_CHANNEL_CODE.sum;
 
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
@@ -282,6 +336,7 @@ export class Heatmap {
       u_floor: loc('u_floor'),
       u_floorScale: loc('u_floorScale'),
       u_ramp: loc('u_ramp'),
+      u_channel: loc('u_channel'),
       u_level: loc('u_level'),
       u_blk: loc('u_blk'),
       u_nRowTaps: loc('u_nRowTaps'),
@@ -356,16 +411,20 @@ export class Heatmap {
     gl.uniform1f(this.u.u_norm, this.encoding.norm);
     gl.uniform1f(this.u.u_gamma, this.gamma);
     gl.uniform1i(this.u.u_ramp, this.encoding.ramp);
+    gl.uniform1i(this.u.u_channel, this.channel);
 
-    // Rows collapsing into one device pixel drive the mip level (§8.3): coarser
-    // level as price zooms out. rowScale is a uniform and the buffer height is
-    // fixed, so this is one selection for the whole frame — a constant the shader
-    // branches on coherently. mip *generation* is incremental (append time); mip
-    // *sampling* is ≤4 texelFetch per pixel, keeping the draw O(1) in history.
-    // `mips` (not this.mips): an unusable chain must level-select to 0 too.
+    // Rows AND columns collapsing into one device pixel drive the mip level
+    // (§8.3): coarser level as either axis zooms out — the column half is what
+    // keeps a time-zoomed-out + price-zoomed-in view from aliasing through the
+    // level-0 blur. rowScale/colScale are uniforms and the buffer size is fixed,
+    // so this is one selection for the whole frame — a constant the shader
+    // branches on coherently. mip *generation* is incremental (append time);
+    // mip *sampling* is ≤4 texelFetch per pixel, keeping the draw O(1) in
+    // history. `mips` (not this.mips): an unusable chain must level-select to 0.
     const maxLevel = mips ? mips.maxLevel : 0;
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
-    const sel = selectLevel(rowsPerPixel, maxLevel);
+    const colsPerPixel = view.colScale / Math.max(1, gl.drawingBufferWidth);
+    const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel);
     gl.uniform1i(this.u.u_level, sel.level);
     gl.uniform1i(this.u.u_blk, sel.blk);
     gl.uniform1i(this.u.u_nRowTaps, sel.nRowTaps);

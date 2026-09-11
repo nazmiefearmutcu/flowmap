@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildClassicLUT,
   buildFlowLUT,
+  buildImbalanceLUT,
   buildInfernoLUT,
   buildLUTAtlas,
   buildSynthLUT,
@@ -401,5 +402,98 @@ describe('clearColorForRamp — the clear color IS LUT entry 0 (B-6, no reset fl
 
   it('falls back to inferno for an unknown row (never NaN into clearColor)', () => {
     expect(clearColorForRamp(999)).toEqual(clearColorForRamp(RAMP_INFERNO));
+  });
+});
+
+describe('atlas golden bytes — rows 0..3 are BIT-IDENTICAL to pre-channel releases', () => {
+  // Captured from buildLUTAtlas() before the divergent imbalance row (row 4)
+  // was appended. Rows 0 (real depth) and 1 (synth amber) are pinned by the
+  // e2e parity matrix; 2 and 3 by user-facing continuity. If one of these
+  // bytes moves, a density ramp changed — that must NEVER ride along with an
+  // unrelated feature.
+  const GOLDEN: Record<string, string[]> = {
+    row0: [
+      '2,2,8,255', '3,2,10,255', '15,7,37,255', '28,12,65,255', '69,17,90,255',
+      '115,23,89,255', '165,34,68,255', '195,44,49,255', '198,47,46,255',
+      '209,62,39,255', '238,115,26,255', '251,181,43,255', '253,199,42,255',
+      '255,215,40,255', '255,216,40,255',
+    ],
+    row1: [
+      '6,3,0,255', '7,3,0,255', '25,10,0,255', '43,17,0,255', '80,30,0,255',
+      '122,55,0,255', '164,80,0,255', '186,98,3,255', '189,102,5,255',
+      '199,115,9,255', '229,155,24,255', '246,197,97,255', '251,219,150,255',
+      '255,239,197,255', '255,240,200,255',
+    ],
+    row2: [
+      '2,4,12,255', '2,4,14,255', '5,12,45,255', '9,19,79,255', '6,66,136,255',
+      '1,120,190,255', '11,166,211,255', '19,193,219,255', '21,197,221,255',
+      '33,209,217,255', '178,226,91,255', '241,230,39,255', '248,229,36,255',
+      '255,228,32,255', '255,228,32,255',
+    ],
+    row3: [
+      '5,8,14,255', '5,9,15,255', '10,17,27,255', '16,25,40,255', '23,42,60,255',
+      '25,60,78,255', '31,83,92,255', '40,99,99,255', '42,101,100,255',
+      '59,112,102,255', '137,147,98,255', '219,180,86,255', '237,199,95,255',
+      '254,215,103,255', '255,216,104,255',
+    ],
+  };
+  const SAMPLES = [0, 1, 16, 32, 64, 96, 128, 147, 150, 160, 192, 224, 240, 254, 255];
+
+  it('the appended imbalance row did not renumber or rebyte rows 0..3', () => {
+    const atlas = buildLUTAtlas();
+    expect(LUT_ROWS).toBe(5); // appended, never renumbered
+    for (let row = 0; row < 4; row++) {
+      const golden = GOLDEN[`row${row}`];
+      for (let k = 0; k < SAMPLES.length; k++) {
+        const o = (row * LUT_SIZE + SAMPLES[k]) * 4;
+        const got = `${atlas[o]},${atlas[o + 1]},${atlas[o + 2]},${atlas[o + 3]}`;
+        expect(got, `row ${row} @ ${SAMPLES[k]}`).toBe(golden[k]);
+      }
+    }
+  });
+});
+
+describe('imbalance LUT (row 4) — the DIVERGENT channel ramp', () => {
+  const lut = buildImbalanceLUT();
+  const luma = (i: number): number =>
+    0.299 * lut[i * 4] + 0.587 * lut[i * 4 + 1] + 0.114 * lut[i * 4 + 2];
+
+  it('is a 256x1 RGBA8 buffer with opaque alpha', () => {
+    expect(lut.length).toBe(LUT_SIZE * 4);
+    for (let i = 0; i < LUT_SIZE; i++) expect(lut[i * 4 + 3]).toBe(255);
+  });
+
+  it('is DIVERGENT: quiet dark neutral midpoint, bright blue and orange extremes', () => {
+    expect(luma(128)).toBeLessThan(30); // balanced book stays near-background
+    expect(luma(0)).toBeGreaterThan(120); // max ask dominance — bright
+    expect(luma(255)).toBeGreaterThan(120); // max bid dominance — bright
+    // NOT monotone overall (that would make it a density ramp).
+    expect(luma(255)).toBeGreaterThan(luma(128));
+    expect(luma(0)).toBeGreaterThan(luma(128));
+  });
+
+  it('is CVD-safe blue<->orange: ask side B-dominant, bid side R-dominant', () => {
+    // Hue reads clearly everywhere except the few indices adjacent to the
+    // neutral midpoint (smooth sRGB interpolation needs ~10 indices to swing
+    // from the blue-tinted slate neutral to R-dominant amber) — the transition
+    // band is pinned quiet by the luma assertion below.
+    for (let i = 0; i <= 120; i++) {
+      expect(lut[i * 4 + 2], `blue side @${i}`).toBeGreaterThan(lut[i * 4]);
+    }
+    for (let i = 140; i < LUT_SIZE; i++) {
+      expect(lut[i * 4], `orange side @${i}`).toBeGreaterThan(lut[i * 4 + 2]);
+    }
+    for (let i = 120; i <= 140; i++) {
+      expect(luma(i)).toBeLessThan(45); // transition band stays quiet
+    }
+  });
+
+  it('is monotone in brightness AWAY from the midpoint on each side', () => {
+    for (let i = 128; i < LUT_SIZE - 1; i++) {
+      expect(luma(i + 1)).toBeGreaterThanOrEqual(luma(i) - 1.0);
+    }
+    for (let i = 1; i <= 128; i++) {
+      expect(luma(i - 1)).toBeGreaterThanOrEqual(luma(i) - 1.0);
+    }
   });
 });

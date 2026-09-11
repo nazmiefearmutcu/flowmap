@@ -208,22 +208,43 @@ export class OverlayManager {
 
   // --- draw ---------------------------------------------------------------------
 
+  // Reused per-draw scratch (micro GC, survey #8): a dirty frame must not
+  // allocate. GridMap + OverlayFrame are refilled in place; the badge option
+  // objects are mutated in place.
+  private readonly gm = new GridMap(
+    { colOffset: 0, colScale: 0, rowOffset: 0, rowScale: 0 },
+    { drawW: 0, drawH: 0, cssW: 0, cssH: 0 },
+    null,
+    null,
+  );
+  private readonly frameScratch: OverlayFrame = {
+    gm: this.gm,
+    solid: null as unknown as SolidBatch,
+    points: null as unknown as PointBatch,
+    text: null as unknown as TextLayer,
+    resident: null,
+    capability: null,
+    columnArrays: null as unknown as OverlayFrame['columnArrays'],
+  };
+  private readonly badgeOpts: Array<{ align: 'left' | 'right'; color: string; size: number; bg: string }> = [
+    { align: 'left', color: '', size: 9, bg: OVERLAY.badgeBg },
+    { align: 'left', color: '', size: 9, bg: OVERLAY.badgeBg },
+  ];
+
   draw(ctx: OverlayDrawContext): void {
-    const gm = new GridMap(ctx.view, ctx.dims, ctx.time, ctx.price);
-    const frame: OverlayFrame = {
-      gm,
-      solid: this.solid,
-      points: this.points,
-      text: this.text,
-      resident: ctx.resident,
-      capability: ctx.capability,
-      columnArrays: ctx.columnArrays,
-    };
+    this.gm.refill(ctx.view, ctx.dims, ctx.time, ctx.price);
+    const frame = this.frameScratch;
+    frame.solid = this.solid;
+    frame.points = this.points;
+    frame.text = this.text;
+    frame.resident = ctx.resident;
+    frame.capability = ctx.capability;
+    frame.columnArrays = ctx.columnArrays;
 
     // Text layer: size to the viewport, clear once, draw faint gridlines behind.
     this.text.syncSize(ctx.dims.cssW, ctx.dims.cssH, ctx.dpr);
     this.text.clear();
-    if (this.visibility.axes) drawGridlines(this.text, gm);
+    if (this.visibility.axes) drawGridlines(this.text, this.gm);
 
     // GL overlays in spec draw order (each flushes its own geometry → z-order).
     if (this.visibility.profile) this.profile.draw(frame);
@@ -243,11 +264,11 @@ export class OverlayManager {
     if (this.visibility.axes) {
       if (this.priceAxis) {
         this.priceAxis.syncSize(this.priceAxis.canvas.clientWidth, ctx.dims.cssH, ctx.dpr);
-        drawPriceAxis(this.priceAxis, gm, this.visibility.price ? this.priceLine.last() : null);
+        drawPriceAxis(this.priceAxis, this.gm, this.visibility.price ? this.priceLine.last() : null);
       }
       if (this.timeAxis) {
         this.timeAxis.syncSize(ctx.dims.cssW, this.timeAxis.canvas.clientHeight, ctx.dpr);
-        drawTimeAxis(this.timeAxis, gm);
+        drawTimeAxis(this.timeAxis, this.gm);
       }
     }
   }
@@ -276,16 +297,18 @@ export class OverlayManager {
   private drawHonestyBadges(ctx: OverlayDrawContext): void {
     const cap = ctx.capability;
     if (!cap) return;
-    const badges: Array<{ text: string; color: string }> = [];
+    let n = 0;
+    let y = 14;
     if (this.visibility.bubbles && typeof cap.tape === 'string' && cap.tape !== 'tick') {
-      badges.push({ text: 'BUBBLES 1m AGG', color: OVERLAY.event.css });
+      const opts = this.badgeOpts[n++];
+      opts.color = OVERLAY.event.css;
+      this.text.badge(6, y, 'BUBBLES 1m AGG', opts);
+      y += 18;
     }
     if (this.visibility.vwap && cap.vwap === 'approx') {
-      badges.push({ text: 'VWAP approx', color: OVERLAY.vwap.css });
-    }
-    let y = 14;
-    for (const b of badges) {
-      this.text.badge(6, y, b.text, { align: 'left', color: b.color, size: 9, bg: OVERLAY.badgeBg });
+      const opts = this.badgeOpts[n++];
+      opts.color = OVERLAY.vwap.css;
+      this.text.badge(6, y, 'VWAP approx', opts);
       y += 18;
     }
   }

@@ -11,6 +11,11 @@
  *     saturated yellow-gold), kept as a user-selectable option.
  *   - row 3 (RAMP_FLOW): the DEFAULT — a restrained "deep water" ramp (near-black
  *     slate → dark navy → deep teal → sage → sand → bright gold). See FLOW_STOPS.
+ *   - row 4 (RAMP_IMBALANCE): the DIVERGENT row for the depth-channel
+ *     `imbalance` mode (§9 channel modes) — NOT a density ramp: signed
+ *     (bid−ask)/(bid+ask) maps through it, ask-dominant → blue, bid-dominant →
+ *     orange, balanced → near-background neutral. Magnitude is brightness on
+ *     each side; the blue↔orange axis is the CVD-safe divergent pair.
  *
  * **Why the default changed.** The classic thermal ramp crosses half its
  * luminance range by LUT index 96 and spent its top third in bright
@@ -51,13 +56,16 @@ export const RAMP_INFERNO = 0;
 export const RAMP_SYNTH = 1;
 export const RAMP_CLASSIC = 2;
 export const RAMP_FLOW = 3;
+/** Divergent imbalance row (signed bid↔ask dominance) — never a `u_ramp`
+ *  density ramp; the channel-3 shader branch fetches it directly. */
+export const RAMP_IMBALANCE = 4;
 
 /**
- * Row 0 is "whatever REAL depth renders as" — a contract the e2e parity matrix
- * asserts numerically. RAMP_SYNTH is pinned at row 1 for the same reason. New
- * ramps therefore append at row 2 and above; they never renumber these two.
+ * Rows 0 (REAL depth) and 1 (SYNTH amber) are pinned by the e2e parity matrix —
+ * new ramps therefore append and never renumber. Row 4 appends the divergent
+ * imbalance row; rows 0..3 keep their exact bytes (pinned by golden tests).
  */
-export const LUT_ROWS = 4;
+export const LUT_ROWS = 5;
 
 /** The colormap families a user can choose between (the §9 Settings knob). */
 export type Colormap = 'flow' | 'inferno' | 'classic';
@@ -154,6 +162,27 @@ const FLOW_STOPS: Stop[] = [
   { t: 1.0, rgb: [255, 216, 104] },
 ];
 
+// Imbalance (the DIVERGENT row): signed order-flow imbalance d=(bid−ask)/(bid+ask)
+// maps t = d·0.5 + 0.5 onto this row. Design constraints, in priority order:
+//   1. DIVERGENT, not monotone: balanced density must read QUIET (the midpoint is
+//      a near-background dark slate, so a calm two-sided book does not light up),
+//      while both extremes get BRIGHT — magnitude = brightness per side.
+//   2. CVD-SAFE axis: blue ↔ orange is the canonical deuteranopia/protanopia-safe
+//      divergent pair (never red↔green).
+//   3. The side hue is unambiguous at every magnitude: ask-side is B-dominant
+//      (B > R) at every stop below the midpoint; bid-side is R-dominant above it.
+// Per-side luminance is monotone away from the midpoint (blue side darkens toward
+// neutral, orange side brightens away from it) — pinned by lut.test.ts.
+const IMBALANCE_STOPS: Stop[] = [
+  { t: 0.0, rgb: [148, 202, 255] }, // d = −1: strong ask dominance — bright ice blue
+  { t: 0.18, rgb: [62, 128, 196] }, // clear blue
+  { t: 0.38, rgb: [24, 52, 92] }, // deep blue, quieting
+  { t: 0.5, rgb: [11, 15, 22] }, // d = 0: balanced — near-background neutral slate
+  { t: 0.62, rgb: [92, 62, 26] }, // deep amber, waking
+  { t: 0.82, rgb: [204, 128, 46] }, // clear orange
+  { t: 1.0, rgb: [255, 206, 110] }, // d = +1: strong bid dominance — bright amber
+];
+
 /** Atlas row → stop list. The single source of truth for both the GPU texture
  *  and the HTML legend gradient, so they can never drift apart. */
 const RAMP_STOPS: Record<number, Stop[]> = {
@@ -161,6 +190,7 @@ const RAMP_STOPS: Record<number, Stop[]> = {
   [RAMP_SYNTH]: SYNTH_STOPS,
   [RAMP_CLASSIC]: CLASSIC_STOPS,
   [RAMP_FLOW]: FLOW_STOPS,
+  [RAMP_IMBALANCE]: IMBALANCE_STOPS,
 };
 
 /**
@@ -260,6 +290,11 @@ export function buildFlowLUT(): Uint8Array {
   return buildRamp(FLOW_STOPS);
 }
 
+/** The divergent imbalance ramp (row 4). NOT luminance-monotone by design. */
+export function buildImbalanceLUT(): Uint8Array {
+  return buildRamp(IMBALANCE_STOPS);
+}
+
 /**
  * A CSS `linear-gradient` colour-stop list for an atlas row, low → high.
  *
@@ -269,7 +304,21 @@ export function buildFlowLUT(): Uint8Array {
  * does, so the two agree at every point rather than only at the stops.
  */
 export function rampCssGradient(row: number): string {
+  return gradientOfStops(RAMP_STOPS[row] ?? RAMP_STOPS[RAMP_INFERNO]);
+}
+
+/**
+ * {@link rampCssGradient} with the stop list REVERSED (top ↔ bottom) — the
+ * divergent imbalance legend paints the ASK side at the TOP of the bar so the
+ * legend matches the chart's vertical layout (asks above the mid, bids below),
+ * while the LUT row itself is untouched. Same stop list, same source of truth.
+ */
+export function rampCssGradientReversed(row: number): string {
   const stops = RAMP_STOPS[row] ?? RAMP_STOPS[RAMP_INFERNO];
+  return gradientOfStops([...stops].reverse());
+}
+
+function gradientOfStops(stops: Stop[]): string {
   const parts = stops.map((s) => {
     const [r, g, b] = s.rgb.map((v) => Math.round(v));
     return `rgb(${r}, ${g}, ${b}) ${(s.t * 100).toFixed(1)}%`;
@@ -287,6 +336,7 @@ export function buildLUTAtlas(): Uint8Array {
   atlas.set(buildSynthLUT(), RAMP_SYNTH * LUT_SIZE * 4);
   atlas.set(buildClassicLUT(), RAMP_CLASSIC * LUT_SIZE * 4);
   atlas.set(buildFlowLUT(), RAMP_FLOW * LUT_SIZE * 4);
+  atlas.set(buildImbalanceLUT(), RAMP_IMBALANCE * LUT_SIZE * 4);
   return atlas;
 }
 

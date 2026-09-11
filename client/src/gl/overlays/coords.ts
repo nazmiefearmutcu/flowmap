@@ -84,15 +84,20 @@ export function mapScale(p: PriceMap): PriceScale {
 }
 
 /**
- * Immutable per-frame snapshot of the camera transform + epoch geometry. Overlays
- * hold one for the duration of a draw and read coordinates off it; nothing here
- * mutates, so it is trivially pure/testable.
+ * Per-frame snapshot of the camera transform + epoch geometry. Overlays hold one
+ * for the duration of a draw and read coordinates off it; nothing here mutates
+ * during a draw, so it is trivially pure/testable.
+ *
+ * The instance itself is REFILLED per frame by the overlay manager (`refill`) —
+ * a dirty frame must not allocate (micro GC) — so a GridMap must not be retained
+ * across frames. Constructing fresh instances remains fully supported (the
+ * constructor and the refill write the same fields).
  */
 export class GridMap {
-  readonly view: HeatmapView;
-  readonly dims: SurfaceDims;
-  readonly time: TimeMap | null;
-  readonly price: PriceMap | null;
+  view: HeatmapView;
+  dims: SurfaceDims;
+  time: TimeMap | null;
+  price: PriceMap | null;
 
   constructor(
     view: HeatmapView,
@@ -104,6 +109,15 @@ export class GridMap {
     this.dims = dims;
     this.time = time;
     this.price = price;
+  }
+
+  /** Point this GridMap at a new frame's view + geometry (no allocation). */
+  refill(view: HeatmapView, dims: SurfaceDims, time: TimeMap | null, price: PriceMap | null): this {
+    this.view = view;
+    this.dims = dims;
+    this.time = time;
+    this.price = price;
+    return this;
   }
 
   /** Whether `(ts_ns, price)` events can be placed (both affines known). */

@@ -226,3 +226,22 @@ describe('GridMap under a NON-UNIFORM price scale', () => {
     expect(remapRowSpan(120, a, { p0: 999, step: 2 })).toBe(30);
   });
 });
+
+describe('GridMap.refill (micro GC — reused per dirty frame)', () => {
+  it('refill writes the same fields the constructor does', () => {
+    const g = new GridMap(view, dims, null, null);
+    expect(g.hasEvents).toBe(false);
+    g.refill(view, dims, time, price);
+    expect(g.view).toBe(view);
+    expect(g.dims).toBe(dims);
+    expect(g.time).toBe(time);
+    expect(g.price).toBe(price);
+    expect(g.hasEvents).toBe(true);
+    // The refilled map reads identically to a fresh one over the same inputs.
+    const fresh = new GridMap(view, dims, time, price);
+    expect(g.tsToCol(123n)).toBe(fresh.tsToCol(123n));
+    expect(g.priceToRow(101)).toBe(fresh.priceToRow(101));
+    expect(g.cssX(5.5)).toBe(fresh.cssX(5.5));
+    expect(g.clipY(10.25)).toBe(fresh.clipY(10.25));
+  });
+});

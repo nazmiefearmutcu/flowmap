@@ -273,4 +273,133 @@ describe('Renderer (fake GL harness)', () => {
     expect(gl.callsOf('drawArrays').length).toBe(drawsBefore);
     expect(toDataURL).not.toHaveBeenCalled();
   });
+
+  // --- C2: depth channel modes ---------------------------------------------------
+
+  /** The u_channel value of every heatmap draw since `before`. */
+  function channelValues(before: number): number[] {
+    return gl
+      .callsOf('uniform1i')
+      .slice(before)
+      .filter((c) => (c.args[0] as { uniform?: string } | null)?.uniform === 'u_channel')
+      .map((c) => c.args[1] as number);
+  }
+
+  it('C2: the default channel is sum (u_channel 0) on every draw', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    const before = gl.callsOf('uniform1i').length;
+    store.emit(makeCol(1, true));
+    pump(16);
+    expect(r.getDepthChannel()).toBe('sum');
+    expect(channelValues(before)).toEqual([0]);
+  });
+
+  it('C2: setDepthChannel cycles u_channel; invalid values fall back to sum', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    let before = gl.callsOf('uniform1i').length;
+
+    r.setDepthChannel('bid');
+    expect(r.getDepthChannel()).toBe('bid');
+    pump(32);
+    expect(channelValues(before)).toEqual([1]);
+
+    before = gl.callsOf('uniform1i').length;
+    r.setDepthChannel('ask');
+    r.setDepthChannel('imbalance');
+    pump(48);
+    // One draw between captures renders the LATEST setter value.
+    expect(channelValues(before)).toEqual([3]);
+
+    // A settings-persisted garbage value never poisons the shader.
+    before = gl.callsOf('uniform1i').length;
+    r.setDepthChannel('nonsense' as never);
+    expect(r.getDepthChannel()).toBe('sum');
+    pump(64);
+    expect(channelValues(before)).toEqual([0]);
+  });
+
+  it('C2 honesty: a SYNTH session forces u_channel 0 whatever the user picked', () => {
+    const { r, store } = makeRenderer();
+    store.state.capability = { depth: 'SYNTH' }; // §7 honesty tier
+    store.emit(makeCol(0, true)); // MODE_L2 column, but capability says SYNTH
+    r.setDepthChannel('imbalance');
+    const before = gl.callsOf('uniform1i').length;
+    store.emit(makeCol(1, true));
+    pump(16);
+    expect(r.getDepthChannel()).toBe('imbalance'); // the SETTING is remembered...
+    expect(channelValues(before)).toEqual([0]); // ...but SYNTH renders sum
+  });
+
+  // --- C3: renderer.stats() ------------------------------------------------------
+
+  it('C3: stats() EMA-converges fps, counts uploads/draws, and reports cache bytes', () => {
+    const { r, store } = makeRenderer();
+    const s0 = r.stats();
+    expect(s0.fps).toBe(0); // no frame yet
+    expect(s0.frameMs).toBe(0);
+    expect(s0.uploads).toBe(0);
+    expect(s0.draws).toBe(0);
+    expect(s0.cacheBytes).toBeGreaterThan(0); // slot metadata (pool fills on put)
+
+    const n = 12;
+    for (let s = 0; s < n; s++) store.emit(makeCol(s, true));
+    expect(r.stats().uploads).toBe(n);
+
+    let ts = 1000;
+    for (let f = 0; f < 60; f++) {
+      pump(ts);
+      ts += 16.667; // 60 fps rAF cadence
+    }
+    const s1 = r.stats();
+    expect(s1.fps).toBeGreaterThan(55); // converged near 60
+    expect(s1.fps).toBeLessThanOrEqual(60);
+    expect(s1.frameMs).toBeGreaterThanOrEqual(0);
+    expect(s1.draws).toBeGreaterThan(0);
+    expect(s1.cacheBytes).toBeGreaterThan(0);
+    const draws1 = s1.draws;
+
+    // A hung tab (delta > 1 s) is skipped, not folded in as a fake 1 fps.
+    pump(ts + 5000);
+    expect(r.stats().fps).toBeGreaterThan(55);
+
+    // Cumulative counters stay monotonic.
+    expect(r.stats().draws).toBeGreaterThanOrEqual(draws1);
+  });
+
+  it('C3: cacheBytes grows only PAGE-WISE and is fixed once the touched pages stop growing', () => {
+    // Paged pool (fix 2026-09-10 F1-1): pages of 256 slots allocate once on
+    // first touch; re-puts / ring wraps inside resident pages never allocate.
+    const { r, store } = makeRenderer(512);
+    for (let s = 0; s < 100; s++) store.emit(makeCol(s, true)); // page 0 only
+    const bytes = r.stats().cacheBytes;
+    for (let s = 100; s < 250; s++) store.emit(makeCol(s, true)); // still page 0
+    expect(r.stats().cacheBytes).toBe(bytes);
+    for (let s = 250; s < 700; s++) store.emit(makeCol(s, true)); // touches page 1, then wraps
+    expect(r.stats().cacheBytes).toBeGreaterThan(bytes); // one extra page max
+    const capped = r.stats().cacheBytes;
+    for (let s = 700; s < 1200; s++) store.emit(makeCol(s, true)); // wrap within 2 pages
+    expect(r.stats().cacheBytes).toBe(capped);
+  });
+
+  // --- survey #6a: the normalization memo -----------------------------------------
+
+  it('repeated dirty frames with an unchanged window do NOT re-merge tile histograms', () => {
+    const { r, store } = makeRenderer();
+    for (let s = 0; s < 4; s++) store.emit(makeCol(s, true));
+    pump(100); // first draw: the merge actually runs once
+    const norm = r.normalizerForTest;
+    const mergesAfterFold = norm.mergeCount;
+    expect(mergesAfterFold).toBeGreaterThan(0);
+
+    // Redraw the same view several times: the memo must hold.
+    for (let f = 0; f < 5; f++) pump(120 + f * 16);
+    expect(norm.mergeCount).toBe(mergesAfterFold);
+
+    // A NEW final column folds (tilesVersion bump) → the next frame re-merges.
+    store.emit(makeCol(5, true));
+    pump(220);
+    expect(norm.mergeCount).toBeGreaterThan(mergesAfterFold);
+  });
 });

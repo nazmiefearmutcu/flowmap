@@ -3,11 +3,16 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONTRAST,
   DEFAULT_TOLERANCE,
+  DEFAULT_DEPTH_CHANNEL,
+  DEPTH_CHANNEL_CODE,
+  depthChannelOf,
   floorForTolerance,
   gammaForContrast,
   selectLevel,
   TOLERANCE_MAX_FLOOR,
 } from './heatmap';
+import { buildImbalanceLUT, buildFlowLUT, LUT_SIZE } from './lut';
+import { HEATMAP_FRAG } from './shaders/heatmap';
 
 /** The shader's black-point remap, mirrored so its algebra is testable. */
 function remap(t: number, floor: number): number {
@@ -226,5 +231,163 @@ describe('selectLevel (SUM-mip selection) — unchanged by the tolerance work', 
       expect(selectLevel(4 ** k, 16).level).toBe(k);
       expect(selectLevel(4 ** k - 1, 16).level).toBe(Math.max(0, k - 1));
     }
+  });
+});
+
+describe('selectLevel — the TIME axis counts (survey #3)', () => {
+  it('is bit-identical to the row-only selector when colsPerPixel is defaulted/1', () => {
+    for (const rpp of [0.25, 1, 2, 4, 8, 64, 4096]) {
+      expect(selectLevel(rpp, 2)).toEqual(selectLevel(rpp, 2, 1));
+      expect(selectLevel(rpp, 2, 0.5)).toEqual(selectLevel(rpp, 2, 1));
+    }
+  });
+
+  it('climbs a level for time zoom-out while price is zoomed IN (the aliasing fix)', () => {
+    // Whole-session review gesture: colSpan ≫ drawingBufferWidth (hundreds of
+    // columns per pixel) at rowsPerPixel ≤ 1 — historically forced level 0.
+    expect(selectLevel(1, 2, 1).level).toBe(0);
+    expect(selectLevel(1, 2, 4).level).toBe(1);
+    expect(selectLevel(1, 2, 16).level).toBe(2);
+    expect(selectLevel(1, 2, 4096).level).toBe(2); // clamped to maxLevel
+    expect(selectLevel(0.5, 2, 8).level).toBe(1);
+  });
+
+  it('takes the COARSER of the two axes and never regresses below either', () => {
+    expect(selectLevel(16, 2, 1).level).toBe(2); // rows dominate
+    expect(selectLevel(1, 2, 16).level).toBe(2); // cols dominate
+    expect(selectLevel(16, 2, 16).level).toBe(2); // both
+    expect(selectLevel(4, 2, 2).level).toBe(1);
+  });
+
+  it('keeps the row-tap bookkeeping consistent at col-driven levels', () => {
+    // A col-driven level with price zoomed IN collapses to ONE row tap (the
+    // pixel's row footprint ≤ blk) — the same (level, taps) a price zoom to
+    // that level would produce, so intensity semantics do not fork per axis.
+    const sel = selectLevel(1, 2, 20);
+    expect(sel).toEqual({ level: 2, blk: 16, nRowTaps: 1 });
+    expect(selectLevel(1, 2, 8)).toEqual({ level: 1, blk: 4, nRowTaps: 1 });
+    // Non-finite inputs degrade to the identity instead of poisoning the level.
+    expect(selectLevel(Number.NaN, 2, 8)).toEqual({ level: 1, blk: 4, nRowTaps: 1 });
+    expect(selectLevel(8, 2, Number.NaN)).toEqual(selectLevel(8, 2, 1));
+  });
+});
+
+describe('depth channel modes (contract C2) — the intensity chain', () => {
+  // A fixed synthetic column: a bid-heavy wall low in the grid, an ask band
+  // higher up, mirrored here exactly as the fragment shader computes it.
+  const bid = new Float32Array(16);
+  const ask = new Float32Array(16);
+  bid[3] = 250; // dominant bid wall
+  bid[4] = 30;
+  ask[9] = 120; // ask band
+  ask[10] = 40;
+
+  const DECODE = 1;
+  const NORM = 100;
+  const FLOOR = 0.01;
+  const GAMMA = 0.45;
+  const BLK = 1; // level 0: intensity = density (the common live view)
+
+  /** The shader chain from acc.rg to the LUT index — mirrored 1:1 from GLSL. */
+  function lutIndex(accR: number, accG: number, channel: number): number {
+    // GLSL int() truncates toward zero — the historical LUT-index conversion.
+    const toIdx = (t: number): number => Math.trunc(t * 255 + 0.5);
+    if (channel === 3) {
+      const denom = accR + accG;
+      if (denom <= 0) return -1; // background() — flagged, not a ramp index
+      const d = Math.min(1, Math.max(-1, (accR - accG) / denom));
+      return toIdx(d * 0.5 + 0.5);
+    }
+    let intensity = (accR + accG) * DECODE / BLK;
+    if (channel === 1) intensity = accR * DECODE / BLK;
+    else if (channel === 2) intensity = accG * DECODE / BLK;
+    const t1 = Math.min(1, Math.max(0, intensity / Math.max(NORM, 1e-9)));
+    const scale = 1 / Math.max(1 - FLOOR, 1e-6);
+    const t2 = Math.min(1, Math.max(0, (t1 - FLOOR) * scale));
+    const t3 = Math.pow(t2, GAMMA);
+    return toIdx(t3);
+  }
+
+  it("defaults to 'sum' with the historical u_channel code 0", () => {
+    expect(DEFAULT_DEPTH_CHANNEL).toBe('sum');
+    expect(DEPTH_CHANNEL_CODE.sum).toBe(0);
+    expect(DEPTH_CHANNEL_CODE.bid).toBe(1);
+    expect(DEPTH_CHANNEL_CODE.ask).toBe(2);
+    expect(DEPTH_CHANNEL_CODE.imbalance).toBe(3);
+    expect(depthChannelOf(undefined)).toBe('sum');
+    expect(depthChannelOf('nonsense')).toBe('sum');
+    expect(depthChannelOf('ask')).toBe('ask');
+  });
+
+  it('mode 0 computes the EXACT historical expression (bit-identity contract)', () => {
+    // The shader's intensity expression for mode 0 must remain the shipped
+    // string — the golden pixel parity e2e depends on it verbatim.
+    expect(HEATMAP_FRAG).toContain(
+      'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
+    );
+    // And the mirrored chain maps the fixed columns to the same indices the
+    // pre-channel math produces ((bid+ask)/norm → floor → gamma → 0..255).
+    const toIdx = (t: number): number => Math.trunc(t * 255 + 0.5);
+    for (let r = 0; r < 16; r++) {
+      const expected = toIdx(
+        Math.pow(
+          Math.min(1, Math.max(0, ((bid[r] + ask[r]) / NORM - FLOOR) / (1 - FLOOR))),
+          GAMMA,
+        ),
+      );
+      expect(lutIndex(bid[r], ask[r], 0)).toBe(expected);
+    }
+  });
+
+  it('bid/ask modes isolate one side; every mode renders the field distinctly', () => {
+    for (let r = 0; r < 16; r++) {
+      const sum = lutIndex(bid[r], ask[r], 0);
+      const onlyBid = lutIndex(bid[r], ask[r], 1);
+      const onlyAsk = lutIndex(bid[r], ask[r], 2);
+      if (bid[r] > 0 && ask[r] === 0) {
+        expect(onlyBid).toBe(sum); // bid-only cell: sum === bid
+        expect(onlyAsk).toBeLessThan(sum); // ask channel paints it dimmer
+      } else if (ask[r] > 0 && bid[r] === 0) {
+        expect(onlyAsk).toBe(sum);
+        expect(onlyBid).toBeLessThan(sum);
+      }
+      if (bid[r] > 0 && ask[r] > 0) {
+        expect(onlyBid).toBeLessThan(sum);
+        expect(onlyAsk).toBeLessThan(sum);
+      }
+    }
+  });
+
+  it('imbalance is signed, fixed-domain, and maps blue ↔ neutral ↔ orange', () => {
+    const imb = buildImbalanceLUT();
+    // Pure bid wall → orange half of the divergent row; pure ask → blue half.
+    const bidIdx = lutIndex(250, 0, 3);
+    const askIdx = lutIndex(0, 120, 3);
+    expect(bidIdx).toBeGreaterThan(128); // t > 0.5
+    expect(askIdx).toBeLessThan(128); // t < 0.5
+    expect(imb[bidIdx * 4]).toBeGreaterThan(imb[bidIdx * 4 + 2]); // R > B (orange)
+    expect(imb[askIdx * 4 + 2]).toBeGreaterThan(imb[askIdx * 4]); // B > R (blue)
+    // Balanced density → the quiet neutral midpoint, NOT background red.
+    const mid = lutIndex(60, 60, 3);
+    expect(mid).toBe(128);
+    // Magnitude is brightness per side: stronger dominance → farther from 128.
+    expect(lutIndex(250, 10, 3)).toBeGreaterThan(lutIndex(120, 10, 3));
+    expect(lutIndex(10, 250, 3)).toBeLessThan(lutIndex(10, 120, 3));
+  });
+
+  it('the divergent row is quiet at the midpoint and bright at both extremes', () => {
+    const imb = buildImbalanceLUT();
+    const flow = buildFlowLUT();
+    const luma = (lut: Uint8Array, i: number): number =>
+      0.299 * lut[i * 4] + 0.587 * lut[i * 4 + 1] + 0.114 * lut[i * 4 + 2];
+    // Midpoint ≈ the terminal background (a balanced book must not light up).
+    expect(luma(imb, 128)).toBeLessThan(30);
+    // Both extremes are bright and hue-pure (CVD-safe blue/orange axis).
+    expect(luma(imb, 0)).toBeGreaterThan(120);
+    expect(luma(imb, 255)).toBeGreaterThan(120);
+    expect(imb[2]).toBeGreaterThan(imb[0]); // blue end: B > R
+    expect(imb[255 * 4]).toBeGreaterThan(imb[255 * 4 + 2]); // orange end: R > B
+    // The DENSITY default row is untouched by the append (sanity).
+    expect(flow.length).toBe(LUT_SIZE * 4);
   });
 });

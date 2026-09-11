@@ -39,8 +39,8 @@ uniform highp sampler2DArray u_tiles;
 // caller binds u_tiles here too (they are never sampled while u_level == 0).
 uniform highp sampler2DArray u_mip1; // level 1: colsPerTile/4 x rows/4
 uniform highp sampler2DArray u_mip2; // level 2: colsPerTile/16 x rows/16
-// Colormap atlas: 256x4 RGBA8 — row 0 inferno, row 1 synth amber, row 2 classic
-// thermal, row 3 flow (the default).
+// Colormap atlas: 256x5 RGBA8 — row 0 inferno, row 1 synth amber, row 2 classic
+// thermal, row 3 flow (the default), row 4 divergent imbalance (channel 3 only).
 uniform sampler2D u_lut;
 
 // View transform (screen uv -> absolute column/row). Driven by T6; identity-ish
@@ -92,6 +92,21 @@ uniform float u_floorScale;
 
 // Colormap row: 0 = inferno (default), 1 = synth (amber), 2 = classic thermal.
 uniform int u_ramp;
+
+// Depth channel mode (§9 channel modes, contract C2). Coherent uniform branch:
+//   0 = sum        — (bid+ask) total density, the default and the historical
+//                    expression, bit-identical to pre-channel releases.
+//   1 = bid        — bid density only (acc.r).
+//   2 = ask        — ask density only (acc.g).
+//   3 = imbalance  — signed (bid−ask)/(bid+ask), FIXED [−1,1] domain (no
+//                    histogram fit), mapped through the divergent atlas row 4
+//                    (ask = blue, balanced = quiet neutral, bid = orange).
+uniform int u_channel;
+
+// The divergent atlas row (gl/lut.ts RAMP_IMBALANCE). The density u_ramp is NOT
+// redirected in channel 3 — honesty (§7) and the background() readout keep
+// sampling the density ramp; only the imbalance branch indexes this row.
+const int RAMP_IMBALANCE = 4;
 
 // Mip level selection (§8.3 / T7). All three are per-draw CONSTANTS (the CPU
 // derives them from rows-per-pixel, which is a uniform), so every branch below
@@ -207,14 +222,36 @@ void main() {
     }
   }
 
+  // Imbalance channel: signed dominance on a FIXED [−1,1] domain — the norm /
+  // black-point / gamma pipeline below is a density pipeline and must not touch
+  // it (a gamma on a signed value would shift the neutral midpoint). The +eps
+  // of the spec formula is subsumed by the denom > 0 guard: zero density paints
+  // background() exactly like the other channels, keeping an empty field quiet.
+  if (u_channel == 3) {
+    float denom = acc.r + acc.g;
+    if (denom <= 0.0) {
+      fragColor = background();
+      return;
+    }
+    float d = clamp((acc.r - acc.g) / denom, -1.0, 1.0);
+    int li = int((d * 0.5 + 0.5) * 255.0 + 0.5);
+    fragColor = texelFetch(u_lut, ivec2(li, RAMP_IMBALANCE), 0);
+    return;
+  }
+
   // Price rows are SUMMED across the block + taps (a 500-lot wall stays ~500 when
   // tick-grouped). The block's COLUMN dimension is the only thing averaged out
-  // (/blk), so a persistent wall reads at its true size, not blk x brighter — and
-  // NOT diluted the way an average mip (which divides by blk*blk = the full 16^L)
-  // would. That /blk is the "1/16^L rescale folded into normalization" from §8.3,
-  // reduced to the wall-preserving 1/4^L (T9 replaces this with a per-level
-  // histogram percentile).
+  // (/blk), so a persistent wall reads at its true size, not blk x brighter —
+  // and NOT diluted the way an average mip (which divides by blk*blk = the full
+  // 16^L) would. That /blk is the "1/16^L rescale folded into normalization"
+  // from §8.3, reduced to the wall-preserving 1/4^L (T9 replaces this with a
+  // per-level histogram percentile).
+  //
+  // The channel-0 expression is UNCHANGED historical code — mode 0 must stay
+  // bit-identical to pre-channel releases (golden tests pin the LUT index chain).
   float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);
+  if (u_channel == 1) intensity = acc.r * u_decodeScale / float(blk);
+  else if (u_channel == 2) intensity = acc.g * u_decodeScale / float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
   // Black point, then the perceptual display curve. Order matters: clipping
   // AFTER gamma would clip a curve, not a density, and the floor would mean a

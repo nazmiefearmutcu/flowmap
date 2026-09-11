@@ -367,3 +367,80 @@ describe('foldColumnFinal — final columns fold exactly once (B-1)', () => {
     expect(n.totalSamples).toBe(2);
   });
 });
+
+describe('viewport percentile memo (survey #6a — no per-dirty-frame re-merge)', () => {
+  it('repeated calls with an unchanged window return the cached value WITHOUT re-merging', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    addConst(n, 0, 10, 500);
+    addConst(n, 1, 100, 50);
+    const range = tilesRange(0, 1);
+
+    const first = n.viewportPercentile(range, ALL_ROWS, 0);
+    const mergesAfterFirst = n.mergeCount;
+    expect(mergesAfterFirst).toBe(1);
+
+    // Identical key → memo hit: identical value, zero additional merges.
+    for (let i = 0; i < 10; i++) {
+      expect(n.viewportPercentile(range, ALL_ROWS, 0)).toBe(first);
+    }
+    expect(n.mergeCount).toBe(mergesAfterFirst);
+  });
+
+  it('re-merges when the window, percentile, mip level, or histograms change', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    addConst(n, 0, 10, 500);
+    const range0 = tilesRange(0, 0);
+    let merges = 0;
+
+    n.viewportPercentile(range0, ALL_ROWS, 0);
+    merges = n.mergeCount;
+
+    // Percentile change (the Settings Saturation knob) must invalidate.
+    n.percentile = 99;
+    n.viewportPercentile(range0, ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(merges + 1);
+    merges = n.mergeCount;
+
+    // Mip level change must invalidate (the raw is scaled by normMipScale).
+    n.percentile = 97;
+    n.viewportPercentile(range0, ALL_ROWS, 1);
+    expect(n.mergeCount).toBe(merges + 1);
+    merges = n.mergeCount;
+
+    // Window change must invalidate.
+    n.viewportPercentile(tilesRange(0, 1), ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(merges + 1);
+    merges = n.mergeCount;
+
+    // A new fold (tilesVersion bump) must invalidate.
+    addConst(n, 300, 40, 10);
+    n.viewportPercentile(range0, ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(merges + 1);
+    merges = n.mergeCount;
+
+    // reset() must invalidate.
+    n.reset();
+    n.viewportPercentile(range0, ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(merges + 1);
+  });
+
+  it('updateNorm output is unchanged by the memo (EMA math untouched)', () => {
+    const memo = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, emaAlpha: 0.5 });
+    const plain = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, emaAlpha: 0.5 });
+    addConst(memo, 0, 10, 400);
+    addConst(plain, 0, 10, 400);
+
+    // Calling updateNorm repeatedly with the SAME window: the memo skips the
+    // merge, but the EMA must step exactly as if it had re-merged (identical
+    // raw each time).
+    const a: number[] = [];
+    const b: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      a.push(memo.updateNorm(tilesRange(0, 0), ALL_ROWS, 0));
+      b.push(plain.updateNorm(tilesRange(0, 0), ALL_ROWS, 0));
+    }
+    expect(a).toEqual(b);
+    // And the memo actually engaged: six updateNorm calls, ONE merge.
+    expect(memo.mergeCount).toBe(1);
+  });
+});

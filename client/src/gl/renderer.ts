@@ -37,13 +37,24 @@
 
 import { COLS_PER_TILE, TileRing } from './tileRing';
 import {
+  DEFAULT_DEPTH_CHANNEL,
   DEFAULT_DISPLAY_GAMMA,
+  DEPTH_CHANNEL_CODE,
   Heatmap,
   selectLevel,
   TOLERANCE_MAX_FLOOR,
+  depthChannelOf,
+  type DepthChannel,
   type HeatmapView,
 } from './heatmap';
-import { clearColorForRamp, createLUTTexture, rampForMode, RAMP_FLOW, type Colormap } from './lut';
+import {
+  clearColorForRamp,
+  createLUTTexture,
+  rampForMode,
+  RAMP_FLOW,
+  RAMP_SYNTH,
+  type Colormap,
+} from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
 import {
@@ -82,7 +93,7 @@ import {
   type DepthColumn,
   type EpochParams,
 } from '../proto/types';
-import { OverlayManager } from './overlays/manager';
+import { OverlayManager, type OverlayDrawContext } from './overlays/manager';
 import type { OverlayVisibility } from './overlays/frame';
 import {
   mapScale,
@@ -125,6 +136,26 @@ export interface PerfResult {
   drawMs: number[];
   /** Frames drawn during the run. */
   frames: number;
+}
+
+/**
+ * Live render-health counters (contract C3; the PerfHud chip consumes ONLY
+ * this). `fps` and `frameMs` are EMA-smoothed (alpha ≈ 0.1) inside the
+ * existing rAF frame; `uploads`/`draws` are cumulative monotonic counters (a
+ * HUD diffs them between polls); `cacheBytes` is the CPU column-cache pool +
+ * metadata footprint (the exact-readout pool, mirroring the GPU ring).
+ */
+export interface RendererStats {
+  /** EMA-smoothed frames per second (rAF cadence, not dirty frames). */
+  fps: number;
+  /** EMA-smoothed heatmap draw cost in ms (no gl.finish — a cheap sample). */
+  frameMs: number;
+  /** Depth columns uploaded to the GPU ring since renderer creation. */
+  uploads: number;
+  /** Heatmap draw calls since renderer creation. */
+  draws: number;
+  /** CPU column-cache pool + metadata bytes (0 before the first column). */
+  cacheBytes: number;
 }
 
 /**
@@ -177,6 +208,10 @@ const MIN_ROW_PAD = 3;
 const NORM_FLOOR = 6;
 /** Keyboard pan step as a fraction of the current viewport span. */
 const KEY_PAN_FRAC = 0.15;
+/** EMA weight for the per-frame stats ({@link Renderer.stats}, contract C3). */
+const STATS_EMA_ALPHA = 0.1;
+/** Above this many deferred splice columns, batch mip regen into range passes. */
+const MIP_BATCH_MIN_COLS = 8;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -238,6 +273,22 @@ export class Renderer {
   private readonly columnCache: ColumnCache;
   /** Overlays (T10): trades/BBO/VWAP/profile/markers + axes + text layer. */
   private overlays: OverlayManager;
+  /**
+   * Reused overlay-draw context (micro GC): every field is reassigned per dirty
+   * frame, nothing allocated. `columnArrays` reads the (pooled) column cache.
+   */
+  private readonly overlayCtx: OverlayDrawContext = {
+    view: { colOffset: 0, colScale: 0, rowOffset: 0, rowScale: 0 },
+    dims: { drawW: 0, drawH: 0, cssW: 0, cssH: 0 },
+    dpr: 1,
+    resident: null,
+    capability: null,
+    time: null,
+    price: null,
+    columnArrays: (col) => this.columnCache.arrays(col),
+    newestArrays: null,
+  };
+  private readonly overlayResident = { oldest: 0, newest: 0 };
   /** Column⇄time anchor for overlays: newest written column (any is valid). */
   private overlayAnchorSeq = -1;
   private overlayAnchorT0Ns = 0n;
@@ -268,6 +319,8 @@ export class Renderer {
   private lastColMode: number | null = null;
   /** Black point (§9 Tolerance), re-applied to every freshly built Heatmap. */
   private toleranceFloor = 0;
+  /** Depth channel view (contract C2), re-applied like {@link toleranceFloor}. */
+  private depthChannel: DepthChannel = DEFAULT_DEPTH_CHANNEL;
 
   private newestSeq = -1;
   private view: HeatmapView;
@@ -321,6 +374,22 @@ export class Renderer {
   private perf: PerfRun | null = null;
   /** A frame threw and the failure is already surfaced (report-once guard). */
   private frameErrored = false;
+
+  // Live stats (contract C3) — updated in-place inside frame(); no allocations.
+  private statsFpsEma = 0;
+  private statsFrameMsEma = 0;
+  private statsLastRafTs = 0;
+  private statsUploadsN = 0;
+
+  /**
+   * Deferred SUM-mip regeneration range for history-page splices: the loader's
+   * per-column sink extends this instead of firing an FBO pass per appended
+   * column, and the page end flushes ONE range pass per level per tile layer
+   * (survey #6b: a 256-column page used to fire 80 tiny 1-px viewports).
+   * `-1` = nothing pending.
+   */
+  private pendingMipFrom = -1;
+  private pendingMipTo = -1;
 
   private readonly unsubscribeStream: () => void;
   private readonly resizeObserver: ResizeObserver;
@@ -548,6 +617,8 @@ export class Renderer {
     if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
       this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
     }
+    // The channel follows the honesty ramp: a SYNTH session forces 'sum' (§7).
+    this.applyChannel();
   }
 
   /** Heatmap colormap family (§9). Honesty (§7) still wins: a SYNTH feed keeps
@@ -569,6 +640,54 @@ export class Renderer {
     this.toleranceFloor = Math.min(TOLERANCE_MAX_FLOOR, Math.max(0, f));
     if (this.heatmap) this.heatmap.floor = this.toleranceFloor;
     this.dirty = true;
+  }
+
+  /**
+   * Depth channel view (contract C2): how the two RG density channels render.
+   *   'sum'       — (bid+ask) total density. The DEFAULT; bit-identical to
+   *                 pre-channel releases (golden tests).
+   *   'bid'/'ask' — one side's density alone (norm still the two-sided
+   *                 percentile, so intensities scale down accordingly).
+   *   'imbalance' — signed (bid−ask)/(bid+ask) on a FIXED [−1,1] domain (no
+   *                 histogram fit), colored by the divergent atlas row
+   *                 (ask = blue, balanced = quiet neutral, bid = orange).
+   * Honesty (§7) overrides the user: while the SYNTH amber ramp is active the
+   * heatmap keeps rendering 'sum' whatever this is set to (fabricated equity
+   * depth has no honest bid/ask direction to show).
+   */
+  setDepthChannel(mode: DepthChannel): void {
+    this.depthChannel = depthChannelOf(mode);
+    this.applyChannel();
+    this.dirty = true;
+  }
+
+  /** The active depth channel setting (contract C2 getter). */
+  getDepthChannel(): DepthChannel {
+    return this.depthChannel;
+  }
+
+  /** Push the effective channel code into the heatmap (see setDepthChannel). */
+  private applyChannel(): void {
+    if (this.heatmap === null) return;
+    const effective = this.ramp === RAMP_SYNTH ? DEFAULT_DEPTH_CHANNEL : this.depthChannel;
+    const code = DEPTH_CHANNEL_CODE[effective];
+    if (this.heatmap.channel !== code) this.heatmap.channel = code;
+  }
+
+  /**
+   * Render-health snapshot (contract C3): `{fps, frameMs, uploads, draws,
+   * cacheBytes}`. O(1); the counters are maintained inside the existing rAF
+   * frame (fps/frameMs EMA-smoothed with alpha ≈ 0.1); this call only copies
+   * five numbers into the returned object — safe to poll at a few Hz.
+   */
+  stats(): RendererStats {
+    return {
+      fps: this.statsFpsEma,
+      frameMs: this.statsFrameMsEma,
+      uploads: this.statsUploadsN,
+      draws: this.drawCountN,
+      cacheBytes: this.columnCache.byteLength,
+    };
   }
 
   /** Viewport-normalization percentile (§8.3 white-point / Saturation setting).
@@ -680,6 +799,7 @@ export class Renderer {
 
     // Tear down the GL heatmap objects; the next new-session column recreates
     // them at the new row count via createRing (matching the live-path sizing).
+    this.cancelPendingMips();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
@@ -995,19 +1115,26 @@ export class Renderer {
       console.warn(`[flowmap] history column rows ${rows} ≠ ring rows ${ring.rows}; skipping`);
       return;
     }
-    this.writeColumn(col, rows);
+    // Defer the SUM-mip regen: the loader splices a whole page through this sink
+    // synchronously, and one range pass per level per tile layer at page end is
+    // ~80× fewer FBO passes than per-column regeneration (survey #6b).
+    this.writeColumn(col, rows, true);
     this.dirty = true;
   };
 
   /**
    * The shared column write: upload the texel column, regenerate the affected
-   * SUM-mip group (append-time, O(1) in history), refresh the per-slot non-zero
-   * extent, and record (col_seq → t0_ns) for the loader's before_t mapping.
+   * SUM-mip group (append-time, O(1) in history; a history splice DEFERS it to
+   * a batched range pass — see {@link flushPendingMips}), refresh the per-slot
+   * non-zero extent, and record (col_seq → t0_ns) for the loader's before_t
+   * mapping.
    */
-  private writeColumn(col: DepthColumn, rows: number): void {
+  private writeColumn(col: DepthColumn, rows: number, deferMips = false): void {
     const ring = this.ring!;
     ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows);
-    this.mips?.updateFrom(ring, col.col_seq);
+    this.statsUploadsN++;
+    if (deferMips) this.deferMipRange(col.col_seq);
+    else this.mips?.updateFrom(ring, col.col_seq);
 
     const cap = ring.capacityCols;
     const slot = ((col.col_seq % cap) + cap) % cap;
@@ -1046,6 +1173,45 @@ export class Renderer {
     this.overlayAnchorEpoch = col.epoch;
     const r = ring.residentRange();
     if (r !== null) this.overlays.prune(r.oldest, r.newest);
+  }
+
+  // --- deferred SUM-mip batch (history-page splices) -----------------------------
+
+  /** Extend the pending splice range with one spliced column. */
+  private deferMipRange(colSeq: number): void {
+    if (this.pendingMipFrom < 0) {
+      this.pendingMipFrom = colSeq;
+      this.pendingMipTo = colSeq;
+    } else {
+      if (colSeq < this.pendingMipFrom) this.pendingMipFrom = colSeq;
+      if (colSeq > this.pendingMipTo) this.pendingMipTo = colSeq;
+    }
+  }
+
+  /** Cancel any pending splice batch (the ring it referenced is going away). */
+  private cancelPendingMips(): void {
+    this.pendingMipFrom = -1;
+    this.pendingMipTo = -1;
+  }
+
+  /**
+   * Flush the deferred splice range: one batched range pass per mip level per
+   * tile-layer segment (a 256-column page = ~2 passes instead of ~80 tiny
+   * ones). A single-column range keeps the historical per-append path, so a
+   * lone spliced column behaves exactly as before. Called at history-page end
+   * and, as a safety net, by the frame loop.
+   */
+  private flushPendingMips(): void {
+    const from = this.pendingMipFrom;
+    if (from < 0 || this.mips === null || this.ring === null) {
+      this.cancelPendingMips();
+      return;
+    }
+    const to = this.pendingMipTo;
+    this.cancelPendingMips();
+    if (to === from) this.mips.updateFrom(this.ring, from);
+    else if (to - from >= MIP_BATCH_MIN_COLS) this.mips.updateRange(this.ring, from, to);
+    else for (let s = from; s <= to; s++) this.mips.updateFrom(this.ring, s);
   }
 
   private createRing(rows: number): void {
@@ -1095,6 +1261,7 @@ export class Renderer {
    * epoch change rather than a new instrument.
    */
   private recreateRingForRows(rows: number): void {
+    this.cancelPendingMips();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
@@ -1149,6 +1316,8 @@ export class Renderer {
         // survive. Markers likewise, for parity with the live stream.
         for (const bar of resp.bar_cols) this.overlays.onBar(bar);
         for (const marker of resp.markers) this.overlays.onMarker(marker);
+        // Page end: regenerate the deferred SUM-mip range in batched passes.
+        this.flushPendingMips();
         this.dirty = true;
         // Re-arm the per-frame guard: if the visible range still isn't fully
         // resident (a wide pan needs several pages), the next frame fetches the
@@ -1373,12 +1542,19 @@ export class Renderer {
   }
 
   /** SUM-mip level the current view would sample (0/1/2) — drives backfill
-   *  suppression on deep zoom-out (§8.3: level-2 renders from mips). */
+   *  suppression on deep zoom-out (§8.3: level-2 renders from mips). The TIME
+   *  axis counts too: a time-zoomed-out + price-zoomed-in view renders from the
+   *  mips exactly like a price zoom to the same block, so the no-backfill gate
+   *  stays consistent with what the heatmap actually samples. */
   private currentLevel(): number {
     const m = this.mips;
     const maxLevel = m !== null && m.usable ? m.maxLevel : 0;
-    const h = Math.max(1, this.ctx.gl.drawingBufferHeight);
-    return selectLevel(this.view.rowScale / h, maxLevel).level;
+    const gl = this.ctx.gl;
+    return selectLevel(
+      this.view.rowScale / Math.max(1, gl.drawingBufferHeight),
+      maxLevel,
+      this.view.colScale / Math.max(1, gl.drawingBufferWidth),
+    ).level;
   }
 
   /**
@@ -1496,7 +1672,8 @@ export class Renderer {
    * Draw the overlays over the heatmap for the current view. All O(visible): each
    * overlay emits geometry only for the columns/rows in the viewport. Returns
    * early (no cost) when nothing can be placed — no epoch geometry yet, or every
-   * overlay is toggled off.
+   * overlay is toggled off. The context object + dims are reused scratch (micro
+   * GC: nothing here may allocate per frame).
    */
   private drawOverlays(): void {
     if (this.glLost()) return;
@@ -1510,22 +1687,25 @@ export class Renderer {
 
     const gl = this.ctx.gl;
     const range = this.ring?.residentRange() ?? null;
-    overlays.draw({
-      view: this.view,
-      dims: {
-        drawW: gl.drawingBufferWidth,
-        drawH: gl.drawingBufferHeight,
-        cssW: Math.max(1, this.canvas.clientWidth),
-        cssH: Math.max(1, this.canvas.clientHeight),
-      },
-      dpr: window.devicePixelRatio || 1,
-      resident: range ? { oldest: range.oldest, newest: range.newest } : null,
-      capability: this.store.getState().capability,
-      time,
-      price,
-      columnArrays: (col) => this.columnCache.arrays(col),
-      newestArrays: this.newestSeq >= 0 ? this.columnCache.arrays(this.newestSeq) : null,
-    });
+    const ctx = this.overlayCtx;
+    ctx.view = this.view;
+    ctx.dims.drawW = gl.drawingBufferWidth;
+    ctx.dims.drawH = gl.drawingBufferHeight;
+    ctx.dims.cssW = Math.max(1, this.canvas.clientWidth);
+    ctx.dims.cssH = Math.max(1, this.canvas.clientHeight);
+    ctx.dpr = window.devicePixelRatio || 1;
+    if (range !== null) {
+      this.overlayResident.oldest = range.oldest;
+      this.overlayResident.newest = range.newest;
+      ctx.resident = this.overlayResident;
+    } else {
+      ctx.resident = null;
+    }
+    ctx.capability = this.store.getState().capability;
+    ctx.time = time;
+    ctx.price = price;
+    ctx.newestArrays = this.newestSeq >= 0 ? this.columnCache.arrays(this.newestSeq) : null;
+    overlays.draw(ctx);
   }
 
   /**
@@ -1642,6 +1822,7 @@ export class Renderer {
 
     if (this.ringRows > 0) {
       // Rebuild the ring/heatmap/mips at the same geometry; the ring is empty.
+      this.cancelPendingMips();
       this.mips = null;
       this.heatmap = null;
       this.ring = new TileRing(gl, this.ringRows, this.ringLayers);
@@ -1673,12 +1854,27 @@ export class Renderer {
   }
 
   private frame = (ts: number): void => {
-    if (!this.running) return;
-    try {
-      // A lost context can't draw; wait for `restored` to rebuild GL.
-      if (this.glLost()) return;
+      if (!this.running) return;
+      try {
+        // A lost context can't draw; wait for `restored` to rebuild GL.
+        if (this.glLost()) return;
 
-      const perf = this.perf;
+        // Live stats (contract C3): EMA the rAF cadence in place — no
+        // allocations, no GL calls. Deltas >1 s (a suspended tab) are skipped
+        // rather than folded in as a fake 1 fps.
+        if (this.statsLastRafTs > 0) {
+          const dt = ts - this.statsLastRafTs;
+          if (dt > 0 && dt < 1000) {
+            const sample = 1000 / dt;
+            this.statsFpsEma =
+              this.statsFpsEma > 0
+                ? this.statsFpsEma + STATS_EMA_ALPHA * (sample - this.statsFpsEma)
+                : sample;
+          }
+        }
+        this.statsLastRafTs = ts;
+
+        const perf = this.perf;
       if (perf) {
         if (perf.lastTs > 0) perf.deltas.push(ts - perf.lastTs);
         perf.lastTs = ts;
@@ -1703,11 +1899,21 @@ export class Renderer {
       }
 
       if (this.dirty && this.heatmap !== null) {
+        // Safety net: a splice batch whose page-end callback hasn't run yet
+        // (should not happen — onSpliced always fires) flushes before drawing.
+        this.flushPendingMips();
         // T9: refresh u_norm from the visible window before drawing (O(tiles),
         // outside the measured draw cost; a no-op during the perf preload run).
         this.updateNormalization();
         const t0 = performance.now();
         this.heatmap.draw(this.view);
+        // Live stats: EMA the draw cost (no gl.finish — the cheap sample; the
+        // perf-run path below still measures the true flushed cost).
+        const drawCost = performance.now() - t0;
+        this.statsFrameMsEma =
+          this.statsFrameMsEma > 0
+            ? this.statsFrameMsEma + STATS_EMA_ALPHA * (drawCost - this.statsFrameMsEma)
+            : drawCost;
         if (perf) {
           // Flush the (software) GL pipeline so the sample is the true frame cost.
           this.ctx.gl.finish();
@@ -1822,6 +2028,7 @@ export class Renderer {
     if (rows > this.ctx.caps.maxTextureSize) {
       throw new Error(`preloadSynthetic: rows ${rows} > MAX_TEXTURE_SIZE ${this.ctx.caps.maxTextureSize}`);
     }
+    this.cancelPendingMips();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
@@ -1907,6 +2114,7 @@ export class Renderer {
     const wallRow = centerRow;
     const wallBid = 277; // distinctive exact value the crosshair must report
 
+    this.cancelPendingMips();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();
@@ -2122,6 +2330,7 @@ export class Renderer {
     const centerRow = 100; // price 100.0 at step 0.5 → row (100-50)/0.5
     const total = 400;
 
+    this.cancelPendingMips();
     this.mips?.dispose();
     this.heatmap?.dispose();
     this.ring?.dispose();

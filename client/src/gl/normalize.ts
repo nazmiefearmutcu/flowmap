@@ -145,6 +145,21 @@ export class ViewportNormalizer {
   /** Scratch merge accumulator (reused; never leaks between calls). */
   private readonly merged: Int32Array;
 
+  /**
+   * Bumped on EVERY histogram-affecting mutation (a column fold, a tile
+   * eviction, reset). The viewport-percentile memo below keys on it, so a dirty
+   * frame with an unchanged visible window and unchanged histograms skips the
+   * tile merge entirely (survey #6a: updateNormalization runs every dirty
+   * frame; the merge was the only O(tiles·bins) part of it).
+   */
+  private versionN = 0;
+  /** Memo key of the last {@link viewportPercentile} merge. */
+  private memoKey = { oldest: Number.NaN, newest: Number.NaN, percentile: -1, level: -1, version: -1 };
+  /** Memoized merge result (raw percentile, pre-EMA). */
+  private memoRaw = 0;
+  /** Actual merges performed (diagnostics/tests: the memo-hit counter's twin). */
+  private mergeCountN = 0;
+
   private ema = 0;
   private seeded = false;
   /** Last raw viewport percentile computed (pre-EMA); for the settle test. */
@@ -172,6 +187,7 @@ export class ViewportNormalizer {
     this.ema = Math.max(norm, this.floor);
     this.lastRaw = this.ema;
     this.seeded = true;
+    this.versionN++; // the empty-window fallback reads `ema` — re-merge once
   }
 
   /** Whether any non-zero density has been binned (else the seed/floor holds). */
@@ -192,6 +208,16 @@ export class ViewportNormalizer {
       for (let b = 0; b < this.bins; b++) total += hist[b];
     }
     return total;
+  }
+
+  /** Histogram-mutation counter (diagnostics/tests: memo invalidations). */
+  get tilesVersion(): number {
+    return this.versionN;
+  }
+
+  /** Actual tile merges performed (diagnostics/tests: memo effectiveness). */
+  get mergeCount(): number {
+    return this.mergeCountN;
   }
 
   /** Current EMA-smoothed norm (what was last fed to `u_norm`), floored. */
@@ -234,6 +260,7 @@ export class ViewportNormalizer {
         if (a > 0) hist[this.binOf(a)]++;
       }
     }
+    this.versionN++; // histogram changed → the percentile memo is stale
   }
 
   /**
@@ -276,14 +303,23 @@ export class ViewportNormalizer {
       // tile folds again only if its entry is gone, otherwise its histogram
       // would silently never rebuild.
       this.foldedWatermark.delete(victim);
+      this.versionN++; // a tile left the merge set
     }
   }
 
   /**
    * RAW merged viewport percentile (no EMA), already multiplied by the mip
-   * scaling ({@link normMipScale}, = 1). Sums the histograms of every retained
-   * tile that overlaps `[col.oldest, col.newest]` and reads the percentile off
-   * the merged CDF with in-bin log interpolation. `O(tiles in view)`.
+   * scaling ({@link normMipScale}, = 1). MEMOIZED on {visible col range,
+   * percentile, mip level, tilesVersion}: repeated calls with an unchanged
+   * window and no histogram mutation (the every-dirty-frame case while columns
+   * stream in elsewhere, or while the norm EMA settles) return the cached value
+   * WITHOUT re-merging the covered tiles' histograms. Identical output — the
+   * merge is a pure function of exactly those keys.
+   *
+   * Sums the histograms of every retained tile that overlaps
+   * `[col.oldest, col.newest]` and reads the percentile off the merged CDF with
+   * in-bin log interpolation. `O(tiles in view)`, executed at most once per
+   * memo-key change.
    *
    * `row` is accepted per the T9 contract but NOT used to sub-filter: the coarse
    * per-tile histograms are deliberately not row-partitioned (that would cost
@@ -291,6 +327,29 @@ export class ViewportNormalizer {
    * binning already restricts the distribution to the active price band.
    */
   viewportPercentile(col: ColRange, _row: RowRange, mipLevel: number): number {
+    const m = this.memoKey;
+    if (
+      m.version === this.versionN &&
+      m.oldest === col.oldest &&
+      m.newest === col.newest &&
+      m.percentile === this.percentile &&
+      m.level === mipLevel
+    ) {
+      return this.memoRaw;
+    }
+    const raw = this.mergePercentile(col, mipLevel);
+    m.oldest = col.oldest;
+    m.newest = col.newest;
+    m.percentile = this.percentile;
+    m.level = mipLevel;
+    m.version = this.versionN;
+    this.memoRaw = raw;
+    return raw;
+  }
+
+  /** The unmemoized merge: sum covered tiles' histograms, read the percentile. */
+  private mergePercentile(col: ColRange, mipLevel: number): number {
+    this.mergeCountN++;
     const merged = this.merged;
     merged.fill(0);
     let total = 0;
@@ -357,5 +416,7 @@ export class ViewportNormalizer {
     this.ema = 0;
     this.lastRaw = 0;
     this.seeded = false;
+    this.versionN++;
+    this.memoKey.version = -1;
   }
 }

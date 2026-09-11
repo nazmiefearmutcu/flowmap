@@ -47,19 +47,21 @@ layout(location = 0) in vec2 a_pos;
 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
 `;
 
-// 4×4 SUM downsample. Output coords come from gl_FragCoord (the 1-wide viewport
-// is offset to the target column, so int(gl_FragCoord.x) IS that column). Each
-// output texel sums the 4×4 block of the finer level rooted at (4·ox, 4·oy).
+// 4×4 SUM downsample. Output coords come from gl_FragCoord (the viewport is
+// offset to the destination column(s), so int(gl_FragCoord.x) IS the first
+// destination column of the pass). Each output texel sums the 4×4 block of the
+// finer level rooted at (4·ox, 4·oy).
 //
 // validFrom gating: after any col_seq gap (reconnect resume, go-live after deep
 // scroll-back) the ring slots between the old resident window and the new first
 // column still hold PREVIOUS columns. Level 0 masks those stale texels with
 // u_validFrom (see shaders/heatmap.ts); the mips must apply the SAME gate while
 // summing, or a pre-gap column bakes into the mip forever and a zoomed-out view
-// shows a permanently over-bright block. Within the group being summed the four
-// source columns are exactly [u_groupNewest-3 .. u_groupNewest] (group-aligned
-// appends), so each tap's absolute col_seq is known and anything below
-// u_validFrom contributes zero.
+// shows a permanently over-bright block. The group a destination column ox
+// covers ends at ABSOLUTE `u_groupNewest - (u_xEnd - ox)·4`: a single-group pass
+// sets u_xEnd to its own destination column so this reduces to u_groupNewest
+// exactly (the historical behavior), while a batched RANGE pass covers many
+// groups in one draw with u_xEnd at the range's last destination column.
 export const DOWNSAMPLE_FRAG = /* glsl */ `#version 300 es
 precision highp float;
 precision highp int;
@@ -68,9 +70,12 @@ precision highp sampler2DArray;
 uniform highp sampler2DArray u_src;
 uniform int u_srcLayer;
 // First VALID absolute col_seq (TileRing.validFromSeq) and the newest absolute
-// col_seq of the 4-column group this pass sums (see updateFrom).
+// col_seq of the last 4-column group this pass sums (see u_xEnd).
 uniform int u_validFrom;
 uniform int u_groupNewest;
+// Tile-local destination column of the pass's LAST group (itself for a 1-wide
+// pass) — reconstructs each fragment's group end from u_groupNewest.
+uniform int u_xEnd;
 
 out vec4 outColor;
 
@@ -79,12 +84,13 @@ void main() {
   int oy = int(gl_FragCoord.y);
   int bx = ox * 4;
   int by = oy * 4;
+  int gn = u_groupNewest - (u_xEnd - ox) * 4;
   vec2 s = vec2(0.0);
   for (int j = 0; j < 4; j++) {
     for (int i = 0; i < 4; i++) {
       // Mask the source column against the valid window BEFORE summing (the
       // level-0 rule, applied at the source): stale pre-gap texels contribute 0.
-      if (u_groupNewest - 3 + i >= u_validFrom) {
+      if (gn - 3 + i >= u_validFrom) {
         s += texelFetch(u_src, ivec3(bx + i, by + j, u_srcLayer), 0).rg;
       }
     }
@@ -157,6 +163,7 @@ export class MipChain {
   private readonly uSrcLayer: WebGLUniformLocation | null;
   private readonly uValidFrom: WebGLUniformLocation | null;
   private readonly uGroupNewest: WebGLUniformLocation | null;
+  private readonly uXEnd: WebGLUniformLocation | null;
   /**
    * False once a downsample pass finds its FBO incomplete (a driver/alloc
    * failure must not silently paint garbage). The chain then renders nothing
@@ -212,6 +219,7 @@ export class MipChain {
     this.uSrcLayer = gl.getUniformLocation(prog, 'u_srcLayer');
     this.uValidFrom = gl.getUniformLocation(prog, 'u_validFrom');
     this.uGroupNewest = gl.getUniformLocation(prog, 'u_groupNewest');
+    this.uXEnd = gl.getUniformLocation(prog, 'u_xEnd');
 
     const quad = gl.createBuffer();
     const vao = gl.createVertexArray();
@@ -258,10 +266,12 @@ export class MipChain {
         ring.texture,
         this.tex1,
         (x0 / 4) | 0,
+        1,
         this.rows / 4,
         layer,
         ring.validFromSeq(),
         appendedColSeq,
+        (x0 / 4) | 0,
       );
     }
     if (this.tex2 !== null && x0 % 16 === 15) {
@@ -273,7 +283,7 @@ export class MipChain {
       // one level up). Skip until the whole 16-column group is unambiguously
       // post-gap; the stale texel self-heals when the ring wraps this group.
       if (appendedColSeq - 15 >= ring.validFromSeq()) {
-        this.pass(this.tex1, this.tex2, (x0 / 16) | 0, this.rows / 16, layer, null, appendedColSeq);
+        this.pass(this.tex1, this.tex2, (x0 / 16) | 0, 1, this.rows / 16, layer, null, appendedColSeq, (x0 / 16) | 0);
       }
     }
 
@@ -282,15 +292,122 @@ export class MipChain {
     checkGLError(this.gl, 'MipChain.updateFrom');
   }
 
+  /**
+   * Regenerate the mip columns for a whole RANGE of appended columns in ONE FBO
+   * pass per level per tile-layer segment — the history-page splice path. The
+   * per-append {@link updateFrom} fires 64 level-1 + 16 level-2 tiny 1-px
+   * viewports for a 256-column page; this collapses them to ~1 pass per level
+   * per layer (the downsample shader already derives each destination texel
+   * from `gl_FragCoord`, so a wider viewport IS the batch).
+   *
+   * Range handling:
+   *  - The covered groups are group-aligned inward: `[a0 = from − from%4]` and
+   *    `[b0 = hi − hi%4 + 3]` where `hi = min(toSeq, residentNewest)` — a pass
+   *    never reads slots past the resident newest (unwritten garbage is not
+   *    masked; below-validFrom slots are). Over-baking a group whose members are
+   *    contiguous resident columns re-sums identical texels (harmless).
+   *  - One level-1 pass per tile-layer segment of the range, validFrom-masked.
+   *  - Level-2 bakes only the FULLY rebuilt, fully post-gap 16-groups (the same
+   *    R2 H-1 rule updateFrom applies, lifted to range granularity): starts at
+   *    the first 16-aligned start ≥ max(a0, validFrom-aligned-up), so no level-2
+    *    texel mixes pre-gap level-1 columns with post-gap rebuilds.
+   *  - Ragged edges that fall outside the aligned range keep today's behavior:
+   *    they were baked when their group last completed, and they self-heal on
+   *    wrap (same contract as the level-2 skip).
+   */
+  updateRange(ring: TileRing, fromSeq: number, toSeq: number): void {
+    if (!this.usableFlag || toSeq < fromSeq) return;
+
+    const range = ring.residentRange();
+    const hi = Math.min(toSeq, range !== null ? range.newest : toSeq);
+    if (hi < fromSeq) return;
+
+    const cap = ring.capacityCols;
+    const a0 = fromSeq - (fromSeq % 4);
+    // Largest 4-group end ≤ hi — a pass never reads slots past the resident
+    // newest (below-validFrom slots are masked; above-newest slots are unwritten
+    // garbage and NOT masked).
+    const b0 = hi - ((hi + 1) % 4);
+    if (b0 < a0) return;
+    const validFrom = ring.validFromSeq();
+
+    // level-0 → level-1: one batched pass per tile-layer segment of [a0..b0].
+    // Absolute seq mod colsPerTile IS the tile-local x (capacity is a multiple
+    // of colsPerTile), so segments cut at multiples of colsPerTile never mix
+    // layers — including across a ring wrap.
+    let s = a0;
+    while (s <= b0) {
+      const segEnd = Math.min(
+        b0,
+        s - (s % this.colsPerTile) + this.colsPerTile - 1,
+      );
+      const layer = (((s % cap) + cap) % cap) / this.colsPerTile | 0;
+      const dstX0 = ((s % this.colsPerTile) / 4) | 0;
+      const dstX1 = ((segEnd % this.colsPerTile) / 4) | 0;
+      this.pass(
+        ring.texture,
+        this.tex1,
+        dstX0,
+        dstX1 - dstX0 + 1,
+        this.rows / 4,
+        layer,
+        validFrom,
+        segEnd,
+        dstX1,
+      );
+      s = segEnd + 1;
+    }
+
+    // level-1 → level-2: only 16-groups FULLY inside [a0..b0] (all four of their
+    // level-1 columns were rebuilt by the passes above) and fully post-gap. A
+    // 16-group never straddles a tile layer (256 % 16 == 0), so this is again
+    // one pass per tile-layer segment.
+    if (this.tex2 !== null && this.maxLevel >= 2 && b0 >= 15) {
+      const align16Up = (v: number): number => v + ((16 - (v % 16)) % 16);
+      const c0 = Math.max(align16Up(a0), align16Up(validFrom));
+      const c1 = b0 - 15 - ((b0 - 15) % 16); // last 16-aligned group start ≤ b0−15
+      let g = c0;
+      while (g <= c1) {
+        const segEnd = Math.min(
+          c1 + 15,
+          g - (g % this.colsPerTile) + this.colsPerTile - 1,
+        ); // ≡ 15 (mod 16): whole groups only
+        const layer = (((g % cap) + cap) % cap) / this.colsPerTile | 0;
+        const dstX0 = ((g % this.colsPerTile) / 16) | 0;
+        const dstX1 = ((segEnd % this.colsPerTile) / 16) | 0;
+        this.pass(
+          this.tex1,
+          this.tex2,
+          dstX0,
+          dstX1 - dstX0 + 1,
+          this.rows / 16,
+          layer,
+          null,
+          segEnd,
+          dstX1,
+        );
+        g = segEnd + 1;
+      }
+    }
+
+    // Restore the default framebuffer so the display draw targets the screen.
+    this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
+    checkGLError(this.gl, 'MipChain.updateRange');
+  }
+
   private pass(
     srcTex: WebGLTexture,
     dstTex: WebGLTexture,
     dstCol: number,
+    /** Destination columns this pass covers (1 for the per-append path). */
+    dstCols: number,
     dstRows: number,
     layer: number,
     /** validFrom gate for the level-0 source (absolute col_seqs), or null to disable. */
     maskFrom: number | null,
     groupNewest: number,
+    /** Tile-local destination column of the pass's LAST group (see DOWNSAMPLE_FRAG). */
+    xEnd: number,
   ): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
@@ -309,8 +426,8 @@ export class MipChain {
 
     gl.disable(gl.BLEND);
     gl.disable(gl.DEPTH_TEST);
-    // Rasterize exactly the one destination column; gl_FragCoord.x -> dstCol.
-    gl.viewport(dstCol, 0, 1, dstRows);
+    // Rasterize exactly the destination columns; gl_FragCoord.x -> dstCol...
+    gl.viewport(dstCol, 0, dstCols, dstRows);
 
     gl.useProgram(this.prog);
     gl.bindVertexArray(this.vao);
@@ -320,6 +437,7 @@ export class MipChain {
     gl.uniform1i(this.uSrcLayer, layer);
     gl.uniform1i(this.uValidFrom, maskFrom !== null ? maskFrom : -0x7fffffff);
     gl.uniform1i(this.uGroupNewest, groupNewest);
+    gl.uniform1i(this.uXEnd, xEnd);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
