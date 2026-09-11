@@ -286,7 +286,20 @@ export function fuzzyScore(query: string, text: string): number {
       qi += 1;
     }
   }
-  if (qi < q.length) return -1; // not every query char was consumed → no match
+  if (qi < q.length) {
+    // Trader spellings carry separators the compact ticker does not: "btc usdt",
+    // "eth/usd", "brk.b". Retry with every separator stripped from BOTH sides so
+    // those queries reach "BTCUSDT" (and a compact query reaches "ETH/USD"),
+    // scored just below an equally-direct match so normal rankings are intact.
+    // Only reached when the direct pass FAILED, so existing scores never shift.
+    const qc = q.replace(/[\s\-/_.]+/g, '');
+    const tc = t.replace(/[\s\-/_.]+/g, '');
+    if (qc !== q || tc !== t) {
+      const s = fuzzyScore(qc, tc);
+      return s < 0 ? -1 : s - 5;
+    }
+    return -1; // not every query char was consumed → no match
+  }
   return 100 + score - t.length * 0.1;
 }
 

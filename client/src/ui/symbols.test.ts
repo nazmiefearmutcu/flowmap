@@ -370,8 +370,20 @@ describe('fuzzyScore — tiered ranking', () => {
   });
   it('ranks a boundary-hit subsequence above a scattered one (A5)', () => {
     // `TU` against `XBT/USD`: the `u` is an after-separator word start; against
-    // `atzubd` (same idea, no boundary) both letters land mid-word.
+    // `atzubd` the same letters are scattered mid-word.
     expect(fuzzyScore('tu', 'xbt/usd')).toBeGreaterThan(fuzzyScore('tu', 'atzubd'));
+  });
+
+  it('normalizes separator spellings: "btc usdt" reaches BTCUSDT', () => {
+    // Direct exact still wins over the normalized fallback...
+    expect(fuzzyScore('btc usdt', 'btcusdt')).toBeGreaterThan(0);
+    expect(fuzzyScore('btc usdt', 'btcusdt')).toBeLessThan(fuzzyScore('btcusdt', 'btcusdt'));
+    // ...other separators work too, both directions...
+    expect(fuzzyScore('eth/usd', 'ethusd')).toBeGreaterThan(0);
+    expect(fuzzyScore('brk.b', 'brkb')).toBeGreaterThan(0);
+    expect(fuzzyScore('ethusd', 'ETH/USD')).toBeGreaterThan(0);
+    // ...and a genuine non-match stays a non-match.
+    expect(fuzzyScore('btc eur', 'btcusdt')).toBe(-1);
   });
 });
 
@@ -390,5 +402,11 @@ describe('fuzzyRank — best symbol match first', () => {
   it('drops non-matches and respects the limit', () => {
     expect(fuzzyRank(uni, 'zzz')).toEqual([]);
     expect(fuzzyRank(uni, '', 2).length).toBe(2);
+  });
+  it('finds the pair when the user types it with a space', () => {
+    // The exact screenshot case: "btc usdt" must surface BTCUSDT.
+    const r = fuzzyRank(uni, 'btc usdt');
+    expect(r.length).toBeGreaterThan(0);
+    expect(r[0].symbol).toBe('BTCUSDT');
   });
 });
