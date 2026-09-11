@@ -43,8 +43,13 @@ WS_MAX_CONNECTIONS_DEFAULT = 16
 
 # Non-loopback origins always allowed by the built-in policy: the packaged
 # Tauri webview serves the SPA from these (windows/ macOS differ) and opens
-# its WS from there. Matched exactly (after lowercase).
-_TAURI_ORIGINS = frozenset({"tauri://localhost", "https://tauri.localhost"})
+# its WS from there. Matched exactly (after lowercase). Windows WebView2 serves
+# over the custom protocol as `http://tauri.localhost` (the REST CORS list in
+# api/app.py already carries it) while macOS uses `tauri://localhost`; the
+# https variant covers a secure-context webview.
+_TAURI_ORIGINS = frozenset(
+    {"tauri://localhost", "https://tauri.localhost", "http://tauri.localhost"}
+)
 # Browser origins on the loopback hosts are trusted regardless of port (vite
 # and other dev servers pick free ports). http only — the brief's policy.
 # ::1 is the IPv6 loopback: a dev server bound to it (vite -6) sends
@@ -63,8 +68,8 @@ def origin_allowed(origin: str | None, environ: dict[str, str] | None = None) ->
 
     Built-in policy (env unset): ``http://127.0.0.1:<any port>``,
     ``http://localhost:<any port>``, ``http://[::1]:<any port>`` (vite and
-    local tools), ``tauri://localhost`` and ``https://tauri.localhost`` (the
-    packaged desktop webview).
+    local tools), ``tauri://localhost``, ``https://tauri.localhost`` and
+    ``http://tauri.localhost`` (the packaged desktop webview).
 
     ``FLOWMAP_WS_ALLOWED_ORIGINS`` REPLACES that browser-origin list with
     its comma-separated entries; the single value ``*`` accepts everything.

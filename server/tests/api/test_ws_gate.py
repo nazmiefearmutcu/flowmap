@@ -52,6 +52,7 @@ def decode_frame(buf: bytes) -> list:
         ("HTTP://LocalHost:5173", True),  # normalized to lowercase
         ("tauri://localhost", True),
         ("https://tauri.localhost", True),
+        ("http://tauri.localhost", True),  # Windows WebView2 origin (packaged app)
         ("https://127.0.0.1:5173", False),  # policy is http-only for loopback
         ("https://[::1]:5173", False),
         ("http://[fe80::1]:5173", False),  # IPv6 loopback only, not any v6 host
