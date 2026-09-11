@@ -342,11 +342,6 @@ async def test_transient_flush_failure_retries_and_session_continues(
         MARKET, SYMBOL, max_age_ns=10**18, now_ns=10**18, limit_cols=100
     )
     assert tail is not None
-    finals = [
-        e
-        for e in later
-        if isinstance(e, DepthColumn) and e.final
-    ]
     disk_seqs = sorted(c.col_seq for c in tail.columns)
     assert disk_seqs == sorted({c.col_seq for c in later})
 

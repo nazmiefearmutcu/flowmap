@@ -76,7 +76,8 @@ def test_update_cost_under_2ms():
     g = Grid(GridCfg(tick=0.5, tick_multiple=1, dt_ns=250_000_000, p0=0.0, rows=4096,
                      ring_columns=1024, mode=0))
     rng = np.random.default_rng(0)
-    px = np.sort(rng.uniform(10, 2000, 2000)); sz = rng.uniform(0.1, 50, 2000)
+    px = np.sort(rng.uniform(10, 2000, 2000))
+    sz = rng.uniform(0.1, 50, 2000)
     g.on_book(0, px, sz, px + 0.5, sz)
     t = time.perf_counter()
     for i in range(1, 101):

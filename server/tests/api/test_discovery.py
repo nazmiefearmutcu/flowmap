@@ -9,7 +9,6 @@ provider hit) and the never-raise error fallback (stale / unreachable).
 from __future__ import annotations
 
 import httpx
-import pytest
 
 from flowmap_server.api.app import create_app
 from flowmap_server.api.market_cache import MarketDataCache, QuoteData

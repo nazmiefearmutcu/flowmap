@@ -71,10 +71,12 @@ with ``kind`` in {columns, trades, markers, epochs}. Load-bearing decisions:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import re
 import threading
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -94,6 +96,14 @@ _HOUR_KEY_LEN = 11  # "YYYYMMDD-HH" — fixed width, so string compare == time c
 # Sentinel "hour key" above every real bucket — the no-upper-bound case of the
 # ranged file prune in ``load_tail``.
 _HOUR_KEY_MAX = "99991231-99"
+
+# Caps on trades/markers materialized by ONE tail load. The window is bounded
+# in columns, but a busy symbol can still carry hundreds of thousands of tape
+# rows across it; the old path built every in-window row as a Python object.
+# Past a cap the OLDEST rows are dropped (every caller serves a NEWEST-window
+# read) and ``TailData.trades_truncated``/``markers_truncated`` say so.
+_TRADES_MAX_PER_LOAD = 250_000
+_MARKERS_MAX_PER_LOAD = 25_000
 
 _COLUMNS_SCHEMA = {
     "epoch": pl.UInt32,
@@ -191,17 +201,50 @@ def _hour_prefix(p: Path) -> str:
     return p.name[:_HOUR_KEY_LEN]
 
 
-def _ranged_rows(d: Path, pattern: str, lo_key: str, hi_key: str, in_range: pl.Expr):
-    """Yield rows matching ``in_range`` from part files whose filename hour
-    prefix intersects ``[lo_key, hi_key]``; out-of-window files are never
-    opened and unreadable files are skipped (warned)."""
+def _bounded_rows(
+    d: Path,
+    pattern: str,
+    lo_key: str,
+    hi_key: str,
+    in_range: pl.Expr,
+    limit: int,
+) -> tuple[Iterator[dict[str, object]], bool]:
+    """Stream rows matching ``in_range``, capped at the NEWEST ``limit``.
+
+    The old comprehension built every in-window row as a Python object; a
+    busy symbol across a full ring window can carry hundreds of thousands of
+    trades. Past the cap the OLDEST rows are dropped (every caller is serving
+    a NEWEST-window read) and the second tuple element is True so the caller
+    can surface the truncation honestly. Below the cap rows stream lazily and
+    order is unchanged (callers sort)."""
+    frames: list[pl.DataFrame] = []
+    total = 0
     for path in sorted(d.glob(pattern), key=_by_name):
         if not (lo_key <= _hour_prefix(path) <= hi_key):
             continue
         df = _read_parquet_safe(path)
         if df is None:
             continue
-        yield from df.filter(in_range).iter_rows(named=True)
+        fresh = df.filter(in_range)
+        if fresh.height:
+            frames.append(fresh)
+            total += fresh.height
+    if not frames:
+        return iter(()), False
+    if total > limit:
+        logger.warning(
+            "recording %s for %s: capping at %d rows (dropping the oldest %d)",
+            pattern,
+            d.name,
+            limit,
+            total - limit,
+        )
+        merged = pl.concat(frames).sort("ts_ns").tail(limit)
+        return iter(merged.iter_rows(named=True)), True
+    return (
+        iter(itertools.chain.from_iterable(f.iter_rows(named=True) for f in frames)),
+        False,
+    )
 
 
 def _read_parquet_safe(path: Path) -> pl.DataFrame | None:
@@ -221,13 +264,22 @@ def _read_parquet_safe(path: Path) -> pl.DataFrame | None:
 class TailData(msgspec.Struct):
     """Result of :meth:`Recorder.load_tail` — everything Session rehydration
     needs, chronological (oldest first). ``epochs`` contains exactly the
-    epochs referenced by ``columns``, sorted by epoch number."""
+    epochs referenced by ``columns``, sorted by epoch number.
+
+    ``truncated`` — the column cap (``limit_cols``) bit: older recorded
+    columns exist that this read did not serve. ``trades_truncated`` /
+    ``markers_truncated`` — the newest-N tape caps bit (oldest rows dropped).
+    Callers that serve the tail to a user must surface these (log/flag), never
+    present a capped read as the whole history."""
 
     epochs: list[EpochParams]
     columns: list[FinalizedColumn]
     trades: list[Trade]
     markers: list[Marker]
     newest_t0_ns: int
+    truncated: bool = False
+    trades_truncated: bool = False
+    markers_truncated: bool = False
 
 
 class SessionRecorder:
@@ -570,7 +622,11 @@ class Recorder:
         ``t0_ns < end_ns`` — the inclusive-exclusive upper bound a WINDOWED
         replay needs; default ``None`` keeps the open-ended behavior), capped
         at ``limit_cols``, plus every epoch they reference and the
-        trades/markers inside their time range.
+        trades/markers inside their time range (themselves capped at the
+        newest ``_TRADES_MAX_PER_LOAD`` / ``_MARKERS_MAX_PER_LOAD``).
+
+        ``TailData.truncated`` is True when older recorded columns exist that
+        this capped read did not serve; the tape flags mark the row caps.
 
         Returns ``None`` when recording is disabled, nothing fresh exists, or
         the epochs referenced by the surviving columns were pruned (the
@@ -608,7 +664,9 @@ class Recorder:
         )
         frames: list[pl.DataFrame] = []
         have = 0
-        for path in sorted(candidates, key=_by_name, reverse=True):
+        paths = sorted(candidates, key=_by_name, reverse=True)
+        scan_capped = False
+        for i, path in enumerate(paths):
             df = _read_parquet_safe(path)
             if df is None or df.height == 0:
                 continue  # unreadable (warned) or empty: try the next-older part
@@ -617,6 +675,12 @@ class Recorder:
                 frames.append(fresh)
                 have += fresh.height
                 if have >= limit_cols:
+                    # Older candidate parts (if any) were never opened — the
+                    # read hit its cap and cannot know whether they hold more
+                    # in-window rows. Only stopping at the last candidate
+                    # proves completeness; anything earlier is reported as
+                    # truncated (honest uncertainty: the flag drives a log).
+                    scan_capped = i < len(paths) - 1
                     break
             elif int(df["t0_ns"].max()) < cutoff:
                 break  # older files are older still
@@ -628,8 +692,9 @@ class Recorder:
             pl.concat(frames)
             .unique(subset="col_seq", keep="first", maintain_order=True)
             .sort("col_seq")
-            .tail(limit_cols)
         )
+        truncated = scan_capped or table.height > limit_cols
+        table = table.tail(limit_cols)
 
         # Resolve epochs BEFORE materializing columns: the row count comes from
         # the epochs (and the vectorized bid/ask reshape below needs it).
@@ -681,6 +746,9 @@ class Recorder:
         lo_key = _hour_key(max(t_lo, 0))
         hi_key = _hour_key(max(t_hi - 1, 0))
         in_range = (pl.col("ts_ns") >= t_lo) & (pl.col("ts_ns") < t_hi)
+        trade_rows, trades_truncated = _bounded_rows(
+            d, "*-trades-*.parquet", lo_key, hi_key, in_range, _TRADES_MAX_PER_LOAD
+        )
         trades = [
             Trade(
                 ts_ns=int(row["ts_ns"]),
@@ -690,9 +758,12 @@ class Recorder:
                 side_src=int(row["side_src"]),
                 venue=row["venue"],
             )
-            for row in _ranged_rows(d, "*-trades-*.parquet", lo_key, hi_key, in_range)
+            for row in trade_rows
         ]
         trades.sort(key=lambda t: t.ts_ns)
+        marker_rows, markers_truncated = _bounded_rows(
+            d, "*-markers-*.parquet", lo_key, hi_key, in_range, _MARKERS_MAX_PER_LOAD
+        )
         markers = [
             Marker(
                 ts_ns=int(row["ts_ns"]),
@@ -701,7 +772,7 @@ class Recorder:
                 price=row["price"],
                 size=row["size"],
             )
-            for row in _ranged_rows(d, "*-markers-*.parquet", lo_key, hi_key, in_range)
+            for row in marker_rows
         ]
         markers.sort(key=lambda m: m.ts_ns)
 
@@ -711,6 +782,9 @@ class Recorder:
             trades=trades,
             markers=markers,
             newest_t0_ns=columns[-1].t0_ns,
+            truncated=truncated,
+            trades_truncated=trades_truncated,
+            markers_truncated=markers_truncated,
         )
 
     def newest_column_t0(self, market: str, symbol: str) -> int | None:
@@ -792,13 +866,20 @@ class Recorder:
     # -- retention -------------------------------------------------------------
 
     def load_all(self, market: str, symbol: str) -> TailData | None:
-        """Every recorded column for a symbol — the replay data source.
+        """Every recorded column for a symbol — explicitly UNBOUNDED.
 
         Same machinery/contract as :meth:`load_tail` (dedup, epoch resolution,
         corrupt-file tolerance) with the freshness window and column cap
         removed: ``cutoff`` collapses to 0 and ``limit`` to effectively
-        unbounded. ``None`` when nothing usable is recorded (cold start for a
-        replay subscribe is a refusal — the client gets an explicit error)."""
+        unbounded. The tapes are still capped by the newest-N constants.
+
+        Kept for explicit full-history callers/tests; the replay SUBSCRIBE
+        path deliberately does NOT use it — a no-window subscribe is bounded
+        to the newest window (FLOWMAP_REPLAY_MAX_COLS / ring_columns) in
+        :meth:`SessionManager._replay_feed_blocking` rather than materializing
+        a multi-GB recording. ``None`` when nothing usable is recorded (cold
+        start for a replay subscribe is a refusal — the client gets an
+        explicit error)."""
         return self.load_tail(
             market,
             symbol,

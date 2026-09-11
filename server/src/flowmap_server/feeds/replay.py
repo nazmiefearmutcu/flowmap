@@ -152,7 +152,6 @@ class ReplayFeed:
             if scale is not None:
                 yield self._snapshot(col, scale)
 
-            dt = self._dts.get(col.epoch, 0)
             for ev in self._by_t0.get(col.t0_ns, ()):
                 yield ev
 

@@ -134,7 +134,7 @@ _T_MAX = 2**63 - 1
 # session's tail by more than this much RECORDED time is "stale" — a replay
 # feed can never serve columns recorded after the tail it was built from, so
 # accepting would present an outdated replay as current. 2 s absorbs the
-# one-column flush race (any dt) between ``load_all`` and the attach.
+# one-column flush race (any dt) between the tail load and the attach.
 REPLAY_STALE_TOL_NS = 2_000_000_000
 # big_trades note: HistoryResponse.big_trades stays [] at M1 — the rolling-
 # percentile large-lot threshold that selects them arrives with the feature
@@ -1541,9 +1541,11 @@ class SessionManager:
         self.stats = SessionStats(
             wall_clock=wall_clock, active_sessions=lambda: len(self._sessions)
         )
-        # Keyed by (market, symbol, mode, source, band) — the band is part of
-        # the grid geometry, so two bands are genuinely two grids.
-        self._sessions: dict[tuple[str, str, str, str | None, str], Session] = {}
+        # Keyed by (market, symbol, mode, source, band) — live sessions; a
+        # replay key additionally carries (start_t, end_t) because the
+        # window is identity (see _subscribe). The band is part of the grid
+        # geometry, so two bands are genuinely two grids.
+        self._sessions: dict[tuple, Session] = {}
 
     def _default_feed_factory(self, sub: events.Subscribe) -> Feed:
         # Test path: the sim feed is unpaced so tests own the clock. Routing
@@ -1640,6 +1642,14 @@ class SessionManager:
         of recursing forever."""
         band = canonical_band(sub.band)
         key = (sub.market, sub.symbol, sub.mode, sub.source, band)
+        if sub.mode == "replay":
+            # The requested recording window is part of the key: W1 and W2
+            # are two different replays of the same symbol. Without this the
+            # second re-attach silently inherited the FIRST session's window
+            # (survey-1 #2 — silent wrong-data). Distinct windows open
+            # distinct sessions; an idle parked variant of the same
+            # symbol/mode is evicted on the new key (see _evict_other_bands).
+            key = key + (sub.start_t, sub.end_t)
         # The band is part of the key (two clients on the same symbol with
         # different bands must NOT silently share one grid — the second would
         # inherit the first's step and never know). But a band switch on an
@@ -1747,10 +1757,15 @@ class SessionManager:
         Honoring ``Subscribe.start_t`` / ``end_t`` (NEEDS-CORE #2): a
         windowed subscription loads only ``[start_t, end_t)`` through the
         recorder's public ranged read (:meth:`Recorder.load_tail`, capped at
-        the ring) instead of materializing the ENTIRE recording — a user
-        replaying "yesterday 14:00" no longer pays multi-GB RAM and a
-        seconds-long load for data they will never scroll to. Unbounded
-        subscribes keep ``load_all`` exactly as before.
+        the ring).
+
+        A no-window subscription — which used to materialize the ENTIRE
+        recording via ``load_all`` (multi-GB RAM for long recordings, survey-1
+        #1) — now serves the NEWEST bounded window: the same ``ring_columns``
+        cap the windowed path uses, overridable via
+        ``FLOWMAP_REPLAY_MAX_COLS``. When the recording is longer, the load is
+        truncated to that window and a warning is logged; an explicit
+        [start_t, end_t) window is never affected by this bound.
 
         The load runs in the default executor exactly like boot rehydration:
         doing it inline stalled the event loop — and every other session and
@@ -1771,7 +1786,35 @@ class SessionManager:
         (runs in the executor)."""
         assert self._recorder is not None
         if start_t is None and end_t is None:
-            tail = self._recorder.load_all(market, symbol)
+            # Bounded newest-window read (survey-1 #1): the client asked for
+            # "the replay", not "every byte ever recorded". Default cap = the
+            # same ring_columns the windowed path applies; the env knob may
+            # deepen it deliberately. Truncation is NOT silent: it is flagged
+            # by TailData.truncated and logged here; callers that need older
+            # data must send an explicit [start_t, end_t) window.
+            limit_cols = self._cfg.replay_max_cols or self._cfg.ring_columns
+            tail = self._recorder.load_tail(
+                market,
+                symbol,
+                max_age_ns=2**62,
+                now_ns=2**62,
+                limit_cols=limit_cols,
+            )
+            if tail is not None and (
+                tail.truncated or tail.trades_truncated or tail.markers_truncated
+            ):
+                logger.warning(
+                    "replay load for %s:%s truncated to the newest %d columns "
+                    "(columns=%s trades=%s markers=%s); send a "
+                    "[start_t, end_t) window for older data or raise "
+                    "FLOWMAP_REPLAY_MAX_COLS",
+                    market,
+                    symbol,
+                    limit_cols,
+                    tail.truncated,
+                    tail.trades_truncated,
+                    tail.markers_truncated,
+                )
         else:
             if start_t is not None and end_t is not None and end_t <= start_t:
                 raise ReplayUnavailableError(
@@ -1858,14 +1901,18 @@ class SessionManager:
             f"re-subscribe once the old session retires"
         )
 
-    def _evict_other_bands(self, key: tuple[str, str, str, str | None, str]) -> None:
-        """Tear down sessions that differ from ``key`` ONLY in the band.
+    def _evict_other_bands(self, key: tuple) -> None:
+        """Tear down idle sessions that share ``key``'s symbol/mode/source.
 
-        Called before creating a new band variant. Idle variants (no attached
-        clients) are torn down at once; a variant someone else is still watching
-        is left alone — it is a legitimate concurrent session, not a leak.
+        Called before creating a new variant of the same stream. For a live
+        key the variants are bands; for a replay key they are bands AND
+        [start_t, end_t) windows. Idle variants (no attached clients) are
+        torn down at once — a client cycling preset bands or replay windows
+        must not pin one ring per variant for the grace period; a variant
+        someone else is still watching is left alone — it is a legitimate
+        concurrent session, not a leak.
         """
-        market, symbol, mode, source, _band = key
+        market, symbol, mode, source = key[:4]
         for other in list(self._sessions):
             if other == key or other[:4] != (market, symbol, mode, source):
                 continue
@@ -1875,9 +1922,7 @@ class SessionManager:
             self._sessions.pop(other, None)
             sess.teardown_now()
 
-    def _make_remover(
-        self, key: tuple[str, str, str, str | None, str], session: Session
-    ) -> Callable[[], None]:
+    def _make_remover(self, key: tuple, session: Session) -> Callable[[], None]:
         def _remove() -> None:
             # Identity-guarded: a stale grace timer from a torn-down session
             # must never evict a fresh session that reused the key.

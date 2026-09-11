@@ -51,7 +51,8 @@ async def test_health_operational_fields(client):
 
 
 async def test_health_reports_active_sessions(app, client):
-    """One row per active session with its feed kind and state."""
+    """One row per active session with its feed kind, state, and the
+    session_id that joins stats.staleness_ms (survey-1 #8)."""
 
     class _StubFeed:
         market = "sim"
@@ -60,6 +61,7 @@ async def test_health_reports_active_sessions(app, client):
     class _StubSession:
         _feed = _StubFeed()
         _feed_state = "live"
+        session_id = "sim:SIM-DEMO:live:abc123def456"
 
     manager = app.state.manager
     manager._sessions = {("sim", "SIM-DEMO", "live", None, "0"): _StubSession()}
@@ -68,8 +70,40 @@ async def test_health_reports_active_sessions(app, client):
         body = r.json()
         assert body["active_sessions"] == 1
         assert body["feeds"] == [
-            {"market": "sim", "symbol": "SIM-DEMO", "mode": "live", "state": "live"}
+            {
+                "market": "sim",
+                "symbol": "SIM-DEMO",
+                "mode": "live",
+                "state": "live",
+                "session_id": "sim:SIM-DEMO:live:abc123def456",
+            }
         ]
+    finally:
+        manager._sessions = {}
+
+
+async def test_health_survives_mixed_replay_window_keys(app, client):
+    """Regression (campaign-4 R1-H1): replay keys carry ``(start_t, end_t)``
+    with int|None shapes. Two sessions agreeing on (market, symbol, mode,
+    source, band) but differing in window shape must not make the never-500
+    health probe raise None-vs-int TypeError from a bare sorted()."""
+
+    class _StubSession:
+        _feed = None
+        _feed_state = "live"
+
+    manager = app.state.manager
+    manager._sessions = {
+        ("binance-spot", "BTCUSDT", "replay", None, "deep", None, None): _StubSession(),
+        ("binance-spot", "BTCUSDT", "replay", None, "deep", 0, None): _StubSession(),
+    }
+    try:
+        r = await client.get("/api/health")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["active_sessions"] == 2
+        assert [row["mode"] for row in body["feeds"]] == ["replay", "replay"]
     finally:
         manager._sessions = {}
 

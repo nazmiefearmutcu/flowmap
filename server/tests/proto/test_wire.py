@@ -62,7 +62,6 @@ def test_history_response_nested_roundtrip():
 
 
 def test_multi_message_frame_iteration():
-    import numpy as np
     msgs = [events.Ping(server_send_ns=1),
             events.BBO(ts_ns=2, bid_px=9.5, bid_sz=10.0, ask_px=9.6, ask_sz=4.0),
             events.Trade(ts_ns=3, price=9.55, size=1.0, side=1, side_src=0, venue="okx")]

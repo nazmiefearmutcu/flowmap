@@ -39,7 +39,9 @@ P0 = 100.0 - ROWS * TICK / 2  # 84.0 — the manager's sim grid for max_rows=64
 MARKET, SYMBOL = "sim", "SIM-DEMO"
 N0 = 12  # columns in the initial recording: t0 = 0..(N0-1)*DT
 
-KEY = (MARKET, SYMBOL, "replay", None, "native")
+# Replay keys carry the window as part of identity (survey-1 #2); a no-window
+# subscribe is (None, None).
+KEY = (MARKET, SYMBOL, "replay", None, "native", None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -282,23 +284,24 @@ async def test_replay_refuses_traversal_symbol(tmp_path):
 
 
 async def test_replay_load_runs_off_the_event_loop(tmp_path, monkeypatch):
-    """subscribe() must not run the whole-recording load on the event loop:
-    ``load_all`` is unbounded (multi-GB for long recordings) and used to run
-    inline in subscribe(). While a deliberately slow load runs in its
-    executor thread, a concurrent event-loop task keeps ticking."""
+    """subscribe() must not run the recording load on the event loop: it is
+    disk IO over a bounded-but-large window (and was a multi-GB ``load_all``
+    before the bounded default) and used to run inline in subscribe(). While
+    a deliberately slow load runs in its executor thread, a concurrent
+    event-loop task keeps ticking."""
     import time as _time
 
     root = Recorder(tmp_path / "rec", 20.0)
     _record(root, t0_idx=0, n=N0, start_seq=0)
     mgr, timer = _manager(root)
 
-    real = Recorder.load_all
+    real = Recorder.load_tail
 
-    def slow_load_all(self, market, symbol):
+    def slow_load_tail(self, market, symbol, **kwargs):
         _time.sleep(0.25)  # blocking IO stand-in
-        return real(self, market, symbol)
+        return real(self, market, symbol, **kwargs)
 
-    monkeypatch.setattr(Recorder, "load_all", slow_load_all)
+    monkeypatch.setattr(Recorder, "load_tail", slow_load_tail)
 
     ticks = 0
 
@@ -312,7 +315,7 @@ async def test_replay_load_runs_off_the_event_loop(tmp_path, monkeypatch):
     try:
         await asyncio.sleep(0.05)
         sess = await mgr.subscribe(_sub(), ClientTx())
-        assert ticks >= 10, "event loop stalled while load_all ran"
+        assert ticks >= 10, "event loop stalled while load_tail ran"
         assert sess.replay_tail_t0 == (N0 - 1) * DT  # behavior unchanged
     finally:
         spawner.cancel()

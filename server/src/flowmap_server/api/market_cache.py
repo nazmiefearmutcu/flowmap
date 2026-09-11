@@ -19,10 +19,11 @@ Semantics:
   explicit empty ``price=None`` / ``reachable=False`` quote. Display-only data —
   a stale or market-closed equity value is surfaced as ``stale``, never as a live
   print.
-- **Background prewarm (optional).** :meth:`run_background` periodically refreshes
-  movers so the first UI read is warm; it is started only for the production
-  cache (create_app), and httpx's ASGITransport does not run lifespan events, so
-  tests never spin it up.
+- **Background prewarm.** :meth:`run_background` periodically refreshes
+  movers so the first UI read is warm; ``create_app``'s lifespan starts it
+  for the production cache and cancels it on shutdown, and httpx's
+  ASGITransport does not run lifespan events, so plain-ASGI tests never spin
+  it up.
 """
 
 from __future__ import annotations
@@ -57,6 +58,10 @@ SPARK_MAX = 64  # cap sparkline points on the wire
 # own, so one hung provider used to hold the whole endpoint. Past the deadline
 # whatever ranked already — partial results, honestly — is served.
 MOVERS_DEADLINE_S = 15.0
+# The movers cache always fetches this many rows (the same clamp /api/movers
+# enforces) and slices per caller: caching the FIRST caller's limit poisoned
+# a later, larger request for a whole TTL (survey-1 #4).
+_MOVERS_MAX = 100
 
 QuoteFn = Callable[[str, str], Awaitable["QuoteData"]]
 MoversFn = Callable[[str, int], Awaitable[list["QuoteData"]]]
@@ -142,21 +147,25 @@ class MarketDataCache:
         if cached is not None and self._fresh(cached[0]):
             return cached[1]
         lock = self._quote_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            cached = self._quotes.get(key)
-            if cached is not None and self._fresh(cached[0]):
-                self._release_lock(self._quote_locks, key, lock)
-                return cached[1]
-            try:
-                q = await self._quote_fn(market, symbol.upper())
-            except Exception:  # noqa: BLE001 — never raise into the handler
-                logger.debug("quote fetch failed for %s:%s", market, symbol, exc_info=True)
-                self._release_lock(self._quote_locks, key, lock)
-                return self._fallback_quote(market, symbol.upper(), cached)
-            self._quotes[key] = (self._clock(), q)
-            self._evict(self._quotes)
+        try:
+            async with lock:
+                cached = self._quotes.get(key)
+                if cached is not None and self._fresh(cached[0]):
+                    return cached[1]
+                try:
+                    q = await self._quote_fn(market, symbol.upper())
+                except Exception:  # noqa: BLE001 — never raise into the handler
+                    logger.debug("quote fetch failed for %s:%s", market, symbol, exc_info=True)
+                    return self._fallback_quote(market, symbol.upper(), cached)
+                self._quotes[key] = (self._clock(), q)
+                self._evict(self._quotes)
+                return q
+        finally:
+            # AFTER the async with released the lock (and any waiters that
+            # grabbed it have either finished or are holding it) — pruning
+            # INSIDE the block never worked: locked() was always True while
+            # the caller still held it (survey-1 #5).
             self._release_lock(self._quote_locks, key, lock)
-            return q
 
     def _evict(self, store: dict) -> None:
         """Bound a cache store: drop OLDEST-INSERTED entries while over cap.
@@ -176,7 +185,14 @@ class MarketDataCache:
         Called AFTER the ``async with`` releases the lock: if another request
         has already grabbed (or is waiting on) this exact object, ``locked()``
         keeps the entry; otherwise the key is pruned so the dicts do not grow
-        with every symbol ever browsed over a long server lifetime."""
+        with every symbol ever browsed over a long server lifetime.
+
+        A queued waiter resumption window exists where ``locked()`` is False
+        while ``_waiters`` is non-empty (R1-L3): pruning then would let a third
+        caller create a NEW lock and run a duplicate fetch. Keep the mapping
+        whenever waiters are queued; the eventual holder prunes after release."""
+        if getattr(lock, "_waiters", None):
+            return
         if not lock.locked() and locks.get(key) is lock:
             locks.pop(key, None)
 
@@ -200,35 +216,43 @@ class MarketDataCache:
     # -- movers ----------------------------------------------------------------
 
     async def movers(self, market: str, limit: int) -> list[QuoteData]:
+        """Ranked movers for *market*, sliced to *limit* (and hard-bounded by
+        ``_MOVERS_MAX``). The cache always holds a fixed-max fetch, so a small
+        first request can never shrink a later larger one."""
+        take = max(0, min(int(limit), _MOVERS_MAX))
         cached = self._movers.get(market)
         if cached is not None and self._fresh(cached[0]):
-            return cached[1][:limit]
+            return cached[1][:take]
         lock = self._movers_locks.setdefault(market, asyncio.Lock())
-        async with lock:
-            cached = self._movers.get(market)
-            if cached is not None and self._fresh(cached[0]):
-                self._release_lock(self._movers_locks, market, lock)
-                return cached[1][:limit]
-            try:
-                ranked = await self._movers_fn(market, limit)
-            except Exception:  # noqa: BLE001 — never raise into the handler
-                logger.debug("movers fetch failed for %s", market, exc_info=True)
-                self._release_lock(self._movers_locks, market, lock)
-                return cached[1][:limit] if cached is not None else []
-            self._movers[market] = (self._clock(), ranked)
-            self._evict(self._movers)
+        try:
+            async with lock:
+                cached = self._movers.get(market)
+                if cached is not None and self._fresh(cached[0]):
+                    return cached[1][:take]
+                try:
+                    ranked = await self._movers_fn(market, _MOVERS_MAX)
+                except Exception:  # noqa: BLE001 — never raise into the handler
+                    logger.debug("movers fetch failed for %s", market, exc_info=True)
+                    return cached[1][:take] if cached is not None else []
+                self._movers[market] = (self._clock(), ranked)
+                self._evict(self._movers)
+                return ranked[:take]
+        finally:
+            # Prune run AFTER the async with released the lock (survey-1 #5).
             self._release_lock(self._movers_locks, market, lock)
-            return ranked[:limit]
 
     # -- background prewarm (production only) ----------------------------------
 
     async def run_background(self, markets: tuple[str, ...], interval_s: float) -> None:
-        """Periodically refresh movers so the first UI read is warm. Cancelled on
-        shutdown; every cycle is wrapped so one bad refresh never stops the loop."""
+        """Periodically refresh movers so the first UI read is warm. Started
+        by ``create_app``'s lifespan for the production cache (cancelled on
+        shutdown); every cycle is wrapped so one bad refresh never stops the
+        loop. Refreshes the full ``_MOVERS_MAX`` cache row set so every
+        caller's slice is served warm."""
         while True:
             for market in markets:
                 try:
-                    await self.movers(market, limit=50)
+                    await self.movers(market, limit=_MOVERS_MAX)
                 except Exception:  # noqa: BLE001
                     logger.debug("background movers refresh failed for %s", market, exc_info=True)
             await asyncio.sleep(interval_s)

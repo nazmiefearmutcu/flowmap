@@ -43,25 +43,33 @@ class FakeSession:
 class FakeStats:
     def __init__(self) -> None:
         self.rtts: list[float] = []
+        self.rejected = 0
 
     def record_rtt(self, ms: float) -> None:
         self.rtts.append(ms)
+
+    def inc_rejected(self) -> None:
+        self.rejected += 1
 
 
 class FakeManager:
     """Emulates SessionManager.subscribe: attaches + enqueues one tagged
     column frame per subscribe (venue carries the symbol so drained bytes
     are attributable). Sessions are cached per symbol, like a real parked
-    session being handed out again."""
+    session being handed out again. ``raise_nie`` emulates the feed factory
+    refusing an unknown market (NotImplementedError)."""
 
-    def __init__(self, stats: FakeStats | None = None) -> None:
+    def __init__(self, stats: FakeStats | None = None, raise_nie: bool = False) -> None:
         self.stats = stats
+        self.raise_nie = raise_nie
         self.subscriptions: list[events.Subscribe] = []
         self.unsubscribed: list[FakeSession] = []
         self._sessions: dict[str, FakeSession] = {}
 
     async def subscribe(self, sub: events.Subscribe, client) -> FakeSession:
         self.subscriptions.append(sub)
+        if self.raise_nie:
+            raise NotImplementedError(f"market {sub.market!r} has no feed")
         session = self._sessions.get(sub.symbol)
         if session is None:
             session = FakeSession(sub.symbol)
@@ -109,14 +117,6 @@ async def test_resubscribe_drains_old_symbol_frames():
     assert await conn._subscribe(_sub("BBB"))
     tags = _venue_tags(conn)
     assert tags == ["BBB"], f"stale frames leaked across re-subscribe: {tags}"
-
-
-async def test_resubscribe_bumps_epoch_each_time():
-    conn = ws_mod._Connection(FakeWS(), FakeManager())
-    assert conn._sub_epoch == 0
-    for i, sym in enumerate(("AAA", "BBB", "CCC"), start=1):
-        assert await conn._subscribe(_sub(sym))
-        assert conn._sub_epoch == i
 
 
 async def test_resubscribe_detaches_previous_session():
@@ -182,6 +182,30 @@ async def test_refusal_status_carries_measured_latency():
     assert isinstance(ev, events.Status)
     assert ev.latency_ms == pytest.approx(3.21)
     assert ev.clock_skew_ms == pytest.approx(-12.5)
+
+
+# --- item 6: unknown-market refusals reach the C1 counter --------------------
+
+
+async def test_unknown_market_refusal_counts_rejected():
+    """NotImplementedError (no feed for the market) is refused by the WS
+    layer, not the core — it must still land in sessions.rejected
+    (survey-1 #6)."""
+    stats = FakeStats()
+    conn = ws_mod._Connection(FakeWS(), FakeManager(stats=stats, raise_nie=True))
+    assert not await conn._subscribe(_sub("NOPE"))
+    assert stats.rejected == 1
+    assert conn._ws.closed == (ws_mod._CLOSE_UNSUPPORTED, None)
+    assert conn._session is None  # nothing attached
+
+
+async def test_unknown_market_refusal_without_stats_is_harmless():
+    """getattr-guarded like every other stats call: a pre-SessionStats
+    manager keeps the same refusal behavior."""
+    manager = FakeManager(stats=None, raise_nie=True)
+    conn = ws_mod._Connection(FakeWS(), manager)
+    assert not await conn._subscribe(_sub("NOPE"))
+    assert conn._ws.closed == (ws_mod._CLOSE_UNSUPPORTED, None)
 
 
 async def test_subscribe_installs_conn_stats_hook_but_never_clobbers():

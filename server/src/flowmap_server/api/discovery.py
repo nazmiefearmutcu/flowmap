@@ -35,6 +35,9 @@ __all__ = ["router"]
 router = APIRouter(prefix="/api")
 
 _MOVERS_DEFAULT = 20
+# Mirrors _MOVERS_MAX in api/market_cache.py (the cache fetches this many and
+# slices per caller); equality is pinned by test_market_cache.py so the two
+# clamps cannot drift silently.
 _MOVERS_MAX = 100
 _UNIVERSE_DEFAULT = 100
 _UNIVERSE_MAX = 1000

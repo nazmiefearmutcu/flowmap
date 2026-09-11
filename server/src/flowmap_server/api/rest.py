@@ -93,9 +93,23 @@ async def health(request: Request) -> dict[str, object]:
     cfg: Config | None = getattr(request.app.state, "cfg", None)
     manager = getattr(request.app.state, "manager", None)
     feeds: list[dict[str, str]] = []
-    # Keyed (market, symbol, mode, source, band); the band is geometry, not
-    # identity, so it is not surfaced here.
-    for key, s in sorted(getattr(manager, "_sessions", {}).items()):
+    # Keyed (market, symbol, mode, source, band) and, for replay, + (start_t,
+    # end_t); the band is geometry, not identity, so it is not surfaced here.
+    # session_id is the join key to stats.staleness_ms (core/stats.py keys by
+    # session id) — without it an operator had to string-parse ids to learn
+    # WHICH symbol is stale (survey-1 #8).
+    #
+    # Sort with a TOTAL key: the tuple carries None (source for replay/plain
+    # subscribes; start_t/end_t on unbounded windows) and ints, so a bare
+    # sorted() raises TypeError the moment two sessions agree on
+    # (market, symbol, mode, band) but differ in shape — exactly the mixed
+    # replay-window state this round introduces. Same treatment as
+    # export.py `_session_sort_key` (None → ""), inlined to keep this hot
+    # probe dependency-free.
+    for key, s in sorted(
+        getattr(manager, "_sessions", {}).items(),
+        key=lambda kv: tuple("" if part is None else str(part) for part in kv[0]),
+    ):
         feed = getattr(s, "_feed", None)
         feeds.append(
             {
@@ -103,6 +117,7 @@ async def health(request: Request) -> dict[str, object]:
                 "symbol": str(getattr(feed, "symbol", key[1]) if feed else key[1]),
                 "mode": str(key[2]),
                 "state": str(getattr(s, "_feed_state", "unknown")),
+                "session_id": str(getattr(s, "session_id", "")),
             }
         )
     started = getattr(request.app.state, "started_monotonic_ns", None)

@@ -136,9 +136,6 @@ class _Connection:
         # optional Subscribe.client_ts_ns (proto; campaign SB item 4).
         # Positive = client clock ahead. 0.0 until a Subscribe carries one.
         self.clock_skew_ms = 0.0
-        # Bumped on every Subscribe; frames drained from the ClientTx across a
-        # re-subscribe belong to the previous epoch and must never flush.
-        self._sub_epoch = 0
         self._last_recv_ns = time.monotonic_ns()
 
     def _conn_stats(self) -> dict[str, float]:
@@ -166,6 +163,23 @@ class _Connection:
                 record_rtt(latency_ms)
             except Exception:  # noqa: BLE001 — telemetry must never kill the stream
                 logger.debug("stats.record_rtt failed", exc_info=True)
+
+    def _count_rejected(self) -> None:
+        """Count THIS layer's refusal in the C1 aggregate.
+
+        ``SessionManager.subscribe`` already counts the refusals it raises
+        (session limit, replay unavailable/stale, invalid symbol); the
+        no-feed-for-market ``NotImplementedError`` is raised by the feed
+        factory on a path the manager does not wrap, so unknown-market
+        refusals never reached ``sessions.rejected`` (survey-1 #6). Counted
+        here, guarded like every other stats call."""
+        stats = getattr(self._manager, "stats", None)
+        inc = getattr(stats, "inc_rejected", None)
+        if callable(inc):
+            try:
+                inc()
+            except Exception:  # noqa: BLE001 — telemetry must never kill the stream
+                logger.debug("stats.inc_rejected failed", exc_info=True)
 
     # -- sending ---------------------------------------------------------------
 
@@ -323,11 +337,9 @@ class _Connection:
         # Re-subscribe hygiene (campaign SB item 3): frames still queued by
         # the OLD subscription belong to another symbol/session and must
         # never flush after the new Hello/snapshot. The session is detached
-        # above (it can offer nothing more), so draining here is exact, and
-        # the epoch bump marks the queue boundary. The flush loop drains
-        # concurrently — drain() pops >=1 frame per call when non-empty, so
-        # this terminates without a lock.
-        self._sub_epoch += 1
+        # above (it can offer nothing more), so this drain is exact. It is a
+        # purely synchronous loop — no await between the length check and the
+        # drain — so the concurrent flush loop cannot interleave mid-drain.
         while len(self._client):
             self._client.drain(FLUSH_MAX_BYTES)
         # Optional client wall-clock stamp (campaign SB item 4): derive the
@@ -366,6 +378,9 @@ class _Connection:
             await self._refuse("degraded", _CLOSE_UNSUPPORTED)
             return False
         except NotImplementedError as exc:
+            # No feed for this market (feeds.router). Counted here because
+            # the core-side refusal counter does not wrap the feed factory.
+            self._count_rejected()
             logger.warning(
                 "refused subscribe: no feed for market (%s:%s: %s) -> 1003",
                 sub.market, sub.symbol, exc,

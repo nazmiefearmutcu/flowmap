@@ -32,7 +32,7 @@ from flowmap_server.core.stats import SessionStats
 from flowmap_server.feeds.base import BoundedFeedQueue, BookState
 from flowmap_server.feeds.crypto import _BridgeSink
 from flowmap_server.proto import wire
-from flowmap_server.proto.events import MODE_L2, Status, Subscribe, Trade
+from flowmap_server.proto.events import MODE_L2, Status, Subscribe
 
 DT = 250_000_000
 ROWS = 128

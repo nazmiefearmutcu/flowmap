@@ -366,7 +366,6 @@ async def test_replay_engine_streams_recorded_session(port, tmp_path):
     columns flow as final DepthColumns, Pause stalls, SetSpeed accelerates."""
     from flowmap_server.core.grid import FinalizedColumn
     from flowmap_server.core.record import Recorder
-    from flowmap_server.feeds.sim import SimFeed as Sim
     from flowmap_server.proto.events import BarColumn, EpochParams
 
     DT = 250_000_000

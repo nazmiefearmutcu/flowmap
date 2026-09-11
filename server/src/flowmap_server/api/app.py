@@ -12,6 +12,7 @@ or no disk IO inject their own manager.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -113,16 +114,32 @@ def _server_feed_factory(cfg: Config) -> Callable[[events.Subscribe], Feed]:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Shutdown flush (spec §7): up to REC_FLUSH_COLS buffered columns plus
-    trades per active session used to be lost on every sidecar kill. After
-    uvicorn stops serving (loop still running), every session's buffered
-    recording rows are flushed and awaited; failures inside the flush are
+    """Startup background tasks + shutdown flush (spec §7).
+
+    On startup, the discovery cache's prewarm loop is started here — it used
+    to be dead code with a docstring claiming ``create_app`` started it
+    (survey-1 #3), so every cold ``/api/movers`` paid the full provider sweep.
+    On shutdown the prewarm task is cancelled FIRST (no provider calls during
+    teardown), then up to REC_FLUSH_COLS buffered columns plus trades per
+    active session are flushed and awaited; failures inside the flush are
     logged and contained, never propagated into shutdown."""
-    yield
-    manager = getattr(app.state, "manager", None)
-    flush_all = getattr(manager, "flush_all", None)
-    if flush_all is not None:
-        await flush_all()
+    market_cache = getattr(app.state, "market_cache", None)
+    run_background = getattr(market_cache, "run_background", None)
+    prewarm: asyncio.Task | None = None
+    if callable(run_background):
+        prewarm = asyncio.create_task(
+            run_background(("crypto", "equity"), 30.0), name="market-cache-prewarm"
+        )
+    try:
+        yield
+    finally:
+        if prewarm is not None:
+            prewarm.cancel()
+            await asyncio.gather(prewarm, return_exceptions=True)
+        manager = getattr(app.state, "manager", None)
+        flush_all = getattr(manager, "flush_all", None)
+        if flush_all is not None:
+            await flush_all()
 
 
 def create_app(
@@ -149,7 +166,8 @@ def create_app(
         )
     # Discovery cache (GOAL 2): all movers/quote network lives behind this
     # TTL-debounced cache. Tests inject a canned cache; the default wires the live
-    # provider seams (only called when /api/movers or /api/quote is hit).
+    # provider seams, called on /api/movers|/api/quote reads and by the lifespan
+    # prewarm task (see _lifespan).
     if market_cache is None:
         market_cache = MarketDataCache(
             quote_fn=default_quote_fn, movers_fn=default_movers_fn

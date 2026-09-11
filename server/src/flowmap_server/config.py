@@ -45,6 +45,16 @@ _REC_FLUSH_INTERVAL_S_RANGE = (0.001, 3_600.0)
 # EVERY cadence flush (~every 16 s per session). 0 disables the gating (walk
 # after every flush — the old behavior).
 _RETENTION_MIN_INTERVAL_S_RANGE = (0.0, 86_400.0)
+# Bounded replay load (FLOWMAP_REPLAY_MAX_COLS). A no-window replay subscribe
+# used to materialize the ENTIRE recording (multi-GB RAM for long recordings)
+# even though any window the client can look at is bounded by the grid ring;
+# the no-window path now serves the NEWEST bounded window. 0 (default) = use
+# ``ring_columns`` (the same cap the windowed path already applies); a
+# positive value overrides it (deeper replay than the ring is legitimate —
+# the feed replays columns through, the grid keeps only the newest ring).
+# An explicit [start_t, end_t) window is NEVER trimmed by this knob; it stays
+# exact apart from the pre-existing ring cap.
+_REPLAY_MAX_COLS_RANGE = (0, 65_536)
 
 
 def _int_in_range(env: Mapping[str, str], name: str, default: str, lo: int, hi: int) -> int:
@@ -132,6 +142,11 @@ class Config(msgspec.Struct, frozen=True):
     # moves at GB scales, so a per-minute re-walk was pure disk churn. 0
     # restores the walk-after-every-flush behavior.
     retention_min_interval_s: float = 60.0
+    # Bound on the columns a NO-WINDOW replay subscribe may materialize
+    # (FLOWMAP_REPLAY_MAX_COLS). 0 = follow ``ring_columns``; a positive value
+    # is an explicit depth. The client's [start_t, end_t) window is never
+    # affected by this knob (see _REPLAY_MAX_COLS_RANGE).
+    replay_max_cols: int = 0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -203,5 +218,8 @@ class Config(msgspec.Struct, frozen=True):
                 "FLOWMAP_RETENTION_MIN_INTERVAL_S",
                 "60.0",
                 *_RETENTION_MIN_INTERVAL_S_RANGE,
+            ),
+            replay_max_cols=_int_in_range(
+                env, "FLOWMAP_REPLAY_MAX_COLS", "0", *_REPLAY_MAX_COLS_RANGE
             ),
         )

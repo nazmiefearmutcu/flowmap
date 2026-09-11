@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 from flowmap_server.config import Config
@@ -36,3 +35,9 @@ def test_data_dir_env_override_expands_user():
     assert cfg.data_dir == str(Path("~/custom-rec").expanduser())
     assert "~" not in cfg.data_dir
     assert cfg.data_dir.endswith("custom-rec")
+
+
+def test_replay_max_cols_default_and_env_override():
+    # 0 = follow ring_columns (the bounded newest replay window default).
+    assert Config.from_env({}).replay_max_cols == 0
+    assert Config.from_env({"FLOWMAP_REPLAY_MAX_COLS": "123"}).replay_max_cols == 123

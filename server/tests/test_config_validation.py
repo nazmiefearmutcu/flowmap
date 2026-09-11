@@ -26,6 +26,8 @@ CASES = [
     ("FLOWMAP_FLUSH_INTERVAL_S", "0", "FLOWMAP_FLUSH_INTERVAL_S"),
     ("FLOWMAP_FLUSH_INTERVAL_S", "999999", "FLOWMAP_FLUSH_INTERVAL_S"),
     ("FLOWMAP_RETENTION_MIN_INTERVAL_S", "-1", "FLOWMAP_RETENTION_MIN_INTERVAL_S"),
+    ("FLOWMAP_REPLAY_MAX_COLS", "-1", "FLOWMAP_REPLAY_MAX_COLS"),
+    ("FLOWMAP_REPLAY_MAX_COLS", "999999", "FLOWMAP_REPLAY_MAX_COLS"),
 ]
 
 
@@ -55,6 +57,7 @@ def test_range_still_admits_defaults(var, bad, name):
         "FLOWMAP_BACKFILL_MAX_COLS": "512",
         "FLOWMAP_FLUSH_INTERVAL_S": "10.0",
         "FLOWMAP_RETENTION_MIN_INTERVAL_S": "60.0",
+        "FLOWMAP_REPLAY_MAX_COLS": "0",
     }[var]
     cfg = Config.from_env({var: env_default})
     assert cfg is not None

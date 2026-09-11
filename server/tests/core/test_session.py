@@ -36,7 +36,6 @@ from flowmap_server.proto.events import (
     BBO,
     MODE_L1_BAND,
     MODE_L2,
-    MODE_SYNTH_PROFILE,
     BarColumn,
     DepthColumn,
     EpochStart,
