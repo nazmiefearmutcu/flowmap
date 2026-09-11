@@ -50,8 +50,8 @@ docs: document FLOWMAP_LOG_FILE
 
 Before opening a PR, please confirm:
 
-- [ ] **Tests green.** `cd client && npm test` (~626 vitest tests) and
-  `cd server && uv run pytest -q` (~450 pytest tests) both pass locally, and new behavior has
+- [ ] **Tests green.** `cd client && npm test` (~1116 vitest tests) and
+  `cd server && uv run pytest -q` (~630 pytest tests) both pass locally, and new behavior has
   tests.
 - [ ] **TypeScript clean.** `npx tsc -b` in `client/` reports no errors.
 - [ ] **The honest-data rule holds.** Never render, badge, or replay data that the feed did not

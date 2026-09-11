@@ -1,8 +1,13 @@
 name: CI
 
-# Fast push/PR gate: client typecheck + unit tests, server pytest.
-# The heavier release/packaging pipeline lives in release.yml; the original
-# combined suite job (uv-based) remains in test.yml.
+# Fast push/PR gate:
+#   - client typecheck + unit tests (ubuntu + windows)
+#   - client production bundle (tsc -b && vite build) — a broken prod build
+#     no longer ships green
+#   - server pytest (ubuntu + windows; the product is Windows-packaged, so the
+#     server suite is exercised on both OSes)
+#   - Tauri shell `cargo test` (ubuntu, with the Tauri 2 Linux system deps)
+# The heavier release/packaging pipeline lives in release.yml.
 on:
   push:
     branches: [main]
@@ -15,13 +20,64 @@ on:
       - "**.md"
       - "docs/**"
 
+# A new push to the same branch/PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   client:
-    name: client (tsc + vitest)
+    name: client (tsc + vitest, ubuntu)
     runs-on: ubuntu-latest
     steps:
       # Every action ref in every workflow is pinned to a full commit SHA
-      # (SECURITY.md's claim); the same pins are used across ci/test/release.
+      # (SECURITY.md's claim); the same pins are used across ci/release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install
+        working-directory: client
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: client
+        run: npx tsc -b
+
+      - name: Unit tests
+        working-directory: client
+        run: npx vitest run
+
+  client-build:
+    name: client (production bundle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install
+        working-directory: client
+        run: npm ci
+
+      # `npm run build` = `tsc -b && vite build` (client/package.json): proves
+      # the production bundle itself, not just the tests.
+      - name: Production build
+        working-directory: client
+        run: npm run build
+
+  client-windows:
+    name: client (tsc + vitest, windows)
+    runs-on: windows-latest
+    steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -43,14 +99,15 @@ jobs:
         run: npx vitest run
 
   server:
-    name: server (pytest)
+    name: server (pytest, ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # Same pinned action as test.yml and release.yml. uv installs exactly the
-      # versions resolved in server/uv.lock — including the crocodile git
-      # dependency that is not on PyPI and has no meaningful pip pin.
+      # Same pinned action as release.yml. uv installs exactly the versions
+      # resolved in server/uv.lock — including the crocodile git dependency
+      # that is not on PyPI and has no meaningful pip pin. server/pyproject.toml
+      # requires Python >= 3.13, which uv resolves (and downloads if needed).
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       # --frozen: a lockfile that drifted from pyproject.toml fails the build
@@ -59,3 +116,65 @@ jobs:
       - name: Run tests
         working-directory: server
         run: uv sync --frozen && uv run pytest -q
+
+  server-windows:
+    name: server (pytest, windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      # The Windows leg guards the packaged product's own platform: path
+      # handling, file locks and event-loop behavior differ enough that a
+      # green ubuntu run does not imply a green Windows run.
+      - name: Sync dependencies
+        working-directory: server
+        run: uv sync --frozen
+
+      - name: Run tests
+        working-directory: server
+        run: uv run pytest -q
+
+  shell:
+    name: shell (cargo test, tauri deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Tauri 2 Linux build dependencies (webkit2gtk-4.1 and friends) — the
+      # `tauri` crate cannot compile without them, so `cargo test` needs them
+      # even though it only runs unit tests. patchelf is part of the standard
+      # Tauri Linux prerequisite set and is harmless here.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            pkg-config
+
+      # tauri::generate_context! embeds the built client assets
+      # (frontendDist = ../../client/dist in tauri.conf.json) at COMPILE time,
+      # so the client bundle must exist before `cargo test` can even build.
+      # This also re-proves the production bundle on this leg.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Build client bundle (needed by generate_context!)
+        working-directory: client
+        run: npm ci && npm run build
+
+      # Stable Rust is preinstalled on GitHub runners; no toolchain action is
+      # added, keeping the every-action-is-SHA-pinned claim trivially true.
+      - name: Shell tests
+        working-directory: app/src-tauri
+        run: cargo test --locked

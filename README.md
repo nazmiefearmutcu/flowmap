@@ -1,6 +1,5 @@
 # FlowMap
 
-[![tests](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/test.yml/badge.svg)](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/test.yml)
 [![CI](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/ci.yml/badge.svg)](https://github.com/nazmiefearmutcu0/FlowMap/actions/workflows/ci.yml)
 
 FlowMap is an open-source order-flow depth heatmap for crypto and US equities: a WebGL2 chart
@@ -19,7 +18,9 @@ Anything a session shows can be recorded to parquet on disk and replayed with se
 
 - **Depth heatmap** — per-column bid/ask density on a fixed price grid; three colormaps
   (`flow` default, `inferno`, `classic`), SUM-mip zoom-out so walls don't dilute, tolerance
-  black point, contrast and normalization controls.
+  black point, contrast and normalization controls. **Depth channel modes** (`sum` / `bid` /
+  `ask` / `imbalance`) re-color the same map — imbalance renders the signed
+  `(bid−ask)/(bid+ask)` field on a CVD-safe divergent ramp.
 - **Chart navigation that stays honest at any depth** — wheel zooms time at the cursor,
   Shift/Ctrl+wheel zooms price, drag pans; the price gutter is its own control surface
   (wheel = price zoom, vertical drag = price scale, double-click = re-fit). Time-follow and
@@ -37,8 +38,19 @@ Anything a session shows can be recorded to parquet on disk and replayed with se
 - **Recording-backed replay** — sessions record to parquet under a 20 GB rotating cap;
   replay offers seek, 1–100× speed and pause over exactly what was recorded.
 - **Trader conveniences** — export the chart (heatmap + overlays) as a PNG with `E` or the
-  TopBar button, and highlight outsized tape prints with a configurable notional threshold
+  TopBar button, stream raw finalized columns from the active session via
+  [`/api/export`](docs/user-guide.md#export) (CSV/JSON), measure Δprice/Δtime/Δdepth on the
+  chart (`M`), and highlight outsized tape prints with a configurable notional threshold
   (`Settings → Big trade size`).
+- **Annotation & analysis layers** — chart **drawings** (trendline, horizontal ray, rectangle,
+  Fibonacci retracement, horizontal line, text) with select/move/resize and per-symbol
+  persistence; **indicators** (EMA, SMA, RSI, VWAP, Bollinger, MACD) and synthesized
+  **candles** (1m/5m) drawn in sync with the depth columns; **price alerts** (`A`) that are
+  client-local, persisted per symbol, and fire a marker pulse + toast; a **perf HUD** (`H`)
+  with live fps/frame/upload stats from the renderer.
+- **Accessible, honest shell** — five CVD-safe themes (`T` to cycle, OS light/dark honored on
+  first run), English/Turkish interface with graceful fallback, a first-run onboarding tour,
+  keyboard shortcuts everywhere (`?` for the live cheatsheet), and a polished toast stack.
 - **Desktop app** — Tauri 2 shell bundles the client and a relocatable Python sidecar
   (loopback-only), spawns it automatically, keeps a health-monitor thread that respawns it
   if it dies mid-session, and enforces a single running instance, for macOS (Apple Silicon /
@@ -53,6 +65,22 @@ Anything a session shows can be recorded to parquet on disk and replayed with se
 |---|---|
 | ![Live Binance BTCUSDT: WebGL2 heatmap, DOM ladder, tick tape](docs/media/heatmap-btcusdt-live.png) | ![equity:AAPL keyless SYNTH tier, replaying a recorded session](docs/media/equity-aapl-synth-replay.png) |
 | ![Crosshair with exact per-cell liquidity readout](docs/media/crosshair-readout.png) | ![Settings drawer: colormap, tolerance, normalization, overlay toggles](docs/media/settings-drawer.png) |
+
+More captures (`docs/media/sim-demo-markers.png`) ship in the repo. The screens above predate
+the latest feature wave (drawings, indicators, alerts, themes) — fresh captures are tracked in
+the [roadmap](ROADMAP.md). The [user guide](docs/user-guide.md) walks through every feature
+these screenshots show.
+
+## Documentation
+
+| Doc | What's inside |
+|---|---|
+| [docs/user-guide.md](docs/user-guide.md) | Install, first run, reading the heatmap, replay, measure, alerts, drawings, indicators, themes, shortcuts, export, troubleshooting |
+| [docs/architecture.md](docs/architecture.md) | Processes, wire protocol, sessions/grid, recording/replay, API surface |
+| [docs/development.md](docs/development.md) | Repo layout, dev environment, test commands, e2e, release/packaging outline |
+| [CHANGELOG.md](CHANGELOG.md) | Notable changes per work campaign, newest first |
+| [ROADMAP.md](ROADMAP.md) | Near/mid-term plans and explicit non-goals |
+| [CONTRIBUTING.md](CONTRIBUTING.md) / [SECURITY.md](SECURITY.md) | Dev setup, PR checklist · threat model, attestation verification |
 
 ## Architecture
 
@@ -181,6 +209,12 @@ live overlay.
 |---|---|
 | `Space` | Follow the live edge; play/pause in replay |
 | `/` or `Ctrl-K` / `⌘K` | Symbol search palette |
+| `E` | Export the chart as a PNG download |
+| `M` | Measure tool — drag for Δprice / Δtime / Δdepth |
+| `A` | Price alert at the crosshair price |
+| `H` | Perf HUD (fps / frame ms / uploads / draws / cache) |
+| `C` | Cycle depth channel (sum → bid → ask → imbalance) |
+| `T` | Cycle theme |
 | `?` | Toggle the shortcuts overlay |
 | `←` `→` `↑` `↓` | Pan time / price (chart focused) |
 | `+` / `−` | Zoom time (chart focused) |
@@ -199,20 +233,26 @@ live overlay.
 ## Development
 
 ```bash
-# client unit tests (~626, vitest + jsdom)
+# client unit tests (1100+ and growing, vitest + jsdom)
 cd client && npm install && npm test        # or: npx vitest, npm run test:watch
 npx tsc -b                                  # typecheck
+npm run build                               # production bundle (tsc -b && vite build)
 
-# server tests (~450, pytest)
+# server tests (630+ and growing, pytest, Python 3.13)
 cd server && uv sync && uv run pytest -q    # or: PYTHONPATH=server/src pytest server/tests -q
+
+# Tauri shell tests (Rust)
+cd app/src-tauri && cargo test              # Linux needs the Tauri system deps — see ci.yml
 
 # end-to-end (Playwright boots the real server :8720 + vite :5173 itself)
 cd client && npx playwright install chromium && npm run e2e
 ```
 
 E2E prerequisites, repo layout and release/packaging notes: [docs/development.md](docs/development.md).
-Protocol and internals: [docs/architecture.md](docs/architecture.md). Continuous integration runs
-both test suites on every push/PR: [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Protocol and internals: [docs/architecture.md](docs/architecture.md). Continuous integration
+runs the client suite (ubuntu + windows), the production bundle build, the server suite
+(ubuntu + windows) and the shell `cargo test` on every push/PR:
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ### Packaged releases
 

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::path::BaseDirectory;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -286,7 +286,65 @@ fn kill_sidecar(state: &SidecarState) {
     }
 }
 
-fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Result<Child, Box<dyn std::error::Error>> {
+/// UTC calendar stamp `YYYY-MM-DDTHH:MM:SSZ` from unix seconds (Howard
+/// Hinnant's civil-from-days algorithm; no chrono dependency). Diagnostic
+/// log-stamping only — never parsed back.
+fn utc_timestamp(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let secs_of_day = unix_secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// Open the sidecar log for spawn number `spawn_index` (0 = the initial
+/// spawn, >=1 = the monitor's respawn).
+///
+/// The FIRST spawn truncates (a fresh app run starts a fresh log). Every
+/// RESPAWN opens in APPEND mode and writes a dated `--- respawn #N ---`
+/// separator first: the respawn happens exactly when the sidecar died
+/// unexpectedly, and `File::create` here used to erase the Python traceback
+/// the respawn exists to explain (survey-4 M-1) — a crash loop left only the
+/// least informative (newest) log. std::fs::File writes are unbuffered, so
+/// the separator is on disk before the child's first stdout byte.
+fn open_sidecar_log(path: &Path, spawn_index: u32) -> std::io::Result<File> {
+    let mut file = if spawn_index == 0 {
+        File::create(path)? // first spawn of this app run: fresh log
+    } else {
+        OpenOptions::new().create(true).append(true).open(path)?
+    };
+    if spawn_index > 0 {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            file,
+            "\n--- respawn #{spawn_index} --- {} ---",
+            utc_timestamp(secs)
+        );
+    }
+    Ok(file)
+}
+
+fn spawn_sidecar(
+    app: &tauri::AppHandle,
+    port: u16,
+    spawn_index: u32,
+) -> Result<Child, Box<dyn std::error::Error>> {
     let python = resolve_python(app)
         .ok_or("bundled pyruntime not found (expected Contents/Resources/pyruntime)")?;
 
@@ -295,7 +353,7 @@ fn spawn_sidecar(app: &tauri::AppHandle, port: u16) -> Result<Child, Box<dyn std
     std::fs::create_dir_all(&recordings)?;
 
     let log_path = data_dir.join("flowmap-server.log");
-    let log = File::create(&log_path)?;
+    let log = open_sidecar_log(&log_path, spawn_index)?;
     let log_err = log.try_clone()?;
 
     eprintln!("[flowmap] sidecar: {} -m flowmap_server on :{port}", python.display());
@@ -364,7 +422,9 @@ fn spawn_sidecar_monitor(handle: tauri::AppHandle, port: u16) {
             }
             respawned = true;
             eprintln!("[flowmap] sidecar exited unexpectedly; one respawn on :{port}");
-            let child = match spawn_sidecar(&handle, port) {
+            // spawn_index 1 = respawn: the log is APPENDED to (never
+            // truncated), so the crashed process's traceback survives.
+            let child = match spawn_sidecar(&handle, port, 1) {
                 Ok(c) => c,
                 Err(err) => {
                     eprintln!("[flowmap] sidecar respawn failed: {err}; not retrying");
@@ -438,7 +498,7 @@ fn main() {
                     &format!("could not find a free loopback port: {err}"),
                 ),
             };
-            let child = match spawn_sidecar(&handle, port) {
+            let child = match spawn_sidecar(&handle, port, 0) {
                 Ok(child) => child,
                 Err(err) => fatal_error(
                     "FlowMap failed to start",
@@ -532,5 +592,58 @@ mod tests {
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respawn_log_opens_in_append_mode_and_keeps_crash_evidence() {
+        // survey-4 M-1 regression: the respawn monitor used to reopen the log
+        // with File::create (truncate), erasing the crash traceback it exists
+        // to explain. A respawn must APPEND and mark the boundary.
+        let dir = std::env::temp_dir().join(format!("flowmap-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flowmap-server.log");
+        std::fs::write(&path, "Traceback (most recent call last): ...\n").unwrap();
+
+        {
+            let _log = open_sidecar_log(&path, 1).expect("respawn open");
+        } // drop before reading
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("Traceback (most recent call last)"));
+        assert!(contents.contains("--- respawn #1 ---"));
+        assert!(contents.contains("T") && contents.ends_with("Z ---\n")); // dated
+
+        // A second respawn appends again, keeping everything before it.
+        {
+            let _log = open_sidecar_log(&path, 2).expect("second respawn open");
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("Traceback (most recent call last)"));
+        assert!(contents.contains("--- respawn #1 ---"));
+        assert!(contents.contains("--- respawn #2 ---"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_spawn_of_a_run_starts_a_fresh_log() {
+        // spawn_index 0 keeps the historical truncate-on-launch behavior: one
+        // fresh log per app run, no unbounded growth across runs.
+        let dir = std::env::temp_dir().join(format!("flowmap-log-test0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flowmap-server.log");
+        std::fs::write(&path, "stale bytes from the previous run").unwrap();
+        {
+            let _log = open_sidecar_log(&path, 0).expect("first open");
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utc_timestamp_matches_known_epochs() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(utc_timestamp(1_752_710_400), "2025-07-17T00:00:00Z");
+        assert_eq!(utc_timestamp(4_102_444_800), "2100-01-01T00:00:00Z"); // post-2038 sanity
     }
 }

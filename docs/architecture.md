@@ -29,12 +29,53 @@ request handler):
 
 | Route | Purpose | Source |
 |---|---|---|
-| `GET /api/health` | Liveness + operational snapshot: status, version, wire protocol version, uptime, recording enabled, active sessions with feed kind and live/degraded state | `api/rest.py` |
+| `GET /api/health` | Liveness + operational snapshot: status, version, wire protocol version, uptime, recording enabled, active sessions with feed kind and live/degraded state — plus the session-statistics producer's snapshot under `stats` (see below) | `api/rest.py` |
 | `GET /api/symbols` | Merged symbol directory, filtered by `?q=` substring | `api/rest.py` |
 | `GET /api/venues` | Subscribable venue list | `api/discovery.py` |
 | `GET /api/universe` | Full bundled universe (same source as `/api/symbols`) | `api/discovery.py` |
 | `GET /api/movers`, `GET /api/quote` | Network-cached market data for the symbol palette | `api/discovery.py`, `api/market_cache.py` |
-| `WS /ws` | The binary event stream | `api/ws.py` |
+| `GET /api/export` | Stream the last-N finalized density columns of a session as CSV or JSON (see below) | `api/export.py` |
+| `WS /ws` | The binary event stream, guarded by an origin gate and a connection cap (see below) | `api/ws.py` |
+
+### Session statistics (`/api/health` v3)
+
+The core exposes a `SessionStats` producer (`manager.stats.snapshot() -> dict`) whose snapshot
+the health endpoint surfaces **verbatim** under `stats`, alongside `stats_available: true`.
+Field names are frozen by contract: `drops` (per source: `feed`, `tx_lag`, `snapshot`),
+`restarts`, `sessions` (`active`, `rejected`), `latency_ms` (real EMA of measured WebSocket
+RTT — the Pong handler feeds it), `staleness_ms` (per-feed age of the last live sample),
+`clock_skew_ms` (client wall-clock delta from the optional `Subscribe.client_ts_ns` field),
+and `recording` (`enabled`, `flush_failures`, `last_flush_ts`). The API layer never reshapes
+the dict; extra producer keys pass through, and an absent or failing producer degrades to
+`stats: null` / `stats_available: false` with `status: ok` — health never lies by omission.
+
+### Export (`/api/export`)
+
+`GET /api/export?format=csv|json&columns=N&symbol=` streams the last-N **finalized** columns
+of a session, reading only public core accessors (`grid.history`, `grid.to_depth`,
+`grid.scale`, `price_scale.row_to_price`). CSV carries a `#` metadata comment (symbol, market,
+tick, `dt_ns`, extents) then one line per column; JSON is
+`{"symbol","tick","columns":[{"t0","bids","asks"}]}`. `N` defaults to 240 and clamps to the
+ring; a worst-case size check (64 MiB) refuses oversized requests up front with the app's
+structured error shape (404 `not_found`, 400 `bad_request`, 422 `invalid_params`). Encoding
+runs in a sync generator off the event loop, same discipline as `/api/recordings`.
+
+### WS admission control
+
+Before serving, `WS /ws` applies two checks:
+
+- **Origin gate** — browser `Origin` headers must match a built-in loopback allow-list
+  (`http://127.0.0.1:*`, `http://localhost:*`, `tauri://localhost`,
+  `https://tauri.localhost`). `FLOWMAP_WS_ALLOWED_ORIGINS` replaces the list (comma-separated;
+  `*` disables the check); requests with no `Origin` (non-browser tools) always pass.
+  Rejections `ACCEPT` then `CLOSE` with code **1008** and an honest Status frame + reason —
+  they never masquerade as protocol errors.
+- **Connection cap** — a per-app counter (`app.state.ws_live_connections`, i.e. per-process
+  under the single-app sidecar) bounds live sockets (`FLOWMAP_WS_MAX_CONNECTIONS`, default
+  16). Over-cap connects get close code **1013** "connection cap reached; try again later";
+  refused sockets never occupy a slot and slots free on disconnect.
+
+Both env vars are read at call time, so tests (and operators) can flip them without restarts.
 
 ## Wire protocol (`server/src/flowmap_server/proto/wire.py`, mirrored in `client/src/proto/decode.ts`)
 
@@ -119,6 +160,42 @@ badge cannot claim more than the stream delivers.
   `Status{degraded}`, WS close `1003`, and a `replay_stale` token carrying both tail positions:
   a stale tail is never presented as valid replay. Where a recorded tail meets a live edge, the
   session inserts a `Marker{kind=gap}` instead of inventing continuity.
+
+## Client overlay stack
+
+Everything drawn over the heatmap is a **DOM or 2D-canvas layer above the WebGL canvas**,
+anchored in chart space (column, price) through `gl/overlays/coords.ts` + `gl/priceScale.ts`
+— never in pixels — so layers follow the data across pan/zoom/replay:
+
+- GL canvas (the only WebGL2 context) → GL-managed overlays (BBO, VWAP, CVD markers, bubbles,
+  profile, axes) drawn inside the renderer frame.
+- 2D canvas layers: the **drawing overlay** (trendlines, rays, rectangles, Fibonacci
+  retracements, hlines, text — per-symbol `localStorage` persistence) and the **indicator
+  overlay** (EMA/SMA/RSI/VWAP/Bollinger/MACD + synthesized candles) each ride their own
+  canvas wrapped in a `position:relative` container above the GL stage.
+- DOM layers: crosshair with the per-cell readout, the **measure tool** (dashed drag
+  rectangle with Δprice/Δtime/Δdepth), **price-alert lines** and their popover, the perf HUD,
+  toasts and onboarding. These stay `pointer-events: none` unless armed, so chart pan/zoom is
+  never eaten.
+
+Channel modes (`renderer.setDepthChannel('sum'|'bid'|'ask'|'imbalance')`) are a renderer
+uniform + divergent LUT row, not an overlay; the default `sum` path is byte-pinned to be
+bit-identical with pre-channel releases. The renderer also exposes `stats()` (fps, frame ms,
+uploads, draws, cache bytes) for the HUD, and the theme system feeds canvas colors through
+computed CSS variables (below), so no overlay hardcodes palette literals.
+
+## Themes and i18n (client shell)
+
+- **Themes** — `client/src/theme/` holds a registry of five CVD-safe palettes (`midnight`
+  default, `paper`, `swiss`, `amber`, `sea`). Each theme re-declares the full CSS-variable
+  token set on `:root[data-theme='<id>']` over the base sheet, so switching is one
+  `data-theme` attribute stamp plus a `localStorage` write; first run seeds from
+  `prefers-color-scheme`. Canvas overlays read live computed variables through
+  `getCanvasPalette()` — DOM and GL stay in one visual language.
+- **i18n** — `client/src/i18n/` is a dependency-free `t(key, vars?)` table (English source of
+  truth + Turkish) covering the shell (top bar, settings drawer, banners, shortcuts overlay,
+  onboarding, toasts). Fallback chain is locale → English → key text, so a missing translation
+  never renders a raw key. Feature panes remain English until their string sets settle.
 
 ## Threading model
 

@@ -7,27 +7,36 @@ app/       Tauri 2 desktop shell (Rust): sidecar lifecycle, bundling scripts,
            platform tauri.<os>.conf.json overrides. See app/README.md.
 client/    React 18 + TypeScript + WebGL2 renderer. Vite dev server (:5173)
            proxies /api and /ws to the server on :8720.
-  src/gl/      renderer: column textures, SUM-mips, camera, colormaps (gl/lut.ts)
+  src/gl/      renderer: column textures, SUM-mips, camera, colormaps (gl/lut.ts),
+               depth channel modes + renderer stats
   src/input/   gestures.ts (wheel/drag), keys.ts (global keyboard)
   src/net/     connection.ts (WS), history.ts (paged history), serverBase.ts
   src/proto/   decode.ts / encode.ts — TypeScript mirror of the server wire codec
-  src/ui/      top bar, symbol search, DOM ladder, tape, CVD pane, settings, ...
+  src/state/   stores: book/tape, settings, alerts
+  src/theme/   theme registry (5 CVD-safe palettes), CSS-variable tokens
+  src/i18n/    EN/TR shell translation (t(), locale persistence)
+  src/drawings/  chart annotation model + persistence (2D overlay in src/ui)
+  src/indicators/ + src/candles/  indicator kernels, registry, candle synthesis
+  src/ui/      top bar, symbol search, DOM ladder, tape, CVD pane, settings,
+               measure tool, price alerts, drawings/indicator canvases, ...
   tests/e2e/   Playwright specs (heatmap, live-sim, equity, parity, perf gates)
 server/    Python 3.13 sidecar (FastAPI + uvicorn, asyncio).
   src/flowmap_server/
     api/     REST (/api/health, /api/symbols, /api/venues, /api/universe,
-             /api/movers, /api/quote) + the binary /ws WebSocket
-    core/    density grid, sessions, recorder, price scale, backfill
+             /api/movers, /api/quote, /api/export) + the binary /ws WebSocket
+             (origin gate + connection cap)
+    core/    density grid, sessions, recorder, price scale, backfill, session stats
     data/    bundled symbol universe + venue catalog
     feeds/   sim, crypto (Crocodile), equity, replay, and the router
     proto/   wire.py (binary codec) + events.py (msgspec event types)
   tests/     pytest suite (asyncio_mode=auto, 60 s timeout per test)
-docs/       architecture.md, development.md, design specs (superpowers/specs),
-            screenshots (media/)
+docs/       architecture.md, development.md, user-guide.md, design specs
+            (superpowers/specs), screenshots (media/)
 scripts/    dev.sh, dev-windows.ps1, dev-unix.sh (dev boot), package.sh
             (client production bundle)
-.github/    workflows: test.yml, ci.yml (push/PR tests), release.yml (packaged,
-            attested installers)
+.github/    workflows: ci.yml (push/PR gate: client tsc+vitest on ubuntu+windows,
+            production bundle build, server pytest on ubuntu+windows, shell cargo
+            test), release.yml (packaged, attested installers)
 ```
 
 ## Dev environment
@@ -45,14 +54,19 @@ scripts/    dev.sh, dev-windows.ps1, dev-unix.sh (dev boot), package.sh
 ## Tests
 
 ```bash
-# client unit tests (vitest + jsdom, ~626 tests)
+# client unit tests (vitest + jsdom, 900+ and growing every campaign)
 cd client && npm test              # = vitest run; npm run test:watch for watch mode
 npx tsc -b                         # strict typecheck across client tsconfig projects
+npm run build                      # production bundle proof (tsc -b && vite build)
 
-# server tests (pytest, ~450 tests)
+# server tests (pytest, 550+ and growing)
 cd server && uv sync && uv run pytest -q
 # without uv, from the repo root:
 PYTHONPATH=server/src pytest server/tests -q
+
+# Tauri shell tests (Rust; Linux needs the Tauri system deps — copy the apt list
+# from .github/workflows/ci.yml's shell job)
+cd app/src-tauri && cargo test
 ```
 
 pytest is configured in `server/pyproject.toml` (`asyncio_mode = "auto"`,
