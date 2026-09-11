@@ -231,6 +231,21 @@ describe('selectLevel (SUM-mip selection) — unchanged by the tolerance work', 
     expect(selectLevel(4096, 2).nRowTaps).toBeLessThanOrEqual(4);
   });
 
+  it('never under-samples the footprint (ceil, campaign 4.2)', () => {
+    // rpp in (blk, 2*blk) previously rounded DOWN to one tap — a 5.8-row pixel
+    // sampled 4 rows and painted dashed price rows when zoomed far out.
+    for (const rpp of [4.1, 5, 5.8, 6, 7.9, 8.1, 12, 15.9, 16.1, 31.9, 60]) {
+      const sel = selectLevel(rpp, 2);
+      const covered = sel.nRowTaps * sel.blk;
+      // The tap block spans the footprint whenever the clamp allows it; above
+      // 64 rows (4 taps × level-2 blk) the grid's own 4096-row cap takes over.
+      if (covered < rpp) {
+        expect(covered, `rpp ${rpp} must hit the 4-tap clamp`).toBe(64);
+      }
+      expect(covered).toBeGreaterThanOrEqual(Math.min(rpp, 64));
+    }
+  });
+
   it('lands EXACTLY on the level boundary at every exact 4^k footprint (log2)', () => {
     // log2 is exact for powers of two on V8, so the level boundaries must hold
     // far past where log/log drifting could bite (level 4+ = 256+ rows/px).

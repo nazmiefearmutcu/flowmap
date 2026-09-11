@@ -10,7 +10,6 @@ import {
   KILL_PRICE,
   KILL_TIME,
   limitsFor,
-  MAX_ROW_SPAN,
   MIN_COL_SPAN,
   MIN_ROW_SPAN,
   pan,
@@ -238,43 +237,42 @@ describe('zoomPrice — cursor anchored', () => {
     expect(zoomPrice(s, LIMITS, 0.001, s.rowCenter).rowSpan).toBe(MIN_ROW_SPAN);
   });
 
-  it('lets the user zoom price out far past the grid height, up to the zoom cap', () => {
-    // The price twin of the time-axis decoupling: zoom-out is not capped by the
-    // framing/grid height (README: "price and time both zoom out far past the
-    // grid"). A 1e6x from near-grid height lands past ROWS, not on it...
+  it('caps the user price zoom-out at the grid height — the full band', () => {
+    // Campaign 4.2: the zoom-out cap and the framing height COINCIDE. Zooming
+    // past the full band only produced black margins plus a sub-sampled mip
+    // image (the owner-reported dashed rows), so the wall is now meaningful.
     const past = zoomPrice({ ...baseState(), rowSpan: 400 }, LIMITS, 1e6, 256);
-    expect(past.rowSpan).toBeGreaterThan(ROWS);
-    expect(past.rowSpan).toBe(LIMITS.maxRowSpanZoom);
-    // ...but there is still a hard ceiling (maxRowSpanZoom) for numeric safety.
+    expect(past.rowSpan).toBe(ROWS);
+    // ...and the hard ceiling is the same grid height.
     const capped = zoomPrice({ ...baseState(), rowSpan: 400 }, LIMITS, 1e9, 256);
-    expect(capped.rowSpan).toBe(MAX_ROW_SPAN);
+    expect(capped.rowSpan).toBe(ROWS);
   });
 
-  it('an in-between span past the grid height is legal and untouched', () => {
+  it('an in-between span within the grid is legal and untouched', () => {
     const s = { ...baseState(), rowSpan: 400 };
-    const out = zoomPrice(s, LIMITS, 2, s.rowCenter);
-    expect(out.rowSpan).toBe(800); // > ROWS, < MAX_ROW_SPAN — no wall, no jump
+    const out = zoomPrice(s, LIMITS, 1.25, s.rowCenter);
+    expect(out.rowSpan).toBe(500); // < ROWS — no wall, no jump
   });
 });
 
 describe('maxRowSpanZoom — the user price zoom-out cap', () => {
-  it('limitsFor decouples it from the grid height (like maxColSpanZoom)', () => {
-    expect(LIMITS.maxRowSpanZoom).toBe(MAX_ROW_SPAN); // ROWS(512) < cap
-    // A grid that somehow outgrew the cap still gets its full height.
-    expect(limitsFor(MAX_ROW_SPAN * 2, CAP).maxRowSpanZoom).toBe(MAX_ROW_SPAN * 2);
+  it('limitsFor pins it to the grid height (the widest meaningful view)', () => {
+    expect(LIMITS.maxRowSpanZoom).toBe(ROWS);
+    // A taller grid gets its full height, never less.
+    expect(limitsFor(512 * 4, CAP).maxRowSpanZoom).toBe(512 * 4);
   });
 
-  it('clampCamera allows any span in [MIN_ROW_SPAN, maxRowSpanZoom]', () => {
-    expect(clampCamera({ ...baseState(), rowSpan: 500_000 }, LIMITS).rowSpan).toBe(500_000);
-    expect(clampCamera({ ...baseState(), rowSpan: 1e12 }, LIMITS).rowSpan).toBe(MAX_ROW_SPAN);
+  it('clampCamera allows any span in [MIN_ROW_SPAN, rows]', () => {
+    expect(clampCamera({ ...baseState(), rowSpan: 500 }, LIMITS).rowSpan).toBe(500);
+    expect(clampCamera({ ...baseState(), rowSpan: 1e12 }, LIMITS).rowSpan).toBe(ROWS);
   });
 
-  it('rowCenterBounds stays span-relative at the max user zoom-out', () => {
-    const b = rowCenterBounds(MAX_ROW_SPAN, LIMITS);
-    expect(b).toEqual({ lo: -MAX_ROW_SPAN, hi: ROWS + MAX_ROW_SPAN });
+  it('rowCenterBounds stays span-relative at the widest legal span', () => {
+    const b = rowCenterBounds(ROWS, LIMITS);
+    expect(b).toEqual({ lo: -ROWS, hi: ROWS + ROWS });
     // A full overscroll at the widest span keeps the view finite and precise.
-    const p = pan({ ...baseState(), rowSpan: MAX_ROW_SPAN }, LIMITS, 0, -1e12);
-    expect(p.rowCenter).toBe(-MAX_ROW_SPAN);
+    const p = pan({ ...baseState(), rowSpan: ROWS }, LIMITS, 0, -1e12);
+    expect(p.rowCenter).toBe(-ROWS);
   });
 });
 
@@ -421,15 +419,14 @@ describe('clampCamera', () => {
     );
     expect(c.colCenter).toBe(-50); // time center free
     expect(c.colSpan).toBe(MIN_COL_SPAN);
-    expect(c.rowSpan).toBe(MAX_ROW_SPAN); // span tops out at the USER zoom cap
+    expect(c.rowSpan).toBe(ROWS); // span tops out at the USER zoom cap (grid height)
     // rowCenter is bounded by the POST-clamp span, not the 1e12 it came in with.
-    expect(c.rowCenter).toBe(ROWS + MAX_ROW_SPAN);
+    expect(c.rowCenter).toBe(ROWS + ROWS);
   });
 
   it('clamps rowSpan BEFORE deriving the rowCenter band (order matters)', () => {
     // If the band were derived from the pre-clamp span (1e12), rowCenter (1e9)
-    // would pass unclamped; it must use the clamped span (MAX_ROW_SPAN) →
-    // ROWS + MAX_ROW_SPAN.
+    // would pass unclamped; it must use the clamped span (ROWS) → rows + ROWS.
     const c = clampCamera(
       {
         colCenter: 0,
@@ -441,8 +438,8 @@ describe('clampCamera', () => {
       },
       LIMITS,
     );
-    expect(c.rowSpan).toBe(MAX_ROW_SPAN);
-    expect(c.rowCenter).toBe(rowCenterBounds(MAX_ROW_SPAN, LIMITS).hi);
+    expect(c.rowSpan).toBe(ROWS);
+    expect(c.rowCenter).toBe(rowCenterBounds(ROWS, LIMITS).hi);
   });
 });
 
@@ -496,12 +493,12 @@ describe('Camera (imperative wrapper)', () => {
     const cam = new Camera(LIMITS);
     cam.setFollowFrame(0, 100, 0, 500); // rowSpan 500 within 512
     cam.setLimits(limitsFor(256, CAP)); // grid shrinks to 256 rows
-    // A 500-row span is a legal USER zoom-out on the shrunk grid (past the
-    // grid the shader paints background), so it survives; only the centre
-    // re-bounds to the new span-relative band.
-    expect(cam.toView().rowScale).toBe(500);
-    expect(cam.state.rowCenter).toBe(250); // band for span 500 is [-500, 756]
-    // What the shrink still forces back: a span past the USER cap.
+    // Campaign 4.2: the user zoom-out cap IS the grid height, so the 500-row
+    // span now clamps to the shrunk grid's 256 rows, and the centre re-bounds
+    // to the new span-relative band.
+    expect(cam.toView().rowScale).toBe(256);
+    expect(cam.state.rowCenter).toBe(250); // already inside the new span's band
+    // A span past the USER cap clamps to the new cap (256).
     cam.state = { ...cam.state, rowSpan: 2_000_000 };
     cam.setLimits(limitsFor(256, CAP));
     expect(cam.toView().rowScale).toBe(cam.limits.maxRowSpanZoom);

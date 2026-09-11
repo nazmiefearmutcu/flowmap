@@ -202,7 +202,13 @@ export function selectLevel(
     : 0;
   const level = Math.max(floorLevel, Math.max(0, Math.max(rowLevel, colLevel)));
   const blk = 4 ** level;
-  const nRowTaps = Math.max(1, Math.min(4, Math.round(rpp / blk)));
+  // COVERAGE, not rounding (campaign 4.2): round(rpp/blk) picked 1 tap for rpp
+  // in (4,6), leaving ~30% of the pixel's price footprint unsampled — when
+  // price is zoomed far out that aliasing paints every price row as a dashed
+  // line. ceil() guarantees the summed taps span the whole footprint; the ×4
+  // clamp covers 64 rows at level 2, more than any viewport at the 4096-row
+  // grid can demand.
+  const nRowTaps = Math.max(1, Math.min(4, Math.ceil(rpp / blk)));
   return { level, blk, nRowTaps };
 }
 

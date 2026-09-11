@@ -29,12 +29,11 @@
  * "look infinitely far up/down" gesture. That is visually safe with no shader
  * change: the fragment shader already paints the LUT floor (`background()`) for
  * any row outside `[0, rows)`. `rowSpan` tops out at the USER zoom-out cap
- * `maxRowSpanZoom` (≈ MAX_ROW_SPAN), deliberately far past the grid height — the
- * same decoupling the time axis has — so zooming price out to "the whole market
- * in one view" hits no artificial wall. The one trade-off, identical to the time
- * axis's deep zoom-out: past ~16 rows-per-pixel `Renderer.currentLevel()`
- * saturates at SUM-mip level 2, which renders from the mips and suppresses
- * scroll-back backfill (see net/history.ts).
+ * `maxRowSpanZoom`, which is now the GRID HEIGHT: "the whole market in one
+ * view" is exactly the full band, and zooming further only added black margins
+ * plus a sub-sampled mip image (owner-reported "dashed rows" past ~16
+ * rows/pixel where level 2 ran out of footprint coverage). Panning past the
+ * band stays allowed; zooming past it does not. See {@link limitsFor}.
  *
  * All operations are PURE — they take a state (+ limits) and return a new state,
  * so the math is unit-testable with no GL context (see camera.test.ts). The
@@ -149,16 +148,12 @@ export const MIN_ROW_SPAN = 1;
  */
 export const MAX_COL_SPAN = 1_048_576;
 /**
- * Absolute ceiling on the USER price zoom-out (rows across the viewport) — the
- * price-axis twin of {@link MAX_COL_SPAN}. ~1.05M rows is effectively
- * "infinite" for a 2048/4096-row order-flow grid (the whole book, both wings
- * and everything past them, in one view) while staying well inside f32's
- * exact-integer range (2^24), so row indices and the rowScale uniform never
- * lose precision. `maxRowSpanZoom` is `Math.max(rows, MAX_ROW_SPAN)` so a grid
- * that somehow outgrew the cap still gets its full height.
+ * The USER price zoom-out cap (rows across the viewport) is the GRID HEIGHT —
+ * see {@link limitsFor}. There is deliberately no larger constant: zooming out
+ * past the full band only produced black margins and a sub-sampled mip image
+ * (dashed price rows), so the cap and the framing height coincide. Panning
+ * (overscroll) still lets the user push the band off screen.
  */
-export const MAX_ROW_SPAN = 1_048_576;
-
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
@@ -173,8 +168,9 @@ export function limitsFor(rows: number, capacityCols: number): CameraLimits {
     maxColSpan: framing,
     // Manual zoom-out may go far past the ring — no wall.
     maxColSpanZoom: Math.max(framing, MAX_COL_SPAN),
-    // Manual price zoom-out may go far past the grid — no wall.
-    maxRowSpanZoom: Math.max(rows, MAX_ROW_SPAN),
+    // Manual price zoom-out stops at the full band: past it the view is black
+    // margins + a sub-sampled mip (the owner-reported dashed-rows artifact).
+    maxRowSpanZoom: rows,
   };
 }
 
@@ -307,8 +303,8 @@ export function zoomTime(
  * overscroll bounds where rowCenter clamps). Does NOT touch time follow, and
  * does not switch price follow off — it promotes `'fit'` to `'track'` so the
  * span the user just chose is kept and only the centre keeps tracking.
- * Zoom-out runs to `maxRowSpanZoom` (far past the grid — the price twin of
- * {@link zoomTime}'s maxColSpanZoom), not to the framing cap `rows`.
+ * Zoom-out runs to `maxRowSpanZoom`, which equals the grid height — the full
+ * band is the widest meaningful view (see {@link limitsFor}).
  */
 export function zoomPrice(
   s: CameraState,
