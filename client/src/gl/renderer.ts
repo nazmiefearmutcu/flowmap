@@ -99,10 +99,14 @@ import {
   mapScale,
   remapRow,
   remapRowSpan,
+  slotColToTsNs,
+  slotTsToCol,
   type PriceMap,
   type TimeMap,
+  type TimeSlots,
 } from './overlays/coords';
 import {
+  priceToRow as scalePriceToRow,
   rowToPrice as scaleRowToPrice,
   scaleFromEpoch,
   stepAtRow as scaleStepAtRow,
@@ -351,8 +355,47 @@ export class Renderer {
   // --- price auto-follow (gl/follow.ts) ---------------------------------------
   /** Row the live book is currently centred on, or null before any column. */
   private trackedRowN: number | null = null;
+  /**
+   * Epoch the ROW was derived from (D3). The D3 incident: a new epoch's column
+   * arrived before the store held its params, `trackedRowN` was recorded from
+   * its book anyway, and the later remap read it through the OLD affine — a
+   * silent park in the deep wing. Tracked state is epoch-scoped; a mismatched
+   * or missing epoch drops the row instead of remapping it.
+   */
+  private trackedEpoch: number | null = null;
   /** Epoch `trackedRowN` / the camera's price frame are expressed in. */
   private priceEpoch: number | null = null;
+  /**
+   * `sessionId` of the last accepted column (D5). A server-side session
+   * replacement for the same subscription restarts col_seq from a lower value;
+   * the first column of the new session names a different id. Null until the
+   * first column.
+   */
+  private lastSessionId: string | null = null;
+  /**
+   * CP2: per-resident-ring-slot column start time (float64 ns), written with
+   * the extent arrays and cleared with them on ring rebuild/reset. NaN = the
+   * slot has not been written for this ring. Needed because reconstructed
+   * history columns are 60 s apart while the epoch says 250 ms, so the affine
+   * TimeMap lies about time (survey S2/D1).
+   */
+  private slotT0: Float64Array | null = null;
+  /**
+   * CP2: the contiguous seq run currently covered by `slotT0` (inclusive),
+   * tracked from the FIRST written column's seq (R1-M1) — a warm attach starts
+   * mid-sequence, so a slot-0 prefix would never reach the anchor and the whole
+   * table stayed inert. Forward gaps restart the run at the newer column; a
+   * splice landing exactly one below the start extends it downward; older
+   * non-contiguous pages leave the run alone (they cannot affect anchor
+   * coverage). Every knot handed to coords.ts's helpers is finite; the slot
+   * subarray is only served when the run covers the anchor and does not wrap.
+   */
+  private slotT0RunStart = -1;
+  private slotT0RunEnd = -2;
+  /** R1-M2: last PriceMap the camera was interpreted through (see overlayPriceMap). */
+  private lastPriceMapCache: PriceMap | null = null;
+  /** R1-M2: armed by resetOverlaysForNewSession; consumed by the next remap. */
+  private forcedRemapFrom: PriceMap | null = null;
   /** Armed recentre target (rows); null while price sits inside the deadband. */
   private priceTarget: number | null = null;
   /** True once the glide has settled, so a stalled ease stops re-dirtying. */
@@ -495,6 +538,24 @@ export class Renderer {
   /** How the PRICE axis is auto-scaling ('fit' | 'track' | 'off'). Diagnostics. */
   get priceFollow(): PriceFollow {
     return this.camera.followPrice;
+  }
+
+  /**
+   * The TIME-follow POLICY the user/settings asked for (R2-L2) - unlike
+   * {@link following}, which is false both when the policy is off AND while
+   * merely scrolled back. The App reconciles persisted settings against this.
+   */
+  get wantedFollowTime(): boolean {
+    return this.wantFollowTime;
+  }
+
+  /**
+   * CP1: is the newest resident column inside the current view? This is the
+   * condition `stepPriceFollow` gates on — when it is false (scrolled back),
+   * TRACK cannot act, so the UI must not present it as armed (survey S1/D1).
+   */
+  get liveEdgeVisible(): boolean {
+    return this.newestSeq >= 0 && isColVisible(this.view, this.newestSeq);
   }
 
   /** A copy of the current view uniforms. Diagnostics / e2e. */
@@ -885,27 +946,15 @@ export class Renderer {
     this.awaitingSession = true;
     this.gateSessionId = this.store.getState().sessionId;
     this.gateWarned = false;
+    this.lastSessionId = this.gateSessionId;
 
-    // A lost context is mid-rebuild; its own `restored` path re-empties the ring.
-    if (this.glLost()) return;
-
-    // Tear down the GL heatmap objects; the next new-session column recreates
-    // them at the new row count via createRing (matching the live-path sizing).
-    this.cancelPendingMips();
-    this.mips?.dispose();
-    this.heatmap?.dispose();
-    this.ring?.dispose();
-    this.mips = null;
-    this.heatmap = null;
-    this.ring = null;
-    this.history = null;
-    this.extentLo = null;
-    this.extentHi = null;
-    this.extentSeq = null;
-    this.ringRows = 0;
-    this.ringLayers = 0;
-
-    // CPU-side state survives a context loss, but a NEW symbol invalidates it.
+    // CP3 + H-1: the 2D ink (text layer + both gutters) is NOT GL — clear it
+    // and run the whole CPU-side teardown BEFORE the lost-context bail. The old
+    // code returned first, so a symbol switch during a context loss left the
+    // previous symbol's price line / axis labels / pill floating over the new
+    // heatmap until bars overwrote them (survey S3 C-3 + H-1). 2D ops are safe
+    // while the GL context is lost; only the GL teardown waits.
+    this.clearOverlayInk();
     this.normalizer.reset();
     this.columnCache.reset();
     this.overlays.reset();
@@ -921,6 +970,7 @@ export class Renderer {
     // the new session's first (typically lower) col_seq becomes the newest again.
     this.newestSeq = -1;
     this.trackedRowN = null;
+    this.trackedEpoch = null;
     this.priceEpoch = null;
     this.priceTarget = null;
     this.priceStalled = false;
@@ -937,12 +987,83 @@ export class Renderer {
     this.applyWantedFollow();
     this.view = this.camera.toView();
 
+    // A lost context is mid-rebuild; its own `restored` path re-empties the ring
+    // at the remembered geometry. The CPU state above is already re-armed.
+    if (this.glLost()) return;
+
+    // Tear down the GL heatmap objects; the next new-session column recreates
+    // them at the new row count via createRing (matching the live-path sizing).
+    this.cancelPendingMips();
+    this.mips?.dispose();
+    this.heatmap?.dispose();
+    this.ring?.dispose();
+    this.mips = null;
+    this.heatmap = null;
+    this.ring = null;
+    this.history = null;
+    this.extentLo = null;
+    this.extentHi = null;
+    this.extentSeq = null;
+    this.slotT0 = null;
+    this.ringRows = 0;
+    this.ringLayers = 0;
+
     // Wipe the old image now — preserveDrawingBuffer would otherwise keep the
     // stale frame on screen until the first new-session column draws.
     this.clearBackground();
 
     this.dirty = true;
     this.viewMoved = true;
+  }
+
+  /**
+   * CP1/D5: cursor-only reset for a NEW session on the SAME subscription (a
+   * server-side session replacement whose col_seq restarts below the old
+   * high-water, or an explicit App call on a `sessionId` change). Rewinds the
+   * follow/anchor cursors, drops the overlay data and clears the 2D ink, but
+   * does NOT touch the ring — scrolled-back history survives. The next live
+   * column re-derives everything (tracked row, price fit, anchors).
+   */
+  resetOverlaysForNewSession(sessionId?: string): void {
+    // L-3: the renderer also detects session replacement internally; when the
+    // App effect calls this with the SAME id that detection already handled,
+    // skip so the new session's first trades are not wiped twice.
+    if (sessionId !== undefined && sessionId === this.lastSessionId) return;
+    this.newestSeq = -1;
+    this.trackedRowN = null;
+    this.trackedEpoch = null;
+    // R1-M2: a same-numbered epoch replacement (the server grid always starts
+    // at epoch 0 and Hello overwrites the params) skips the numeric remap, so
+    // the camera would be silently reinterpreted through the new affine. Cache
+    // the last map we painted with and force one price-preserving remap on the
+    // next column.
+    this.forcedRemapFrom = this.lastPriceMapCache;
+    this.priceEpoch = null;
+    this.priceTarget = null;
+    this.priceStalled = false;
+    this.priceFitMemo = null;
+    this.overlayAnchorSeq = -1;
+    this.overlayAnchorT0Ns = 0n;
+    this.overlayAnchorEpoch = 0;
+    this.lastPruneOldest = -1;
+    this.lastPruneNewest = -1;
+    // R1-L4: the t0 run table is seq-scoped; a new session re-starts seqs, so
+    // drop the run (slots are overwritten as the new columns arrive).
+    this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
+    this.clearOverlayInk();
+    this.overlays.reset();
+    this.dirty = true;
+  }
+
+  /**
+   * CP3: the synchronous 2D ink teardown (text layer + both gutter canvases,
+   * no GL) owned by the overlay manager. Called on session resets and before
+   * the `drawOverlays` early returns so a frame/session that paints nothing
+   * cannot leave the previous frame's ink floating over the chart.
+   */
+  private clearOverlayInk(): void {
+    this.overlays.clearInk();
   }
 
   // --- gesture control (input/gestures → Camera) --------------------------------
@@ -1144,6 +1265,24 @@ export class Renderer {
     const rows = plan.rows;
     const ring = this.ring!;
 
+    // D5(a): the store's session identity changed under this subscription — a
+    // server-side session replacement (parked-session grace expiry / restart).
+    // Its columns reuse col_seq values the OLD session already consumed, so the
+    // overlay data, anchors and follow cursors must be rewound before they are
+    // accepted; the ring itself survives.
+    if (this.lastSessionId !== null && state.sessionId !== this.lastSessionId) {
+      this.resetOverlaysForNewSession();
+    }
+    this.lastSessionId = state.sessionId;
+
+    // D5(b): col_seq regression — a column more than a whole ring behind the
+    // high-water mark cannot be a re-send or a history splice (neither comes
+    // through this path); it is a restarted sequence. `newestSeq` is max-only,
+    // so without this the live edge stays un-visible forever and TRACK is dead.
+    if (this.newestSeq >= 0 && col.col_seq + ring.capacityCols < this.newestSeq) {
+      this.resetOverlaysForNewSession();
+    }
+
     // Epoch change: the server moved p0, so a USER-OWNED price window (track /
     // off) is now pointing at different prices. Remap the camera + tracked row
     // through the two affines. `priceEpoch` only advances when the remap
@@ -1237,11 +1376,42 @@ export class Renderer {
     this.extentLo![slot] = lo;
     this.extentHi![slot] = hi;
     this.extentSeq![slot] = col.col_seq;
+    // CP2: the true start time of this resident column, for the piecewise time
+    // map (reconstructed history columns are 60 s apart despite a 250 ms epoch).
+    if (this.slotT0 !== null) {
+      this.slotT0[slot] = Number(col.t0_ns);
+      // R1-M1: track the contiguous run from its FIRST WRITTEN column, not a
+      // slot-0 prefix — a warm attach starts mid-sequence and the table must
+      // still serve the reconstructed tail. Forward gaps restart the run at the
+      // newer column; an exactly-contiguous older page (splice backfill)
+      // extends it downward; older non-contiguous pages leave it alone.
+      const s = col.col_seq;
+      if (this.slotT0RunStart < 0) {
+        this.slotT0RunStart = s;
+        this.slotT0RunEnd = s;
+      } else if (s === this.slotT0RunEnd + 1) {
+        this.slotT0RunEnd = s;
+      } else if (s === this.slotT0RunStart - 1) {
+        this.slotT0RunStart = s;
+      } else if (s > this.slotT0RunEnd) {
+        this.slotT0RunStart = s;
+        this.slotT0RunEnd = s;
+      }
+    }
     // Price auto-follow tracks the LIVE edge only: a backfilled history column
     // must never move the tracked row (renderer.ts spliceColumn shares this path).
     if (col.col_seq >= this.newestSeq) {
-      const tracked = trackedRow(bidTop, askBot, lo, hi);
-      if (tracked !== null) this.trackedRowN = tracked;
+      // D3: the tracked row is only meaningful in the epoch it was derived in.
+      // While the store has not delivered the new epoch's params, `priceEpoch`
+      // still names the OLD affine; recording this book's row and remapping it
+      // later "as old" is exactly the wing-corruption incident. Skip the write.
+      if (this.priceEpoch === null || col.epoch === this.priceEpoch) {
+        const tracked = trackedRow(bidTop, askBot, lo, hi);
+        if (tracked !== null) {
+          this.trackedRowN = tracked;
+          this.trackedEpoch = col.epoch;
+        }
+      }
     }
     // The fit memo is keyed on the visible window; a new column inside it
     // invalidates the cached extent union.
@@ -1358,6 +1528,9 @@ export class Renderer {
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
+    this.slotT0 = new Float64Array(cap).fill(Number.NaN);
+    this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
 
     this.history = this.createHistoryLoader();
 
@@ -1394,6 +1567,7 @@ export class Renderer {
     this.extentLo = null;
     this.extentHi = null;
     this.extentSeq = null;
+    this.slotT0 = null;
     this.ringRows = 0;
     this.ringLayers = 0;
 
@@ -1401,12 +1575,17 @@ export class Renderer {
     this.normalizer.reset();
     this.columnCache.reset();
     this.trackedRowN = null;
+    this.trackedEpoch = null;
     this.priceEpoch = null;
     this.priceTarget = null;
     this.priceStalled = false;
     this.priceFitMemo = null;
 
     this.createRing(rows);
+    // H-2: preserveDrawingBuffer keeps the OLD heatmap image on screen until
+    // the next column draws — and with a re-framed camera that reads as a band
+    // mismatch. Wipe it explicitly after the rebuild.
+    this.clearBackground();
   }
 
   /**
@@ -1819,14 +1998,29 @@ export class Renderer {
    * GC: nothing here may allocate per frame).
    */
   private drawOverlays(): void {
-    if (this.glLost()) return;
+    if (this.glLost()) {
+      // L-5: a lost context must not leave 2D ink floating over a dead frame.
+      this.clearOverlayInk();
+      return;
+    }
     const overlays = this.overlays;
-    if (!overlays.anyVisible) return;
+    // C-2: the 2D ink (price line / dashed level / axis labels / pill) is NOT
+    // GL — the manager's own clear only runs when it draws. On the early-exit
+    // paths below the previous frame's ink would stay floating over the live
+    // heatmap (toggling every overlay off could never clear it; survey S3 C-2),
+    // so clear the ink BEFORE returning.
+    if (!overlays.anyVisible) {
+      this.clearOverlayInk();
+      return;
+    }
     const price = this.overlayPriceMap();
     const time = this.overlayTimeMap();
     // Need at least a price affine (axes/BBO/profile) or a time affine (events);
     // with neither there is nothing to map onto the camera.
-    if (price === null && time === null) return;
+    if (price === null && time === null) {
+      this.clearOverlayInk();
+      return;
+    }
 
     const gl = this.ctx.gl;
     const range = this.ring?.residentRange() ?? null;
@@ -1868,6 +2062,21 @@ export class Renderer {
 
     const prev = this.priceEpoch;
     if (prev === null) {
+      // R1-M2: same-numbered session replacement — remap from the last map the
+      // camera was actually painted under instead of silently reinterpreting.
+      const forced = this.forcedRemapFrom;
+      if (forced !== null) {
+        const st = this.camera.state;
+        const rowCenter = remapRow(st.rowCenter, forced, toMap);
+        const rowSpan = remapRowSpan(st.rowSpan, forced, toMap, st.rowCenter);
+        if (Number.isFinite(rowCenter) && Number.isFinite(rowSpan) && rowSpan > 0) {
+          this.camera.remapPrice(rowCenter, rowSpan);
+        }
+        this.forcedRemapFrom = null;
+        this.priceTarget = null;
+        this.priceStalled = false;
+        this.priceFitMemo = null;
+      }
       this.priceEpoch = epoch; // first epoch: nothing to remap from
       return;
     }
@@ -1885,11 +2094,30 @@ export class Renderer {
     this.camera.remapPrice(rowCenter, rowSpan);
 
     if (this.trackedRowN !== null) {
-      const tracked = remapRow(this.trackedRowN, fromMap, toMap);
-      const rows = this.ring?.rows ?? 0;
-      this.trackedRowN = Number.isFinite(tracked)
-        ? Math.min(Math.max(tracked, 0), rows)
-        : null;
+      // D3: only remap a row we know was derived in the epoch we are coming
+      // from. A row with no recorded epoch (or one from an older transition)
+      // cannot be reinterpreted — drop it and let the next live column
+      // re-derive it, rather than silently writing a wrong row into the glide.
+      if (this.trackedEpoch === null || this.trackedEpoch !== prev) {
+        this.trackedRowN = null;
+        this.trackedEpoch = null;
+      } else {
+        const tracked = remapRow(this.trackedRowN, fromMap, toMap);
+        const rows = this.ring?.rows ?? 0;
+        // A remap that leaves the grid (e.g. a nominal-linear 102 price read
+        // through a deep-band hybrid affine → row 2052 of 64) must be DROPPED,
+        // not clamped: clamping parks the camera in a wing — the exact
+        // reported incident (price axis 791-802 while the book was at 79,165).
+        if (!Number.isFinite(tracked) || tracked < 0 || tracked > rows) {
+          this.trackedRowN = null;
+          this.trackedEpoch = null;
+        } else {
+          this.trackedRowN = tracked;
+          this.trackedEpoch = epoch;
+        }
+      }
+    } else {
+      this.trackedEpoch = null;
     }
     this.priceTarget = null;
     this.priceStalled = false;
@@ -1902,7 +2130,11 @@ export class Renderer {
     const st = this.store.getState();
     const ep = st.gridEpoch !== null ? st.epochs.get(st.gridEpoch) : undefined;
     if (ep === undefined) return null;
-    return this.priceMapFor(ep);
+    const map = this.priceMapFor(ep);
+    // R1-M2: remember the map the camera is actually expressed in, so a
+    // same-numbered session replacement can force a price-preserving remap.
+    this.lastPriceMapCache = map;
+    return map;
   }
 
   /**
@@ -1920,12 +2152,89 @@ export class Renderer {
     };
   }
 
-  /** Column⇄time affine anchored on the newest written column, or null. */
+  /**
+   * Column⇄time affine anchored on the newest written column, or null. When the
+   * per-resident-slot t0 table densely covers the anchor it is attached as
+   * `slots` (CP2): reconstructed history columns are 60 s apart while the epoch
+   * claims 250 ms, so the piecewise table — not this affine — is the truth
+   * there (survey S2/D1).
+   */
   private overlayTimeMap(): TimeMap | null {
     if (this.overlayAnchorSeq < 0) return null;
     const ep = this.store.getState().epochs.get(this.overlayAnchorEpoch);
     const dtNs = ep?.dt_ns ?? this.currentDtNs();
-    return { anchorSeq: this.overlayAnchorSeq, anchorT0Ns: this.overlayAnchorT0Ns, dtNs };
+    const base: TimeMap = {
+      anchorSeq: this.overlayAnchorSeq,
+      anchorT0Ns: this.overlayAnchorT0Ns,
+      dtNs,
+    };
+    const slots = this.overlaySlotsFor();
+    return slots === null ? base : { ...base, slots: slots };
+  }
+
+  /**
+   * CP2: expose the per-slot t0 table as a dense `{ t0, startSeq }` subarray
+   * (`t0[i]` = start time of column `startSeq + i`, coords.ts's TimeSlots) —
+   * but ONLY when it is a contiguous, fully-written, non-wrapping run that
+   * covers the anchor:
+   *  - a WRAP would need a per-frame copy to linearize, and it is only
+   *    reachable long after the reconstructed block scrolled out, where the
+   *    affine map is exact anyway;
+   *  - the run is the contiguous seq run tracked in
+   *    {@link slotT0RunStart}/{@link slotT0RunEnd} (R1-M1), so a warm attach
+   *    works; every knot handed to coords.ts's helpers is finite (slots outside
+   *    the run are never included);
+   *  - the anchor must lie inside, so the table and the affine fallback agree
+   *    at the seed column.
+   * Returns null otherwise: callers use the affine, which is bit-identical to
+   * the pre-CP2 behaviour.
+   */
+  private overlaySlotsFor(): TimeSlots | null {
+    const ring = this.ring;
+    const t0 = this.slotT0;
+    if (ring === null || t0 === null || this.overlayAnchorSeq < 0) return null;
+    const range = ring.residentRange();
+    if (range === null) return null;
+    const cap = ring.capacityCols;
+    const from = Math.max(this.slotT0RunStart, range.oldest);
+    const to = Math.min(this.slotT0RunEnd, range.newest);
+    if (from < 0 || to < from) return null;
+    const anchor = this.overlayAnchorSeq;
+    if (anchor < from || anchor > to) return null;
+    const fromSlot = ((from % cap) + cap) % cap;
+    const len = to - from + 1;
+    if (len < 2) return null; // coords.ts needs two knots
+    if (fromSlot + len > cap) return null; // wrapped in slot space → affine fallback
+    return { t0: t0.subarray(fromSlot, fromSlot + len), startSeq: from };
+  }
+
+  /**
+   * CP2 test hook: the true start time (ns) of a (fractional) column, using the
+   * piecewise slot table when it covers the column, else the affine map. e2e
+   * verification of the reconstructed-history time warp (survey S2/D1).
+   */
+  colToTsForTest(col: number): bigint | null {
+    const time = this.overlayTimeMap();
+    if (time === null) return null;
+    if (time.slots !== undefined) {
+      const ts = slotColToTsNs(time.slots, col);
+      if (ts !== null) return ts;
+    }
+    return time.anchorT0Ns + BigInt(Math.round((col - time.anchorSeq) * time.dtNs));
+  }
+
+  /**
+   * CP2 test hook: the (fractional) column containing `tsNs`, piecewise when the
+   * slot table covers it, else the affine inverse. e2e verification hook.
+   */
+  colForTsForTest(tsNs: bigint): number | null {
+    const time = this.overlayTimeMap();
+    if (time === null) return null;
+    if (time.slots !== undefined) {
+      const col = slotTsToCol(time.slots, tsNs);
+      if (col !== null) return col;
+    }
+    return time.anchorSeq + Number(tsNs - time.anchorT0Ns) / time.dtNs;
   }
 
   // --- context-loss lifecycle (§8.3) --------------------------------------------
@@ -1984,6 +2293,9 @@ export class Renderer {
       this.extentLo = new Int32Array(cap).fill(-1);
       this.extentHi = new Int32Array(cap).fill(-1);
       this.extentSeq = new Int32Array(cap).fill(-1);
+      this.slotT0 = new Float64Array(cap).fill(Number.NaN);
+      this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
       this.history = this.createHistoryLoader();
       this.camera.setLimits(limitsFor(this.ringRows, cap));
       // Rebuild the empty ring's frame, then RESTORE the user's follow intent
@@ -2205,6 +2517,9 @@ export class Renderer {
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
+    this.slotT0 = new Float64Array(cap).fill(Number.NaN);
+    this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
     this.camera.setLimits(limitsFor(rows, cap));
 
     const bid = new Float32Array(rows);
@@ -2296,6 +2611,9 @@ export class Renderer {
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
+    this.slotT0 = new Float64Array(cap).fill(Number.NaN);
+    this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
     this.decodeScale = 1;
     this.ramp = RAMP_FLOW;
     this.camera.setLimits(limitsFor(rows, cap));
@@ -2425,8 +2743,14 @@ export class Renderer {
     if (priceMap === null || time === null) return null;
     const cssW = Math.max(1, this.canvas.clientWidth);
     const cssH = Math.max(1, this.canvas.clientHeight);
-    const colf = time.anchorSeq + Number(tsNs - time.anchorT0Ns) / time.dtNs + 0.5;
-    const rowf = (price - priceMap.p0) / priceMap.step + 0.5;
+    // Same ts→col transform the overlay glyphs use (coords.ts GridMap.tsToCol):
+    // piecewise through the slot table when it covers the ts, affine otherwise.
+    const piecewise = time.slots !== undefined ? slotTsToCol(time.slots, tsNs) : null;
+    const colOf = piecewise ?? time.anchorSeq + Number(tsNs - time.anchorT0Ns) / time.dtNs;
+    const colf = colOf + 0.5;
+    // L-1: the row must come from the AUTHORITATIVE scale (hybrid-aware), not
+    // the core affine — on a wide-band epoch the two disagree away from the core.
+    const rowf = scalePriceToRow(mapScale(priceMap), price) + 0.5;
     const uvX = (colf - this.view.colOffset) / this.view.colScale;
     const uvY = (rowf - this.view.rowOffset) / this.view.rowScale;
     return { x: uvX * cssW, y: (1 - uvY) * cssH };
@@ -2514,6 +2838,9 @@ export class Renderer {
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
     this.extentSeq = new Int32Array(cap).fill(-1);
+    this.slotT0 = new Float64Array(cap).fill(Number.NaN);
+    this.slotT0RunStart = -1;
+    this.slotT0RunEnd = -2;
     this.decodeScale = 1;
     this.ramp = RAMP_FLOW;
     this.camera.setLimits(limitsFor(rows, cap));

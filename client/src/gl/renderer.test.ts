@@ -587,4 +587,303 @@ describe('Renderer (fake GL harness)', () => {
     off2();
     warn.mockRestore();
   });
+
+  // --- chart bug-fix campaign (2026-09-11): B2 renderer + follow ---------------
+
+  interface PrivRenderer {
+    trackedRowN: number | null;
+    trackedEpoch: number | null;
+    priceEpoch: number | null;
+    forcedRemapFrom: unknown;
+    lastPriceMapCache: unknown;
+    overlayPriceMap(): unknown;
+    camera: { remapPrice(rowCenter: number, rowSpan: number): void };
+  }
+
+  function priv(r: Renderer): PrivRenderer {
+    return r as unknown as PrivRenderer;
+  }
+
+  function overlaysOf(r: Renderer): { reset: () => void; clearInk?: () => void } {
+    return (r as unknown as { overlays: { reset: () => void } }).overlays;
+  }
+
+  function makeColAt(
+    seq: number,
+    epoch: number,
+    bidRow: number,
+    askRow: number,
+    rows: number,
+    t0?: bigint,
+  ): DepthColumn {
+    const bid = new Float32Array(rows);
+    bid[bidRow] = 5;
+    const ask = new Float32Array(rows);
+    ask[askRow] = 7;
+    return {
+      type: MsgType.DEPTH_COL,
+      epoch,
+      col_seq: seq,
+      t0_ns: t0 ?? BigInt(seq) * BigInt(DT_NS),
+      mode: MODE_L2,
+      final: true,
+      bid,
+      ask,
+    };
+  }
+
+  it('B2-CP1: liveEdgeVisible follows the newest column, not the follow mode', () => {
+    const { r, store } = makeRenderer();
+    expect(r.liveEdgeVisible).toBe(false); // no column yet
+    store.emit(makeCol(0, true));
+    expect(r.liveEdgeVisible).toBe(true);
+    r.panColumnsForTest(-100000); // scrolled back: edge off-screen, TRACK cannot act
+    expect(r.following).toBe(false);
+    expect(r.liveEdgeVisible).toBe(false);
+    r.goLive();
+    expect(r.liveEdgeVisible).toBe(true);
+  });
+
+  it('B2-CP1: resetOverlaysForNewSession rewinds cursors + clears ink but KEEPS the ring', () => {
+    const { r, store } = makeRenderer();
+    for (let s = 0; s < 5; s++) store.emit(makeCol(s, true));
+    const overlays = overlaysOf(r);
+    const resetSpy = vi.spyOn(overlays, 'reset');
+    const inkSpy = vi.fn();
+    overlays.clearInk = inkSpy;
+    const range = r.residentRange();
+    expect(range).not.toBeNull();
+
+    r.resetOverlaysForNewSession();
+
+    expect(resetSpy).toHaveBeenCalledTimes(1);
+    expect(inkSpy).toHaveBeenCalledTimes(1);
+    expect(r.newestColSeq).toBe(-1);
+    expect(priv(r).trackedRowN).toBeNull();
+    // Cursor-only: the resident ring (scrolled-back history) survives.
+    expect(r.residentRange()).toEqual(range);
+    expect(r.isResidentFullRes(0)).toBe(true);
+  });
+
+  it('B2-H1/C3: resetForSession clears overlay ink + data even while the GL context is lost', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    const overlays = overlaysOf(r);
+    const resetSpy = vi.spyOn(overlays, 'reset');
+    const inkSpy = vi.fn();
+    overlays.clearInk = inkSpy;
+
+    gl.contextLost = true;
+    r.resetForSession();
+
+    expect(inkSpy).toHaveBeenCalledTimes(1); // BEFORE the glLost early return
+    expect(resetSpy).toHaveBeenCalledTimes(1); // CPU teardown is unconditional now
+    expect(r.newestColSeq).toBe(-1); // cursors rewound even while lost
+  });
+
+  it('B2-H2: recreateRingForRows clears the stale GL image when it rebuilds the ring', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    const clears = gl.callsOf('clear').length;
+    (r as unknown as { recreateRingForRows(rows: number): void }).recreateRingForRows(64);
+    expect(gl.callsOf('clear').length).toBeGreaterThan(clears);
+  });
+
+  it('B2-C2: drawOverlays clears leftover 2D ink when every overlay is off', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    const overlays = overlaysOf(r);
+    const inkSpy = vi.fn();
+    overlays.clearInk = inkSpy;
+    r.setOverlayVisibility({
+      bubbles: false,
+      bbo: false,
+      vwap: false,
+      profile: false,
+      markers: false,
+      axes: false,
+      price: false,
+    });
+    (r as unknown as { drawOverlays(): void }).drawOverlays();
+    expect(inkSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('B2-C2: drawOverlays clears ink when neither the price nor the time map exists', () => {
+    const { r, store } = makeRenderer();
+    const overlays = overlaysOf(r);
+    const inkSpy = vi.fn();
+    overlays.clearInk = inkSpy;
+    (store.state as unknown as { gridEpoch: number | null }).gridEpoch = null; // no price affine
+    (r as unknown as { drawOverlays(): void }).drawOverlays();
+    expect(inkSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('B2-D3: tracked row is epoch-scoped — no wing corruption across an epoch change', () => {
+    const { r, store } = makeRenderer();
+    setEpochRows(store, 64);
+    store.emit(makeColAt(0, 0, 3, 4, 64)); // epoch-0 book, inside quote rows 3/4
+    expect(priv(r).trackedRowN).toBe(4);
+    expect(priv(r).trackedEpoch).toBe(0);
+
+    // The new epoch's first column arrives BEFORE its params are in the store:
+    // remapPriceEpoch refuses to advance, and the tracked row must NOT be
+    // recorded from a book whose affine is still unknown (the D3 incident).
+    store.emit(makeColAt(1, 1, 30, 31, 64));
+    expect(priv(r).priceEpoch).toBe(0); // no params → epoch not advanced
+    expect(priv(r).trackedRowN).toBe(4); // still the old epoch's row
+    expect(priv(r).trackedEpoch).toBe(0);
+
+    // Params land. The stale row read through the new affine (p0 = −924) would
+    // land at row 2052 of a 64-row grid — the exact wing-park. The fix drops
+    // the invalid remap; this same column re-derives from the new book.
+    (store.state as unknown as { epochs: Map<number, Record<string, unknown>> }).epochs.set(1, {
+      epoch: 1,
+      tick: 0.5,
+      tick_multiple: 1,
+      dt_ns: DT_NS,
+      p0: -924,
+      rows: 64,
+    });
+    store.emit(makeColAt(2, 1, 40, 40, 64)); // same-row two-sided → 40.5
+    expect(priv(r).priceEpoch).toBe(1);
+    expect(priv(r).trackedRowN).toBe(40.5);
+    expect(priv(r).trackedEpoch).toBe(1);
+  });
+
+  it('B2-D3: a remap with an unknown/mismatched trackedEpoch drops the row', () => {
+    const { r, store } = makeRenderer();
+    setEpochRows(store, 64);
+    store.emit(makeColAt(0, 0, 3, 4, 64));
+    expect(priv(r).trackedRowN).toBe(4);
+    priv(r).trackedEpoch = null; // legacy state with no epoch provenance
+    (store.state as unknown as { epochs: Map<number, Record<string, unknown>> }).epochs.set(1, {
+      epoch: 1,
+      tick: 0.5,
+      tick_multiple: 1,
+      dt_ns: DT_NS,
+      p0: 100,
+      rows: 64,
+    });
+    (r as unknown as { remapPriceEpoch(epoch: number): void }).remapPriceEpoch(1);
+    expect(priv(r).trackedRowN).toBeNull();
+    expect(priv(r).trackedEpoch).toBeNull();
+  });
+
+  it('B2-D3: a remap that would clamp an interior row into a wing drops it instead', () => {
+    const { r, store } = makeRenderer();
+    setEpochRows(store, 64);
+    store.emit(makeColAt(0, 0, 3, 4, 64));
+    (store.state as unknown as { epochs: Map<number, Record<string, unknown>> }).epochs.set(1, {
+      epoch: 1,
+      tick: 0.5,
+      tick_multiple: 1,
+      dt_ns: DT_NS,
+      p0: -924,
+      rows: 64,
+    });
+    (r as unknown as { remapPriceEpoch(epoch: number): void }).remapPriceEpoch(1);
+    // The old code clamped row 2052 → 64 (an off-grid wing); the fix drops it.
+    expect(priv(r).trackedRowN).toBeNull();
+  });
+
+  it('B2-D5: a col_seq regression rewinds the overlay cursors (same-subscription restart)', () => {
+    const { r, store } = makeRenderer(512); // ring capacity 512
+    for (let s = 0; s < 600; s++) store.emit(makeCol(s, true));
+    expect(r.newestColSeq).toBe(599);
+    const overlays = overlaysOf(r);
+    const resetSpy = vi.spyOn(overlays, 'reset');
+    const inkSpy = vi.fn();
+    overlays.clearInk = inkSpy;
+
+    store.emit(makeCol(0, true)); // restarted col_seq: 0 + 512 < 599
+    expect(resetSpy).toHaveBeenCalledTimes(1);
+    expect(inkSpy).toHaveBeenCalledTimes(1);
+    expect(r.newestColSeq).toBe(0); // accepted as the new newest
+  });
+
+  it('B2-D5: a store sessionId change rewinds once, on the first column of the new session', () => {
+    const { r, store } = makeRenderer();
+    for (let s = 0; s < 5; s++) store.emit(makeCol(s, true));
+    const overlays = overlaysOf(r);
+    const resetSpy = vi.spyOn(overlays, 'reset');
+    (store.state as unknown as { sessionId: string }).sessionId = 'sess-2';
+    store.emit(makeCol(6, true));
+    expect(resetSpy).toHaveBeenCalledTimes(1);
+    expect(r.newestColSeq).toBe(6);
+    store.emit(makeCol(7, true));
+    expect(resetSpy).toHaveBeenCalledTimes(1); // stable session → no further resets
+  });
+
+  it('B2-CP2: the piecewise t0 table reports real candle times for reconstructed history', () => {
+    const { r, store } = makeRenderer();
+    const candleNs = 60_000_000_000n;
+    for (let s = 0; s < 4; s++) {
+      store.emit(makeColAt(s, 0, 3, 4, ROWS, BigInt(s) * candleNs));
+    }
+    // The epoch says 25 ms/col; the table says 60 s/col (the S2/D1 time warp).
+    expect(r.colToTsForTest(1)).toBe(candleNs);
+    expect(r.colToTsForTest(3)).toBe(3n * candleNs);
+    expect(r.colForTsForTest(2n * candleNs)).toBeCloseTo(2, 6);
+    expect(r.colForTsForTest((3n * candleNs) / 2n)).toBeCloseTo(1.5, 6);
+    const tm = (
+      r as unknown as {
+        overlayTimeMap(): { slots?: { startSeq: number; t0: Float64Array } } | null;
+      }
+    ).overlayTimeMap();
+    expect(tm?.slots).toBeDefined();
+    expect(tm!.slots!.startSeq).toBe(0);
+    expect(tm!.slots!.t0[3]).toBe(180_000_000_000);
+  });
+
+  it('B2-CP2: the piecewise table is retired when the resident run wraps the ring', () => {
+    const { r, store } = makeRenderer(512);
+    for (let s = 0; s < 520; s++) store.emit(makeCol(s, true));
+    expect((r as unknown as { overlaySlotsFor(): unknown }).overlaySlotsFor()).toBeNull();
+    // …and the affine fallback still answers (honest, if time-warped).
+    expect(r.colToTsForTest(r.newestColSeq)).not.toBeNull();
+  });
+
+  it('R1-M1: a warm attach (first column mid-sequence) still serves the piecewise table', () => {
+    const { r, store } = makeRenderer(1024);
+    const candleNs = 60_000_000_000n;
+    // The client attaches to an already-running grid: the first accepted column
+    // is 502, so nothing ever writes slot 0.
+    for (let s = 502; s < 566; s++) {
+      store.emit(makeColAt(s, 0, 3, 4, ROWS, BigInt(s) * candleNs));
+    }
+    expect(r.colToTsForTest(510)).toBe(510n * candleNs);
+    const tm = (
+      priv(r) as unknown as {
+        overlayTimeMap(): { slots?: { startSeq: number; t0: Float64Array } } | null;
+      }
+    ).overlayTimeMap();
+    expect(tm?.slots, 'warm attach must serve the slot table').toBeDefined();
+    expect(tm!.slots!.startSeq).toBe(502);
+  });
+
+  it('R1-M2: same-numbered session replacement forces a price-preserving remap', () => {
+    const { r, store } = makeRenderer();
+    for (let s = 0; s < 4; s++) store.emit(makeCol(s, true));
+    priv(r).overlayPriceMap(); // populate lastPriceMapCache (as a draw would)
+    expect(priv(r).lastPriceMapCache).not.toBeNull();
+
+    const cam = priv(r).camera;
+    const spy = vi.spyOn(cam, 'remapPrice');
+    // New server session: SAME epoch number (0), DIFFERENT params under it.
+    (store.state as unknown as { epochs: Map<number, Record<string, unknown>> }).epochs.set(0, {
+      epoch: 0,
+      tick: 0.5,
+      tick_multiple: 1,
+      dt_ns: DT_NS,
+      p0: 300,
+      rows: ROWS,
+    });
+    (store.state as unknown as { sessionId: string }).sessionId = 'sess-2';
+    r.resetOverlaysForNewSession('sess-2');
+    store.emit(makeCol(0, true));
+
+    expect(spy, 'the replacement must remap, not silently reinterpret').toHaveBeenCalledTimes(1);
+    expect(priv(r).forcedRemapFrom).toBeNull();
+    spy.mockRestore();
+  });
 });

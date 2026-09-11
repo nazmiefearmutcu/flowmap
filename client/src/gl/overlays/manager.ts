@@ -4,9 +4,10 @@
  * Owns the two shared GL batches, the over-heatmap text layer, the optional
  * price/time gutter layers, and every overlay instance; routes the canonical
  * stream (Trade/BBO/BarColumn/Marker) into them; and draws them in the spec order
- * (heatmap already drawn → profile → vwap → bbo → bubbles → markers → text/axes)
- * each dirty frame. The renderer holds ONE of these and calls {@link draw} after
- * the heatmap pass — keeping renderer.ts focused on the tile ring / camera.
+ * (heatmap already drawn → profile → vwap → bbo → price → bubbles → markers →
+ * text/axes) each dirty frame. The renderer holds ONE of these and calls
+ * {@link draw} after the heatmap pass — keeping renderer.ts focused on the tile
+ * ring / camera.
  *
  * Everything is O(visible): each overlay only emits geometry for the columns in
  * the viewport, so the §10 perf gate is untouched (the renderer additionally
@@ -102,7 +103,6 @@ export class OverlayManager {
   recreateGL(gl: WebGL2RenderingContext): void {
     this.solid = new SolidBatch(gl);
     this.points = new PointBatch(gl);
-    // eslint-disable-next-line no-empty
     while (gl.getError() !== gl.NO_ERROR) {
       /* drain any stale error so the ring/heatmap rebuild's checkGLError is clean */
     }
@@ -168,8 +168,35 @@ export class OverlayManager {
     this.priceLine.reset();
     this.cvd.reset();
     this.markers.reset();
+    this.resetCursor();
+  }
+
+  /**
+   * Re-init every per-session high-water cursor without touching overlay data:
+   * the price line's `lastClose` (which derives the dashed level + axis pill) and
+   * the channel BBO. A replaced session restarts `col_seq` at 0, so a surviving
+   * max-cursor would keep `last()` frozen on the old session's price forever
+   * (survey S1 D5). `reset()` calls this; the renderer's cursor-only session
+   * reset can call it alone when it wants to keep data.
+   */
+  resetCursor(): void {
+    this.priceLine.resetCursor();
     this.channelBbo = null;
     this.hasChannelBbo = false;
+  }
+
+  /**
+   * Wipe the 2D ink — the over-heatmap text layer AND both gutter canvases —
+   * synchronously (pure 2D, safe while the GL context is lost). The renderer
+   * calls this on a session reset and before its `drawOverlays` early returns,
+   * which otherwise leave the previous frame/session's price line, badges, tick
+   * labels and price pill floating over a cleared or fresh chart (survey S3
+   * C-2/C-3/C-4). No GL state is touched.
+   */
+  clearInk(): void {
+    this.text.clear();
+    this.priceAxis?.clear();
+    this.timeAxis?.clear();
   }
 
   /**
@@ -254,30 +281,42 @@ export class OverlayManager {
     this.text.clear();
     if (this.visibility.axes) drawGridlines(this.text, this.gm);
 
-    // GL overlays in spec draw order (each flushes its own geometry → z-order).
+    // GL overlays in the effective z-order (each flushes its own geometry →
+    // z-order). BBO draws BEFORE the price line so the near-white last-price
+    // core keeps the top layer where the inside quote touches it (survey S2 D4:
+    // the teal/red quote lines used to overpaint the 1.8px price core).
     if (this.visibility.profile) this.profile.draw(frame);
     if (this.visibility.vwap) this.vwap.draw(frame);
-    if (this.visibility.price) this.priceLine.draw(frame);
     if (this.visibility.bbo) {
       this.bbo.set(this.effectiveBbo(ctx));
       this.bbo.draw(frame);
     }
+    if (this.visibility.price) this.priceLine.draw(frame);
     if (this.visibility.bubbles) this.bubbles.draw(frame);
     if (this.visibility.markers) this.markers.draw(frame);
 
     // Honesty badges (§7): surface reduced-fidelity states on the text layer.
     this.drawHonestyBadges(ctx);
 
-    // Axes into their gutters (share the viewport dimension → aligned).
+    // Axes into their gutters (share the viewport dimension → aligned). The
+    // gutters are wiped on EVERY repaint: with axes off they would otherwise
+    // keep the last tick labels and the price pill, and nothing else ever
+    // clears those canvases (survey S3 C-4). drawPriceAxis/drawTimeAxis clear
+    // before they draw, so each path clears exactly once.
+    if (this.priceAxis) {
+      this.priceAxis.syncSize(this.priceAxis.canvas.clientWidth, ctx.dims.cssH, ctx.dpr);
+    }
+    if (this.timeAxis) {
+      this.timeAxis.syncSize(ctx.dims.cssW, this.timeAxis.canvas.clientHeight, ctx.dpr);
+    }
     if (this.visibility.axes) {
       if (this.priceAxis) {
-        this.priceAxis.syncSize(this.priceAxis.canvas.clientWidth, ctx.dims.cssH, ctx.dpr);
         drawPriceAxis(this.priceAxis, this.gm, this.visibility.price ? this.priceLine.last() : null);
       }
-      if (this.timeAxis) {
-        this.timeAxis.syncSize(ctx.dims.cssW, this.timeAxis.canvas.clientHeight, ctx.dpr);
-        drawTimeAxis(this.timeAxis, this.gm);
-      }
+      if (this.timeAxis) drawTimeAxis(this.timeAxis, this.gm);
+    } else {
+      this.priceAxis?.clear();
+      this.timeAxis?.clear();
     }
   }
 
@@ -317,6 +356,15 @@ export class OverlayManager {
       const opts = this.badgeOpts[n++];
       opts.color = OVERLAY.vwap.css;
       this.text.badge(6, y, 'VWAP approx', opts);
+      y += 18;
+    } else if (this.visibility.vwap && cap.history === 'reconstructed') {
+      // Reconstructed 1 m-candle history: the piecewise time map places the line
+      // honestly in time, but its CUMULANTS were seeded from candles, not tape —
+      // say so (survey S2 D1 honesty; the `vwap:` capability badge above covers
+      // the keyless equity case).
+      const opts = this.badgeOpts[n++];
+      opts.color = OVERLAY.vwap.css;
+      this.text.badge(6, y, 'VWAP ≈ reconstructed', opts);
       y += 18;
     }
   }

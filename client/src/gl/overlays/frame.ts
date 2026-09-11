@@ -4,9 +4,10 @@
  * The renderer builds ONE of these each dirty frame — the camera snapshot
  * ({@link GridMap}), the two shared GL batches, the text layer, the resident
  * column clamp, and the capability descriptor (for §7 honesty gating) — then
- * calls each enabled overlay's `draw(frame)` in the spec draw order
- * (profile → vwap → bbo → bubbles → markers). Overlays never own GL state; they
- * emit clip-space geometry into the shared batches and flush in call order.
+ * calls each enabled overlay's `draw(frame)` in the effective z-order
+ * (profile → vwap → bbo → price → bubbles → markers). Overlays never own GL
+ * state; they emit clip-space geometry into the shared batches and flush in call
+ * order.
  */
 
 import type { GridMap } from './coords';

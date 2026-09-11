@@ -68,7 +68,9 @@ export class Bbo {
       key: string,
     ): void => {
       if (!Number.isFinite(price)) return; // one-sided book / unknown quote
-      const rowf = gm.priceToRow(price);
+      // `+0.5` = row-cell centre: the quote line/badge ride the density cell the
+      // heatmap paints (survey S2 D3 half-cell convention).
+      const rowf = gm.priceToRow(price) + 0.5;
       const y = gm.clipY(rowf);
       if (y < -1.02 || y > 1.02) return; // off-screen vertically
       solid.begin();

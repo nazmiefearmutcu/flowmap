@@ -45,15 +45,96 @@ export interface SurfaceDims {
 }
 
 /**
- * Column⇄time affine for the current epoch: `t0(col) = anchorT0Ns + (col −
- * anchorSeq)·dtNs`, invertible to `col(ts) = anchorSeq + (ts − anchorT0Ns)/dtNs`.
- * Any resident `(col_seq, t0_ns)` is a valid anchor (the relation is exact within
- * an epoch), so the renderer supplies the newest written column.
+ * Per-column start-time table for a resident window: `t0[i]` is the ns start
+ * time of column `startSeq + i` (ascending). Present when the session's column
+ * cadence is NOT uniform in time: a reconstructed (1 m-candle) history block is
+ * 60 s-spaced while the live epoch is `dtNs` apart, so the single affine
+ * `anchorT0Ns + (col − anchorSeq)·dtNs` lies about every reconstructed column
+ * (survey S2 D1) and scatters trades/markers onto wrong lanes. When the table is
+ * present and in range, ts⇄col go through it (binary search + linear
+ * interpolation); everywhere else the affine is used and the result is
+ * bit-identical to the pre-slot implementation.
+ *
+ * `t0` is float64 (the renderer's storage contract): ns values near 1.7e18
+ * quantize to ~512 ns, far below the 250 ms column cadence — placement is exact
+ * to sub-µs, and axis labels (ms-resolution) are unaffected.
+ */
+export interface TimeSlots {
+  t0: Float64Array;
+  /** Absolute `col_seq` of `t0[0]`. */
+  startSeq: number;
+}
+
+/**
+ * Column⇄time map for the current epoch. The AFFINE path is `t0(col) =
+ * anchorT0Ns + (col − anchorSeq)·dtNs`, invertible to `col(ts) = anchorSeq +
+ * (ts − anchorT0Ns)/dtNs`; any resident `(col_seq, t0_ns)` is a valid anchor
+ * (the relation is exact within a uniform-cadence epoch), so the renderer
+ * supplies the newest written column.
+ *
+ * `slots`, when present, is authoritative INSIDE its range: reconstructed
+ * history makes the cadence non-uniform, and only the per-column table can
+ * express that. Outside the table (or with no table at all) the affine is the
+ * fallback — bit-identical to the historical behaviour.
  */
 export interface TimeMap {
   anchorSeq: number;
   anchorT0Ns: bigint;
   dtNs: number;
+  /** Optional per-column start-time table; see {@link TimeSlots}. */
+  slots?: TimeSlots;
+}
+
+/**
+ * Piecewise column→ts from a {@link TimeSlots} table: `t0` entries are exact
+ * knots, fractional columns (and the boundary margin) interpolate linearly
+ * between neighbours. Returns null when `col` is outside the table's range or
+ * the table is unusable (fewer than 2 entries, reversed ends) — the caller then
+ * falls back to the affine, which is what keeps the absent/out-of-range path
+ * bit-identical to today. The producer writes columns in ascending order, so
+ * the interior is trusted (no O(n) re-scan per query).
+ */
+export function slotColToTsNs(s: TimeSlots, col: number): bigint | null {
+  const n = s.t0.length;
+  if (n < 2) return null;
+  const last = s.startSeq + n - 1;
+  if (!(col >= s.startSeq) || !(col <= last)) return null;
+  const t0 = s.t0;
+  if (!(t0[n - 1] >= t0[0])) return null; // reversed ends → not usable
+  const pos = col - s.startSeq;
+  const i = Math.floor(pos);
+  if (i >= n - 1) return BigInt(Math.round(t0[n - 1]));
+  const v = t0[i] + (pos - i) * (t0[i + 1] - t0[i]);
+  return BigInt(Math.round(v));
+}
+
+/**
+ * Piecewise ts→column from a {@link TimeSlots} table (the inverse of
+ * {@link slotColToTsNs}): binary-search the segment whose t0 span contains
+ * `tsNs`, then interpolate linearly. Returns null when `tsNs` is outside the
+ * table's range (the forming live edge belongs to the affine anchor) or the
+ * table is unusable — the caller falls back to the affine.
+ */
+export function slotTsToCol(s: TimeSlots, tsNs: bigint): number | null {
+  const n = s.t0.length;
+  if (n < 2) return null;
+  const t0 = s.t0;
+  if (!(t0[n - 1] >= t0[0])) return null;
+  const ts = Number(tsNs);
+  if (!Number.isFinite(ts)) return null;
+  if (ts < t0[0] || ts > t0[n - 1]) return null;
+  // Largest `lo` with t0[lo] <= ts (ascending table → plain binary search).
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (t0[mid] <= ts) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo >= n - 1) return s.startSeq + n - 1;
+  const span = t0[lo + 1] - t0[lo];
+  const frac = span > 0 ? (ts - t0[lo]) / span : 0;
+  return s.startSeq + lo + frac;
 }
 
 /**
@@ -127,17 +208,29 @@ export class GridMap {
 
   // --- event space → grid space -------------------------------------------------
 
-  /** Fractional absolute column of a timestamp, or NaN when time is unknown. */
+  /** Fractional absolute column of a timestamp, or NaN when time is unknown.
+   *  Piecewise through {@link TimeMap.slots} when that table covers the ts;
+   *  otherwise the linear affine (bit-identical to the pre-slot behaviour). */
   tsToCol(tsNs: bigint): number {
     const t = this.time;
     if (t === null) return Number.NaN;
+    if (t.slots !== undefined) {
+      const piecewise = slotTsToCol(t.slots, tsNs);
+      if (piecewise !== null) return piecewise;
+    }
     return t.anchorSeq + Number(tsNs - t.anchorT0Ns) / t.dtNs;
   }
 
-  /** Nanosecond start time of a (fractional) column, or null when time unknown. */
+  /** Nanosecond start time of a (fractional) column, or null when time unknown.
+   *  Piecewise through {@link TimeMap.slots} when that table covers the column;
+   *  otherwise the linear affine (bit-identical to the pre-slot behaviour). */
   colToTsNs(col: number): bigint | null {
     const t = this.time;
     if (t === null) return null;
+    if (t.slots !== undefined) {
+      const piecewise = slotColToTsNs(t.slots, col);
+      if (piecewise !== null) return piecewise;
+    }
     return t.anchorT0Ns + BigInt(Math.round((col - t.anchorSeq) * t.dtNs));
   }
 

@@ -66,13 +66,15 @@ export class Vwap {
     if (range === null) return;
 
     // Collect visible vertices in ascending column order (one per column).
+    // `+0.5` = row-cell centre (survey S2 D3: the line family must sit on the
+    // density cell the heatmap paints, matching the bubbles/markers convention).
     const pts: Array<{ x: number; y: number }> = [];
     for (let c = range.lo; c <= range.hi; c++) {
       const e = this.bars.get(c);
       if (e === undefined) continue;
       const v = sessionVwap(e.num, e.den);
       if (!Number.isFinite(v)) continue;
-      pts.push({ x: gm.clipX(c + 0.5), y: gm.clipY(gm.priceToRow(v)) });
+      pts.push({ x: gm.clipX(c + 0.5), y: gm.clipY(gm.priceToRow(v) + 0.5) });
     }
     if (pts.length === 0) return;
 

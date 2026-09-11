@@ -154,7 +154,9 @@ export function drawPriceAxis(layer: TextLayer, gm: GridMap, last: LastClose | n
   if (last === null || gm.price === null) return;
   const step = localStep(gm) || gm.price.step;
   const dec = priceDecimals(step > 0 ? step : gm.price.step);
-  const y = gm.cssY(gm.priceToRow(last.price));
+  // Row-cell centre (`+0.5`), matching the price line and its dashed level —
+  // the pill must sit on the cell the heatmap paints (survey S2 D3).
+  const y = gm.cssY(gm.priceToRow(last.price) + 0.5);
   if (y < -8 || y > layer.height + 8) return;
   layer.badge(cssW - 3, Math.min(Math.max(y, 9), layer.height - 9), last.price.toFixed(dec), {
     align: 'right',

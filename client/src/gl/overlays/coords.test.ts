@@ -4,10 +4,14 @@ import {
   GridMap,
   remapRow,
   remapRowSpan,
+  slotColToTsNs,
+  slotTsToCol,
   toBigNs,
   visibleColRange,
   type PriceMap,
   type SurfaceDims,
+  type TimeMap,
+  type TimeSlots,
 } from './coords';
 import type { HeatmapView } from '../heatmap';
 import { makeHybrid, priceToRow, rowToPrice } from '../priceScale';
@@ -243,5 +247,109 @@ describe('GridMap.refill (micro GC — reused per dirty frame)', () => {
     expect(g.priceToRow(101)).toBe(fresh.priceToRow(101));
     expect(g.cssX(5.5)).toBe(fresh.cssX(5.5));
     expect(g.clipY(10.25)).toBe(fresh.clipY(10.25));
+  });
+});
+
+describe('TimeMap.slots — piecewise ts⇄col (CP2, survey S2 D1)', () => {
+  /**
+   * A reconstructed history block: columns 100..101 are 60 s apart (1 m
+   * candles), then the live cadence resumes at 250 ms (102..104). The affine
+   * anchored on the newest live column lies about the whole reconstructed block;
+   * the slots table tells the truth.
+   */
+  const slots: TimeSlots = {
+    startSeq: 100,
+    t0: Float64Array.from([1_000, 61_000, 121_000, 121_250, 121_500]),
+  };
+  const piecewise = { anchorSeq: 104, anchorT0Ns: 121_500n, dtNs: 250, slots };
+  const affine: TimeMap = { anchorSeq: 104, anchorT0Ns: 121_500n, dtNs: 250 };
+
+  function pieceGm(): GridMap {
+    return new GridMap(view, dims, piecewise, price);
+  }
+  function affineGm(): GridMap {
+    return new GridMap(view, dims, affine, price);
+  }
+
+  it('maps exact knots through the table (not the affine)', () => {
+    const g = pieceGm();
+    expect(g.colToTsNs(100)).toBe(1_000n);
+    expect(g.colToTsNs(101)).toBe(61_000n);
+    expect(g.colToTsNs(102)).toBe(121_000n);
+    expect(g.colToTsNs(104)).toBe(121_500n);
+    // The affine would say something completely different for col 100:
+    expect(affineGm().colToTsNs(100)).not.toBe(1_000n);
+    expect(affineGm().colToTsNs(100)).toBe(
+      121_500n + BigInt(Math.round((100 - 104) * 250)),
+    );
+  });
+
+  it('interpolates linearly between entries (fractional columns)', () => {
+    const g = pieceGm();
+    expect(g.colToTsNs(100.5)).toBe(31_000n);
+    expect(g.colToTsNs(102.5)).toBe(121_125n);
+    expect(g.tsToCol(31_000n)).toBe(100.5);
+    expect(g.tsToCol(121_125n)).toBe(102.5);
+    expect(g.tsToCol(61_000n)).toBe(101);
+  });
+
+  it('round-trips columns that land on exact ns knots', () => {
+    const g = pieceGm();
+    for (const c of [100, 100.5, 101, 102.5, 103, 104]) {
+      expect(g.tsToCol(g.colToTsNs(c)!)).toBe(c);
+    }
+  });
+
+  it('falls back to the affine when the column is outside the table', () => {
+    const g = pieceGm();
+    const a = affineGm();
+    expect(g.colToTsNs(99)).toBe(a.colToTsNs(99)); // older than startSeq
+    expect(g.colToTsNs(105)).toBe(a.colToTsNs(105)); // newer than last entry
+    expect(g.tsToCol(-5n)).toBe(a.tsToCol(-5n)); // before t0[0]
+    expect(g.tsToCol(200_000n)).toBe(a.tsToCol(200_000n)); // after t0[n-1]
+  });
+
+  it('is bit-identical to the affine when slots are absent', () => {
+    // The same map WITHOUT a table is the literal historical formula.
+    const withoutSlots = new GridMap(view, dims, { ...affine }, price);
+    for (const c of [99, 100, 104, 105, 500]) {
+      expect(withoutSlots.colToTsNs(c)).toBe(121_500n + BigInt(Math.round((c - 104) * 250)));
+    }
+    for (const ts of [-5n, 1_000n, 999_999n]) {
+      expect(withoutSlots.tsToCol(ts)).toBe(104 + Number(ts - 121_500n) / 250);
+    }
+    // A slots map whose range excludes the query returns those exact bits.
+    const g = pieceGm();
+    expect(g.colToTsNs(99)).toBe(withoutSlots.colToTsNs(99));
+    expect(g.colToTsNs(105)).toBe(withoutSlots.colToTsNs(105));
+    expect(g.tsToCol(-5n)).toBe(withoutSlots.tsToCol(-5n));
+    expect(g.tsToCol(200_000n)).toBe(withoutSlots.tsToCol(200_000n));
+    // ...while a ts INSIDE the range demonstrably differs (the fix's purpose).
+    expect(g.colToTsNs(100)).not.toBe(withoutSlots.colToTsNs(100));
+  });
+
+  it('falls back when the table is unusable (single entry / reversed ends)', () => {
+    const single: TimeMap = {
+      ...affine,
+      slots: { startSeq: 100, t0: Float64Array.from([1_000]) },
+    };
+    const g1 = new GridMap(view, dims, single, price);
+    expect(g1.colToTsNs(100)).toBe(affineGm().colToTsNs(100)); // not 1_000n
+    // The producer writes ascending columns; a table whose ENDS are not
+    // ascending is unusable and must not be trusted.
+    const bad: TimeMap = {
+      ...affine,
+      slots: { startSeq: 100, t0: Float64Array.from([9_000, 1_000, 5_000]) },
+    };
+    const g2 = new GridMap(view, dims, bad, price);
+    expect(g2.colToTsNs(101)).toBe(affineGm().colToTsNs(101));
+    expect(g2.tsToCol(5_000n)).toBe(affineGm().tsToCol(5_000n));
+  });
+
+  it('exports pure helpers with the same null-outside contract', () => {
+    expect(slotColToTsNs(slots, 99)).toBeNull();
+    expect(slotColToTsNs(slots, 100)).toBe(1_000n);
+    expect(slotTsToCol(slots, 999n)).toBeNull();
+    expect(slotTsToCol(slots, 1_000n)).toBe(100);
   });
 });

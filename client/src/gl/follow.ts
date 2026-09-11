@@ -77,11 +77,17 @@ export function panFollowKill(peakDx: number, peakDy: number): FollowKill {
  *   - `askBot` — lowest row with ask > 0 (−1 when the ask side is empty),
  *   - `[lo, hi]` — the column's overall non-zero row extent (−1/−1 when empty).
  *
- * Two-sided and uncrossed (`askBot > bidTop`) → the inside-quote midpoint, which
- * is the closest thing to "the price" that needs no BBO channel, no capability
- * check and no overlay state. Otherwise (one-sided SYNTH_PROFILE books, a
- * crossed snapshot mid-update) → the extent midpoint. Empty column → null, and
- * the caller keeps the previous tracked row rather than jumping to row 0.
+ * Two-sided (`askBot >= bidTop`) → the inside-quote midpoint, which is the
+ * closest thing to "the price" that needs no BBO channel, no capability check
+ * and no overlay state. The `>=` matters: real L2 columns routinely quantize
+ * the best bid and best ask onto the SAME row (`bidTop === askBot` — the BTC
+ * case in survey S1/D2), for which the formula yields exactly `bidTop + 0.5`,
+ * the density-cell centre. With the old strict `>` that whole class fell
+ * through to the extent midpoint, so the tracked row was pulled toward the
+ * far wings (and moved whenever a wall appeared) instead of the inside quote.
+ * Otherwise (one-sided SYNTH_PROFILE books, a crossed snapshot mid-update) →
+ * the extent midpoint. Empty column → null, and the caller keeps the previous
+ * tracked row rather than jumping to row 0.
  */
 export function trackedRow(
   bidTop: number,
@@ -89,7 +95,7 @@ export function trackedRow(
   lo: number,
   hi: number,
 ): number | null {
-  if (bidTop >= 0 && askBot >= 0 && askBot > bidTop) return (bidTop + askBot + 1) / 2;
+  if (bidTop >= 0 && askBot >= 0 && askBot >= bidTop) return (bidTop + askBot + 1) / 2;
   if (lo >= 0 && hi >= lo) return (lo + hi + 1) / 2;
   return null;
 }

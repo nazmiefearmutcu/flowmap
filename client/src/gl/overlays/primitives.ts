@@ -15,8 +15,8 @@
  * {@link GridMap} (see coords.ts) and hand this module CLIP-space geometry, so
  * the GL side is trivial and shares nothing with the heatmap program. Each
  * overlay does its own `begin() … flush()` so draw ORDER equals call order
- * (profile → vwap → bbo → bubbles → markers), i.e. z-order is honored without a
- * depth buffer. Cost is O(vertices) = O(visible), never O(history).
+ * (profile → vwap → bbo → price → bubbles → markers), i.e. z-order is honored
+ * without a depth buffer. Cost is O(vertices) = O(visible), never O(history).
  *
  * Blending is premultiplied-alpha over the heatmap: the shaders output
  * `rgb · a, a` and the flushes use `blendFuncSeparate(ONE, ONE_MINUS_SRC_ALPHA,

@@ -69,9 +69,19 @@ export class PriceLine {
     }
   }
 
+  /**
+   * Re-init ONLY the session high-water cursor (`lastClose`). A replaced session
+   * restarts `col_seq` at 0; without this the col_seq-max would keep `last()`
+   * frozen on the old session's price (dashed level + axis pill; survey S1 D5).
+   * `reset()` calls this and additionally drops the per-column data.
+   */
+  resetCursor(): void {
+    this.lastClose = null;
+  }
+
   reset(): void {
     this.closes.clear();
-    this.lastClose = null;
+    this.resetCursor();
   }
 
   /** The newest close (for the price-axis pill), or null with no data. */
@@ -91,12 +101,15 @@ export class PriceLine {
     const range = visibleColRange(gm.view, frame.resident);
     if (range === null) return;
 
-    // One vertex per visible column, in ascending column order.
+    // One vertex per visible column, in ascending column order. `+0.5` puts the
+    // line on the row-CELL CENTRE — the same convention bubbles/markers use — so
+    // the trace rides the density cell the heatmap paints instead of its top
+    // boundary (survey S2 D3: the boundary convention split line and dots ~7px).
     const pts: Pt[] = [];
     for (let c = range.lo; c <= range.hi; c++) {
       const close = this.closes.get(c);
       if (close === undefined || !Number.isFinite(close)) continue;
-      pts.push({ x: gm.cssX(c + 0.5), y: gm.cssY(gm.priceToRow(close)) });
+      pts.push({ x: gm.cssX(c + 0.5), y: gm.cssY(gm.priceToRow(close) + 0.5) });
     }
     if (pts.length === 0) return;
 
@@ -124,10 +137,11 @@ export class PriceLine {
     }
 
     // Dashed last-price level marker across the chart, with a solid right-edge
-    // stub that meets the axis pill drawn by drawPriceAxis.
+    // stub that meets the axis pill drawn by drawPriceAxis. Row-cell centre,
+    // matching the trace and the pill.
     const last = this.lastClose;
     if (last !== null && gm.price !== null) {
-      const y = gm.cssY(gm.priceToRow(last.price));
+      const y = gm.cssY(gm.priceToRow(last.price) + 0.5);
       if (y >= -1 && y <= gm.dims.cssH + 1) {
         text.dashedLine(0, y, gm.dims.cssW, y, OVERLAY.priceLevel.css, [2, 4], 1);
       }

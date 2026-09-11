@@ -53,6 +53,22 @@ describe('trackedRow — "where is the price" from one column', () => {
     expect(trackedRow(100, 104, 40, 160)).toBe(102.5);
   });
 
+  it('D2: accepts the same-row two-sided case (the real BTC book) at the cell centre', () => {
+    // Live BTC columns quantize best bid and best ask onto the SAME row
+    // (survey S1/D2: bidTop === askBot === 2311). The inside quote is then
+    // that cell's centre — NOT the whole-book extent midpoint.
+    expect(trackedRow(2311, 2311, 1161, 3411)).toBe(2311.5);
+    // Counterexample pinned: the old strict `>` fell through to
+    // (lo + hi + 1)/2 = 2286.5, which a far-wing wall could drag by dozens
+    // of rows (the tracked-camera lurch in the survey).
+    expect(trackedRow(2311, 2311, 1161, 3411)).not.toBe(2286.5);
+  });
+
+  it('keeps the inside midpoint for a genuine multi-row spread', () => {
+    // One row of clearance between the sides must not change the convention.
+    expect(trackedRow(100, 101, 40, 160)).toBe(101);
+  });
+
   it('falls back to the extent midpoint for a one-sided (SYNTH) book', () => {
     expect(trackedRow(100, -1, 40, 160)).toBe(100.5);
     expect(trackedRow(-1, 104, 40, 160)).toBe(100.5);
