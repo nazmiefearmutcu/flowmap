@@ -237,6 +237,73 @@ export function selectLevel(
 }
 
 /**
+ * Smooth SUM-mip level cross-fade (campaign visual 2026-09-11, wave P2).
+ *
+ * The historical SUM-mip selector switched levels at hard 4^k footprints: at
+ * colsPerPixel 4.0 the shader jumped from a single level-0 column sample to a
+ * 4x4 SUM block (equivalently at 16.0 for level 2), a measured mean-luma spike
+ * of 88.9 — 9.4x the median — exactly at the boundary. This returns a blend
+ * plan instead: across a transition band [0.75*4^k, 4^k] the draw mixes the
+ * FINER level (k-1) into the coarse level k with weight `fade` (smoothstep,
+ * zero slope at both band ends), so the LOD change is continuous.
+ *
+ * Pure function, byte-identical outside the band:
+ *   - fp <= 1 / non-finite / <= 0        -> pure level 0 (no finer sample).
+ *   - fp < 0.75*4^k (outside the band)   -> pure level k-1 (fade 0; the draw
+ *     then uploads the LEGACY selectLevel() values verbatim).
+ *   - fp >= 4^k (k < maxLevel)           -> pure level k (fade 1; equals the
+ *     old selectLevel() output at every historical switch point 4.0/16.0...).
+ *   - 0.75*4^k < fp < 4^k                -> { level: k, finerLevel: k-1,
+ *     fade: w } with w = smoothstep((fp/4^k - 0.75) / 0.25).
+ *   - fp beyond 4^maxLevel               -> pure maxLevel (weight saturates).
+ *   - `levelFloor > 0` (tick grouping) or `maxLevel < 1` -> fade 0: a forced
+ *     or absent level must stay pure and bit-exact (the draw falls back to the
+ *     legacy selectLevel() upload; nothing is blended).
+ *
+ * `fp` is the dominant footprint axis the selector uses,
+ * `max(rowsPerPixel, colsPerPixel)`. `finerLevel` is -1 whenever no second
+ * sample exists (fade 0 or 1); the draw reports it additively for diagnostics.
+ */
+export function levelBlendFor(
+  fp: number,
+  maxLevel: number,
+  levelFloor = 0,
+): { level: number; finerLevel: number; fade: number } {
+  if (!Number.isFinite(fp) || fp <= 0) return { level: 0, finerLevel: -1, fade: 0 };
+  const maxL = Number.isFinite(maxLevel) ? Math.max(0, Math.floor(maxLevel)) : 0;
+  const floor = Number.isFinite(levelFloor)
+    ? Math.max(0, Math.min(maxL, Math.floor(levelFloor)))
+    : 0;
+  if (maxL < 1 || floor > 0) {
+    return { level: Math.max(0, Math.min(floor, maxL)), finerLevel: -1, fade: 0 };
+  }
+  // Smallest integer k with fp <= 4^k (log2 is exact for powers of two on V8,
+  // so the 4^k boundaries never ride on log/log rounding).
+  const kRaw = Math.ceil(Math.log2(fp) / 2);
+  if (kRaw <= 0) return { level: 0, finerLevel: -1, fade: 0 };
+  const k = Math.min(maxL, kRaw);
+  const boundary = 4 ** k;
+  // The band is deliberately WIDE (0.55..1.00 of the boundary): the LOD change
+  // is a brightness ramp of the aggregation factor (up to 4x), so a narrow band
+  // still concentrates it into a couple of wheel steps. 0.55..1.0 spreads the
+  // same total change over ~4x more zoom range (zoom-ladder re-measured).
+  // Exact band edges: the two pure regimes compare against their own constants
+  // so fp == bandLo and fp == boundary are bit-exact endpoints (a t-formula
+  // would land on 0.9999999999999999 and break endpoint byte-identity).
+  const bandLo = boundary * 0.55;
+  if (fp <= bandLo) return { level: k - 1, finerLevel: -1, fade: 0 };
+  if (fp >= boundary) return { level: k, finerLevel: -1, fade: 1 };
+  const t = (fp - bandLo) / (boundary - bandLo);
+  // LINEAR ramp, not smoothstep: the pixel delta per zoom step is ~proportional
+  // to the weight change, so a uniform ramp minimizes the MAX per-step pop
+  // (smoothstep concentrated ~1.5x the average change in the band's middle —
+  // measured on the zoom ladder). The band edges meet constant regimes, so the
+  // slope kink there is sub-step and invisible.
+  const w = t;
+  return { level: k, finerLevel: k - 1, fade: w };
+}
+
+/**
  * Zoom-aware level-0 sampler mix (campaign 5, contract F4). The historical
  * level-0 kernel (bilinear + 0.25/0.5/0.25 column blur) spans ~4 columns; while
  * a column is sub-pixel that blur is the right anti-confetti filter, but at
@@ -247,7 +314,7 @@ export function selectLevel(
  *   - cpp >= 1.5 → full blur, crisp off — columns are (sub-)pixel wide.
  *   - cpp <= 0.5 → blur off, full crisp cell sampling — flat data plateaus
  *     with hard time edges.
- *   - linear cross-fade in between, so the two filters never pop while
+ *   - smoothstep cross-fade in between, so the two filters never pop while
  *     zooming; the weights always sum to 1.
  *
  * Non-finite input degrades to the conservative historical output (full blur).
@@ -256,8 +323,76 @@ export function sampleMix(colsPerPixel: number): { blur: number; cell: number } 
   if (!Number.isFinite(colsPerPixel)) return { blur: 1, cell: 0 };
   if (colsPerPixel >= 1.5) return { blur: 1, cell: 0 };
   if (colsPerPixel <= 0.5) return { blur: 0, cell: 1 };
-  const cell = (1.5 - colsPerPixel) / (1.5 - 0.5);
+  // Resolution-transition polish (lane P): smoothstep the cross-fade instead of
+  // the historical linear ramp, so the crisp/blur handoff has zero derivative at
+  // BOTH ends — a zoom series through cpp 0.5..1.5 no longer shows the subtle
+  // slope discontinuity the zoom-ladder probe caught at the crossover. `t` is
+  // the complementary fraction (1 at cpp 0.5 → crisp, 0 at cpp 1.5 → blur), so
+  // cell stays monotone decreasing as columns grow; 1.0 still lands exactly on
+  // {0.5, 0.5}, and the endpoint branches above stay bit-exact.
+  const t = (1.5 - colsPerPixel) / (1.5 - 0.5);
+  const cell = t * t * (3 - 2 * t);
   return { blur: 1 - cell, cell };
+}
+
+/**
+ * Row-mip cross-fade weight (resolution-transition polish, lane P).
+ *
+ * The historical row LOD switch was a hard threshold: rpp < 2.5 sampled the
+ * level-0 single-row bilinear, rpp >= 2.5 sampled the 4-row-sum mip — a
+ * measured brightness/pop spike in the zoom ladder through rpp 2.4–3.9 (the
+ * band where row aggregation flips). This ramps the handoff instead:
+ *
+ *   - rpp <= 2.0  → 0 (pure level-0 rows, EXACT legacy output)
+ *   - rpp >= 3.2  → 1 (pure row-mip sums, EXACT post-4.1 output)
+ *   - in between  → smoothstep((rpp-2.0)/1.2), zero derivative at both ends
+ *
+ * Non-finite input degrades to 0 (the legacy level-0 path) rather than
+ * poisoning the blend weight. NOTE the DRAW applies this only inside the
+ * row-mip eligibility regime and renormalizes the edge — see
+ * {@link effectiveRowMode}, which is the single source of truth for the
+ * uploaded weight.
+ */
+export function rowFadeFor(rowsPerPixel: number): number {
+  if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 2.0) return 0;
+  if (rowsPerPixel >= 4.5) return 1;
+  // Linear ramp (see levelBlendFor): uniform weight deltas minimize the max
+  // per-step pop; the regime edges are renormalized by effectiveRowMode anyway.
+  return (rowsPerPixel - 2.0) / (4.5 - 2.0);
+}
+
+/** `selectLevel`'s row-mip threshold (rpp >= 2.5) — the fade's eligibility edge. */
+const ROW_MIP_EDGE = 2.5;
+
+/**
+ * The draw-side effective row mode for a frame — the SINGLE source of truth for
+ * `{rowOnly, rowFade}`. `Heatmap.draw` and `testHook.levelInfo` both call this,
+ * so the reported selection can never drift from the painted one.
+ *
+ * The hard row-mip threshold (`selectLevel`'s `rowOnly`, which already encodes
+ * rpp >= 2.5 AND a deep time zoom AND no tick-grouping floor) is replaced by a
+ * smooth blend, but the regime edges themselves are preserved: a frame is only
+ * eligible inside that regime (`rowEligible`), so the time-zoomed-out SUM path,
+ * a forced tick-grouping floor, and the rpp < 2.5 level-0 path keep their exact
+ * historical output. Inside the regime the weight from {@link rowFadeFor} is
+ * RENORMALIZED to 0 at the regime edge (rpp 2.5) — the draw switches from the
+ * legacy level-0 sample to the row-mip mix with a zero-weight blend, so there is
+ * no step at the edge — and reaches 1 at rpp 3.2, fully continuous across the
+ * measured 2.4–3.9 pop band.
+ *
+ * Without a usable row-mip chain (`rowUsable` false) the weight is 0: the
+ * legacy selection is used verbatim.
+ */
+export function effectiveRowMode(
+  rowsPerPixel: number,
+  rowUsable: boolean,
+  rowEligible = true,
+): { rowOnly: boolean; rowFade: number } {
+  if (!rowUsable || !rowEligible) return { rowOnly: false, rowFade: 0 };
+  const raw = rowFadeFor(rowsPerPixel);
+  const knee = rowFadeFor(ROW_MIP_EDGE);
+  const rowFade = raw <= knee ? 0 : (raw - knee) / (1 - knee);
+  return { rowOnly: rowFade > 0, rowFade };
 }
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -318,7 +453,10 @@ type UniformName =
   | 'u_level'
   | 'u_blk'
   | 'u_nRowTaps'
+  | 'u_levelFade'
+  | 'u_nRowTapsFine'
   | 'u_rowOnly'
+  | 'u_rowFade'
   | 'u_colBlur'
   | 'u_colCell';
 
@@ -374,11 +512,19 @@ export class Heatmap {
   levelFloor = 0;
 
   /**
-   * The scale-aware sampler mix from the LAST {@link draw} (campaign 5, F4):
-   * `colsPerPixel` (time-axis footprint) plus the blur/cell weights that were
-   * uploaded. Defaults to the zoomed-out historical blur before the first draw.
+   * Scale-aware sampler state from the LAST {@link draw} (campaign 5, F4 + lane
+   * P): `colsPerPixel` (time-axis footprint), the blur/cell weights, and the
+   * row-mip cross-fade weight that were uploaded. Defaults to the zoomed-out
+   * historical blur before the first draw.
    */
-  private lastSample = { colsPerPixel: 1, colBlur: 1, colCell: 0 };
+  private lastSample = {
+    colsPerPixel: 1,
+    colBlur: 1,
+    colCell: 0,
+    rowFade: 0,
+    levelFade: 0,
+    finerLevel: -1,
+  };
 
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
@@ -440,7 +586,10 @@ export class Heatmap {
       u_level: loc('u_level'),
       u_blk: loc('u_blk'),
       u_nRowTaps: loc('u_nRowTaps'),
+      u_levelFade: loc('u_levelFade'),
+      u_nRowTapsFine: loc('u_nRowTapsFine'),
       u_rowOnly: loc('u_rowOnly'),
+      u_rowFade: loc('u_rowFade'),
       u_colBlur: loc('u_colBlur'),
       u_colCell: loc('u_colCell'),
     };
@@ -535,27 +684,75 @@ export class Heatmap {
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
     const colsPerPixel = view.colScale / Math.max(1, gl.drawingBufferWidth);
     const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel, this.levelFloor);
-    // Row-only sampling (R2-M1): the flag is only honoured with a usable chain.
-    // The shader branch ignores u_level, so the draw uploads the row-mip
-    // geometry explicitly: level 0 / 4-ROW block, taps = ceil(rpp/4) (the
-    // row-mip texel is 4 rows tall). The floor below scales by the same
-    // `nRowTaps * blk` row footprint as every other path.
-    const rowOnly = sel.rowOnly === true && mips !== null && mips.rowUsable;
-    const level = rowOnly ? 0 : sel.level;
-    const blk = rowOnly ? 4 : sel.blk;
-    const nRowTaps = rowOnly
-      ? Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / 4)))
-      : sel.nRowTaps;
+    // Row-mip cross-fade (lane P; see rowFadeFor/effectiveRowMode). The hard
+    // row-mip threshold pops while zooming; instead the row-mip blend weight
+    // ramps smoothly across the row-mip eligibility regime (sel.rowOnly:
+    // rpp >= 2.5, deep time zoom, no tick-grouping floor), renormalized to 0 at
+    // the regime edge so the switch has no step. Any fade > 0 uploads the
+    // row-mip geometry explicitly — level 0 / 4-ROW block, taps = ceil(rpp/4)
+    // (the row-mip texel is 4 rows tall) — because the shader's blend branch
+    // ignores u_level for the row term. With `blk = 4` the pinned `/float(blk)`
+    // × `if (u_rowOnly == 1) intensity *= float(blk)` pair cancels, so the mix
+    // ramps raw 1-row sample → 4-row sum and both endpoints stay exact. The
+    // floor below scales by the same `nRowTaps * blk` row footprint as every
+    // other path. Ineligible frames (no usable chain, cpp zoomed out, forced
+    // floor, rpp < 2.5) keep the legacy selection verbatim.
+    const rowEligible = sel.rowOnly === true && mips !== null && mips.rowUsable;
+    const rowFade = effectiveRowMode(rowsPerPixel, rowEligible).rowFade;
+    // SUM-mip level cross-fade (wave P2; see levelBlendFor). The hard 4^k LOD
+    // switch is a measured brightness pop; outside a transition band the blend
+    // is pure: `fade <= 0` uploads sel verbatim, `fade === 1` uploads the
+    // coarse level k (4^k / taps / floor identical to the old output AT the
+    // switch point). Inside the band the shader mixes the finer level in via
+    // u_levelFade / u_nRowTapsFine. The row path above never blends levels: it
+    // owns the row axis (level 0 + 4-row sums), so the SUM blend is skipped
+    // while it is active.
+    let level: number;
+    let blk: number;
+    let nRowTaps: number;
+    let levelFade = 0;
+    let nRowTapsFine = 1;
+    let finerLevel = -1;
+    if (rowFade > 0) {
+      level = 0;
+      blk = 4;
+      nRowTaps = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / 4)));
+    } else {
+      const fp = Math.max(rowsPerPixel, colsPerPixel);
+      const blend = levelBlendFor(fp, maxLevel, this.levelFloor);
+      if (blend.fade <= 0) {
+        level = sel.level;
+        blk = sel.blk;
+        nRowTaps = sel.nRowTaps;
+      } else {
+        level = blend.level;
+        blk = 4 ** level;
+        nRowTaps = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / blk)));
+        levelFade = blend.fade;
+        nRowTapsFine = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / (blk / 4))));
+        finerLevel = blend.finerLevel;
+      }
+    }
     gl.uniform1i(this.u.u_level, level);
     gl.uniform1i(this.u.u_blk, blk);
     gl.uniform1i(this.u.u_nRowTaps, nRowTaps);
-    gl.uniform1i(this.u.u_rowOnly, rowOnly ? 1 : 0);
+    gl.uniform1f(this.u.u_levelFade, levelFade);
+    gl.uniform1i(this.u.u_nRowTapsFine, nRowTapsFine);
+    gl.uniform1i(this.u.u_rowOnly, rowFade > 0 ? 1 : 0);
+    gl.uniform1f(this.u.u_rowFade, rowFade);
 
     // Scale-aware level-0 sampler mix (campaign 5, F4; see sampleMix). Always
     // uploaded, so the zoomed-out path stays EXACTLY the historical filter and
     // the deep-zoom path switches to crisp cells without a shader recompile.
     const mix = sampleMix(colsPerPixel);
-    this.lastSample = { colsPerPixel, colBlur: mix.blur, colCell: mix.cell };
+    this.lastSample = {
+      colsPerPixel,
+      colBlur: mix.blur,
+      colCell: mix.cell,
+      rowFade,
+      levelFade,
+      finerLevel,
+    };
     gl.uniform1f(this.u.u_colBlur, mix.blur);
     gl.uniform1f(this.u.u_colCell, mix.cell);
 
@@ -578,11 +775,22 @@ export class Heatmap {
 
   /**
    * The level-0 sampler mix the LAST {@link draw} uploaded — `colsPerPixel`
-   * plus the blur/cell weights (see {@link sampleMix}). Defaults to the
-   * zoomed-out historical blur `{ colsPerPixel: 1, colBlur: 1, colCell: 0 }`
-   * before the first draw. Diagnostics/tests only (testHook.levelInfo).
+   * plus the blur/cell weights (see {@link sampleMix}), the effective row-mip
+   * cross-fade weight (see {@link effectiveRowMode}) and the SUM-mip level
+   * cross-fade (see {@link levelBlendFor}; `finerLevel` is -1 whenever no
+   * second sample exists). Defaults to the zoomed-out historical blur
+   * `{ colsPerPixel: 1, colBlur: 1, colCell: 0, rowFade: 0, levelFade: 0,
+   * finerLevel: -1 }` before the first draw. Diagnostics/tests only
+   * (testHook.levelInfo).
    */
-  sampleInfo(): { colsPerPixel: number; colBlur: number; colCell: number } {
+  sampleInfo(): {
+    colsPerPixel: number;
+    colBlur: number;
+    colCell: number;
+    rowFade: number;
+    levelFade: number;
+    finerLevel: number;
+  } {
     return { ...this.lastSample };
   }
 

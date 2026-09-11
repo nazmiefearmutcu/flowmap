@@ -10,7 +10,13 @@
 
 import type { GLContext } from './context';
 import { initGL } from './context';
-import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
+import {
+  Heatmap,
+  effectiveRowMode,
+  levelBlendFor,
+  selectLevel,
+  type HeatmapView,
+} from './heatmap';
 import {
   createLUTTexture,
   rampForMode,
@@ -32,12 +38,18 @@ export interface HeatmapSampleInfo {
   colsPerPixel: number;
   colBlur: number;
   colCell: number;
+  /** Row-mip cross-fade weight of the last draw (lane P; 0..1). */
+  rowFade: number;
+  /** SUM-mip level cross-fade weight of the last draw (wave P2; 0..1). */
+  levelFade: number;
+  /** Finer level blended into the last draw (k-1), or -1 for a pure level. */
+  finerLevel: number;
 }
 
 /**
  * L3's `Heatmap.sampleInfo()` — read through an optional handle so this lane
- * type-checks before/after that method lands; values default 1/1/0 (before the
- * first draw) exactly as the contract specifies.
+ * type-checks before/after that method lands; values default 1/1/0/0 (before
+ * the first draw) exactly as the contract specifies.
  */
 function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
   const fn = (
@@ -46,7 +58,7 @@ function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
     }
   ).sampleInfo;
   if (typeof fn === 'function') return fn.call(heatmap);
-  return { colsPerPixel: 1, colBlur: 1, colCell: 0 };
+  return { colsPerPixel: 1, colBlur: 1, colCell: 0, rowFade: 0, levelFade: 0, finerLevel: -1 };
 }
 
 export interface FlowmapTestApi {
@@ -89,7 +101,14 @@ export interface FlowmapTestApi {
    * plus (campaign visual 2026-09-11) the last-draw level-0 sampler weights:
    * `colsPerPixel` (view scale), `colBlur` (3-tap column blend amount) and
    * `colCell` (crisp nearest-column cell weight). Defaults 1/1/0 before a draw.
-   * `rowOnly` mirrors the real draw's R2-M1 selection (row-only mip active).
+   * `rowOnly`/`rowFade` mirror the real draw's lane-P row-mip selection: they
+   * come from the SAME {@link effectiveRowMode} helper the draw calls (fade > 0
+   * && a usable row chain), so the report can never drift from the paint.
+   * `levelFade`/`finerLevel` likewise mirror the wave-P2 SUM-mip level
+   * cross-fade through the SAME {@link levelBlendFor} helper: fade 0 means the
+   * legacy level upload (no second sample, finerLevel -1); inside a transition
+   * band `finerLevel` is the level blended in (k-1). The row path never blends
+   * levels, so both read 0/-1 while `rowFade > 0`.
    */
   levelInfo(): {
     rowsPerPixel: number;
@@ -100,6 +119,9 @@ export interface FlowmapTestApi {
     colBlur: number;
     colCell: number;
     rowOnly: boolean;
+    rowFade: number;
+    levelFade: number;
+    finerLevel: number;
   };
   /**
    * Set the tick-grouping mip floor (contract P1; campaign 4) on the hook's
@@ -231,11 +253,29 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
       const maxLevel = state.mips ? state.mips.maxLevel : 0;
       const rowsPerPixel = state.view.rowScale / Math.max(1, gl.drawingBufferHeight);
       const colsPerPixel = state.view.colScale / Math.max(1, gl.drawingBufferWidth);
-      // R2-M1: mirror the draw's selection (real colsPerPixel, row-mip
-      // usability) so the additive `rowOnly` field reports what was painted.
-      const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel);
-      const rowOnly = sel.rowOnly === true && state.mips !== null && state.mips.rowUsable;
-      return { rowsPerPixel, ...sel, rowOnly, ...sampleInfoOf(state.heatmap) };
+      // Lane P: `rowOnly`/`rowFade` mirror the draw's selection through the SAME
+      // helper the draw uses (with the same tick-grouping floor folded into the
+      // eligibility), so the additive report can never drift from the paint.
+      const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel, state.heatmap.levelFloor);
+      const rowEligible = sel.rowOnly === true && state.mips !== null && state.mips.rowUsable;
+      const field = effectiveRowMode(rowsPerPixel, rowEligible);
+      // Wave P2: mirror the draw's SUM-path level cross-fade for the CURRENT
+      // view through the same pure helper. The row path owns the row axis and
+      // never blends levels, so it reports fade 0 / finer -1.
+      const blend = levelBlendFor(
+        Math.max(rowsPerPixel, colsPerPixel),
+        maxLevel,
+        state.heatmap.levelFloor,
+      );
+      return {
+        rowsPerPixel,
+        ...sel,
+        ...sampleInfoOf(state.heatmap),
+        rowOnly: field.rowOnly,
+        rowFade: field.rowFade,
+        levelFade: field.rowFade > 0 ? 0 : blend.fade,
+        finerLevel: field.rowFade > 0 ? -1 : blend.finerLevel,
+      };
     },
 
     setLevelFloor(levelFloor) {

@@ -122,13 +122,37 @@ uniform int u_level;
 uniform int u_blk;
 uniform int u_nRowTaps;
 
+// SUM-mip level cross-fade (campaign visual 2026-09-11, wave P2). The hard LOD
+// switch at 4^k footprints is a measured brightness pop; the CPU ramps this
+// weight 0→1 across the boundary band [0.75*4^k, 4^k]. 0 = pure legacy upload
+// (the finer fetch is skipped entirely); 1 = pure coarse level (the mix carries
+// no finer weight). In between the finer level (u_level-1) is summed with its
+// own geometry (u_nRowTapsFine taps) and scaled by 4.0 so the pinned /blk
+// intensity expression below stays exact at BOTH endpoints: the finer level's
+// blk is blk/4, and mix(accF*4, acc, w)*/blk equals accF/(blk/4) at w=0 and
+// acc/blk at w=1. The ×4 is exact in powers of two.
+uniform float u_levelFade;
+uniform int u_nRowTapsFine;
+
 // Row-only mip flag (campaign visual 2026-09-11, R2-M1). 1 when the price axis
 // collapses rows per pixel (rpp >= 2.5) while the time axis is deep-zoomed
 // (cpp < 1.5): the 4x4 SUM mip would paint 4-column blocks, so rows are summed
 // through u_rowMip1 (ONE column per texel) instead. u_blk is then the row
 // block (4) and u_nRowTaps the 4-row taps covering the pixel footprint; the
 // intensity correction below undoes the SUM path's /blk column division.
+// With the lane-P cross-fade active this stays 1 for the WHOLE fade so the
+// /blk * blk pair cancels and the raw-scale mix is magnitude-correct.
 uniform int u_rowOnly;
+
+// Row-mip cross-fade weight (resolution-transition polish, lane P). 0 = pure
+// level-0 single-row sampling (the exact legacy output); 1 = pure 4-row-sum
+// row-mip sampling (the exact post-4.1 rowOnly output). In between the level-0
+// sample and the row sums are blended so the LOD switch never pops while
+// zooming (the CPU ramps this across the row-mip eligibility band, reaching 0
+// at the old rpp 2.5 switch edge — no step — and 1 at rpp 3.2). The 0 endpoint
+// skips the row fetches entirely; the 1 endpoint takes the full-row branch,
+// skipping the level-0 sampler — both stay bit-exact to their historical paths.
+uniform float u_rowFade;
 
 // Scale-aware level-0 sampler mix (campaign 5, contract F4). Per-draw constants
 // derived from the view's cols-per-pixel (columns / drawingBufferWidth):
@@ -152,6 +176,14 @@ vec2 fetchLevel(int x, int y, int layer) {
   if (u_level == 0) return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
   if (u_level == 1) return texelFetch(u_mip1, ivec3(x, y, layer), 0).rg;
   return texelFetch(u_mip2, ivec3(x, y, layer), 0).rg;
+}
+
+// One texel at the FINER level during a wave-P2 LOD cross-fade: u_level 1 →
+// level 0 (u_tiles), u_level 2 → level 1 (u_mip1). Only called from the SUM
+// else-branch, where u_level >= 1 (level 0 never blends).
+vec2 fetchFine(int x, int y, int layer) {
+  if (u_level == 1) return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
+  return texelFetch(u_mip1, ivec3(x, y, layer), 0).rg;
 }
 
 // One level-0 texel at an ABSOLUTE column, clamped into the VALID resident
@@ -246,11 +278,12 @@ void main() {
   int y0 = (row / blk) - (u_nRowTaps / 2);
 
   vec2 acc;
-  if (u_rowOnly == 1) {
-    // Row-only mip (R2-M1): SUM u_nRowTaps 4-row texels of THIS pixel's ONE
-    // column — a collapsing price axis still groups rows, but the time axis
-    // keeps hard cell edges (no 4-column block average). Bounds-clamped like
-    // the SUM path (a tap outside the grid contributes nothing).
+  if (u_rowFade >= 0.999) {
+    // Full row-sum endpoint (lane P; exact legacy row-only mip, R2-M1): SUM
+    // u_nRowTaps 4-row texels of THIS pixel's ONE column — a collapsing price
+    // axis still groups rows, but the time axis keeps hard cell edges (no
+    // 4-column block average). Bounds-clamped like the SUM path (a tap outside
+    // the grid contributes nothing). No level-0 fetches at this endpoint.
     int rowsR = u_rows / 4;
     int yBase = (row / 4) - (u_nRowTaps / 2);
     acc = vec2(0.0);
@@ -262,22 +295,65 @@ void main() {
     }
   } else if (u_level == 0) {
     // Scale-aware cross-fade (campaign 5): zoomed out → smooth continuous field
-    // (see sampleField0); deep zoom → crisp data cells (see crisp0). The 2-4
-    // rows/pixel band is handled one level up (selectLevel switches to the
-    // row-only / 4-row SUM mip at rpp >= 2.5) precisely so this path stays the
-    // CHEAP single-pass sampler — a per-pixel multi-tap sum here measurably
-    // blew the SwiftShader §10 draw budget while the mip gives the same
-    // smoothing for one texel fetch. L1: full-crisp skips the 12 blur fetches.
+    // (see sampleField0); deep zoom → crisp data cells (see crisp0). L1:
+    // full-crisp skips the 12 blur fetches.
     if (u_colCell >= 0.999) acc = crisp0(colf, rowf);
     else acc = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);
+    // Row-mip cross-fade (lane P): inside the row-mip regime the CPU ramps a
+    // weight from 0 at the old rpp 2.5 switch edge to full row sums by rpp 3.2,
+    // so the hard LOD switch becomes a smooth, step-free ramp. The legacy
+    // endpoint (<= 0.001) skips the row fetches entirely; the full endpoint was
+    // handled by the branch above. acc is in raw (single-row) scale while
+    // accRow is a 4-row sum; u_blk == 4 during the fade, so the /blk * blk
+    // correction below leaves this raw-scale mix magnitude-correct.
+    if (u_rowFade > 0.001) {
+      int rowsR = u_rows / 4;
+      int yBase = (row / 4) - (u_nRowTaps / 2);
+      vec2 accRow = vec2(0.0);
+      for (int t = 0; t < 4; t++) {
+        if (t >= u_nRowTaps) break;
+        int y = yBase + t;
+        if (y < 0 || y >= rowsR) continue;
+        accRow += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+      }
+      acc = mix(acc, accRow, clamp(u_rowFade, 0.0, 1.0));
+    }
   } else {
-    // Zoomed out: exact SUM path over the coarse level (unchanged).
+    // Zoomed out: the SUM path over the coarse level, plus the wave-P2 level
+    // cross-fade when the CPU is ramping across a 4^k LOD boundary.
     acc = vec2(0.0);
     for (int t = 0; t < 4; t++) {
       if (t >= u_nRowTaps) break;
       int y = y0 + t;
       if (y < 0 || y >= rowsL) continue;
       acc += fetchLevel(xL, y, layer);
+    }
+    // Finer-level sample (u_level-1), scaled by 4.0 so the pinned /float(blk)
+    // intensity below is exact at both endpoints (fade 0 → pure finer, fade 1 →
+    // pure coarse; ×4 and ÷4 cancel in powers of two). When the finer level IS
+    // level 0 the DISPLAY sampler (blur/crisp mix) is the right source: the
+    // draw switches to the level-0 branch at fade 0, so a raw texelFetch sum
+    // here left a visible band-entry step (coordinator amendment on P2).
+    // fade <= 0.001 skips these fetches entirely.
+    if (u_levelFade > 0.001) {
+      vec2 accF;
+      if (u_level == 1) {
+        if (u_colCell >= 0.999) accF = crisp0(colf, rowf);
+        else accF = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);
+      } else {
+        int blkF = blk / 4;
+        int xLf = x0 / blkF;
+        int rowsLf = u_rows / blkF;
+        int y0f = (row / blkF) - (u_nRowTapsFine / 2);
+        accF = vec2(0.0);
+        for (int t = 0; t < 4; t++) {
+          if (t >= u_nRowTapsFine) break;
+          int y = y0f + t;
+          if (y < 0 || y >= rowsLf) continue;
+          accF += fetchFine(xLf, y, layer);
+        }
+      }
+      acc = mix(accF * 4.0, acc, clamp(u_levelFade, 0.0, 1.0));
     }
   }
 
