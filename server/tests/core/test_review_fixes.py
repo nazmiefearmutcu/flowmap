@@ -253,7 +253,7 @@ def test_c2_degenerate_candle_clamps_before_range():
         Candle(t0_ns=DT_NS, o=100.0, h=1e18, l=-1e18, c=100.0, volume=10.0),
         Candle(t0_ns=2 * DT_NS, o=100.0, h=100.5, l=99.5, c=100.0, volume=10.0),
     ]
-    out = columns_from_candles(candles, cfg)
+    out = columns_from_candles(candles, cfg, stretch=1)
     assert out is not None
     built, ep = out
     assert len(built) == 3

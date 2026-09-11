@@ -84,7 +84,11 @@ import msgspec
 import numpy as np
 
 from flowmap_server.config import Config
-from flowmap_server.core.backfill import BackfillFn, columns_from_candles
+from flowmap_server.core.backfill import (
+    DEFAULT_BACKFILL_STRETCH,
+    BackfillFn,
+    columns_from_candles,
+)
 from flowmap_server.core.grid import FinalizedColumn, Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder, TailData
 from flowmap_server.core.stats import SessionStats
@@ -384,6 +388,7 @@ class Session:
         wall_clock: Clock = time.time_ns,
         backfill_fn: BackfillFn | None = None,
         backfill_max_cols: int = 0,
+        backfill_stretch: int = DEFAULT_BACKFILL_STRETCH,
         stats: SessionStats | None = None,
         rec_flush_interval_s: float = 10.0,
         retention_min_interval_s: float = 60.0,
@@ -454,6 +459,7 @@ class Session:
         # ``history: 'reconstructed'`` (candle volume-at-price, not resting L2).
         self._backfill_fn = backfill_fn
         self._backfill_max_cols = backfill_max_cols
+        self._backfill_stretch = backfill_stretch
         self._history_reconstructed = False
 
         self._clients: set[ClientTx] = set()
@@ -585,7 +591,9 @@ class Session:
         if not candles:
             return
         try:
-            result = columns_from_candles(candles, self._grid.cfg)
+            result = columns_from_candles(
+                candles, self._grid.cfg, stretch=self._backfill_stretch
+            )
             if result is None:
                 return
             columns, epoch = result
@@ -1688,6 +1696,7 @@ class SessionManager:
                 backfill_max_cols=self._cfg.backfill_max_cols
                 if self._cfg.backfill_enabled
                 else 0,
+                backfill_stretch=self._cfg.backfill_stretch,
                 stats=self.stats,
                 rec_flush_interval_s=self._cfg.rec_flush_interval_s,
                 retention_min_interval_s=self._cfg.retention_min_interval_s,

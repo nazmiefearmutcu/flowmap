@@ -63,12 +63,24 @@ __all__ = ["Candle", "BackfillFn", "columns_from_candles", "default_backfill_fn"
 
 logger = logging.getLogger(__name__)
 
-# Normalized peak of the reconstructed density (mirrors the equity SYNTH profile
-# target): a bounded RELATIVE intensity, never a share count. A liquid name's raw
-# candle volume cast to the grid's float16 ring (max 65 504) would overflow to
-# inf; one global scale keeps every texel ~1e3 (~65x headroom) while preserving
-# between-bucket and cross-side ratios.
-PEAK_TARGET = 1000.0
+# Safety ceiling for the reconstructed density. The per-row density is a TRUE
+# size unit (candle volume / row span, the same base-units-per-row scale the
+# live book ring uses), so a mixed viewport normalizes both regimes coherently —
+# the historical PEAK_TARGET inflation to a fixed 1000 made every candle band
+# saturate to the top of the ramp AND crush the live field below the black
+# point. The only scaling left is a downward clamp for pathological candles
+# (a doji whose whole volume lands in one row) so the float16 ring cannot
+# overflow to inf (max finite 65 504).
+DENSITY_SAFETY_MAX = 60_000.0
+
+# How many depth columns each reconstructed candle becomes. The candle's
+# density band is repeated across this many consecutive columns with the t0
+# spread over the candle's span (kept on the dt grid), so scroll-back history
+# paints as a CONTINUOUS field instead of one thin bar per minute; the client's
+# piecewise t0<->col map keeps the time axis honest. The column budget stays
+# bounded (512 candles x 16 = 8192, inside the 32768 server / 16384 client
+# rings). ``1`` restores the historical one-column-per-candle layout.
+DEFAULT_BACKFILL_STRETCH = 16
 _NAN = float("nan")
 # Total wall-clock timeout for every network client this module builds (A2-5):
 # the boot path holds the session's _start_lock while backfilling, so one hung
@@ -107,8 +119,16 @@ def _finite(*vals: float) -> bool:
 def columns_from_candles(
     candles: Sequence[Candle],
     cfg: GridCfg,
+    *,
+    stretch: int = DEFAULT_BACKFILL_STRETCH,
 ) -> tuple[list[FinalizedColumn], EpochParams] | None:
     """Convert candles to ``(columns, epoch)`` for :meth:`Grid.preload`.
+
+    Each candle is emitted as up to ``stretch`` consecutive columns whose t0s
+    spread across the candle's span on the dt grid, so reconstructed history
+    paints as a continuous band on the time axis instead of one thin bar per
+    minute (the band's density is the candle's per-row density, repeated).
+    ``stretch=1`` restores the historical one-column-per-candle layout.
 
     Returns ``None`` when nothing usable can be produced (no finite candles, a
     banded grid, a degenerate price frame) — the caller then degrades to a cold
@@ -214,21 +234,41 @@ def columns_from_candles(
             )
         )
 
-    scale = (PEAK_TARGET / global_peak) if global_peak > 0.0 else 1.0
+    # True size units: a candle band's per-row density is on the same
+    # base-units-per-row scale as live book densities, so a viewport that mixes
+    # reconstructed and live columns normalizes both fairly. Only a pathological
+    # peak (doji: whole volume in one row) is scaled DOWN to stay f16-finite.
+    scale = min(1.0, DENSITY_SAFETY_MAX / global_peak) if global_peak > 0.0 else 1.0
+    k_req = max(1, min(240, int(stretch)))
     columns: list[FinalizedColumn] = []
-    for seq, (dens, t0, bar) in enumerate(zip(raw, t0s, bars, strict=True)):
+    next_seq = 0
+    for seq_c, (dens, t0, bar) in enumerate(zip(raw, t0s, bars, strict=True)):
         d16 = (dens * scale).astype(np.float16)
-        bar = msgspec.structs.replace(bar, col_seq=seq)
-        columns.append(
-            FinalizedColumn(
-                epoch=0,
-                col_seq=seq,
-                t0_ns=t0,
-                bid=d16[0],
-                ask=d16[1],
-                bar=bar,
+        # The candle's true span: the next candle's snapped open minus ours,
+        # falling back to the nominal 1-minute interval for the last candle.
+        # Same-dt-slot candles span only dt, so they stay one column wide.
+        if seq_c + 1 < len(t0s):
+            span = max(dt, t0s[seq_c + 1] - t0)
+        else:
+            span = max(dt, _INTERVAL_NS["1m"])
+        slots = max(1, span // dt)
+        k = min(k_req, slots)
+        step_slots = max(1, slots // k)
+        # One bar per candle, keyed to the group's FIRST column: the client's
+        # overlays are col_seq-keyed maps, so repeated emissions dedupe.
+        bar = msgspec.structs.replace(bar, col_seq=next_seq)
+        for j in range(k):
+            columns.append(
+                FinalizedColumn(
+                    epoch=0,
+                    col_seq=next_seq + j,
+                    t0_ns=t0 + j * step_slots * dt,
+                    bid=d16[0],
+                    ask=d16[1],
+                    bar=bar,
+                )
             )
-        )
+        next_seq += k
 
     epoch = EpochParams(
         epoch=0,

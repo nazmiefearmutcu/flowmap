@@ -116,6 +116,12 @@ class Config(msgspec.Struct, frozen=True):
     # the session badges it ``history: 'reconstructed'`` (see core/session.py).
     backfill_enabled: bool = True
     backfill_max_cols: int = 512
+    # Depth columns emitted per reconstructed candle (FLOWMAP_BACKFILL_STRETCH,
+    # default 16, range 1..240). The candle's density band is repeated across
+    # this many consecutive columns with t0s spread over the candle's span, so
+    # scroll-back history paints as a continuous field instead of one thin bar
+    # per minute. 1 restores the legacy one-column-per-candle layout.
+    backfill_stretch: int = 16
     # Levels per side kept when a crypto book is emitted (see feeds/crypto.py
     # BOOK_TOP_N). The cap exists so one array build cannot blow up on a venue
     # that streams a very deep book; it is NOT a fidelity choice, and it is the
@@ -209,6 +215,9 @@ class Config(msgspec.Struct, frozen=True):
             not in ("0", "false", "False"),
             backfill_max_cols=_int_in_range(
                 env, "FLOWMAP_BACKFILL_MAX_COLS", "512", *_BACKFILL_MAX_COLS_RANGE
+            ),
+            backfill_stretch=_int_in_range(
+                env, "FLOWMAP_BACKFILL_STRETCH", "16", 1, 240
             ),
             rec_flush_interval_s=_float_in_range(
                 env, "FLOWMAP_FLUSH_INTERVAL_S", "10.0", *_REC_FLUSH_INTERVAL_S_RANGE

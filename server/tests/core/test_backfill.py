@@ -20,7 +20,12 @@ import asyncio
 import numpy as np
 
 from flowmap_server.config import Config
-from flowmap_server.core.backfill import PEAK_TARGET, Candle, columns_from_candles
+from flowmap_server.core.backfill import (
+    DEFAULT_BACKFILL_STRETCH,
+    DENSITY_SAFETY_MAX,
+    Candle,
+    columns_from_candles,
+)
 from flowmap_server.core.grid import Grid, GridCfg
 from flowmap_server.core.session import ClientTx, Session, SessionManager
 from flowmap_server.proto import wire
@@ -74,7 +79,7 @@ def _candles(n: int, *, base_price: float = 100.0, with_split: bool = True) -> l
 
 def test_columns_contiguous_and_monotonic():
     cfg = _cfg()
-    result = columns_from_candles(_candles(8), cfg)
+    result = columns_from_candles(_candles(8), cfg, stretch=1)
     assert result is not None
     cols, epoch = result
     assert len(cols) == 8
@@ -109,16 +114,52 @@ def test_density_bounded_peak_and_two_sided_split():
         max(float(c.bid.astype(np.float64).max()), float(c.ask.astype(np.float64).max()))
         for c in cols
     )
-    # one global scale normalizes the densest bucket to the target (f16-safe).
-    assert abs(combined_peak - PEAK_TARGET) < 1.0
+    # TRUE size units: per-row density is candle volume / row span, never the
+    # historical fixed-1000 inflation (which saturated the ramp and crushed the
+    # live field in mixed viewports). These candles carry ~100 volume over a
+    # ~4-row band, so the peak sits near 25.
+    assert 0.0 < combined_peak < 100.0
     # split at the candle close leaves mass on BOTH channels for a ranged candle.
     assert any(float(c.ask.astype(np.float64).max()) > 0.0 for c in cols)
     assert any(float(c.bid.astype(np.float64).max()) > 0.0 for c in cols)
 
 
+def test_pathological_doji_is_scaled_below_f16_max():
+    cfg = _cfg()
+    # h == l == c == a single row and an absurd volume: the whole volume lands
+    # in one row, so the safety scale must pull it below f16's finite max.
+    candles = [Candle(t0_ns=0, o=100.0, h=100.0, l=100.0, c=100.0, volume=1e9)]
+    cols, _ = columns_from_candles(candles, cfg)
+    peak = max(float(c.bid.astype(np.float64).max()) for c in cols)
+    assert peak <= DENSITY_SAFETY_MAX
+    assert np.isfinite(cols[0].bid.astype(np.float64)).all()
+
+
+def test_stretch_repeats_each_candle_as_a_contiguous_band():
+    """Default layout: each candle becomes a run of columns whose t0s span the
+    candle's minute on the dt grid, so history paints as a CONTINUOUS band (the
+    density repeats; one bar per candle keyed to the group's first column)."""
+    cfg = _cfg()
+    cols, _ = columns_from_candles(_candles(4), cfg, stretch=4)
+    assert len(cols) == 16
+    assert [c.col_seq for c in cols] == list(range(16))
+    for a, b in zip(cols, cols[1:]):
+        assert b.t0_ns > a.t0_ns
+    assert all(c.t0_ns % DT == 0 for c in cols)
+    for g in range(4):
+        group = cols[g * 4 : (g + 1) * 4]
+        base = group[0]
+        for c in group:
+            assert np.array_equal(c.bid, base.bid) and np.array_equal(c.ask, base.ask)
+            assert c.bar.col_seq == base.col_seq  # one bar per candle (dedupes client-side)
+        # t0 spans the minute in equal dt-aligned steps (15 s each at stretch 4).
+        assert [c.t0_ns - base.t0_ns for c in group] == [0, 60 * DT, 120 * DT, 180 * DT]
+    assert [cols[i].bar.col_seq for i in range(0, 16, 4)] == [0, 4, 8, 12]
+
+
 def test_reconstructed_cvd_from_taker_split():
     cfg = _cfg()
-    cols, _ = columns_from_candles(_candles(4, with_split=True), cfg)
+    cols, _ = columns_from_candles(_candles(4, with_split=True), cfg, stretch=1)
     # buy 60 / sell 40 per candle -> cvd rises by 20 each column.
     assert [round(c.bar.cvd_cum, 6) for c in cols] == [20.0, 40.0, 60.0, 80.0]
     assert all(c.bar.vol_buy == 60.0 and c.bar.vol_sell == 40.0 for c in cols)
@@ -135,7 +176,7 @@ def test_equity_no_split_leaves_cvd_flat():
 
 def test_preload_roundtrip_accepts_backfill_columns():
     cfg = _cfg()
-    cols, epoch = columns_from_candles(_candles(10), cfg)
+    cols, epoch = columns_from_candles(_candles(10), cfg, stretch=1)
     grid = Grid(cfg)
     grid.preload(cols, [epoch])  # must not raise: contiguity contract honored
     served = grid.history(2**62, 100)
@@ -220,8 +261,8 @@ async def test_session_backfill_seeds_ring_and_badges_history():
         assert sum(isinstance(m, DepthColumn) for m in flat) > 0
         # a gap marker separates the reconstructed tail from live.
         assert any(isinstance(m, Marker) and m.kind == "gap" for m in flat)
-        # grid ring actually holds them.
-        assert len(grid.history(2**62, 100)) == 12
+        # grid ring actually holds the full stretched reconstruction.
+        assert len(grid.history(2**62, 500)) == 12 * DEFAULT_BACKFILL_STRETCH
     finally:
         sess.teardown_now()
 
@@ -296,7 +337,7 @@ def test_same_slot_candles_both_kept_with_forced_t0():
         Candle(t0_ns=0, o=100.0, h=101.0, l=99.0, c=100.0, volume=10.0),
         Candle(t0_ns=DT // 2, o=100.0, h=101.0, l=99.0, c=100.5, volume=5.0),
     ]
-    out = columns_from_candles(cs, _cfg())
+    out = columns_from_candles(cs, _cfg(), stretch=1)
     assert out is not None
     cols, _epoch = out
     assert [c.t0_ns for c in cols] == [0, DT]
