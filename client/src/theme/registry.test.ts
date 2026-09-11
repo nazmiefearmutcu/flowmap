@@ -23,6 +23,7 @@ import {
   nextTheme,
   resolveCanvasPalette,
   type CanvasPalette,
+  type ChartPalette,
   type ThemeId,
 } from './registry';
 
@@ -55,19 +56,78 @@ function valueOf(body: string, name: string): string {
   return (m as RegExpMatchArray)[1].replace(/\s+/g, ' ').trim();
 }
 
-/** WCAG relative luminance for a `#rrggbb` literal. */
-function relLum(hex: string): number {
-  const c = hex.replace('#', '');
-  const [r, g, b] = [0, 2, 4].map((i) => parseInt(c.slice(i, i + 2), 16) / 255);
-  const lin = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+/** WCAG contrast ratio between two css color literals. */
+function contrast(a: string, b: string): number {
+  return contrastRgb(parseCss(a), b);
+}
+
+/** Parse `#rrggbb` / `rgb()` / `rgba()` into 0-255 channels + alpha. */
+function parseCss(value: string): [number, number, number, number] {
+  const v = value.trim();
+  const hex = /^#([0-9a-f]{6})$/i.exec(v);
+  if (hex) {
+    const h = hex[1];
+    return [
+      parseInt(h.slice(0, 2), 16),
+      parseInt(h.slice(2, 4), 16),
+      parseInt(h.slice(4, 6), 16),
+      1,
+    ];
+  }
+  const fn = /^rgba?\(([^)]+)\)$/i.exec(v);
+  if (!fn) throw new Error(`test helper: unparseable css color: ${value}`);
+  const parts = fn[1].split(/[\s,]+/).filter((p) => p !== '').map(Number);
+  return [parts[0], parts[1], parts[2], parts[3] ?? 1];
+}
+
+/** WCAG relative luminance of an rgb triple. */
+function relLumRgb(rgb: readonly number[]): number {
+  const lin = rgb.slice(0, 3).map((v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
   return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
 }
 
-/** WCAG contrast ratio between two `#rrggbb` literals. */
-function contrast(a: string, b: string): number {
-  const [hi, lo] = relLum(a) > relLum(b) ? [relLum(a), relLum(b)] : [relLum(b), relLum(a)];
+/** WCAG contrast between an rgb triple and a css ground literal. */
+function contrastRgb(rgb: readonly number[], ground: string): number {
+  const g = parseCss(ground);
+  const [hi, lo] = relLumRgb(rgb) > relLumRgb(g) ? [relLumRgb(rgb), relLumRgb(g)] : [relLumRgb(g), relLumRgb(rgb)];
   return (hi + 0.05) / (lo + 0.05);
 }
+
+/** Composite an rgba() color over an opaque ground. */
+function compositeOver(fg: readonly [number, number, number, number], ground: string): [number, number, number] {
+  const bg = parseCss(ground);
+  return [0, 1, 2].map((i) => fg[3] * fg[i] + (1 - fg[3]) * bg[i]) as [
+    number,
+    number,
+    number,
+  ];
+}
+
+/** Chebyshev (max-channel) distance between two rgb triples. */
+function chebyshev(a: readonly number[], b: readonly number[]): number {
+  return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+}
+
+type ChartColorField = Exclude<keyof ChartPalette, 'density' | 'synth' | 'gridAlpha'>;
+
+/** Which CSS variable each chart palette color field reads. */
+const CHART_VAR_FOR: Readonly<Record<ChartColorField, string>> = {
+  bg: '--chart-bg',
+  ink: '--chart-ink',
+  inkDim: '--chart-ink-dim',
+  chipBg: '--chart-chip-bg',
+  chipBorder: '--chart-chip-border',
+  accent: '--chart-accent',
+  gutterBg: '--chart-gutter-bg',
+  grid: '--chart-grid',
+  axis: '--chart-axis',
+  price: '--chart-price',
+  sell: '--chart-sell',
+  warn: '--chart-warn',
+};
 
 describe('theme registry / css coverage', () => {
   it('ships the two campaign-4 a11y themes on top of the four contract themes', () => {
@@ -82,9 +142,9 @@ describe('theme registry / css coverage', () => {
     expect(THEME_IDS[0]).toBe('midnight');
   });
 
-  /** Chart-island tokens (fix 2026-09-10 F1-3): fixed dark values for chips
-   *  rendered inside the always-dark GL chart. Deliberately NOT theme-owned —
-   *  see the dedicated test below. */
+  /** Chart-palette tokens (theme-owned since campaign 2026-09-11): every
+   *  theme declares all twelve; the F6 legacy-ramp override re-pins midnight's
+   *  set when `data-chart-ramp` selects flow/inferno/classic. */
   function isChartToken(name: string): boolean {
     return name.startsWith('--chart-');
   }
@@ -92,7 +152,7 @@ describe('theme registry / css coverage', () => {
   it('every theme declares every THEME variable ui/theme.css owns — no more, no less', () => {
     const root = varNames(blockOf(uiCss, ':root'));
     expect(root.size).toBeGreaterThan(40); // sanity: the sheet really has tokens
-    const themeVars = [...root].filter((n) => !isChartToken(n));
+    const themeVars = [...root];
     for (const id of THEME_IDS) {
       const block = varNames(blockOf(themesCss, `:root[data-theme='${id}']`));
       for (const name of themeVars) {
@@ -105,30 +165,50 @@ describe('theme registry / css coverage', () => {
     }
   });
 
-  it('NO theme block redefines a --chart-* token (the chart is a dark island in every theme)', () => {
+  it('every theme declares every --chart-* token — the chart palette is theme-owned', () => {
     const root = varNames(blockOf(uiCss, ':root'));
-    const chartTokens = [...root].filter(isChartToken);
-    expect(chartTokens, 'the chart-island tokens exist on :root').toEqual([
-      '--chart-ink',
-      '--chart-ink-dim',
+    const chartTokens = [...root].filter(isChartToken).sort();
+    expect(chartTokens, 'the chart palette token set').toEqual([
+      '--chart-accent',
+      '--chart-axis',
+      '--chart-bg',
       '--chart-chip-bg',
       '--chart-chip-border',
-      '--chart-accent',
+      '--chart-grid',
       '--chart-gutter-bg',
+      '--chart-ink',
+      '--chart-ink-dim',
+      '--chart-price',
+      '--chart-sell',
+      '--chart-warn',
     ]);
     for (const id of THEME_IDS) {
-      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
-      const redefined = [...varNames(body)].filter(isChartToken);
-      expect(redefined, `${id} must not redefine chart-island tokens`).toEqual([]);
+      const declared = [
+        ...varNames(blockOf(themesCss, `:root[data-theme='${id}']`)),
+      ]
+        .filter(isChartToken)
+        .sort();
+      expect(declared, `${id} chart tokens`).toEqual(chartTokens);
     }
   });
 
-  it('midnight is visually identical to :root — every theme-owned value matches', () => {
+  it('the legacy-ramp override pins the midnight chart palette and comes last (F6)', () => {
+    const selector = ":root[data-chart-ramp='flow'],";
+    const body = blockOf(themesCss, selector);
+    const rootBody = blockOf(uiCss, ':root');
+    for (const name of [...varNames(rootBody)].filter(isChartToken)) {
+      expect(valueOf(body, name), `override ${name}`).toBe(valueOf(rootBody, name));
+    }
+    expect(themesCss.indexOf(selector)).toBeGreaterThan(
+      themesCss.indexOf(":root[data-theme='contrast']"),
+    );
+  });
+
+  it('midnight is visually identical to :root — every value matches (chart tokens included)', () => {
     const rootBody = blockOf(uiCss, ':root');
     const midnightBody = blockOf(themesCss, ":root[data-theme='midnight']");
     for (const name of varNames(rootBody)) {
-      if (isChartToken(name)) continue; // fixed dark-island values, not theme-owned
-      expect(valueOf(midnightBody, name)).toBe(valueOf(rootBody, name));
+      expect(valueOf(midnightBody, name), `midnight ${name}`).toBe(valueOf(rootBody, name));
     }
   });
 
@@ -145,6 +225,76 @@ describe('theme registry / css coverage', () => {
       const canvas = THEMES[id].canvas;
       for (const field of Object.keys(CANVAS_VAR_FOR) as Array<keyof CanvasPalette>) {
         expect(valueOf(body, CANVAS_VAR_FOR[field])).toBe(canvas[field]);
+      }
+    }
+  });
+
+  it('registry chart literals mirror each theme css chart values (all ten tokens)', () => {
+    for (const id of THEME_IDS) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const chart = THEMES[id].chart;
+      for (const field of Object.keys(CHART_VAR_FOR) as ChartColorField[]) {
+        expect(valueOf(body, CHART_VAR_FOR[field]), `${id} ${field}`).toBe(chart[field]);
+      }
+    }
+  });
+
+  it('chart ink clears 4.5:1 on the composited chip plate in every theme', () => {
+    for (const id of THEME_IDS) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const plate = compositeOver(parseCss(valueOf(body, '--chart-chip-bg')), valueOf(body, '--chart-bg'));
+      expect(contrastRgb(plate, valueOf(body, '--chart-ink')), `${id} chip ink`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it('chart price ink clears 3:1 on the chart ground and stays ≥48 Chebyshev from every density stop', () => {
+    for (const id of THEME_IDS) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const price = parseCss(valueOf(body, '--chart-price'));
+      expect(contrastRgb(price, valueOf(body, '--chart-bg')), `${id} price on bg`).toBeGreaterThanOrEqual(3);
+      for (const stop of THEMES[id].chart.density) {
+        expect(chebyshev(price, stop.rgb), `${id} price vs density@${stop.t}`).toBeGreaterThanOrEqual(48);
+      }
+    }
+  });
+
+  it('chart sell/warn state inks clear 4.5:1 on the composited chip plate in every theme (M-3)', () => {
+    for (const id of THEME_IDS) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const plate = compositeOver(parseCss(valueOf(body, '--chart-chip-bg')), valueOf(body, '--chart-bg'));
+      for (const name of ['--chart-sell', '--chart-warn'] as const) {
+        const ink = parseCss(valueOf(body, name));
+        const [hi, lo] = relLumRgb(ink) > relLumRgb(plate) ? [relLumRgb(ink), relLumRgb(plate)] : [relLumRgb(plate), relLumRgb(ink)];
+        expect((hi + 0.05) / (lo + 0.05), `${id} ${name} on chip plate`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it('chart ink-dim clears 4.5:1 on the composited chip plate (livectl chip labels, H-2)', () => {
+    for (const id of THEME_IDS) {
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const plate = compositeOver(parseCss(valueOf(body, '--chart-chip-bg')), valueOf(body, '--chart-bg'));
+      const ink = parseCss(valueOf(body, '--chart-ink-dim'));
+      const [hi, lo] = relLumRgb(ink) > relLumRgb(plate) ? [relLumRgb(ink), relLumRgb(plate)] : [relLumRgb(plate), relLumRgb(ink)];
+      expect((hi + 0.05) / (lo + 0.05), `${id} ink-dim on chip plate`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it('light themes raise gridAlpha so the composited grid clears 1.4:1 on the chart ground (L-4)', () => {
+    for (const id of THEME_IDS) {
+      const theme = THEMES[id];
+      const body = blockOf(themesCss, `:root[data-theme='${id}']`);
+      const bg = valueOf(body, '--chart-bg');
+      const grid = parseCss(theme.chart.grid);
+      const alpha = theme.chart.gridAlpha ?? 0.14;
+      if (theme.mode === 'light') {
+        expect(theme.chart.gridAlpha, `${id} declares gridAlpha`).toBeTypeOf('number');
+        expect(theme.chart.gridAlpha, `${id} gridAlpha raised`).toBeGreaterThanOrEqual(0.25);
+        const composited = compositeOver([grid[0], grid[1], grid[2], alpha], bg);
+        expect(contrastRgb(composited, bg), `${id} grid vs chart bg`).toBeGreaterThanOrEqual(1.4);
+      } else {
+        // Dark themes keep the shipped 0.14 hairline (byte-identity).
+        expect(theme.chart.gridAlpha ?? 0.14, `${id} dark gridAlpha`).toBe(0.14);
       }
     }
   });

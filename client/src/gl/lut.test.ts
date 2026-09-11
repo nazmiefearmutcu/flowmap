@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   buildClassicLUT,
@@ -6,12 +6,14 @@ import {
   buildImbalanceLUT,
   buildInfernoLUT,
   buildLUTAtlas,
+  buildRamp,
   buildSynthLUT,
   clearColorForRamp,
   DEFAULT_COLORMAP,
   LUT_ROWS,
   LUT_SIZE,
   rampCssGradient,
+  rampCssGradientReversed,
   rampForColormap,
   rampForMode,
   RAMP_CLASSIC,
@@ -19,6 +21,10 @@ import {
   RAMP_FLOW,
   RAMP_INFERNO,
   RAMP_SYNTH,
+  RAMP_THEME,
+  RAMP_THEME_SYNTH,
+  setThemeStops,
+  type RampStop,
 } from './lut';
 import { MODE_L1_BAND, MODE_L2, MODE_SYNTH_PROFILE } from '../proto/types';
 
@@ -275,15 +281,19 @@ describe('synth (amber) LUT', () => {
 });
 
 describe('rampForColormap (§9 user choice)', () => {
-  it('maps the three families to their atlas rows', () => {
+  it('maps the three legacy families to their atlas rows', () => {
     expect(rampForColormap('flow')).toBe(RAMP_FLOW);
     expect(rampForColormap('inferno')).toBe(RAMP_INFERNO);
     expect(rampForColormap('classic')).toBe(RAMP_CLASSIC);
   });
 
-  it('defaults to flow', () => {
+  it('defaults to the identity (flow) row; the default family is now theme', () => {
+    // The default flipped with campaign visual 2026-09-11: `theme` resolves to
+    // the theme rows via rampForMode, and to FLOW here when no theme is active
+    // (the midnight identity path).
     expect(rampForColormap(DEFAULT_COLORMAP)).toBe(RAMP_FLOW);
-    expect(DEFAULT_COLORMAP).toBe('flow');
+    expect(rampForColormap('theme')).toBe(RAMP_FLOW);
+    expect(DEFAULT_COLORMAP).toBe('theme');
   });
 });
 
@@ -315,9 +325,35 @@ describe('rampForMode (§7 mode → colormap)', () => {
   });
 
   it('NO colormap choice can dress synthetic depth as real depth', () => {
-    for (const cm of ['flow', 'inferno', 'classic'] as const) {
+    for (const cm of ['theme', 'flow', 'inferno', 'classic'] as const) {
       expect(rampForMode(MODE_L1_BAND, 'SYNTH', cm)).toBe(RAMP_SYNTH);
       expect(rampForMode(MODE_SYNTH_PROFILE, undefined, cm)).toBe(RAMP_SYNTH);
+    }
+  });
+
+  it("resolves 'theme' to the identity rows when no theme rows are passed", () => {
+    expect(rampForMode(MODE_L2, 'L2', 'theme')).toBe(RAMP_FLOW);
+    expect(rampForMode(MODE_L1_BAND, 'L1', 'theme')).toBe(RAMP_FLOW);
+    expect(rampForMode(MODE_SYNTH_PROFILE, undefined, 'theme')).toBe(RAMP_SYNTH);
+  });
+
+  it("maps 'theme' to the caller's themed rows when provided (F2)", () => {
+    const themed = { density: RAMP_THEME, synth: RAMP_THEME_SYNTH };
+    expect(rampForMode(MODE_L2, 'L2', 'theme', themed)).toBe(RAMP_THEME);
+    expect(rampForMode(MODE_L1_BAND, 'SYNTH', 'theme', themed)).toBe(RAMP_THEME_SYNTH);
+    expect(rampForMode(MODE_SYNTH_PROFILE, undefined, 'theme', themed)).toBe(RAMP_THEME_SYNTH);
+    // Legacy families ignore the themed rows entirely.
+    expect(rampForMode(MODE_L2, 'L2', 'flow', themed)).toBe(RAMP_FLOW);
+    expect(rampForMode(MODE_L2, 'L2', 'inferno', themed)).toBe(RAMP_INFERNO);
+    expect(rampForMode(MODE_L2, 'L2', 'classic', themed)).toBe(RAMP_CLASSIC);
+  });
+
+  it('synthetic still wins over the theme rows (honesty is unconditional)', () => {
+    const themed = { density: RAMP_THEME, synth: RAMP_THEME_SYNTH };
+    expect(rampForMode(MODE_L1_BAND, 'SYNTH_PROFILE', 'theme', themed)).toBe(RAMP_THEME_SYNTH);
+    for (const cm of ['theme', 'flow', 'inferno', 'classic'] as const) {
+      expect(rampForMode(MODE_L1_BAND, 'SYNTH', cm, themed)).not.toBe(RAMP_THEME);
+      expect(rampForMode(MODE_L1_BAND, 'SYNTH', cm, themed)).not.toBe(RAMP_FLOW);
     }
   });
 
@@ -328,19 +364,25 @@ describe('rampForMode (§7 mode → colormap)', () => {
 });
 
 describe('LUT atlas', () => {
-  it('stacks inferno/synth/classic/flow as 256×4 RGBA8', () => {
+  it('stacks inferno/synth/classic/flow as 256×LUT_ROWS RGBA8 with theme row defaults', () => {
     const atlas = buildLUTAtlas();
     expect(atlas.length).toBe(LUT_SIZE * LUT_ROWS * 4);
     expect(atlas.slice(0, LUT_SIZE * 4)).toEqual(buildInfernoLUT());
     expect(atlas.slice(LUT_SIZE * 4, LUT_SIZE * 8)).toEqual(buildSynthLUT());
     expect(atlas.slice(LUT_SIZE * 8, LUT_SIZE * 12)).toEqual(buildClassicLUT());
     expect(atlas.slice(LUT_SIZE * 12, LUT_SIZE * 16)).toEqual(buildFlowLUT());
+    // Rows 5/6 with no theme registered are the flow/synth identity bytes, so
+    // an un-themed boot is byte-identical to the legacy atlas (F2).
+    expect(atlas.slice(LUT_SIZE * 20, LUT_SIZE * 24)).toEqual(buildFlowLUT());
+    expect(atlas.slice(LUT_SIZE * 24, LUT_SIZE * 28)).toEqual(buildSynthLUT());
   });
 
   it('pins the row indices the e2e parity matrix asserts numerically', () => {
     expect(RAMP_INFERNO).toBe(0); // "whatever real depth renders as" (legacy)
     expect(RAMP_SYNTH).toBe(1); // the §7 honesty row
-    expect(RAMP_FLOW).toBe(3); // the default real-depth row
+    expect(RAMP_FLOW).toBe(3); // the identity real-depth row
+    expect(RAMP_THEME).toBe(5); // theme density — APPENDED, never renumbered
+    expect(RAMP_THEME_SYNTH).toBe(6); // theme synth — APPENDED
   });
 });
 
@@ -409,6 +451,75 @@ describe('clearColorForRamp — the clear color IS LUT entry 0 (B-6, no reset fl
   });
 });
 
+describe('theme ramp rows 5/6 (campaign visual 2026-09-11, F2)', () => {
+  // The store is module state — always restore the identity after each case so
+  // the byte-identity assertions elsewhere in this file stay meaningful.
+  afterEach(() => setThemeStops(null));
+
+  const DENSITY: RampStop[] = [
+    { t: 0.0, rgb: [4, 4, 6] },
+    { t: 0.5, rgb: [40, 80, 120] },
+    { t: 1.0, rgb: [240, 230, 200] },
+  ];
+  const SYNTH_ROWS: RampStop[] = [
+    { t: 0.0, rgb: [9, 9, 9] },
+    { t: 1.0, rgb: [90, 60, 30] },
+  ];
+
+  it('defaults rows 5/6 to the flow/synth bytes (no theme registered)', () => {
+    const atlas = buildLUTAtlas();
+    expect(atlas.slice(RAMP_THEME * LUT_SIZE * 4, (RAMP_THEME + 1) * LUT_SIZE * 4)).toEqual(
+      buildFlowLUT(),
+    );
+    expect(
+      atlas.slice(RAMP_THEME_SYNTH * LUT_SIZE * 4, (RAMP_THEME_SYNTH + 1) * LUT_SIZE * 4),
+    ).toEqual(buildSynthLUT());
+  });
+
+  it('setThemeStops then buildLUTAtlas writes the custom stops into rows 5/6 exactly', () => {
+    setThemeStops({ density: DENSITY, synth: SYNTH_ROWS });
+    const atlas = buildLUTAtlas();
+    expect(atlas.slice(RAMP_THEME * LUT_SIZE * 4, (RAMP_THEME + 1) * LUT_SIZE * 4)).toEqual(
+      buildRamp(DENSITY),
+    );
+    expect(
+      atlas.slice(RAMP_THEME_SYNTH * LUT_SIZE * 4, (RAMP_THEME_SYNTH + 1) * LUT_SIZE * 4),
+    ).toEqual(buildRamp(SYNTH_ROWS));
+    // Rows 0..4 are untouched by the theme store.
+    expect(atlas.slice(0, LUT_SIZE * 4)).toEqual(buildInfernoLUT());
+    expect(atlas.slice(LUT_SIZE * 12, LUT_SIZE * 16)).toEqual(buildFlowLUT());
+  });
+
+  it('clearColorForRamp follows the store for the theme rows', () => {
+    expect(clearColorForRamp(RAMP_THEME)).toEqual([5 / 255, 8 / 255, 14 / 255, 1]);
+    expect(clearColorForRamp(RAMP_THEME_SYNTH)).toEqual([6 / 255, 3 / 255, 0 / 255, 1]);
+    setThemeStops({ density: DENSITY, synth: SYNTH_ROWS });
+    expect(clearColorForRamp(RAMP_THEME)).toEqual([4 / 255, 4 / 255, 6 / 255, 1]);
+    expect(clearColorForRamp(RAMP_THEME_SYNTH)).toEqual([9 / 255, 9 / 255, 9 / 255, 1]);
+  });
+
+  it('rampCssGradient follows the store for the theme rows', () => {
+    expect(rampCssGradient(RAMP_THEME)).toBe(rampCssGradient(RAMP_FLOW));
+    expect(rampCssGradient(RAMP_THEME_SYNTH)).toBe(rampCssGradient(RAMP_SYNTH));
+    setThemeStops({ density: DENSITY, synth: SYNTH_ROWS });
+    expect(rampCssGradient(RAMP_THEME)).toContain('rgb(4, 4, 6) 0.0%');
+    expect(rampCssGradient(RAMP_THEME_SYNTH)).toContain('rgb(90, 60, 30) 100.0%');
+    expect(rampCssGradientReversed(RAMP_THEME)).toContain('rgb(240, 230, 200) 100.0%');
+    expect(rampCssGradientReversed(RAMP_THEME)).toContain('rgb(4, 4, 6) 0.0%');
+  });
+
+  it('an explicit buildLUTAtlas(theme) argument overrides the store', () => {
+    setThemeStops({ density: DENSITY, synth: SYNTH_ROWS });
+    const atlas = buildLUTAtlas({ density: SYNTH_ROWS, synth: DENSITY });
+    expect(atlas.slice(RAMP_THEME * LUT_SIZE * 4, (RAMP_THEME + 1) * LUT_SIZE * 4)).toEqual(
+      buildRamp(SYNTH_ROWS),
+    );
+    expect(atlas.slice(RAMP_THEME_SYNTH * LUT_SIZE * 4, (RAMP_THEME_SYNTH + 1) * LUT_SIZE * 4)).toEqual(
+      buildRamp(DENSITY),
+    );
+  });
+});
+
 describe('atlas golden bytes — rows 0..3 are BIT-IDENTICAL to pre-channel releases', () => {
   // Captured from buildLUTAtlas() before the divergent imbalance row (row 4)
   // was appended. Rows 0 (real depth) and 1 (synth amber) are pinned by the
@@ -445,7 +556,7 @@ describe('atlas golden bytes — rows 0..3 are BIT-IDENTICAL to pre-channel rele
 
   it('the appended imbalance row did not renumber or rebyte rows 0..3', () => {
     const atlas = buildLUTAtlas();
-    expect(LUT_ROWS).toBe(5); // appended, never renumbered
+    expect(LUT_ROWS).toBe(7); // rows 0..4 + the appended theme rows 5/6
     for (let row = 0; row < 4; row++) {
       const golden = GOLDEN[`row${row}`];
       for (let k = 0; k < SAMPLES.length; k++) {

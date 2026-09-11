@@ -179,6 +179,107 @@ export function applyOverlayPalette(p: OverlayThemePalette | null): void {
     setColor(rec, 'sell', ask, 0.95, 1);
     setColor(rec, 'ask', ask, 0.95, 1);
   }
-  // p.text / p.grid / p.bg intentionally unused: the chart is a dark island in
-  // every theme (see the bridge docblock above).
+  // p.text / p.grid / p.bg intentionally unused: they belong to the chart-ink
+  // bridge (`applyChartInk`) that follows the chart ground, not the shell.
+}
+
+// --- chart-ink bridge (visual campaign 2026-09-11, L4) --------------------------
+//
+// The theme-aware chart makes the canvas ground follow the active theme (ramp
+// LUT store + CSS `--chart-*` mirror). The NON-semantic ink over the canvas —
+// axis ticks, gridlines, the whole last-price family and the honesty-badge
+// plate — must follow that same ground, which is what this bridge writes into
+// the live OVERLAY entries. It is disjoint from `applyOverlayPalette`
+// (bid/ask/buy/sell only), so the two can be called in any order.
+//
+// `applyChartInk(null)` restores the exact shipped midnight literals from the
+// deep MIDNIGHT snapshot (byte-for-byte, entry alphas included); an
+// unparseable field is skipped so a bad computed style can never blank the ink.
+
+/** The chart-ink fields the theme registry+CSS expose (structural mirror). */
+export interface ChartInkPalette {
+  ink: string;
+  inkDim: string;
+  grid: string;
+  /** Gridline opacity for the target ground (registry `ChartPalette.gridAlpha`).
+   *  Omitted = keep the `grid` entry's shipped 0.14 alpha (byte-identity). */
+  gridAlpha?: number;
+  axis: string;
+  price: string;
+  bg: string;
+  chipBg?: string;
+  /** CSS-only channel (M-3): fired-alert ink on chip plates. Declared here so
+   *  the registry palette satisfies the interface; there is no OVERLAY entry. */
+  sell?: string;
+  /** CSS-only channel (M-3): caution ink on chip plates. Same contract. */
+  warn?: string;
+}
+
+/** Every entry `applyChartInk` can write — also the exact null-restore scope. */
+const CHART_INK_KEYS = [
+  'axis',
+  'grid',
+  'price',
+  'priceGlow',
+  'priceLevel',
+  'pricePill',
+  'priceFillTop',
+  'priceFillBottom',
+  'pricePillText',
+  'badgeBg',
+] as const;
+
+/** The last-price family: every entry fed by the palette's single `price` ink. */
+const CHART_INK_PRICE_KEYS = [
+  'price',
+  'priceGlow',
+  'priceLevel',
+  'pricePill',
+  'priceFillTop',
+  'priceFillBottom',
+] as const;
+
+/** Per-entry opacities, read off the SHIPPED literals so a themed write keeps
+ *  today's alpha pairing (gl vs css alpha legitimately differ on some entries). */
+function midnightAlpha(key: string): { gl: number; css: number } {
+  const v = MIDNIGHT[key] as OverlayColor | string | undefined;
+  if (!v || typeof v === 'string') return { gl: 1, css: 1 };
+  return { gl: v.gl[3], css: parseCssColor(v.css)?.[3] ?? 1 };
+}
+
+/**
+ * Feed a theme's chart-ground ink into the overlay palette, or `null` to
+ * restore the shipped `midnight` values for exactly the entries this bridge
+ * owns. Alphas are preserved per existing OVERLAY entry (`.gl` and `.css`
+ * separately); `badgeBg` takes the rgb of `chipBg` at its shipped 0.82 alpha.
+ */
+export function applyChartInk(p: ChartInkPalette | null): void {
+  const rec = OVERLAY as unknown as Record<string, OverlayColor | string>;
+  if (p === null) {
+    for (const key of CHART_INK_KEYS) {
+      const v = MIDNIGHT[key];
+      rec[key] = typeof v === 'string' ? v : { ...v, gl: [...v.gl] as unknown as RGBA };
+    }
+    return;
+  }
+  const write = (key: string, value: string | undefined, alpha?: number): void => {
+    if (!value) return;
+    const rgb = parseCssColor(value);
+    if (!rgb) return;
+    const a = midnightAlpha(key);
+    setColor(rec, key, rgb, alpha ?? a.gl, alpha ?? a.css);
+  };
+  write('axis', p.axis);
+  // L-4: light themes raise the gridline alpha (the shipped 0.14 hairline
+  // vanishes on paper/white); omitted keeps the entry's shipped alpha.
+  write('grid', p.grid, p.gridAlpha);
+  // p.sell / p.warn are consumed by CSS (`--chart-sell`/`--chart-warn`); the
+  // overlay palette deliberately has no entries for them.
+  for (const key of CHART_INK_PRICE_KEYS) write(key, p.price);
+  write('pricePillText', p.bg);
+  if (p.chipBg) {
+    const chip = parseCssColor(p.chipBg);
+    const base = typeof MIDNIGHT.badgeBg === 'string' ? parseCssColor(MIDNIGHT.badgeBg) : null;
+    if (chip && base) rec.badgeBg = rgbaStr(chip[0], chip[1], chip[2], base[3]);
+  }
 }

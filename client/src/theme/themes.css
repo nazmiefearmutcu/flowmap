@@ -18,6 +18,14 @@
  * `--accent-bright` doubles as the canvas-overlay accent (getCanvasPalette):
  * on dark themes it is a brighter accent, on light themes a deeper one —
  * whichever reads strongest against that theme's `--bg`.
+ *
+ * Chart palette (campaign 2026-09-11): every theme also declares all twelve
+ * `--chart-*` tokens (mirroring `ThemeMeta.chart`). The legacy-ramp override
+ * at the END of this sheet re-pins midnight's dark chart tokens whenever
+ * `<html data-chart-ramp>` selects flow/inferno/classic, so a legacy colormap
+ * never inherits a light theme's chart ink. It sits last on purpose: with
+ * equal specificity (0,2,0), source order decides against the `[data-theme]`
+ * blocks above (main.tsx imports ui/theme.css BEFORE this file).
  */
 
 /* ---------------------------------------------------------------- midnight */
@@ -60,6 +68,21 @@
   --warn-line: #3a3016;
   --replay: var(--warn);
   --live: var(--accent);
+
+  /* --- chart palette (theme-owned since campaign 2026-09-11; every value
+     mirrors ThemeMeta.chart — pinned by theme/registry.test.ts) --- */
+  --chart-bg: #05080e;
+  --chart-ink: #e6edf3;
+  --chart-ink-dim: #93a1b4;
+  --chart-chip-bg: rgba(8, 11, 17, 0.92);
+  --chart-chip-border: #1a2030;
+  --chart-accent: #33d6c4;
+  --chart-gutter-bg: #0e121a;
+  --chart-grid: #788496;
+  --chart-axis: #a3b0c2;
+  --chart-price: #f5f8fc;
+  --chart-sell: #e8635f;
+  --chart-warn: #d6a13a;
 
   /* --- type scale --- */
   --fs-2xs: 9px;
@@ -142,6 +165,20 @@
   --replay: var(--warn);
   --live: var(--accent);
 
+  /* --- chart palette (ink on paper; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #f3f1ea;
+  --chart-ink: #24272d;
+  --chart-ink-dim: #57606c;
+  --chart-chip-bg: rgba(255, 253, 248, 0.92);
+  --chart-chip-border: #d6d0c0;
+  --chart-accent: #0a6158;
+  --chart-gutter-bg: #ebe8dd;
+  --chart-grid: #5a6472;
+  --chart-axis: #3a414d;
+  --chart-price: #0a6158;
+  --chart-sell: #99272c;
+  --chart-warn: #8a6410;
+
   /* --- type scale --- */
   --fs-2xs: 9px;
   --fs-xs: 10px;
@@ -162,8 +199,8 @@
   --r-1: 3px;
   --r-2: 4px;
   --r-3: 6px;
-  --shadow-pop: 0 4px 18px rgba(40, 36, 24, 0.18);
-  --shadow-drop: 0 12px 40px rgba(40, 36, 24, 0.22);
+  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
+  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
   --t-fast: 0.12s ease;
   --t-med: 0.2s ease;
 
@@ -182,8 +219,6 @@
 }
 
 /* ------------------------------------------------------------------- swiss */
-/* High-contrast light: pure white ground, near-black hairlines, true black
-   ink — WCAG AAA-grade separation for daylight / screenshot legibility. */
 :root[data-theme='swiss'] {
   /* --- layered surfaces --- */
   --bg: #ffffff;
@@ -222,6 +257,20 @@
   --warn-line: #d3bd7d;
   --replay: var(--warn);
   --live: var(--accent);
+
+  /* --- chart palette (monochrome ink; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #ffffff;
+  --chart-ink: #000000;
+  --chart-ink-dim: #1f1f1f;
+  --chart-chip-bg: rgba(255, 255, 255, 0.92);
+  --chart-chip-border: #2b2b2b;
+  --chart-accent: #004d45;
+  --chart-gutter-bg: #f0f0f0;
+  --chart-grid: #808080;
+  --chart-axis: #333333;
+  --chart-price: #a52a1d;
+  --chart-sell: #7f1a10;
+  --chart-warn: #7a5800;
 
   /* --- type scale --- */
   --fs-2xs: 9px;
@@ -303,6 +352,20 @@
   --warn-line: #3a3016;
   --replay: var(--warn);
   --live: var(--accent);
+
+  /* --- chart palette (violet→ember→gold ramp; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #0c090b;
+  --chart-ink: #ede0bd;
+  --chart-ink-dim: #b3a67f;
+  --chart-chip-bg: rgba(16, 12, 8, 0.92);
+  --chart-chip-border: #352b14;
+  --chart-accent: #5fe3ba;
+  --chart-gutter-bg: #1c1709;
+  --chart-grid: #8a7c60;
+  --chart-axis: #c9b98e;
+  --chart-price: #f5f8fc;
+  --chart-sell: #f08577;
+  --chart-warn: #e0a83e;
 
   /* --- type scale --- */
   --fs-2xs: 9px;
@@ -387,6 +450,20 @@
   --replay: var(--warn);
   --live: var(--accent);
 
+  /* --- chart palette (navy→azure→ice; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #050709;
+  --chart-ink: #e6edf3;
+  --chart-ink-dim: #93a1b4;
+  --chart-chip-bg: rgba(8, 11, 17, 0.92);
+  --chart-chip-border: #1a2030;
+  --chart-accent: #33d6c4;
+  --chart-gutter-bg: #0e121a;
+  --chart-grid: #788496;
+  --chart-axis: #a3b0c2;
+  --chart-price: #f5f8fc;
+  --chart-sell: #6f9ae2;
+  --chart-warn: #b78ce0;
+
   /* --- type scale --- */
   --fs-2xs: 9px;
   --fs-xs: 10px;
@@ -470,6 +547,20 @@
   --replay: var(--warn);
   --live: var(--accent);
 
+  /* --- chart palette (ink on paper; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #f3f1ea;
+  --chart-ink: #24272d;
+  --chart-ink-dim: #57606c;
+  --chart-chip-bg: rgba(255, 253, 248, 0.92);
+  --chart-chip-border: #d6d0c0;
+  --chart-accent: #075149;
+  --chart-gutter-bg: #ebe8dd;
+  --chart-grid: #5a6472;
+  --chart-axis: #3a414d;
+  --chart-price: #075149;
+  --chart-sell: #24499c;
+  --chart-warn: #6d3fa8;
+
   /* --- type scale --- */
   --fs-2xs: 9px;
   --fs-xs: 10px;
@@ -552,6 +643,20 @@
   --replay: var(--warn);
   --live: var(--accent);
 
+  /* --- chart palette (classic blue→cyan→yellow; mirrors ThemeMeta.chart) --- */
+  --chart-bg: #000000;
+  --chart-ink: #ffffff;
+  --chart-ink-dim: #d9d9d9;
+  --chart-chip-bg: rgba(0, 0, 0, 0.92);
+  --chart-chip-border: #3d3d3d;
+  --chart-accent: #4dffe0;
+  --chart-gutter-bg: #0a0a0a;
+  --chart-grid: #6e6e6e;
+  --chart-axis: #c9c9c9;
+  --chart-price: #ffffff;
+  --chart-sell: #ff8a8a;
+  --chart-warn: #ffcc00;
+
   /* --- type scale --- */
   --fs-2xs: 9px;
   --fs-xs: 10px;
@@ -589,4 +694,27 @@
     'Liberation Mono', monospace;
 
   color-scheme: dark;
+}
+
+/* ------------------------------------------------- legacy ramp override (F6) */
+/* When the user runs a legacy colormap (flow/inferno/classic), the chart keeps
+   midnight's dark-island tokens regardless of the active shell theme — the GL
+   background for those ramps is always dark, so light-theme ink would vanish.
+   Declared AFTER the [data-theme] blocks: same specificity (0,2,0), later
+   source order wins when both selectors match <html>. */
+:root[data-chart-ramp='flow'],
+:root[data-chart-ramp='inferno'],
+:root[data-chart-ramp='classic'] {
+  --chart-bg: #05080e;
+  --chart-ink: #e6edf3;
+  --chart-ink-dim: #93a1b4;
+  --chart-chip-bg: rgba(8, 11, 17, 0.92);
+  --chart-chip-border: #1a2030;
+  --chart-accent: #33d6c4;
+  --chart-gutter-bg: #0e121a;
+  --chart-grid: #788496;
+  --chart-axis: #a3b0c2;
+  --chart-price: #f5f8fc;
+  --chart-sell: #e8635f;
+  --chart-warn: #d6a13a;
 }

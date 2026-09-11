@@ -9,11 +9,13 @@
   overflow: hidden;
 }
 
-/* Thin cursor lines — 1px, low-alpha teal so structure stays readable under them. */
+/* Thin cursor lines — 1px, low-alpha chart-accent so structure stays readable
+   under them; the solid first declaration is the pre-color-mix fallback. */
 .crosshair__vline,
 .crosshair__hline {
   position: absolute;
-  background: rgba(31, 182, 166, 0.55);
+  background: var(--chart-accent, #33d6c4);
+  background: color-mix(in srgb, var(--chart-accent, #33d6c4) 55%, transparent);
 }
 
 .crosshair__vline {
@@ -56,9 +58,10 @@
   color: var(--chart-ink-dim, #93a1b4);
 }
 
-/* Amber SYNTH tag — synthetic depth must never read as real (§7 honesty). */
+/* Amber SYNTH tag — synthetic depth must never read as real (§7 honesty).
+   Chart-owned ink: matches the chip plate pinned by a legacy ramp (M-3). */
 .crosshair__tag--synth {
-  color: var(--warn, #d6a13a);
+  color: var(--chart-warn, #d6a13a);
   font-weight: 600;
 }
 
@@ -99,14 +102,14 @@
 }
 
 .crosshair__val--bid {
-  color: #4fd6c7;
+  color: var(--chart-accent, #33d6c4);
 }
 
 .crosshair__val--ask {
-  color: #e08585;
+  color: var(--sell, #c65454);
 }
 
 /* Synthetic sizes rendered amber so SYNTH depth never reads as real (§7). */
 .crosshair__val--synth {
-  color: var(--warn, #d6a13a);
+  color: var(--chart-warn, #d6a13a);
 }

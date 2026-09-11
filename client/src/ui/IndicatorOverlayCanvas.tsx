@@ -247,6 +247,12 @@ export function IndicatorOverlayCanvas({
       if (raw.length > 0) return raw;
       return FALLBACK_COLORS[out.colorVar] ?? '#8ea0b5';
     };
+    /** Resolve a chart token off <html>; the shipped literal when unavailable. */
+    const themedVar = (name: string, fallback: string): string => {
+      if (styleEl === null) styleEl = getComputedStyle(document.documentElement);
+      const raw = styleEl.getPropertyValue(name).trim();
+      return raw.length > 0 ? raw : fallback;
+    };
 
     /** Candle bucket-start time → fractional chart column (NaN when unmappable). */
     const candleCol = (t0Ns: bigint, tfNs: number, tm: CandleSnapshot['timeMap']): number => {
@@ -280,6 +286,13 @@ export function IndicatorOverlayCanvas({
       const slotOf = (bi: number): number => bi % SLOT_CAP;
 
       styleEl = null; // re-resolve theme colors each paint
+      // R1-L3: the sub-pane chrome follows the active chart tokens (fallback:
+      // the shipped midnight literals) so a light chart is not overlapped by a
+      // dark plate.
+      const chipBg = themedVar('--chart-chip-bg', 'rgba(8, 11, 17, 0.82)');
+      const inkDim = themedVar('--chart-ink-dim', 'rgba(111, 123, 140, 0.9)');
+      const zeroInk = themedVar('--chart-axis', 'rgba(111, 123, 140, 0.35)');
+      const titleInk = themedVar('--chart-ink-dim', 'rgba(230, 237, 243, 0.95)');
 
       const stripH = stripRef.current;
       const subActive = active.filter((a) => instances.get(a.uid)?.def.pane === 'sub');
@@ -339,7 +352,7 @@ export function IndicatorOverlayCanvas({
       // --- sub pane strip -----------------------------------------------------------
       if (subActive.length === 0) return;
       const laneH = stripH / subActive.length;
-      ctx.fillStyle = 'rgba(8, 11, 17, 0.82)';
+      ctx.fillStyle = chipBg;
       ctx.fillRect(0, cssH - stripH, cssW, stripH);
       ctx.strokeStyle = 'rgba(35, 44, 62, 0.95)';
       ctx.lineWidth = 1;
@@ -387,7 +400,7 @@ export function IndicatorOverlayCanvas({
           ctx.lineTo(cssW, laneBottom - 0.5);
         }
         ctx.stroke();
-        ctx.fillStyle = 'rgba(111, 123, 140, 0.9)';
+        ctx.fillStyle = inkDim;
         ctx.textAlign = 'left';
         ctx.fillText(fmtVal(hi), 4, y0);
         ctx.fillText(fmtVal(lo), 4, y1 - 10);
@@ -400,7 +413,7 @@ export function IndicatorOverlayCanvas({
         // Zero line when the lane spans it (MACD-style lanes).
         if (lo < 0 && hi > 0) {
           const zy = yOf(0);
-          ctx.strokeStyle = 'rgba(111, 123, 140, 0.35)';
+          ctx.strokeStyle = zeroInk;
           ctx.setLineDash([3, 3]);
           ctx.beginPath();
           ctx.moveTo(0, zy);
@@ -456,7 +469,7 @@ export function IndicatorOverlayCanvas({
         }
 
         // Lane title (left, after the scale labels) + latest values (right).
-        ctx.fillStyle = 'rgba(230, 237, 243, 0.95)';
+        ctx.fillStyle = titleInk;
         ctx.textAlign = 'left';
         ctx.fillText(inst.def.outputs.map((o) => o.label).join('·'), 40, y0);
         let labelX = cssW - 6;

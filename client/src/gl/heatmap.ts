@@ -55,6 +55,7 @@ const TILE_UNIT = 0;
 const LUT_UNIT = 1;
 const MIP1_UNIT = 2;
 const MIP2_UNIT = 3;
+const ROWMIP_UNIT = 4;
 
 /**
  * Default perceptual display gamma (§8.3). Order-flow density is heavy-tailed:
@@ -144,6 +145,12 @@ interface LevelSel {
   level: number;
   blk: number;
   nRowTaps: number;
+  /**
+   * Row-only mip selected (campaign visual 2026-09-11, R2-M1). Present ONLY
+   * when true, so every pre-existing caller/assertion keeps its exact object
+   * shape; the draw then overrides level/blk/taps itself (see {@link Heatmap.draw}).
+   */
+  rowOnly?: boolean;
 }
 
 /**
@@ -176,6 +183,13 @@ interface LevelSel {
  * (`maxLevel === 0`) it is ignored (there is no coarser texture to sample).
  * `levelFloor = 0` — the default, and every pre-tickGrouping call — reproduces
  * the exact previous output.
+ *
+ * `rowOnly: true` (campaign visual 2026-09-11, R2-M1) is a purely ADDITIVE flag:
+ * present only when the row axis needs the 4-row mip at rpp >= 2.5, the time
+ * axis is NOT zoomed out (cpp < 1.5) and no tick-grouping floor is active.
+ * {@link Heatmap.draw} then samples the row-only chain (4-row sums of ONE
+ * column) instead of the 4x4 SUM mip; level/blk/nRowTaps remain the historical
+ * SUM-path fields so every pre-existing consumer output is unchanged.
  */
 export function selectLevel(
   rowsPerPixel: number,
@@ -200,6 +214,16 @@ export function selectLevel(
   const floorLevel = Number.isFinite(levelFloor)
     ? Math.max(0, Math.min(maxLevel, Math.floor(levelFloor)))
     : 0;
+  // Row-only decoupling (campaign visual 2026-09-11, R2-M1): at rpp >= 2.5 the
+  // ROW axis alone needs 4-row grouping, and when the time axis is NOT zoomed
+  // out (cpp < 1.5) that grouping is done WITHOUT the 4-column averaging the
+  // 4x4 SUM mip applies — the owner's scrolled-back / reconstructed regime
+  // (rpp 3.05, cpp < 1) keeps crisp cell edges instead of 4-column blocks. The
+  // flag is additive: level/blk stay the historical SUM-path fields so every
+  // pre-existing consumer output is unchanged, and the draw derives the actual
+  // row-mip taps (blk 4) itself. A tick-grouping floor keeps the forced SUM
+  // path (the floor is an explicit user choice of block size).
+  const rowOnly = rpp >= 2.5 && cpp < 1.5 && floorLevel === 0;
   const level = Math.max(floorLevel, Math.max(0, Math.max(rowLevel, colLevel)));
   const blk = 4 ** level;
   // COVERAGE, not rounding (campaign 4.2): round(rpp/blk) picked 1 tap for rpp
@@ -209,7 +233,31 @@ export function selectLevel(
   // clamp covers 64 rows at level 2, more than any viewport at the 4096-row
   // grid can demand.
   const nRowTaps = Math.max(1, Math.min(4, Math.ceil(rpp / blk)));
-  return { level, blk, nRowTaps };
+  return rowOnly ? { level, blk, nRowTaps, rowOnly: true } : { level, blk, nRowTaps };
+}
+
+/**
+ * Zoom-aware level-0 sampler mix (campaign 5, contract F4). The historical
+ * level-0 kernel (bilinear + 0.25/0.5/0.25 column blur) spans ~4 columns; while
+ * a column is sub-pixel that blur is the right anti-confetti filter, but at
+ * deep zoom (one column over many pixels) it smears cell edges over 40–200 px
+ * and never sharpens (S3 measurement).
+ *
+ * `colsPerPixel = view.colScale / drawingBufferWidth`:
+ *   - cpp >= 1.5 → full blur, crisp off — columns are (sub-)pixel wide.
+ *   - cpp <= 0.5 → blur off, full crisp cell sampling — flat data plateaus
+ *     with hard time edges.
+ *   - linear cross-fade in between, so the two filters never pop while
+ *     zooming; the weights always sum to 1.
+ *
+ * Non-finite input degrades to the conservative historical output (full blur).
+ */
+export function sampleMix(colsPerPixel: number): { blur: number; cell: number } {
+  if (!Number.isFinite(colsPerPixel)) return { blur: 1, cell: 0 };
+  if (colsPerPixel >= 1.5) return { blur: 1, cell: 0 };
+  if (colsPerPixel <= 0.5) return { blur: 0, cell: 1 };
+  const cell = (1.5 - colsPerPixel) / (1.5 - 0.5);
+  return { blur: 1 - cell, cell };
 }
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -249,6 +297,7 @@ type UniformName =
   | 'u_tiles'
   | 'u_mip1'
   | 'u_mip2'
+  | 'u_rowMip1'
   | 'u_lut'
   | 'u_colOffset'
   | 'u_colScale'
@@ -268,7 +317,10 @@ type UniformName =
   | 'u_channel'
   | 'u_level'
   | 'u_blk'
-  | 'u_nRowTaps';
+  | 'u_nRowTaps'
+  | 'u_rowOnly'
+  | 'u_colBlur'
+  | 'u_colCell';
 
 export class Heatmap {
   readonly gl: WebGL2RenderingContext;
@@ -321,6 +373,13 @@ export class Heatmap {
    */
   levelFloor = 0;
 
+  /**
+   * The scale-aware sampler mix from the LAST {@link draw} (campaign 5, F4):
+   * `colsPerPixel` (time-axis footprint) plus the blur/cell weights that were
+   * uploaded. Defaults to the zoomed-out historical blur before the first draw.
+   */
+  private lastSample = { colsPerPixel: 1, colBlur: 1, colCell: 0 };
+
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
     this.gl = gl;
@@ -360,6 +419,7 @@ export class Heatmap {
       u_tiles: loc('u_tiles'),
       u_mip1: loc('u_mip1'),
       u_mip2: loc('u_mip2'),
+      u_rowMip1: loc('u_rowMip1'),
       u_lut: loc('u_lut'),
       u_colOffset: loc('u_colOffset'),
       u_colScale: loc('u_colScale'),
@@ -380,6 +440,9 @@ export class Heatmap {
       u_level: loc('u_level'),
       u_blk: loc('u_blk'),
       u_nRowTaps: loc('u_nRowTaps'),
+      u_rowOnly: loc('u_rowOnly'),
+      u_colBlur: loc('u_colBlur'),
+      u_colCell: loc('u_colCell'),
     };
     checkGLError(gl, 'Heatmap.ctor');
   }
@@ -428,6 +491,13 @@ export class Heatmap {
     gl.activeTexture(gl.TEXTURE0 + MIP2_UNIT);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, mip2);
     gl.uniform1i(this.u.u_mip2, MIP2_UNIT);
+    // Row-only chain (R2-M1). No chain → the ring texture is a valid stand-in;
+    // u_rowOnly is forced to 0 below so it is never sampled (same honesty
+    // fallback as the SUM levels).
+    const rowMip = mips ? mips.texRow1 : this.tileRing.texture;
+    gl.activeTexture(gl.TEXTURE0 + ROWMIP_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, rowMip);
+    gl.uniform1i(this.u.u_rowMip1, ROWMIP_UNIT);
 
     gl.uniform1f(this.u.u_colOffset, view.colOffset);
     gl.uniform1f(this.u.u_colScale, view.colScale);
@@ -465,9 +535,29 @@ export class Heatmap {
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
     const colsPerPixel = view.colScale / Math.max(1, gl.drawingBufferWidth);
     const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel, this.levelFloor);
-    gl.uniform1i(this.u.u_level, sel.level);
-    gl.uniform1i(this.u.u_blk, sel.blk);
-    gl.uniform1i(this.u.u_nRowTaps, sel.nRowTaps);
+    // Row-only sampling (R2-M1): the flag is only honoured with a usable chain.
+    // The shader branch ignores u_level, so the draw uploads the row-mip
+    // geometry explicitly: level 0 / 4-ROW block, taps = ceil(rpp/4) (the
+    // row-mip texel is 4 rows tall). The floor below scales by the same
+    // `nRowTaps * blk` row footprint as every other path.
+    const rowOnly = sel.rowOnly === true && mips !== null && mips.rowUsable;
+    const level = rowOnly ? 0 : sel.level;
+    const blk = rowOnly ? 4 : sel.blk;
+    const nRowTaps = rowOnly
+      ? Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / 4)))
+      : sel.nRowTaps;
+    gl.uniform1i(this.u.u_level, level);
+    gl.uniform1i(this.u.u_blk, blk);
+    gl.uniform1i(this.u.u_nRowTaps, nRowTaps);
+    gl.uniform1i(this.u.u_rowOnly, rowOnly ? 1 : 0);
+
+    // Scale-aware level-0 sampler mix (campaign 5, F4; see sampleMix). Always
+    // uploaded, so the zoomed-out path stays EXACTLY the historical filter and
+    // the deep-zoom path switches to crisp cells without a shader recompile.
+    const mix = sampleMix(colsPerPixel);
+    this.lastSample = { colsPerPixel, colBlur: mix.blur, colCell: mix.cell };
+    gl.uniform1f(this.u.u_colBlur, mix.blur);
+    gl.uniform1f(this.u.u_colCell, mix.cell);
 
     // Scale the black point by the pixel's ROW footprint. `intensity` sums
     // nRowTaps rows of a blk-row block and divides only the COLUMN dimension by
@@ -476,7 +566,7 @@ export class Heatmap {
     // size at every zoom. Clamped below 1 so the re-expansion never degenerates.
     const floor = Math.min(
       TOLERANCE_MAX_FLOOR,
-      Math.max(0, this.floor) * sel.nRowTaps * sel.blk,
+      Math.max(0, this.floor) * nRowTaps * blk,
     );
     gl.uniform1f(this.u.u_floor, floor);
     gl.uniform1f(this.u.u_floorScale, 1 / Math.max(1 - floor, 1e-6));
@@ -484,6 +574,16 @@ export class Heatmap {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
     checkGLError(gl, 'Heatmap.draw');
+  }
+
+  /**
+   * The level-0 sampler mix the LAST {@link draw} uploaded — `colsPerPixel`
+   * plus the blur/cell weights (see {@link sampleMix}). Defaults to the
+   * zoomed-out historical blur `{ colsPerPixel: 1, colBlur: 1, colCell: 0 }`
+   * before the first draw. Diagnostics/tests only (testHook.levelInfo).
+   */
+  sampleInfo(): { colsPerPixel: number; colBlur: number; colCell: number } {
+    return { ...this.lastSample };
   }
 
   dispose(): void {

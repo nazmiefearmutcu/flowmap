@@ -11,9 +11,43 @@
 import type { GLContext } from './context';
 import { initGL } from './context';
 import { Heatmap, selectLevel, type HeatmapView } from './heatmap';
-import { createLUTTexture, RAMP_SYNTH, RAMP_INFERNO } from './lut';
+import {
+  createLUTTexture,
+  rampForMode,
+  RAMP_SYNTH,
+  RAMP_INFERNO,
+  RAMP_THEME,
+  RAMP_THEME_SYNTH,
+  setThemeStops,
+  uploadLUTAtlas,
+  type Colormap,
+  type RampStop,
+} from './lut';
 import { MipChain } from './mips';
+import { MODE_L2 } from '../proto/types';
 import { COLS_PER_TILE, TileRing, type ResidentRange } from './tileRing';
+
+/** Additive per-draw sampler diagnostics (campaign visual 2026-09-11). */
+export interface HeatmapSampleInfo {
+  colsPerPixel: number;
+  colBlur: number;
+  colCell: number;
+}
+
+/**
+ * L3's `Heatmap.sampleInfo()` — read through an optional handle so this lane
+ * type-checks before/after that method lands; values default 1/1/0 (before the
+ * first draw) exactly as the contract specifies.
+ */
+function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
+  const fn = (
+    heatmap as unknown as {
+      sampleInfo?: () => HeatmapSampleInfo;
+    }
+  ).sampleInfo;
+  if (typeof fn === 'function') return fn.call(heatmap);
+  return { colsPerPixel: 1, colBlur: 1, colCell: 0 };
+}
 
 export interface FlowmapTestApi {
   /**
@@ -35,6 +69,14 @@ export interface FlowmapTestApi {
   /** Append one synthetic column. `ask` null → SYNTH_PROFILE (amber ramp path). */
   appendColumn(colSeq: number, bid: number[], ask: number[] | null): void;
   setEncoding(decodeScale: number, norm: number, synth?: boolean): void;
+  /**
+   * Register theme stops into the lut store and re-upload atlas rows 5/6
+   * (campaign visual 2026-09-11). `null`/`null` restores the flow/synth identity.
+   */
+  setThemeRamp(density: readonly RampStop[] | null, synth: readonly RampStop[] | null): void;
+  /** Select a colormap family row via the real {@link rampForMode} rule; with
+   *  `'theme'` the theme-owned rows 5/6 are used (register them first). */
+  setColormap(colormap: Colormap): void;
   setView(view: HeatmapView): void;
   /** Fit-to-resident view (fills the canvas with all resident columns). */
   fitView(): HeatmapView;
@@ -42,8 +84,23 @@ export interface FlowmapTestApi {
   /** Draw fresh, then read back RGBA bytes (origin bottom-left). */
   readPixels(x: number, y: number, w: number, h: number): number[];
   residentRange(): ResidentRange | null;
-  /** The SUM-mip level the current view+canvas would sample (T7 diagnostics). */
-  levelInfo(): { rowsPerPixel: number; level: number; blk: number; nRowTaps: number };
+  /**
+   * The SUM-mip level the current view+canvas would sample (T7 diagnostics),
+   * plus (campaign visual 2026-09-11) the last-draw level-0 sampler weights:
+   * `colsPerPixel` (view scale), `colBlur` (3-tap column blend amount) and
+   * `colCell` (crisp nearest-column cell weight). Defaults 1/1/0 before a draw.
+   * `rowOnly` mirrors the real draw's R2-M1 selection (row-only mip active).
+   */
+  levelInfo(): {
+    rowsPerPixel: number;
+    level: number;
+    blk: number;
+    nRowTaps: number;
+    colsPerPixel: number;
+    colBlur: number;
+    colCell: number;
+    rowOnly: boolean;
+  };
   /**
    * Set the tick-grouping mip floor (contract P1; campaign 4) on the hook's
    * Heatmap: 0 = off, 1 = 4-row cells, 2 = 16-row cells (clamped to the chain).
@@ -59,6 +116,8 @@ interface HookState {
   ctx: GLContext;
   ring: TileRing;
   heatmap: Heatmap;
+  /** The LUT texture handed to the Heatmap — re-specified by `setThemeRamp`. */
+  lut: WebGLTexture;
   mips: MipChain | null;
   view: HeatmapView;
 }
@@ -83,7 +142,7 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
         mipChain = new MipChain(ctx, COLS_PER_TILE, rows, layers);
         heatmap.mips = mipChain;
       }
-      state = { ctx, ring, heatmap, mips: mipChain, view: heatmap.fitView() };
+      state = { ctx, ring, heatmap, lut, mips: mipChain, view: heatmap.fitView() };
       return {
         maxTextureImageUnits: ctx.caps.maxTextureImageUnits,
         maxArrayTextureLayers: ctx.caps.maxArrayTextureLayers,
@@ -115,6 +174,22 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
         decodeScale,
         norm,
         ramp: synth ? RAMP_SYNTH : RAMP_INFERNO,
+      };
+    },
+
+    setThemeRamp(density, synth) {
+      if (!state) throw new Error('__flowmapTest: init() first');
+      setThemeStops(density && synth ? { density, synth } : null);
+      uploadLUTAtlas(state.ctx.gl, state.lut);
+    },
+
+    setColormap(colormap) {
+      if (!state) throw new Error('__flowmapTest: init() first');
+      const themed =
+        colormap === 'theme' ? { density: RAMP_THEME, synth: RAMP_THEME_SYNTH } : null;
+      state.heatmap.encoding = {
+        ...state.heatmap.encoding,
+        ramp: rampForMode(MODE_L2, 'L2', colormap, themed),
       };
     },
 
@@ -152,9 +227,15 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
 
     levelInfo() {
       if (!state) throw new Error('__flowmapTest: init() first');
+      const gl = state.ctx.gl;
       const maxLevel = state.mips ? state.mips.maxLevel : 0;
-      const rowsPerPixel = state.view.rowScale / Math.max(1, state.ctx.gl.drawingBufferHeight);
-      return { rowsPerPixel, ...selectLevel(rowsPerPixel, maxLevel) };
+      const rowsPerPixel = state.view.rowScale / Math.max(1, gl.drawingBufferHeight);
+      const colsPerPixel = state.view.colScale / Math.max(1, gl.drawingBufferWidth);
+      // R2-M1: mirror the draw's selection (real colsPerPixel, row-mip
+      // usability) so the additive `rowOnly` field reports what was painted.
+      const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel);
+      const rowOnly = sel.rowOnly === true && state.mips !== null && state.mips.rowUsable;
+      return { rowsPerPixel, ...sel, rowOnly, ...sampleInfoOf(state.heatmap) };
     },
 
     setLevelFloor(levelFloor) {

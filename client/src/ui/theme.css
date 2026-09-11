@@ -51,19 +51,25 @@
   --replay: var(--warn);
   --live: var(--accent);
 
-  /* --- chart island (FIXED dark — never overridden by any theme) ---
-     The GL canvas background is ramp-derived and stays near-black in EVERY
-     theme, so chips pinned INSIDE the chart viewport (perf HUD, measure,
-     crosshair, draw toolbar, alerts bell, heat legend) must not inherit theme
-     ink that flips dark on light themes. These tokens hold the midnight-island
-     values; theme blocks in theme/themes.css deliberately do NOT redeclare
-     them (pinned by theme/registry.test.ts). */
+  /* --- chart palette (theme-owned since campaign 2026-09-11) ---
+     These are the MIDNIGHT values: the pre-theme-boot defaults AND the exact
+     values the default theme re-declares. Every theme block in
+     theme/themes.css declares all ten tokens with its own palette; the F6
+     legacy-ramp override at the end of themes.css re-pins this midnight set
+     whenever `data-chart-ramp` is flow/inferno/classic, so legacy colormaps
+     keep today's dark chart regardless of the active theme. */
+  --chart-bg: #05080e; /* the GL clear colour / active ramp's first stop */
   --chart-ink: #e6edf3; /* primary chip text (= midnight --text) */
   --chart-ink-dim: #93a1b4; /* secondary chip text (= midnight --text-2) */
   --chart-chip-bg: rgba(8, 11, 17, 0.92); /* translucent dark chip plate */
   --chart-chip-border: #1a2030; /* chip hairline (= midnight --line) */
   --chart-accent: #33d6c4; /* chip accent (= midnight --accent-bright) */
-  --chart-gutter-bg: #0e121a; /* axis gutters: the renderer paints light ticks into them (= midnight --bg-2) */
+  --chart-gutter-bg: #0e121a; /* axis gutters, behind the light tick ink (= midnight --bg-2) */
+  --chart-grid: #788496; /* gridline rgb; per-entry alpha in gl/overlays/palette.ts */
+  --chart-axis: #a3b0c2; /* axis tick/label rgb */
+  --chart-price: #f5f8fc; /* last-price line rgb (dark ground: near-white) */
+  --chart-sell: #e8635f; /* fired-alert ink on chip plates (= midnight --sell-bright) */
+  --chart-warn: #d6a13a; /* caution ink on chip plates (= midnight --warn) */
 
   /* --- type scale (px) --- */
   --fs-2xs: 9px;

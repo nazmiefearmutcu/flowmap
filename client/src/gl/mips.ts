@@ -8,12 +8,17 @@
  * show. Tick-grouping requires the SUMMED resting size, so mips are SUMS, not
  * averages, and `generateMipmap` is NEVER used.
  *
- * This module builds two extra array textures alongside the {@link TileRing}:
+ * This module builds three extra array textures alongside the {@link TileRing}:
  *
  *   - level-1: `colsPerTile/4 × rows/4 × layers`  (each texel = SUM of a 4×4 block of level 0)
  *   - level-2: `colsPerTile/16 × rows/16 × layers`(each texel = SUM of a 4×4 block of level 1)
+ *   - row-only: `colsPerTile × rows/4 × layers`   (each texel = SUM of 4 ROWS of ONE
+ *     column — no column summing). The R2-M1 decoupling: when the price axis
+ *     collapses rows per pixel (rpp ≥ 2.5) but time is deep-zoomed (cpp < 1.5),
+ *     the 4×4 SUM mip would paint 4-column blocks; the row-only chain groups
+ *     price alone and keeps the time axis crisp.
  *
- * Both are `RG16F` and color-renderable (needs `EXT_color_buffer_float`, a hard
+ * All are `RG16F` and color-renderable (needs `EXT_color_buffer_float`, a hard
  * §8.3 requirement) so the downsample runs on the GPU: an FBO ping-pong where a
  * fragment shader reads the finer level via `texelFetch` and writes the 4×4 sum
  * into the coarser level's FBO-attached layer. The per-texel coordinate mapping
@@ -23,14 +28,16 @@
  * normalization divisor.
  *
  * Incremental generation (NOT per frame — that is the whole point of the O(1)
- * draw): `updateFrom(ring, appendedColSeq)` runs the level-1 pass for the just-
- * completed group of 4 columns on every 4th append (when `x % 4 === 3`) and the
- * level-2 pass on every 16th (when `x % 16 === 15`). Each pass renders exactly
- * one coarser column (a 1×rowsL viewport), so the amortized cost is well under
- * one pass per append and is independent of history depth. Because the ring
- * capacity (`256 × layers`) is a multiple of 16, a group of 4/16 consecutive
- * ring slots always holds 4/16 consecutive column sequences even across a ring
- * wrap, so the group alignment stays valid.
+ * draw): `updateFrom(ring, appendedColSeq)` runs the row-only pass for the just-
+ * appended column on EVERY append (1×rows/4 viewport), the level-1 pass for the
+ * just-completed group of 4 columns on every 4th append (when `x % 4 === 3`) and
+ * the level-2 pass on every 16th (when `x % 16 === 15`). Each pass renders one or
+ * a few coarser columns, so the amortized cost stays well under two passes per
+ * append and is independent of history depth. Because the ring capacity
+ * (`256 × layers`) is a multiple of 16, a group of 4/16 consecutive ring slots
+ * always holds 4/16 consecutive column sequences even across a ring wrap, so the
+ * group alignment stays valid; the row-only grouping is per-column and thus has
+ * no alignment constraint at all.
  *
  * Saturation: sums are clamped at 60 000 (f16 max is 65 504; a fully-dense 4×4
  * block of near-max values, compounded across levels, would otherwise overflow).
@@ -76,22 +83,37 @@ uniform int u_groupNewest;
 // Tile-local destination column of the pass's LAST group (itself for a 1-wide
 // pass) — reconstructs each fragment's group end from u_groupNewest.
 uniform int u_xEnd;
+// Row-only mode (campaign visual 2026-09-11, R2-M1): each destination texel
+// sums the 4 ROWS of the SINGLE source column at the same x — no column summing,
+// so a collapsing price axis no longer drags the 4-column block average into a
+// deeply time-zoomed view. Groups are one column wide here.
+uniform int u_rowOnly;
 
 out vec4 outColor;
 
 void main() {
   int ox = int(gl_FragCoord.x);
   int oy = int(gl_FragCoord.y);
-  int bx = ox * 4;
   int by = oy * 4;
-  int gn = u_groupNewest - (u_xEnd - ox) * 4;
   vec2 s = vec2(0.0);
-  for (int j = 0; j < 4; j++) {
-    for (int i = 0; i < 4; i++) {
-      // Mask the source column against the valid window BEFORE summing (the
-      // level-0 rule, applied at the source): stale pre-gap texels contribute 0.
-      if (gn - 3 + i >= u_validFrom) {
-        s += texelFetch(u_src, ivec3(bx + i, by + j, u_srcLayer), 0).rg;
+  if (u_rowOnly == 1) {
+    // The single source column's absolute col_seq (groups are 1 wide).
+    int col = u_groupNewest - (u_xEnd - ox);
+    if (col >= u_validFrom) {
+      for (int j = 0; j < 4; j++) {
+        s += texelFetch(u_src, ivec3(ox, by + j, u_srcLayer), 0).rg;
+      }
+    }
+  } else {
+    int bx = ox * 4;
+    int gn = u_groupNewest - (u_xEnd - ox) * 4;
+    for (int j = 0; j < 4; j++) {
+      for (int i = 0; i < 4; i++) {
+        // Mask the source column against the valid window BEFORE summing (the
+        // level-0 rule, applied at the source): stale pre-gap texels contribute 0.
+        if (gn - 3 + i >= u_validFrom) {
+          s += texelFetch(u_src, ivec3(bx + i, by + j, u_srcLayer), 0).rg;
+        }
       }
     }
   }
@@ -154,6 +176,8 @@ export class MipChain {
   readonly tex1: WebGLTexture;
   /** level-2 texture (colsPerTile/16 × rows/16 × layers), or null when maxLevel<2. */
   readonly tex2: WebGLTexture | null;
+  /** Row-only texture (colsPerTile × rows/4 × layers): 4-row sums of ONE column. */
+  readonly texRow1: WebGLTexture;
 
   private readonly prog: WebGLProgram;
   private readonly vao: WebGLVertexArrayObject;
@@ -164,6 +188,7 @@ export class MipChain {
   private readonly uValidFrom: WebGLUniformLocation | null;
   private readonly uGroupNewest: WebGLUniformLocation | null;
   private readonly uXEnd: WebGLUniformLocation | null;
+  private readonly uRowOnly: WebGLUniformLocation | null;
   /**
    * False once a downsample pass finds its FBO incomplete (a driver/alloc
    * failure must not silently paint garbage). The chain then renders nothing
@@ -174,6 +199,14 @@ export class MipChain {
 
   /** Whether the FBO passes are (still) known-complete — see {@link usableFlag}. */
   get usable(): boolean {
+    return this.usableFlag;
+  }
+
+  /**
+   * Whether the row-only chain is safe to sample — same shared FBO verdict as
+   * {@link usable} (the row pass shares the framebuffer and target format).
+   */
+  get rowUsable(): boolean {
     return this.usableFlag;
   }
 
@@ -198,6 +231,7 @@ export class MipChain {
 
     this.tex1 = allocLevel(gl, colsPerTile / 4, rows / 4, layers);
     this.tex2 = this.maxLevel >= 2 ? allocLevel(gl, colsPerTile / 16, rows / 16, layers) : null;
+    this.texRow1 = allocLevel(gl, colsPerTile, rows / 4, layers);
 
     // Downsample program + a clip-space quad (viewport clips to one column).
     const vs = compile(gl, gl.VERTEX_SHADER, DOWNSAMPLE_VERT);
@@ -220,6 +254,7 @@ export class MipChain {
     this.uValidFrom = gl.getUniformLocation(prog, 'u_validFrom');
     this.uGroupNewest = gl.getUniformLocation(prog, 'u_groupNewest');
     this.uXEnd = gl.getUniformLocation(prog, 'u_xEnd');
+    this.uRowOnly = gl.getUniformLocation(prog, 'u_rowOnly');
 
     const quad = gl.createBuffer();
     const vao = gl.createVertexArray();
@@ -243,10 +278,11 @@ export class MipChain {
   }
 
   /**
-   * Regenerate the mip columns affected by appending `appendedColSeq`. Runs the
-   * level-1 pass when the 4-column group is complete (`x % 4 === 3`) and the
-   * level-2 pass when the 16-column group is complete (`x % 16 === 15`). No-op on
-   * other appends — that is what keeps generation incremental and O(1).
+   * Regenerate the mip columns affected by appending `appendedColSeq`: the
+   * row-only pass for the new column on EVERY append, the level-1 pass when the
+   * 4-column group is complete (`x % 4 === 3`) and the level-2 pass when the
+   * 16-column group is complete (`x % 16 === 15`). No-op on other appends for
+   * the SUM levels — that is what keeps generation incremental and O(1).
    */
   updateFrom(ring: TileRing, appendedColSeq: number): void {
     // A chain whose FBO went incomplete renders nothing further; the heatmap has
@@ -258,7 +294,24 @@ export class MipChain {
     const x0 = slot % this.colsPerTile;
     const layer = (slot / this.colsPerTile) | 0;
 
-    if (x0 % 4 === 3) {
+    // Row-only mip: EVERY append writes its own destination column (groups are
+    // one column wide — no group-alignment wait). Source and destination share
+    // the tile-local x; the single source column is masked against the ring's
+    // validFrom gate...
+    this.pass(
+      ring.texture,
+      this.texRow1,
+      x0,
+      1,
+      this.rows / 4,
+      layer,
+      ring.validFromSeq(),
+      appendedColSeq,
+      x0,
+      true,
+    );
+
+    if (this.usableFlag && x0 % 4 === 3) {
       // level-0 → level-1: write coarser column x0/4 from level-0 columns [x0-3 .. x0].
       // Mask each source column against the ring's validFrom gate so a pre-gap
       // column never bakes into the SUM (see DOWNSAMPLE_FRAG).
@@ -274,7 +327,7 @@ export class MipChain {
         (x0 / 4) | 0,
       );
     }
-    if (this.tex2 !== null && x0 % 16 === 15) {
+    if (this.usableFlag && this.tex2 !== null && x0 % 16 === 15) {
       // level-1 → level-2: write coarser column x0/16 from the 4 level-1
       // columns just built. Those sources were each validFrom-masked at their
       // OWN build time — after a gap growth, the three columns completed
@@ -307,10 +360,12 @@ export class MipChain {
    *    masked; below-validFrom slots are). Over-baking a group whose members are
    *    contiguous resident columns re-sums identical texels (harmless).
    *  - One level-1 pass per tile-layer segment of the range, validFrom-masked.
+   *  - The row-only chain has no group alignment: one batched pass per tile-layer
+   *    segment of the WHOLE spliced range [fromSeq..hi], validFrom-masked.
    *  - Level-2 bakes only the FULLY rebuilt, fully post-gap 16-groups (the same
    *    R2 H-1 rule updateFrom applies, lifted to range granularity): starts at
    *    the first 16-aligned start ≥ max(a0, validFrom-aligned-up), so no level-2
-    *    texel mixes pre-gap level-1 columns with post-gap rebuilds.
+   *    texel mixes pre-gap level-1 columns with post-gap rebuilds.
    *  - Ragged edges that fall outside the aligned range keep today's behavior:
    *    they were baked when their group last completed, and they self-heal on
    *    wrap (same contract as the level-2 skip).
@@ -328,8 +383,44 @@ export class MipChain {
     // newest (below-validFrom slots are masked; above-newest slots are unwritten
     // garbage and NOT masked).
     const b0 = hi - ((hi + 1) % 4);
-    if (b0 < a0) return;
     const validFrom = ring.validFromSeq();
+
+    // Row-only mip: per-column groups, so the WHOLE resident part of the splice
+    // [fromSeq..hi] is rebuilt in one pass per tile-layer segment. Runs even
+    // when the 4-group range [a0..b0] is empty (ragged page edges).
+    if (range !== null) {
+      let r = fromSeq;
+      while (r <= hi) {
+        const segEnd = Math.min(
+          hi,
+          r - (r % this.colsPerTile) + this.colsPerTile - 1,
+        );
+        const layer = ((((r % cap) + cap) % cap) / this.colsPerTile) | 0;
+        const x0 = (r % this.colsPerTile) | 0;
+        const x1 = (segEnd % this.colsPerTile) | 0;
+        this.pass(
+          ring.texture,
+          this.texRow1,
+          x0,
+          x1 - x0 + 1,
+          this.rows / 4,
+          layer,
+          validFrom,
+          segEnd,
+          x1,
+          true,
+        );
+        r = segEnd + 1;
+      }
+    }
+
+    if (b0 < a0) {
+      // No complete 4-group in range: the SUM levels keep their previous bakes,
+      // but the row-only chain above still ran (and the FBO is restored).
+      this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
+      checkGLError(this.gl, 'MipChain.updateRange');
+      return;
+    }
 
     // level-0 → level-1: one batched pass per tile-layer segment of [a0..b0].
     // Absolute seq mod colsPerTile IS the tile-local x (capacity is a multiple
@@ -408,6 +499,8 @@ export class MipChain {
     groupNewest: number,
     /** Tile-local destination column of the pass's LAST group (see DOWNSAMPLE_FRAG). */
     xEnd: number,
+    /** Row-only pass: 4-row sums of ONE column per destination texel. */
+    rowOnly = false,
   ): void {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
@@ -438,6 +531,7 @@ export class MipChain {
     gl.uniform1i(this.uValidFrom, maskFrom !== null ? maskFrom : -0x7fffffff);
     gl.uniform1i(this.uGroupNewest, groupNewest);
     gl.uniform1i(this.uXEnd, xEnd);
+    gl.uniform1i(this.uRowOnly, rowOnly ? 1 : 0);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
@@ -450,6 +544,7 @@ export class MipChain {
     gl.deleteVertexArray(this.vao);
     gl.deleteProgram(this.prog);
     gl.deleteTexture(this.tex1);
+    gl.deleteTexture(this.texRow1);
     if (this.tex2 !== null) gl.deleteTexture(this.tex2);
   }
 }

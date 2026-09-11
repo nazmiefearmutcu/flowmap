@@ -9,6 +9,7 @@ import {
   depthChannelOf,
   floorForTolerance,
   gammaForContrast,
+  sampleMix,
   selectLevel,
   TOLERANCE_MAX_FLOOR,
 } from './heatmap';
@@ -458,5 +459,112 @@ describe('depth channel modes (contract C2) — the intensity chain', () => {
     expect(imb[255 * 4]).toBeGreaterThan(imb[255 * 4 + 2]); // orange end: R > B
     // The DENSITY default row is untouched by the append (sanity).
     expect(flow.length).toBe(LUT_SIZE * 4);
+  });
+});
+
+describe('sampleMix — zoom-aware level-0 sampler mix (campaign 5, contract F4)', () => {
+  it('is full blur at/above 1.5 cpp and full crisp at/below 0.5 cpp', () => {
+    expect(sampleMix(1.5)).toEqual({ blur: 1, cell: 0 });
+    expect(sampleMix(4)).toEqual({ blur: 1, cell: 0 });
+    expect(sampleMix(0.5)).toEqual({ blur: 0, cell: 1 });
+    expect(sampleMix(0.1)).toEqual({ blur: 0, cell: 1 });
+  });
+
+  it('is the linear cross-fade between the two regimes', () => {
+    const mid = sampleMix(1.0);
+    expect(mid.blur).toBeCloseTo(0.5, 12);
+    expect(mid.cell).toBeCloseTo(0.5, 12);
+    expect(sampleMix(0.75).cell).toBeCloseTo(0.75, 12);
+    expect(sampleMix(1.25).cell).toBeCloseTo(0.25, 12);
+    expect(sampleMix(1.25).blur).toBeCloseTo(0.75, 12);
+  });
+
+  it('keeps the weights summing to 1 and monotone across the band', () => {
+    let prevBlur = -1;
+    let prevCell = 2;
+    for (let cpp = 0.1; cpp <= 4; cpp += 0.1) {
+      const m = sampleMix(cpp);
+      expect(m.blur + m.cell).toBeCloseTo(1, 12);
+      expect(m.blur).toBeGreaterThanOrEqual(prevBlur);
+      expect(m.cell).toBeLessThanOrEqual(prevCell);
+      prevBlur = m.blur;
+      prevCell = m.cell;
+    }
+  });
+
+  it('falls back to the conservative historical blur on non-finite input', () => {
+    expect(sampleMix(Number.NaN)).toEqual({ blur: 1, cell: 0 });
+    expect(sampleMix(Number.POSITIVE_INFINITY)).toEqual({ blur: 1, cell: 0 });
+    expect(sampleMix(Number.NEGATIVE_INFINITY)).toEqual({ blur: 1, cell: 0 });
+  });
+});
+
+describe('the scale-aware sampler in the fragment shader source', () => {
+  it('declares the two mix uniforms', () => {
+    expect(HEATMAP_FRAG).toContain('uniform float u_colBlur;');
+    expect(HEATMAP_FRAG).toContain('uniform float u_colCell;');
+  });
+
+  it('scales the sampleField0 side weights by u_colBlur (validity checks kept)', () => {
+    // Both side taps must keep their valid-window condition and multiply it by
+    // the blur weight; wC closes the sum back to 1.
+    expect(HEATMAP_FRAG).toContain('? 0.25 : 0.0) * u_colBlur');
+    expect(HEATMAP_FRAG).toContain('1.0 - wL - wR');
+  });
+
+  it('cross-fades a crisp nearest-column sampler on the level-0 path only', () => {
+    expect(HEATMAP_FRAG).toContain('int cx = int(floor(colf));');
+    expect(HEATMAP_FRAG).toContain(
+      'acc = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);',
+    );
+    // The zoomed-out SUM path is untouched: no crisp term there.
+    const mipBranch = HEATMAP_FRAG.slice(HEATMAP_FRAG.indexOf('} else {'));
+    expect(mipBranch).not.toContain('crisp0(');
+  });
+
+  it('L1: full-crisp short-circuits the blur fetches (no lazy mix in GLSL)', () => {
+    expect(HEATMAP_FRAG).toContain('if (u_colCell >= 0.999) acc = crisp0(colf, rowf);');
+  });
+});
+
+describe('selectLevel — row-only mip at deep time zoom (campaign visual 2026-09-11, R2-M1)', () => {
+  it('flags rowOnly for the collapsing-price / deep-time gesture', () => {
+    const a = selectLevel(3.05, 2, 0.25);
+    expect(a.rowOnly).toBe(true);
+    expect(a.nRowTaps).toBe(1); // ceil(3.05 / 4)
+    const b = selectLevel(6, 2, 0.1);
+    expect(b.rowOnly).toBe(true);
+    expect(b.nRowTaps).toBe(2); // ceil(6 / 4)
+  });
+
+  it('stays off when price is zoomed in, time is zoomed out, or there are no mips', () => {
+    expect(selectLevel(1, 2, 0.2).rowOnly).toBeUndefined(); // rpp < 2.5
+    expect(selectLevel(2.4, 2, 0.2).rowOnly).toBeUndefined();
+    expect(selectLevel(3, 2, 2).rowOnly).toBeUndefined(); // cpp >= 1.5
+    expect(selectLevel(3, 0, 0.2).rowOnly).toBeUndefined(); // no mip chain
+  });
+
+  it('yields to a tick-grouping floor (the historical forced SUM path)', () => {
+    // The flag is additive: level/blk/nRowTaps keep the historical fields, so
+    // every pre-existing consumer output is unchanged.
+    const floored = selectLevel(8, 2, 1, 1);
+    expect(floored.rowOnly).toBeUndefined();
+    expect(floored).toEqual({ level: 1, blk: 4, nRowTaps: 2 });
+  });
+});
+
+describe('the row-only mip path in the fragment shader source', () => {
+  it('declares the row mip sampler + rowOnly uniform', () => {
+    expect(HEATMAP_FRAG).toContain('uniform highp sampler2DArray u_rowMip1;');
+    expect(HEATMAP_FRAG).toContain('uniform int u_rowOnly;');
+  });
+
+  it('samples 4-row sums of ONE column and undoes the SUM-path column division', () => {
+    expect(HEATMAP_FRAG).toMatch(/texelFetch\(u_rowMip1,\s*ivec3\(x0,\s*y,\s*layer\),\s*0\)/);
+    expect(HEATMAP_FRAG).toContain('if (u_rowOnly == 1) intensity *= float(blk);');
+    // The pinned historical intensity expression is untouched.
+    expect(HEATMAP_FRAG).toContain(
+      'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
+    );
   });
 });

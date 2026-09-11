@@ -39,6 +39,9 @@ uniform highp sampler2DArray u_tiles;
 // caller binds u_tiles here too (they are never sampled while u_level == 0).
 uniform highp sampler2DArray u_mip1; // level 1: colsPerTile/4 x rows/4
 uniform highp sampler2DArray u_mip2; // level 2: colsPerTile/16 x rows/16
+// Row-only mip (campaign visual 2026-09-11, R2-M1): each texel sums 4 ROWS of
+// ONE column — no column summing. Sampled only when u_rowOnly == 1.
+uniform highp sampler2DArray u_rowMip1; // colsPerTile x rows/4
 // Colormap atlas: 256x5 RGBA8 — row 0 inferno, row 1 synth amber, row 2 classic
 // thermal, row 3 flow (the default), row 4 divergent imbalance (channel 3 only).
 uniform sampler2D u_lut;
@@ -119,6 +122,25 @@ uniform int u_level;
 uniform int u_blk;
 uniform int u_nRowTaps;
 
+// Row-only mip flag (campaign visual 2026-09-11, R2-M1). 1 when the price axis
+// collapses rows per pixel (rpp >= 2.5) while the time axis is deep-zoomed
+// (cpp < 1.5): the 4x4 SUM mip would paint 4-column blocks, so rows are summed
+// through u_rowMip1 (ONE column per texel) instead. u_blk is then the row
+// block (4) and u_nRowTaps the 4-row taps covering the pixel footprint; the
+// intensity correction below undoes the SUM path's /blk column division.
+uniform int u_rowOnly;
+
+// Scale-aware level-0 sampler mix (campaign 5, contract F4). Per-draw constants
+// derived from the view's cols-per-pixel (columns / drawingBufferWidth):
+//   u_colBlur : weight of the historical 3-tap column blur (1 = full
+//               0.25/0.5/0.25, used while a column is sub-pixel / anti-confetti).
+//   u_colCell : weight of the crisp cell sampler below (1 = one column spans
+//               several device pixels, where the fixed-width blur would smear
+//               cell edges over 40–200 px and never sharpen).
+// The two always sum to 1, so the field cross-fades continuously while zooming.
+uniform float u_colBlur;
+uniform float u_colCell;
+
 vec4 background() {
   // LUT entry 0 is the near-black floor — reuse it so out-of-range and
   // zero-density read identically.
@@ -176,14 +198,30 @@ vec2 bilinear0(float colf, float rowf) {
 // crisp, time gets the smoothing. Blur neighbours that fall outside the VALID
 // window (the live edge's not-yet-written future column, the oldest valid
 // edge) are dropped and their weight folded into the core, so the newest column
-// paints at full weight instead of blending against an empty slot.
+// paints at full weight instead of blending against an empty slot. u_colBlur
+// scales both side taps (0 = core bilinear only); wC still closes the sum to 1.
 vec2 sampleField0(float colf, float rowf) {
-  float wL = colf - 1.0 >= float(u_validFrom) ? 0.25 : 0.0;
-  float wR = colf + 1.0 <= float(u_residentNewest) ? 0.25 : 0.0;
+  float wL = (colf - 1.0 >= float(u_validFrom) ? 0.25 : 0.0) * u_colBlur;
+  float wR = (colf + 1.0 <= float(u_residentNewest) ? 0.25 : 0.0) * u_colBlur;
   float wC = 1.0 - wL - wR;
   return bilinear0(colf - 1.0, rowf) * wL
        + bilinear0(colf, rowf) * wC
        + bilinear0(colf + 1.0, rowf) * wR;
+}
+
+// Crisp cell sampler (campaign 5, contract F4): horizontal NEAREST column at
+// the pixel center — the column whose [c, c+1) span contains colf, i.e. the
+// flat data cell as sampled — plus the SAME vertical bilinear conventions as
+// bilinear0 (identical y0/fy), so the price-axis response is unchanged. At deep
+// zoom, where one column spans many pixels, this paints hard cell edges instead
+// of the fixed 4-column smear; at sub-pixel column widths the CPU folds it out
+// (u_colCell → 0) in favour of the blur above.
+vec2 crisp0(float colf, float rowf) {
+  float yf = rowf - 0.5;
+  int y0 = int(floor(yf));
+  float fy = yf - float(y0);
+  int cx = int(floor(colf));
+  return mix(fetchCol(cx, y0), fetchCol(cx, y0 + 1), fy);
 }
 
 void main() {
@@ -208,13 +246,30 @@ void main() {
   int y0 = (row / blk) - (u_nRowTaps / 2);
 
   vec2 acc;
-  if (u_level == 0) {
-    // Smooth continuous field (see sampleField0). The 2-4 rows/pixel band is
-    // handled one level up (selectLevel switches to the 4-row SUM mip at
-    // rpp >= 2.5) precisely so this path stays the CHEAP single-pass sampler —
-    // a per-pixel multi-tap sum here measurably blew the SwiftShader §10 draw
-    // budget while the mip gives the same smoothing for one texel fetch.
-    acc = sampleField0(colf, rowf);
+  if (u_rowOnly == 1) {
+    // Row-only mip (R2-M1): SUM u_nRowTaps 4-row texels of THIS pixel's ONE
+    // column — a collapsing price axis still groups rows, but the time axis
+    // keeps hard cell edges (no 4-column block average). Bounds-clamped like
+    // the SUM path (a tap outside the grid contributes nothing).
+    int rowsR = u_rows / 4;
+    int yBase = (row / 4) - (u_nRowTaps / 2);
+    acc = vec2(0.0);
+    for (int t = 0; t < 4; t++) {
+      if (t >= u_nRowTaps) break;
+      int y = yBase + t;
+      if (y < 0 || y >= rowsR) continue;
+      acc += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+    }
+  } else if (u_level == 0) {
+    // Scale-aware cross-fade (campaign 5): zoomed out → smooth continuous field
+    // (see sampleField0); deep zoom → crisp data cells (see crisp0). The 2-4
+    // rows/pixel band is handled one level up (selectLevel switches to the
+    // row-only / 4-row SUM mip at rpp >= 2.5) precisely so this path stays the
+    // CHEAP single-pass sampler — a per-pixel multi-tap sum here measurably
+    // blew the SwiftShader §10 draw budget while the mip gives the same
+    // smoothing for one texel fetch. L1: full-crisp skips the 12 blur fetches.
+    if (u_colCell >= 0.999) acc = crisp0(colf, rowf);
+    else acc = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);
   } else {
     // Zoomed out: exact SUM path over the coarse level (unchanged).
     acc = vec2(0.0);
@@ -256,6 +311,10 @@ void main() {
   float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);
   if (u_channel == 1) intensity = acc.r * u_decodeScale / float(blk);
   else if (u_channel == 2) intensity = acc.g * u_decodeScale / float(blk);
+  // Row-only mip: blk is the 4-ROW block baked into each row-mip texel, but
+  // the SUM path's /blk is a COLUMN average the row-mip never applied — undo
+  // it so a row-mip view reads exactly like the SUM path at the same footprint.
+  if (u_rowOnly == 1) intensity *= float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
   // Black point, then the perceptual display curve. Order matters: clipping
   // AFTER gamma would clip a curve, not a density, and the floor would mean a

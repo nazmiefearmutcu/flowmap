@@ -3,8 +3,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { floorForTolerance, gammaForContrast } from './gl/heatmap';
 import { Renderer } from './gl/renderer';
 import type { PriceFollow } from './gl/camera';
-import { applyOverlayPalette } from './gl/overlays/palette';
-import { attachThemeKey, DEFAULT_THEME_ID, getCanvasPalette, useTheme } from './theme';
+import { applyChartInk, applyOverlayPalette } from './gl/overlays/palette';
+import {
+  attachThemeKey,
+  DEFAULT_THEME_ID,
+  getCanvasPalette,
+  getTheme,
+  THEMES,
+  useTheme,
+  type ThemeId,
+} from './theme';
 import { attachGlobalKeys, classifyTarget } from './input/keys';
 import { decodeFrame } from './proto/decode';
 import type { StreamMode } from './proto/types';
@@ -42,6 +50,7 @@ import {
   historyDepthCols,
   loadSettings,
   saveSettings,
+  type Colormap,
   type FlowMapSettings,
 } from './ui/settings';
 import { useAlertMonitor } from './state/alertMonitor';
@@ -76,6 +85,35 @@ type RendererCp1 = Renderer & {
   readonly liveEdgeVisible?: boolean;
   resetOverlaysForNewSession?: (sessionId?: string) => void;
 };
+
+/**
+ * F6 chart-harmony bridge: the subset of `ThemeMeta.chart` the 2D ink bridge
+ * (`applyChartInk`) consumes. Mapping explicitly keeps the ramps (density/synth)
+ * off the 2D canvas seam — they go to the LUT store via `renderer.setChartTheme`.
+ */
+type ChartInk = {
+  ink: string;
+  inkDim: string;
+  grid: string;
+  gridAlpha?: number;
+  axis: string;
+  price: string;
+  bg: string;
+  chipBg: string;
+};
+
+function chartInkOf(c: ChartInk): ChartInk {
+  return {
+    ink: c.ink,
+    inkDim: c.inkDim,
+    grid: c.grid,
+    gridAlpha: c.gridAlpha,
+    axis: c.axis,
+    price: c.price,
+    bg: c.bg,
+    chipBg: c.chipBg,
+  };
+}
 
 /** ≤4 Hz renderer→settings price-follow reconciliation (survey D4). */
 const FOLLOW_RECONCILE_MS = 250;
@@ -134,6 +172,9 @@ export function App() {
   // The chart container every data-space overlay (measure / drawings / indicator
   // canvas) anchors to — lane CD's mount contract.
   const stageViewportRef = useRef<HTMLDivElement>(null);
+  // F6: last (theme, colormap) tuple pushed to `renderer.setChartTheme` — the
+  // setter recreates the LUT texture, so only a real change may call it.
+  const lastChartThemeRef = useRef<string | null>(null);
 
   const [settings, setSettings] = useState<FlowMapSettings>(() =>
     loadSettings(typeof window !== 'undefined' ? window.localStorage : null),
@@ -154,6 +195,23 @@ export function App() {
   // re-renders on an actual theme switch (useSyncExternalStore), which is
   // human-frequency.
   const { theme } = useTheme();
+
+  // F6: push the (theme, colormap) pair onto the renderer's theme ramp. Legacy
+  // families pin today's ramps (`null`); `'theme'` follows the active theme.
+  // Idempotent via `lastChartThemeRef` — `setChartTheme` recreates the LUT
+  // texture, so repeated settings writes must not re-upload it.
+  const syncChartTheme = useCallback((themeId: ThemeId, colormap: Colormap): void => {
+    const r = rendererRef.current;
+    if (!r) return;
+    const sig = `${themeId}|${colormap}`;
+    if (lastChartThemeRef.current === sig) return;
+    lastChartThemeRef.current = sig;
+    r.setChartTheme(
+      colormap === 'theme'
+        ? { id: themeId, density: THEMES[themeId].chart.density, synth: THEMES[themeId].chart.synth }
+        : null,
+    );
+  }, []);
 
   // Campaign-4 P4: evaluates armed alerts for NON-active symbols by polling
   // `/api/quote` through the shared quoteFeed (visibility-gated, stale-skipping).
@@ -224,12 +282,24 @@ export function App() {
       };
     }
     rendererRef.current = renderer;
+    // R1-H1: the `lastChartThemeRef` gate below survives StrictMode's
+    // setup→cleanup→setup (and Vite HMR) while the RENDERER that received the
+    // first `setChartTheme` is disposed with the previous effect. Invalidate
+    // the signature on every new renderer instance so the boot sync below
+    // (line ~295) actually reaches it; the gate still prevents texture
+    // re-uploads on later settings writes.
+    lastChartThemeRef.current = null;
     // Apply persisted, live-honourable settings at boot.
     renderer.setOverlayVisibility(settingsRef.current.overlays);
     renderer.setBubbleMinSize(settingsRef.current.bubbleMinSize);
     renderer.setContrast(gammaForContrast(settingsRef.current.contrast));
     renderer.setTolerance(floorForTolerance(settingsRef.current.tolerance));
     renderer.setColormap(settingsRef.current.colormap);
+    // F6 boot: seed the chart ramp from the RESOLVED theme (getTheme(), not the
+    // hook value — the mount effect is [] deps and must not trust a closure).
+    // The bridge effect below re-syncs on theme/colormap changes; the ref makes
+    // this call a no-op then.
+    syncChartTheme(getTheme(), settingsRef.current.colormap);
     renderer.setNormPercentile(settingsRef.current.normPercentile);
     // Follow policy is remembered by the renderer (`want*`) so the lazy ring
     // creation on the first column cannot discard it.
@@ -288,6 +358,9 @@ export function App() {
       r.setContrast(gammaForContrast(settings.contrast)); // idempotent
       r.setTolerance(floorForTolerance(settings.tolerance)); // idempotent
       r.setColormap(settings.colormap); // idempotent
+      // F6: same (theme, colormap) source of truth as the boot path; the ref
+      // inside makes this a no-op unless the pair actually changed.
+      syncChartTheme(theme, settings.colormap);
       r.setNormPercentile(settings.normPercentile); // idempotent
       r.setDepthChannel?.(settings.depthChannel); // C2, idempotent
       r.setTickGrouping?.(settings.tickGrouping); // P1, idempotent
@@ -511,7 +584,17 @@ export function App() {
   // midnight restores the originals via the null call.
   useEffect(() => {
     applyOverlayPalette(theme === DEFAULT_THEME_ID ? null : getCanvasPalette(theme));
-  }, [theme]);
+    // F6 chart harmony: theme (or colormap) changes repaint the 2D ink layers
+    // through `applyChartInk` and re-ramp the GL canvas through `setChartTheme`.
+    // `'theme'` skips the midnight restore (midnight IS the shipped literal
+    // palette); legacy families force the null restore.
+    applyChartInk(
+      settings.colormap === 'theme' && theme !== DEFAULT_THEME_ID
+        ? chartInkOf(THEMES[theme].chart)
+        : null,
+    );
+    syncChartTheme(theme, settings.colormap);
+  }, [theme, settings.colormap]);
 
   // The theme STORE owns the value (useTheme resolves stored → prefers →
   // default); this effect keeps <html data-theme> in lockstep with it, so the
@@ -524,6 +607,13 @@ export function App() {
       document.documentElement.dataset.theme = theme;
     }
   }, [theme]);
+
+  // F6 chart harmony: stamp the ramp choice on <html> so the CSS pin
+  // `:root[data-chart-ramp='flow'|'inferno'|'classic']` can keep the legacy
+  // dark chart tokens while `'theme'` lets the theme own them.
+  useEffect(() => {
+    document.documentElement.dataset.chartRamp = settings.colormap;
+  }, [settings.colormap]);
 
   // --- settings patch (merge → state → effect persists + applies) --------------
   const applyPatch = useCallback((patch: Partial<FlowMapSettings>) => {

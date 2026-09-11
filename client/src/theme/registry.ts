@@ -17,6 +17,12 @@
  * canvas layers always match the DOM chrome. A pure resolver
  * ({@link resolveCanvasPalette}) keeps the computed→palette mapping
  * unit-testable without a real stylesheet engine.
+ *
+ * Chart palette (campaign 2026-09-11): {@link ThemeMeta.chart} carries the
+ * chart-surface ink, chip plate and the per-theme density/synth RAMPS the GL
+ * renderer uploads when the `theme` colormap is active. `midnight` holds a
+ * structural copy of the shipped `gl/lut.ts` FLOW/SYNTH stop tables (no gl
+ * import — chart.test.ts pins the rasterized byte-identity instead).
  */
 
 export type ThemeId =
@@ -54,6 +60,50 @@ export const CANVAS_VAR_FOR: Readonly<Record<keyof CanvasPalette, string>> = {
   accent: '--accent-bright',
 };
 
+/** One control point of a themed chart ramp; `t` runs 0 (low) → 1 (high). */
+export interface ChartStop {
+  readonly t: number;
+  readonly rgb: readonly [number, number, number];
+}
+
+/**
+ * The chart surface a theme paints: chip ink, the GL background and the
+ * density/synth ramps. Consumed by the `theme` colormap path (renderer LUT
+ * store) and the F5 ink bridge; mirrored 1:1 into `--chart-*` CSS tokens
+ * (registry.test.ts asserts the mirror).
+ */
+export interface ChartPalette {
+  bg: string;
+  ink: string;
+  inkDim: string;
+  chipBg: string;
+  chipBorder: string;
+  accent: string;
+  gutterBg: string;
+  grid: string;
+  /**
+   * Per-theme gridline opacity (TS-only; no CSS token). The shipped dark
+   * canvas value is 0.14; light themes raise it so the composited grid clears
+   * ≥1.4:1 on {@link bg} (a 0.14 hairline vanishes on paper/white). The GL/2D
+   * bridge applies it to the `grid` overlay entry when provided; omitted = the
+   * entry's shipped alpha (byte-identity).
+   */
+  gridAlpha?: number;
+  axis: string;
+  price: string;
+  /**
+   * Fired/triggered alert ink for chip plates (mirrors `--chart-sell`).
+   * Consumed by CSS directly — the overlay palette has no entry for it.
+   */
+  sell: string;
+  /** Caution ink for chip plates (mirrors `--chart-warn`), same contract. */
+  warn: string;
+  /** Real-depth ramp, low → high density, rooted at {@link bg}. */
+  density: readonly ChartStop[];
+  /** Synthetic-depth ramp (honesty §7), rooted at {@link bg}. */
+  synth: readonly ChartStop[];
+}
+
 export interface ThemeMeta {
   id: ThemeId;
   /** Human name (picker rows, status text). */
@@ -67,6 +117,11 @@ export interface ThemeMeta {
    * by registry.test.ts). Used only when computed styles are unavailable.
    */
   canvas: CanvasPalette;
+  /**
+   * Chart palette + the theme's density/synth ramps (mirrors the theme's
+   * `--chart-*` values; ramps are pinned by chart.test.ts).
+   */
+  chart: ChartPalette;
 }
 
 /** Cycling / picker order. Midnight first = default. */
@@ -96,6 +151,41 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       ask: '#d3524f',
       accent: '#33d6c4',
     },
+    chart: {
+      bg: '#05080e',
+      ink: '#e6edf3',
+      inkDim: '#93a1b4',
+      chipBg: 'rgba(8, 11, 17, 0.92)',
+      chipBorder: '#1a2030',
+      accent: '#33d6c4',
+      gutterBg: '#0e121a',
+      grid: '#788496',
+      gridAlpha: 0.14,
+      axis: '#a3b0c2',
+      price: '#f5f8fc',
+      sell: '#e8635f',
+      warn: '#d6a13a',
+      // Structural copy of gl/lut.ts FLOW_STOPS (no gl import). chart.test.ts
+      // rasterizes this and pins the byte-identity with buildFlowLUT().
+      density: [
+        { t: 0.0, rgb: [5, 8, 14] },
+        { t: 0.16, rgb: [10, 22, 60] },
+        { t: 0.34, rgb: [20, 48, 120] },
+        { t: 0.5, rgb: [60, 48, 150] },
+        { t: 0.55, rgb: [160, 60, 150] },
+        { t: 0.59, rgb: [232, 112, 58] },
+        { t: 0.8, rgb: [250, 170, 40] },
+        { t: 1.0, rgb: [255, 225, 90] },
+      ],
+      // Structural copy of gl/lut.ts SYNTH_STOPS (frozen §7 amber row).
+      synth: [
+        { t: 0.0, rgb: [6, 3, 0] },
+        { t: 0.25, rgb: [80, 30, 0] },
+        { t: 0.55, rgb: [180, 90, 0] },
+        { t: 0.8, rgb: [240, 170, 30] },
+        { t: 1.0, rgb: [255, 240, 200] },
+      ],
+    },
   },
   paper: {
     id: 'paper',
@@ -109,6 +199,38 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       bid: '#0e7c72',
       ask: '#b3383d',
       accent: '#0a6158',
+    },
+    chart: {
+      bg: '#f3f1ea',
+      ink: '#24272d',
+      inkDim: '#57606c',
+      chipBg: 'rgba(255, 253, 248, 0.92)',
+      chipBorder: '#d6d0c0',
+      accent: '#0a6158',
+      gutterBg: '#ebe8dd',
+      grid: '#5a6472',
+      gridAlpha: 0.35,
+      axis: '#3a414d',
+      price: '#0a6158',
+      sell: '#99272c',
+      warn: '#8a6410',
+      // Ink on paper: cream → steel blue → indigo → deep ink. Deliberately
+      // teal-free so the teal price/accent ink stays distinguishable.
+      density: [
+        { t: 0.0, rgb: [243, 241, 234] },
+        { t: 0.2, rgb: [200, 205, 210] },
+        { t: 0.45, rgb: [120, 145, 180] },
+        { t: 0.7, rgb: [60, 75, 135] },
+        { t: 1.0, rgb: [25, 30, 72] },
+      ],
+      // Warm sepia ink family, clearly channel-separated from the cool density.
+      synth: [
+        { t: 0.0, rgb: [243, 241, 234] },
+        { t: 0.28, rgb: [205, 150, 85] },
+        { t: 0.55, rgb: [150, 95, 45] },
+        { t: 0.8, rgb: [95, 60, 30] },
+        { t: 1.0, rgb: [55, 32, 14] },
+      ],
     },
   },
   swiss: {
@@ -124,6 +246,38 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       ask: '#a52a1d',
       accent: '#004d45',
     },
+    chart: {
+      bg: '#ffffff',
+      ink: '#000000',
+      inkDim: '#1f1f1f',
+      chipBg: 'rgba(255, 255, 255, 0.92)',
+      chipBorder: '#2b2b2b',
+      accent: '#004d45',
+      gutterBg: '#f0f0f0',
+      grid: '#808080',
+      gridAlpha: 0.4,
+      axis: '#333333',
+      price: '#a52a1d',
+      sell: '#7f1a10',
+      warn: '#7a5800',
+      // Monochrome ink: white → grey → near-black. The red price ink is the
+      // theme's sell accent, never white.
+      density: [
+        { t: 0.0, rgb: [255, 255, 255] },
+        { t: 0.25, rgb: [190, 190, 190] },
+        { t: 0.5, rgb: [120, 120, 120] },
+        { t: 0.75, rgb: [55, 55, 55] },
+        { t: 1.0, rgb: [12, 12, 12] },
+      ],
+      // Sepia ink, channel-separated from the grey density.
+      synth: [
+        { t: 0.0, rgb: [255, 255, 255] },
+        { t: 0.25, rgb: [215, 175, 120] },
+        { t: 0.5, rgb: [165, 110, 55] },
+        { t: 0.75, rgb: [110, 65, 30] },
+        { t: 1.0, rgb: [62, 34, 12] },
+      ],
+    },
   },
   amber: {
     id: 'amber',
@@ -137,6 +291,42 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       bid: '#35c99e',
       ask: '#e06a5a',
       accent: '#5fe3ba',
+    },
+    chart: {
+      bg: '#0c090b',
+      ink: '#ede0bd',
+      inkDim: '#b3a67f',
+      chipBg: 'rgba(16, 12, 8, 0.92)',
+      chipBorder: '#352b14',
+      accent: '#5fe3ba',
+      gutterBg: '#1c1709',
+      grid: '#8a7c60',
+      gridAlpha: 0.14,
+      axis: '#c9b98e',
+      price: '#f5f8fc',
+      sell: '#f08577',
+      warn: '#e0a83e',
+      // Inferno-family on the warm ground: violet/magenta head → ember → gold.
+      // The ground is a cool plum-black so the head can stay (b ≥ g) — the
+      // §7 cool-field contract the warm synth ramp leans on.
+      density: [
+        { t: 0.0, rgb: [12, 9, 11] },
+        { t: 0.16, rgb: [34, 18, 58] },
+        { t: 0.34, rgb: [78, 24, 110] },
+        { t: 0.5, rgb: [130, 32, 120] },
+        { t: 0.62, rgb: [196, 60, 70] },
+        { t: 0.78, rgb: [240, 120, 30] },
+        { t: 0.9, rgb: [250, 180, 45] },
+        { t: 1.0, rgb: [255, 225, 95] },
+      ],
+      // Warm amber synth, held ≥48 Chebyshev from the density path at every stop.
+      synth: [
+        { t: 0.0, rgb: [12, 9, 11] },
+        { t: 0.25, rgb: [86, 52, 12] },
+        { t: 0.5, rgb: [170, 110, 30] },
+        { t: 0.72, rgb: [200, 175, 90] },
+        { t: 1.0, rgb: [255, 235, 160] },
+      ],
     },
   },
   sea: {
@@ -152,6 +342,39 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       ask: '#4f7fd6',
       accent: '#33d6c4',
     },
+    chart: {
+      bg: '#050709',
+      ink: '#e6edf3',
+      inkDim: '#93a1b4',
+      chipBg: 'rgba(8, 11, 17, 0.92)',
+      chipBorder: '#1a2030',
+      accent: '#33d6c4',
+      gutterBg: '#0e121a',
+      grid: '#788496',
+      gridAlpha: 0.14,
+      axis: '#a3b0c2',
+      price: '#f5f8fc',
+      sell: '#6f9ae2',
+      warn: '#b78ce0',
+      // Navy → azure → ice-cyan top; cool all the way up.
+      density: [
+        { t: 0.0, rgb: [5, 7, 9] },
+        { t: 0.14, rgb: [10, 26, 58] },
+        { t: 0.32, rgb: [16, 58, 110] },
+        { t: 0.5, rgb: [30, 110, 170] },
+        { t: 0.68, rgb: [60, 170, 210] },
+        { t: 0.85, rgb: [110, 215, 235] },
+        { t: 1.0, rgb: [135, 230, 245] },
+      ],
+      // Amber synth against the cool field (readable honesty contrast).
+      synth: [
+        { t: 0.0, rgb: [5, 7, 9] },
+        { t: 0.25, rgb: [74, 40, 10] },
+        { t: 0.5, rgb: [150, 90, 20] },
+        { t: 0.75, rgb: [225, 150, 40] },
+        { t: 1.0, rgb: [255, 235, 170] },
+      ],
+    },
   },
   'paper-deut': {
     id: 'paper-deut',
@@ -166,6 +389,36 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       ask: '#2f5fc4',
       accent: '#075149',
     },
+    chart: {
+      bg: '#f3f1ea',
+      ink: '#24272d',
+      inkDim: '#57606c',
+      chipBg: 'rgba(255, 253, 248, 0.92)',
+      chipBorder: '#d6d0c0',
+      accent: '#075149',
+      gutterBg: '#ebe8dd',
+      grid: '#5a6472',
+      gridAlpha: 0.35,
+      axis: '#3a414d',
+      price: '#075149',
+      sell: '#24499c',
+      warn: '#6d3fa8',
+      // Same ink-on-paper family as `paper`, slightly cooler stop spacing.
+      density: [
+        { t: 0.0, rgb: [243, 241, 234] },
+        { t: 0.22, rgb: [196, 201, 214] },
+        { t: 0.48, rgb: [110, 135, 175] },
+        { t: 0.72, rgb: [52, 72, 126] },
+        { t: 1.0, rgb: [20, 26, 64] },
+      ],
+      synth: [
+        { t: 0.0, rgb: [243, 241, 234] },
+        { t: 0.28, rgb: [200, 148, 88] },
+        { t: 0.55, rgb: [145, 92, 48] },
+        { t: 0.8, rgb: [92, 58, 28] },
+        { t: 1.0, rgb: [52, 30, 12] },
+      ],
+    },
   },
   contrast: {
     id: 'contrast',
@@ -179,6 +432,38 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       bid: '#00e0c0',
       ask: '#ff5f5f',
       accent: '#4dffe0',
+    },
+    chart: {
+      bg: '#000000',
+      ink: '#ffffff',
+      inkDim: '#d9d9d9',
+      chipBg: 'rgba(0, 0, 0, 0.92)',
+      chipBorder: '#3d3d3d',
+      accent: '#4dffe0',
+      gutterBg: '#0a0a0a',
+      grid: '#6e6e6e',
+      gridAlpha: 0.14,
+      axis: '#c9c9c9',
+      price: '#ffffff',
+      sell: '#ff8a8a',
+      warn: '#ffcc00',
+      // Classic family on true black: deep blue → cyan → bright yellow.
+      density: [
+        { t: 0.0, rgb: [0, 0, 0] },
+        { t: 0.14, rgb: [8, 20, 80] },
+        { t: 0.36, rgb: [0, 110, 190] },
+        { t: 0.55, rgb: [30, 200, 225] },
+        { t: 0.78, rgb: [235, 235, 50] },
+        { t: 1.0, rgb: [255, 245, 60] },
+      ],
+      // Warm amber synth: distinct from the blue/cyan/yellow density path.
+      synth: [
+        { t: 0.0, rgb: [0, 0, 0] },
+        { t: 0.25, rgb: [80, 40, 0] },
+        { t: 0.5, rgb: [170, 100, 20] },
+        { t: 0.72, rgb: [215, 150, 30] },
+        { t: 1.0, rgb: [255, 235, 150] },
+      ],
     },
   },
 };

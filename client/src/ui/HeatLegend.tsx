@@ -8,6 +8,11 @@
  * that silently drifts when the ramp is retuned. CSS interpolates sRGB linearly
  * exactly as `buildRamp` does, so the legend IS the ramp, not an approximation.
  *
+ * F6 (visual campaign 2026-09-11): when the colormap is `'theme'` the bar paints
+ * the ACTIVE theme's density stops (`THEMES[theme].chart.density` — the same
+ * list the renderer uploads to atlas row 5), so the legend follows a light theme
+ * the moment it switches; the legacy families keep the frozen lut rows.
+ *
  * Depth channel (fix 2026-09-10 F1-5): the legend mirrors the channel the chart
  * is actually rendering (the settings store's `depthChannel`):
  *   - `sum` — the density ramp, "more"/"less" caps (unchanged default);
@@ -23,9 +28,10 @@
  * low-frequency store slice, so this never touches the GL render path.
  */
 
-import { rampCssGradient, rampCssGradientReversed, rampForColormap, RAMP_IMBALANCE, RAMP_SYNTH, type Colormap } from '../gl/lut';
+import { rampCssGradient, rampCssGradientReversed, rampForColormap, RAMP_IMBALANCE, RAMP_SYNTH, RAMP_THEME, RAMP_THEME_SYNTH, type Colormap } from '../gl/lut';
 import type { DepthChannelMode } from './settings';
 import { useFlowMapStore } from '../state/store';
+import { THEMES, useTheme } from '../theme';
 import { depthTier } from './DomLadder';
 
 interface HeatLegendProps {
@@ -35,11 +41,35 @@ interface HeatLegendProps {
   channel: DepthChannelMode;
 }
 
+/** Minimal stop shape the legend needs (structurally `ChartStop`). */
+export interface LegendStop {
+  readonly t: number;
+  readonly rgb: readonly [number, number, number];
+}
+
+/**
+ * CSS stop list from a theme ramp — same serialization as lut's private
+ * gradient helper, so a `'theme'` legend bar is the theme atlas row, not an
+ * approximation.
+ */
+function stopsGradient(stops: readonly LegendStop[]): string {
+  return stops
+    .map((s) => {
+      const [r, g, b] = s.rgb.map((v) => Math.round(v));
+      return `rgb(${r}, ${g}, ${b}) ${(s.t * 100).toFixed(1)}%`;
+    })
+    .join(', ');
+}
+
 /** Legend copy + ramp row per (channel, tier) — pure, unit-testable. */
 export function legendForChannel(
   channel: DepthChannelMode,
   colormap: Colormap,
   synth: boolean,
+  /** Active theme's density stops — required for the `'theme'` colormap. */
+  themeStops?: readonly LegendStop[] | null,
+  /** Active theme's synthetic-depth stops — pairs with `'theme'` + SYNTH. */
+  themeSynthStops?: readonly LegendStop[] | null,
 ): {
   row: number;
   /** Stop list painted bottom → top of the bar (CSS `to top` order). */
@@ -52,6 +82,19 @@ export function legendForChannel(
   rampName: string;
 } {
   if (synth) {
+    // R1-M2: with the `'theme'` colormap the renderer paints atlas row 6 (the
+    // active theme's synth ramp), so the legend must paint the SAME stops —
+    // not the frozen amber row 1. Legacy families keep the amber row.
+    if (colormap === 'theme' && themeSynthStops && themeSynthStops.length > 0) {
+      return {
+        row: RAMP_THEME_SYNTH,
+        gradient: stopsGradient(themeSynthStops),
+        topCap: 'more',
+        bottomCap: 'less',
+        channelNote: null,
+        rampName: 'synthetic theme colormap',
+      };
+    }
     return {
       row: RAMP_SYNTH,
       gradient: rampCssGradient(RAMP_SYNTH),
@@ -75,6 +118,16 @@ export function legendForChannel(
       rampName: 'divergent imbalance (ask blue → bid amber)',
     };
   }
+  if (colormap === 'theme' && themeStops && themeStops.length > 0) {
+    return {
+      row: RAMP_THEME,
+      gradient: stopsGradient(themeStops),
+      topCap: 'more',
+      bottomCap: 'less',
+      channelNote: channel === 'bid' ? 'bid depth' : channel === 'ask' ? 'ask depth' : null,
+      rampName: 'theme colormap',
+    };
+  }
   return {
     row: rampForColormap(colormap),
     gradient: rampCssGradient(rampForColormap(colormap)),
@@ -86,10 +139,16 @@ export function legendForChannel(
 }
 
 export function HeatLegend({ colormap, channel }: HeatLegendProps): JSX.Element {
+  const { theme } = useTheme();
   const capability = useFlowMapStore((s) => s.capability);
   const tier = depthTier(capability, null);
   const synth = tier === 'SYNTH';
-  const legend = legendForChannel(channel, colormap, synth);
+  // F6: `'theme'` follows the active theme's density ramp. Midnight's ramp is
+  // byte-identical to FLOW at the source (registry constraint), so the default
+  // stays pixel-for-pixel today's legend.
+  const themeStops = colormap === 'theme' ? THEMES[theme].chart.density : null;
+  const themeSynthStops = colormap === 'theme' ? THEMES[theme].chart.synth : null;
+  const legend = legendForChannel(channel, colormap, synth, themeStops, themeSynthStops);
   const channelSuffix =
     channel === 'sum' || synth ? '' : `, ${channel} channel`;
   return (

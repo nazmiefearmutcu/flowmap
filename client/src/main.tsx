@@ -8,6 +8,7 @@ import './App.css';
 
 import { initLocale } from './i18n';
 import { initTheme } from './theme';
+import { loadSettings } from './ui/settings';
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {
@@ -19,6 +20,14 @@ if (!rootEl) {
 // the user's theme/language and never flashes the default. Idempotent.
 initTheme();
 initLocale();
+
+// R1-L1: stamp the persisted colormap on <html data-chart-ramp> BEFORE the
+// first paint. The App effect (App.tsx) keeps it in sync for later changes;
+// doing it here too means a stored legacy family pins the dark chart tokens
+// from frame one instead of flashing the light theme mirror first.
+document.documentElement.dataset.chartRamp = loadSettings(
+  typeof window !== 'undefined' ? window.localStorage : null,
+).colormap;
 
 createRoot(rootEl).render(
   <StrictMode>

@@ -397,24 +397,65 @@ test('imbalance channel paints a divergent sample and sum restores the frame (?s
     };
 
     await settle();
+    // R2-M2: pin the viewport norm so the EMA glide cannot move pixels between
+    // the grabs (freezeNormForTest; reset by any session reset).
+    r.freezeNormForTest();
+
+    // R2-M2 cont'd: the live sim can SPLICE its history once shortly after the
+    // settle (a one-time frame change in a sealed window — measured: adjacent
+    // grabs differ by ~8k px ONCE, then stay byte-identical for the rest of the
+    // probe). Wait for a run of byte-identical adjacent frames before starting
+    // the channel legs, so the comparison is deterministic and the tolerance
+    // below only has to absorb live-data advance (new columns outside the
+    // sealed window).
+    let quiet = 0;
+    for (let attempt = 0; attempt < 40 && quiet < 4; attempt++) {
+      const a = grab();
+      await frames(2);
+      const b = grab();
+      quiet = diff(a, b) === 0 ? quiet + 1 : 0;
+    }
+
     r.setDepthChannel('sum');
     await frames(3);
-    const sum1 = grab();
-    r.setDepthChannel('imbalance');
-    await frames(3);
-    const imb = grab();
-    r.setDepthChannel('sum');
-    await frames(3);
-    const sum2 = grab();
+
+    // R2-M2: retry the channel round-trip until one lands in a quiet window.
+    // The live sim's history loader splices pages asynchronously, and a splice
+    // that intersects the sealed view moves a band of pixels regardless of the
+    // norm being pinned (measured ~5–10k px, a few frames wide). A real restore
+    // regression fails EVERY attempt; a splice transient only fails the
+    // attempts it lands inside. The quiescence gate above already removed the
+    // common case; this is the belt-and-braces.
+    let diffChannel = 0;
+    let diffRestore = Number.POSITIVE_INFINITY;
+    let sumStats = stats(new Uint8ClampedArray(4));
+    let imbStats = stats(new Uint8ClampedArray(4));
+    let attempts = 0;
+    for (; attempts < 8 && diffRestore > 200; attempts++) {
+      r.setDepthChannel('sum');
+      await frames(3);
+      const a = grab();
+      r.setDepthChannel('imbalance');
+      await frames(3);
+      const b = grab();
+      r.setDepthChannel('sum');
+      await frames(3);
+      const c = grab();
+      diffChannel = diff(a, b);
+      diffRestore = diff(a, c);
+      sumStats = stats(a);
+      imbStats = stats(b);
+    }
 
     return {
       channel: r.getDepthChannel(),
       ramp: r.currentRamp,
-      sum: stats(sum1),
-      imb: stats(imb),
-      diffChannel: diff(sum1, imb),
-      diffRestore: diff(sum1, sum2),
+      sum: sumStats,
+      imb: imbStats,
+      diffChannel,
+      diffRestore,
       totalPixels: canvas.width * canvas.height,
+      attempts,
     };
   });
 
@@ -431,15 +472,15 @@ test('imbalance channel paints a divergent sample and sum restores the frame (?s
   // The divergent LUT row is actually used: switching changes many pixels...
   expect(result.diffChannel, `channel-switch diff px ${result.diffChannel}`).toBeGreaterThan(300);
   // ...while switching back restores the sealed frame (no time-driven drift).
-  // Tolerance = 1% of the canvas: the normalizer's EMA "settled" band is ±2% of
-  // the norm (normalize.ts SETTLE_EPS), and on the steep campaign-4.1 blue head
-  // that residual glide alone flips a few thousand pixels across the >8/channel
-  // bar — same order as before this campaign, not a frame change. A real
-  // time-driven shift or a corrupted restore moves an order of magnitude more.
+  // The norm is PINNED (freezeNormForTest), the probe waits for quiescent
+  // (byte-identical adjacent) frames before the legs, and the round-trip
+  // retries past async history splices — so the only residual is live-data
+  // advance outside this sealed window. Tolerance = 1% of the canvas as a
+  // documented margin on top of that.
   const restoreTolerance = Math.max(4713, Math.round(0.01 * result.totalPixels));
   expect(
     result.diffRestore,
-    `restore diff px ${result.diffRestore} (tol ${restoreTolerance}, channel ${result.diffChannel})`,
+    `restore diff px ${result.diffRestore} (tol ${restoreTolerance}, channel ${result.diffChannel}, attempts ${result.attempts})`,
   ).toBeLessThanOrEqual(restoreTolerance);
 
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(' | ')}`).toEqual([]);

@@ -13,11 +13,16 @@
  * **Migration policy.** `normalizeSettings` is a total coercion over an
  * arbitrary parsed blob with a per-field default, so a stored payload that
  * predates any field adopts that field's default with no migration code and no
- * `SETTINGS_KEY` bump. The one deliberate exception is `colormap`: its legacy
- * values (`'thermal'` / `'alt'`) were persisted on every mount but NEVER applied
- * to the renderer, so a stored value carries no user intent — honouring it would
- * mean returning users silently never see the new default ramp. Both legacy
- * strings therefore fall through to {@link DEFAULT_COLORMAP} on purpose.
+ * `SETTINGS_KEY` bump. The one deliberate exception is `colormap`, which carries
+ * a ONE-TIME schema migration: `settingsVersion` was introduced with the
+ * chart-harmony fix (F6, visual campaign 2026-09-11). Any blob WITHOUT
+ * `settingsVersion >= 2` has its colormap FORCED to `'theme'` on first load —
+ * pre-v2 the chart ignored the shell theme entirely (a pinned dark island), so
+ * a stored family choice was never the chart the user actually saw. The default
+ * is now `'theme'` (the chart follows the active theme); a family explicitly
+ * picked AFTER the upgrade persists under version 2 and is honoured verbatim.
+ * The old `'thermal'` / `'alt'` values stay dead either way: they were persisted
+ * on every mount but never applied to the renderer, so they carry no intent.
  */
 
 import { DEFAULT_CONTRAST, DEFAULT_TOLERANCE } from '../gl/heatmap';
@@ -102,6 +107,12 @@ export function historyDepthCols(depth: HistoryDepth, dtNs: number): number {
 }
 
 export interface FlowMapSettings {
+  /**
+   * Persisted schema version. `2` since the chart-harmony fix (F6): a stored
+   * blob without `settingsVersion >= 2` gets its `colormap` migrated to
+   * `'theme'` ONCE on load. See the migration note in the module docblock.
+   */
+  settingsVersion: number;
   /** Heatmap display contrast 0–100 (drives the perceptual gamma, §8.3). */
   contrast: number;
   /** Heatmap black point 0–100 — how much density a cell needs to paint at all. */
@@ -141,7 +152,18 @@ export interface FlowMapSettings {
 
 export const SETTINGS_KEY = 'flowmap.settings.v1';
 
+/** Current persisted schema version (F6 chart-harmony migration). */
+export const SETTINGS_VERSION = 2;
+
+/**
+ * The colormap families `normalizeSettings` accepts. `'theme'` (the F6 default)
+ * makes the chart follow the active theme; the three legacy families pin the
+ * fixed dark chart they always did.
+ */
+const COLORMAPS: readonly Colormap[] = ['theme', 'flow', 'inferno', 'classic'];
+
 export const DEFAULT_SETTINGS: FlowMapSettings = {
+  settingsVersion: SETTINGS_VERSION,
   contrast: DEFAULT_CONTRAST,
   tolerance: DEFAULT_TOLERANCE,
   colormap: DEFAULT_COLORMAP,
@@ -192,16 +214,25 @@ export function normalizeSettings(raw: unknown): FlowMapSettings {
   for (const k of Object.keys(overlays) as (keyof OverlayVisibility)[]) {
     if (typeof overlaysIn[k] === 'boolean') overlays[k] = overlaysIn[k] as boolean;
   }
+  const storedVersion =
+    typeof o.settingsVersion === 'number' && Number.isFinite(o.settingsVersion)
+      ? o.settingsVersion
+      : 0;
   return {
+    settingsVersion: SETTINGS_VERSION,
     contrast: Math.round(clampNumber(o.contrast, 0, 100, DEFAULT_SETTINGS.contrast)),
     tolerance: Math.round(clampNumber(o.tolerance, 0, 100, DEFAULT_SETTINGS.tolerance)),
-    // 'classic', 'inferno' and 'flow' are honoured; every other stored value
-    // (including the legacy 'thermal' / 'alt' from the never-applied knob)
-    // adopts the default. See the migration note in the module docblock.
+    // F6 chart-harmony migration: a blob with no `settingsVersion` (or < 2)
+    // predates the theme-aware chart, so its stored family choice is overridden
+    // ONCE with 'theme'. Version >= 2 honours an explicit choice; junk values
+    // (including the legacy 'thermal' / 'alt' from the never-applied knob) fall
+    // back to DEFAULT_COLORMAP. See the module docblock.
     colormap:
-      o.colormap === 'classic' || o.colormap === 'inferno' || o.colormap === 'flow'
-        ? o.colormap
-        : DEFAULT_COLORMAP,
+      storedVersion >= SETTINGS_VERSION
+        ? COLORMAPS.includes(o.colormap as Colormap)
+          ? (o.colormap as Colormap)
+          : DEFAULT_COLORMAP
+        : 'theme',
     normPercentile: clampNumber(o.normPercentile, 50, 100, DEFAULT_SETTINGS.normPercentile),
     tickGrouping: Math.round(clampNumber(o.tickGrouping, 1, 16, DEFAULT_SETTINGS.tickGrouping)),
     bubbleMinSize: clampNumber(o.bubbleMinSize, 0, 1e9, DEFAULT_SETTINGS.bubbleMinSize),

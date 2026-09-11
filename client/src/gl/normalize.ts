@@ -164,6 +164,12 @@ export class ViewportNormalizer {
   private seeded = false;
   /** Last raw viewport percentile computed (pre-EMA); for the settle test. */
   private lastRaw = 0;
+  /**
+   * Test-only pin (R2-M2): while frozen, {@link updateNorm} returns the pinned
+   * floored norm without stepping the EMA, so repeated grabs of a sealed frame
+   * are deterministic. {@link reset} clears it.
+   */
+  private frozen = false;
 
   constructor(cfg: NormalizeConfig = {}) {
     this.bins = cfg.bins ?? DEFAULT_BINS;
@@ -392,6 +398,7 @@ export class ViewportNormalizer {
    * view-settle). O(tiles in view).
    */
   updateNorm(col: ColRange, row: RowRange, mipLevel: number): number {
+    if (this.frozen) return Math.max(this.ema, this.floor);
     const raw = this.viewportPercentile(col, row, mipLevel);
     this.lastRaw = raw;
     if (!this.seeded) {
@@ -401,6 +408,20 @@ export class ViewportNormalizer {
       this.ema += this.alpha * (raw - this.ema);
     }
     return Math.max(this.ema, this.floor);
+  }
+
+  /**
+   * Test-only (R2-M2): pin the norm so repeated grabs of a sealed frame cannot
+   * drift through the EMA glide. Sets the EMA (and its raw target, so `settled`
+   * reads true) to `value ?? current`, both floored, and makes {@link updateNorm}
+   * return it without stepping until {@link reset}.
+   */
+  freezeForTest(value?: number): void {
+    const v = Math.max(value ?? this.current, this.floor);
+    this.ema = v;
+    this.lastRaw = v;
+    this.seeded = true;
+    this.frozen = true;
   }
 
   /** Whether the EMA has essentially reached the last raw target (settle gate). */
@@ -416,6 +437,7 @@ export class ViewportNormalizer {
     this.ema = 0;
     this.lastRaw = 0;
     this.seeded = false;
+    this.frozen = false;
     this.versionN++;
     this.memoKey.version = -1;
   }

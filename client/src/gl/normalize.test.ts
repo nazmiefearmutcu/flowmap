@@ -444,3 +444,42 @@ describe('viewport percentile memo (survey #6a — no per-dirty-frame re-merge)'
     expect(memo.mergeCount).toBe(1);
   });
 });
+
+describe('freezeForTest — pinned norm for deterministic e2e grabs (R2-M2)', () => {
+  it('returns the pinned floored norm across windows/levels without EMA stepping', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, emaAlpha: 0.5 });
+    addConst(n, 0, 10, 500);
+    addConst(n, 300, 100, 50);
+    n.updateNorm(tilesRange(0, 1), ALL_ROWS, 0); // seed the EMA
+    n.freezeForTest();
+    const pinned = n.current;
+    expect(pinned).toBeGreaterThan(0);
+
+    // Every subsequent update — different windows, different mip levels — must
+    // return the pinned value: no EMA glide, no merge-induced drift.
+    for (let i = 0; i < 5; i++) {
+      expect(n.updateNorm(tilesRange(0, 0), ALL_ROWS, 0)).toBe(pinned);
+      expect(n.updateNorm(tilesRange(0, 1), ALL_ROWS, 1)).toBe(pinned);
+      expect(n.updateNorm(tilesRange(1, 1), ALL_ROWS, 2)).toBe(pinned);
+    }
+    expect(n.settled).toBe(true);
+  });
+
+  it('accepts an explicit value (floored, no-op if <= 0) and reset clears the freeze', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, emaAlpha: 0.5 });
+    n.freezeForTest(120);
+    expect(n.current).toBe(120);
+    n.freezeForTest(1); // below the floor → clamped
+    expect(n.current).toBe(DEFAULT_NORM_FLOOR);
+
+    // reset() clears the freeze: fresh data glides again (a frozen norm would
+    // return the same value even as the raw target moves).
+    n.reset();
+    addConst(n, 0, 10, 500);
+    const a = n.updateNorm(tilesRange(0, 0), ALL_ROWS, 0);
+    addConst(n, 300, 100, 500);
+    n.percentile = 99;
+    const b = n.updateNorm(tilesRange(0, 1), ALL_ROWS, 0);
+    expect(b).toBeGreaterThan(a);
+  });
+});

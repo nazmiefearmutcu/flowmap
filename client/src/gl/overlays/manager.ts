@@ -349,12 +349,17 @@ export class OverlayManager {
     if (this.visibility.bubbles && typeof cap.tape === 'string' && cap.tape !== 'tick') {
       const opts = this.badgeOpts[n++];
       opts.color = OVERLAY.event.css;
+      // R1-M1: `badgeOpts.bg` copied the string at construction; `applyChartInk`
+      // reassigns `OVERLAY.badgeBg`, so refresh it here (like `color`) or the
+      // live badge plate stays the midnight box on light charts.
+      opts.bg = OVERLAY.badgeBg;
       this.text.badge(6, y, 'BUBBLES 1m AGG', opts);
       y += 18;
     }
     if (this.visibility.vwap && cap.vwap === 'approx') {
       const opts = this.badgeOpts[n++];
       opts.color = OVERLAY.vwap.css;
+      opts.bg = OVERLAY.badgeBg;
       this.text.badge(6, y, 'VWAP approx', opts);
       y += 18;
     } else if (this.visibility.vwap && cap.history === 'reconstructed') {
@@ -364,6 +369,7 @@ export class OverlayManager {
       // the keyless equity case).
       const opts = this.badgeOpts[n++];
       opts.color = OVERLAY.vwap.css;
+      opts.bg = OVERLAY.badgeBg;
       this.text.badge(6, y, 'VWAP ≈ reconstructed', opts);
       y += 18;
     }

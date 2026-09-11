@@ -31,7 +31,90 @@ interface CvdPaneProps {
 
 const AXIS = 'rgba(163, 176, 194, 0.75)';
 const AXIS_FAINT = 'rgba(120, 132, 150, 0.28)';
-const BG = 'rgba(9, 12, 16, 1)';
+const BG_FALLBACK = 'rgba(9, 12, 16, 1)';
+/** Shipped amber fade of the CVD area fill (midnight/dark grounds). */
+const AMBER_FILL_TOP = 'rgba(232, 176, 74, 0.26)';
+const AMBER_FILL_BOTTOM = 'rgba(232, 176, 74, 0.02)';
+
+/** Parse `#rgb` / `#rrggbb` / `#rrggbbaa` / `rgb()` / `rgba()` to sRGB bytes. */
+function parseColor(raw: string): [number, number, number] | null {
+  const s = raw.trim();
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(s);
+  if (hex) {
+    const h = hex[1];
+    if (h.length === 3 || h.length === 4) {
+      return [
+        Number.parseInt(h[0] + h[0], 16),
+        Number.parseInt(h[1] + h[1], 16),
+        Number.parseInt(h[2] + h[2], 16),
+      ];
+    }
+    if (h.length === 6 || h.length === 8) {
+      return [
+        Number.parseInt(h.slice(0, 2), 16),
+        Number.parseInt(h.slice(2, 4), 16),
+        Number.parseInt(h.slice(4, 6), 16),
+      ];
+    }
+    return null;
+  }
+  const fn = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i.exec(s);
+  if (!fn) return null;
+  return [Number(fn[1]), Number(fn[2]), Number(fn[3])];
+}
+
+/** Re-emit a resolvable CSS color at a fixed alpha (null when unparsable). */
+function withAlpha(raw: string, alpha: number): string | null {
+  const rgb = parseColor(raw);
+  if (!rgb) return null;
+  return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+}
+
+/** WCAG relative luminance of a resolved CSS color (0 when unparsable). */
+function relLuma(raw: string): number {
+  const rgb = parseColor(raw);
+  if (!rgb) return 0;
+  const lin = (v: number): number => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+}
+
+/** Pane ink resolved from the chart tokens (R1-H3). */
+export interface CvdInk {
+  ground: string;
+  axis: string;
+  zero: string;
+  series: string;
+  fillTop: string;
+  fillBottom: string;
+}
+
+/**
+ * Resolve the pane's ground/ink from the `--chart-*` tokens at paint time so a
+ * themed (light) chart ground is not painted with midnight literals. On a LIGHT
+ * ground (`--chart-bg` relative luminance ≥ 0.5) the series + fill follow
+ * `--chart-price`; on dark grounds the shipped amber series is kept
+ * byte-identical. Labels follow `--chart-axis`, the zero baseline follows
+ * `--chart-grid` at the shipped 0.28 alpha. Every token falls back to the
+ * literal it replaced when unresolvable.
+ */
+export function resolveCvdInk(getVar: (name: string) => string): CvdInk {
+  const raw = (name: string): string => getVar(name).trim();
+  const ground = raw('--chart-bg') || BG_FALLBACK;
+  const light = relLuma(ground) >= 0.5;
+  const price = light ? raw('--chart-price') : '';
+  return {
+    ground,
+    axis: withAlpha(raw('--chart-axis'), 0.75) ?? AXIS,
+    zero: withAlpha(raw('--chart-grid'), 0.28) ?? AXIS_FAINT,
+    series: withAlpha(price, 1) ?? OVERLAY.cvd.css,
+    fillTop: withAlpha(price, 0.26) ?? AMBER_FILL_TOP,
+    fillBottom: withAlpha(price, 0.02) ?? AMBER_FILL_BOTTOM,
+  };
+}
+
 
 export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -90,19 +173,22 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, cssW, cssH);
-      ctx.fillStyle = BG;
+      // R1-H3: resolve ground + ink from the live chart tokens each paint, so a
+      // themed light ground gets ink that is actually visible on it.
+      const ink = resolveCvdInk((name) => getComputedStyle(canvas).getPropertyValue(name));
+      ctx.fillStyle = ink.ground;
       ctx.fillRect(0, 0, cssW, cssH);
 
       // Top-left tag.
       ctx.font = '10px ui-monospace, monospace';
       ctx.textBaseline = 'top';
       ctx.textAlign = 'left';
-      ctx.fillStyle = OVERLAY.cvd.css;
+      ctx.fillStyle = ink.series;
       ctx.fillText('CVD', 6, 4);
 
       // Honesty: no usable aggressor side → don't draw a fake flat zero.
       if (cap === 'na') {
-        ctx.fillStyle = AXIS;
+        ctx.fillStyle = ink.axis;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText('not measurable for this feed (no trade side)', cssW / 2, cssH / 2);
@@ -123,8 +209,8 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       const xy = proj.xy;
       const zeroY = cvdValueToY(0, bounds, cssH);
 
-      // Zero baseline (dashed, faint).
-      ctx.strokeStyle = AXIS_FAINT;
+      // Zero baseline (dashed, faint) — follows `--chart-grid` on light grounds.
+      ctx.strokeStyle = ink.zero;
       ctx.lineWidth = 1;
       ctx.setLineDash([3, 3]);
       ctx.beginPath();
@@ -140,8 +226,8 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       // polished series instead of a flat brown slab.
       const yMin = xy.reduce((m, p) => Math.min(m, p.y), xy[0].y);
       const grad = ctx.createLinearGradient(0, yMin, 0, zeroY);
-      grad.addColorStop(0, 'rgba(232, 176, 74, 0.26)');
-      grad.addColorStop(1, 'rgba(232, 176, 74, 0.02)');
+      grad.addColorStop(0, ink.fillTop);
+      grad.addColorStop(1, ink.fillBottom);
       ctx.beginPath();
       ctx.moveTo(xy[0].x, zeroY);
       for (const p of xy) ctx.lineTo(p.x, p.y);
@@ -154,7 +240,7 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.beginPath();
       ctx.moveTo(xy[0].x, xy[0].y);
       for (let i = 1; i < xy.length; i++) ctx.lineTo(xy[i].x, xy[i].y);
-      ctx.strokeStyle = OVERLAY.cvd.css;
+      ctx.strokeStyle = ink.series;
       ctx.lineWidth = 1.8;
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
@@ -163,7 +249,7 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       // Latest value marker + label on the right.
       const last = pts[pts.length - 1];
       const lastXY = xy[xy.length - 1];
-      ctx.fillStyle = OVERLAY.cvd.css;
+      ctx.fillStyle = ink.series;
       ctx.beginPath();
       ctx.arc(lastXY.x, lastXY.y, 2.4, 0, Math.PI * 2);
       ctx.fill();

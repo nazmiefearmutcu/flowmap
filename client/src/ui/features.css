@@ -3,9 +3,10 @@
    Mounted by INT via `import './ui/features.css'` (single import in App.tsx;
    the components also import it directly so standalone test pages work).
    Token vocabulary matches ui/theme.css; nothing hardcodes the palette.
-   Chips rendered INSIDE the chart viewport use the FIXED dark-island tokens
-   (--chart-*, ui/theme.css) — the GL canvas is ramp-dark in every theme, so
-   this ink must never follow a light theme (fix 2026-09-10 F1-3).
+   Chips rendered INSIDE the chart viewport use the chart tokens (--chart-*),
+   which the theme mirror pairs with the active chart ground — the ink and its
+   plate always flip together (visual campaign 2026-09-11; was the fixed
+   dark-island rule, fix 2026-09-10 F1-3).
    ========================================================================= */
 
 /* --- measure tool (M) ----------------------------------------------------- */
@@ -64,7 +65,7 @@
   color: var(--chart-accent, #33d6c4);
 }
 .measure__ask {
-  color: var(--sell-bright, #e8635f);
+  color: var(--chart-sell, #e8635f);
 }
 .measure__mode {
   position: absolute;
@@ -97,7 +98,7 @@
   left: 0;
   right: 0;
   height: 0;
-  border-top: 1px dashed var(--warn, #d6a13a);
+  border-top: 1px dashed var(--chart-warn, #d6a13a);
 }
 .alert-line__tag {
   position: absolute;
@@ -108,7 +109,7 @@
   font-size: var(--fs-2xs, 9px);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
-  color: var(--warn, #d6a13a);
+  color: var(--chart-warn, #d6a13a);
   background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
   border: 1px solid var(--warn-line, #3a3016);
   border-radius: 3px;
@@ -116,10 +117,10 @@
 }
 .alert-line--triggered {
   border-top-style: solid;
-  border-top-color: var(--sell-bright, #e8635f);
+  border-top-color: var(--chart-sell, #e8635f);
 }
 .alert-line--triggered .alert-line__tag {
-  color: var(--sell-bright, #e8635f);
+  color: var(--chart-sell, #e8635f);
   border-color: var(--sell-line, #3b1f1f);
 }
 /* Fired alerts pulse the marker for a couple of seconds (reduced-motion safe). */
@@ -164,11 +165,13 @@
   border-color: var(--warn-line, #3a3016);
 }
 .alerts-chip__count {
-  color: var(--warn, #d6a13a);
+  color: var(--chart-warn, #d6a13a);
   font-variant-numeric: tabular-nums;
 }
 
-/* Alerts popover — a compact panel anchored to the bell chip. */
+/* Alerts popover — a compact panel anchored to the bell chip. It lives INSIDE
+   the chart viewport, so it follows the chart-ground tokens (`--chart-*`) —
+   the per-theme mirror keeps plate + ink paired in every theme. */
 .alerts-pop {
   position: absolute;
   bottom: 40px;
@@ -179,9 +182,9 @@
   display: flex;
   flex-direction: column;
   font-size: var(--fs-xs, 10px);
-  color: var(--text, #e6edf3);
-  background: rgba(10, 13, 19, 0.98);
-  border: 1px solid var(--line-2, #232c3e);
+  color: var(--chart-ink, #e6edf3);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: 8px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
 }
@@ -190,7 +193,7 @@
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--line, #1a2030);
+  border-bottom: 1px solid var(--chart-chip-border, #1a2030);
 }
 .alerts-pop__title {
   flex: 1;
@@ -203,7 +206,7 @@
 }
 .alerts-pop__empty {
   padding: 14px 10px;
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
   text-align: center;
 }
 .alert-row {
@@ -215,22 +218,22 @@
   font-variant-numeric: tabular-nums;
 }
 .alert-row:hover {
-  background: var(--bg-3, #141a26);
+  background: color-mix(in srgb, var(--chart-ink, #e6edf3) 8%, transparent);
 }
 .alert-row__px {
   flex: 1;
-  color: var(--text-money, #f2f6fa);
+  color: var(--chart-ink, #e6edf3);
 }
 .alert-row__state {
   font-size: var(--fs-2xs, 9px);
   letter-spacing: 0.05em;
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 .alert-row__state--fired {
-  color: var(--sell-bright, #e8635f);
+  color: var(--chart-sell, #e8635f);
 }
 .alert-row__state--muted {
-  color: var(--warn, #d6a13a);
+  color: var(--chart-warn, #d6a13a);
 }
 .alert-row__btn {
   padding: 2px 7px;
@@ -238,21 +241,21 @@
   font-size: var(--fs-2xs, 9px);
   font-weight: 600;
   letter-spacing: 0.05em;
-  color: var(--text-2, #93a1b4);
+  color: var(--chart-ink-dim, #93a1b4);
   background: transparent;
-  border: 1px solid var(--line, #1a2030);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: 4px;
   cursor: pointer;
 }
 .alert-row__btn:hover {
-  color: var(--text, #e6edf3);
-  border-color: var(--line-2, #232c3e);
+  color: var(--chart-ink, #e6edf3);
+  border-color: var(--chart-accent, #33d6c4);
 }
 .alerts-add {
   display: flex;
   gap: 6px;
   padding: 8px 10px;
-  border-top: 1px solid var(--line, #1a2030);
+  border-top: 1px solid var(--chart-chip-border, #1a2030);
 }
 .alerts-add__input {
   flex: 1;
@@ -260,14 +263,14 @@
   padding: 4px 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: var(--fs-xs, 10px);
-  color: var(--text, #e6edf3);
-  background: var(--bg-inset, #080b11);
-  border: 1px solid var(--line, #1a2030);
+  color: var(--chart-ink, #e6edf3);
+  background: var(--chart-gutter-bg, #0e121a);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: 4px;
 }
 .alerts-add__input:focus-visible {
   outline: none;
-  border-color: var(--accent-line, #1c3b37);
+  border-color: var(--chart-accent, #33d6c4);
 }
 .alerts-add__go {
   padding: 4px 10px;
@@ -275,9 +278,9 @@
   font-size: var(--fs-2xs, 9px);
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: var(--accent-bright, #33d6c4);
+  color: var(--chart-accent, #33d6c4);
   background: transparent;
-  border: 1px solid var(--accent-line, #1c3b37);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: 4px;
   cursor: pointer;
 }

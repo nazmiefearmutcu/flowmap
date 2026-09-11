@@ -37,7 +37,7 @@ export const en: Record<string, string> = {
   'drawer.sectionKeyboard': 'Keyboard',
   'settings.colormap': 'Colormap',
   'settings.colormapHint':
-    'Flow keeps the field dark and lets walls earn warm gold; Inferno separates size by hue (indigo → red → gold); Classic is the legacy blue→cyan→yellow ramp. Synthetic depth always stays amber.',
+    'Theme makes the chart follow the active theme. Flow / Inferno / Classic pin the fixed dark chart.',
   'settings.contrast': 'Contrast',
   'settings.contrastHint': 'Darkens the mid-density field against the brightest walls — higher is punchier.',
   'settings.tolerance': 'Tolerance',

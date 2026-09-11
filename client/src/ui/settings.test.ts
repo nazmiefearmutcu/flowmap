@@ -72,7 +72,7 @@ describe('normalizeSettings', () => {
   });
 
   it('merges a partial object over defaults', () => {
-    const n = normalizeSettings({ colormap: 'classic', overlays: { profile: true } });
+    const n = normalizeSettings({ settingsVersion: 2, colormap: 'classic', overlays: { profile: true } });
     expect(n.colormap).toBe('classic');
     expect(n.overlays.profile).toBe(true);
     expect(n.overlays.bubbles).toBe(true); // untouched default
@@ -98,19 +98,41 @@ describe('normalizeSettings', () => {
   });
 
   it('ignores an invalid colormap and non-boolean toggles', () => {
-    const n = normalizeSettings({ colormap: 'rainbow', follow: 'yes', railVisible: 0 });
+    const n = normalizeSettings({ settingsVersion: 2, colormap: 'rainbow', follow: 'yes', railVisible: 0 });
     expect(n.colormap).toBe(DEFAULT_SETTINGS.colormap);
     expect(n.follow).toBe(DEFAULT_SETTINGS.follow);
     expect(n.railVisible).toBe(DEFAULT_SETTINGS.railVisible);
   });
 
-  it('migrates the legacy colormap values to the new default ON PURPOSE', () => {
+  it('one-time migration: an unversioned blob is forced onto the theme colormap', () => {
+    // Pre-chart-harmony payloads never saw a theme-aware chart, so their stored
+    // family choice (even a valid one) is overridden ONCE — a valid explicit
+    // choice made afterwards carries settingsVersion 2 and persists (below).
+    const n = normalizeSettings({ colormap: 'inferno' });
+    expect(n.colormap).toBe('theme');
+    expect(n.settingsVersion).toBe(2);
+  });
+
+  it('a version-2 blob honors an explicit legacy family choice', () => {
+    expect(normalizeSettings({ settingsVersion: 2, colormap: 'inferno' }).colormap).toBe('inferno');
+    expect(normalizeSettings({ settingsVersion: 2, colormap: 'flow' }).colormap).toBe('flow');
+    expect(normalizeSettings({ settingsVersion: 2, colormap: 'classic' }).colormap).toBe('classic');
+    expect(normalizeSettings({ settingsVersion: 2, colormap: 'theme' }).colormap).toBe('theme');
+  });
+
+  it('a version-2 blob with a junk colormap falls back to the default', () => {
+    expect(normalizeSettings({ settingsVersion: 2, colormap: 'rainbow' }).colormap).toBe(
+      DEFAULT_SETTINGS.colormap,
+    );
+    expect(DEFAULT_SETTINGS.colormap).toBe('theme');
+  });
+
+  it('migrates the legacy thermal/alt values to the theme default ON PURPOSE', () => {
     // 'thermal' / 'alt' were persisted on every mount but never applied to the
-    // renderer, so a stored value carries no user intent. Honouring it would mean
-    // returning users silently never see the new default ramp.
-    expect(normalizeSettings({ colormap: 'thermal' }).colormap).toBe(DEFAULT_SETTINGS.colormap);
-    expect(normalizeSettings({ colormap: 'alt' }).colormap).toBe(DEFAULT_SETTINGS.colormap);
-    expect(DEFAULT_SETTINGS.colormap).toBe('flow');
+    // renderer, so a stored value carries no user intent. The v1→v2 migration
+    // also overrides them, so returning users land on the theme-following chart.
+    expect(normalizeSettings({ colormap: 'thermal' }).colormap).toBe('theme');
+    expect(normalizeSettings({ colormap: 'alt' }).colormap).toBe('theme');
   });
 
   it('coerces the new tolerance / followPrice / priceBand fields', () => {
@@ -190,10 +212,12 @@ describe('normalizeSettings', () => {
       price: DEFAULT_SETTINGS.overlays.price,
       cvd: DEFAULT_SETTINGS.overlays.cvd,
     });
-    // New fields adopt defaults (colormap deliberately does NOT keep 'thermal').
+    // New fields adopt defaults (colormap deliberately does NOT keep 'thermal':
+    // the v1→v2 chart-harmony migration forces 'theme').
     expect(n.tolerance).toBe(DEFAULT_SETTINGS.tolerance);
     expect(n.followPrice).toBe(DEFAULT_SETTINGS.followPrice);
     expect(n.priceBand).toBe(DEFAULT_SETTINGS.priceBand);
     expect(n.colormap).toBe(DEFAULT_SETTINGS.colormap);
+    expect(n.settingsVersion).toBe(2);
   });
 });

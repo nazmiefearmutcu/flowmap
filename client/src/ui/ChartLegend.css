@@ -1,7 +1,8 @@
 /* ChartLegend (CP4, campaign 2026-09-11) — compact key for the price-family
-   lines. Pinned INSIDE the always-dark chart viewport, so it uses the FIXED
-   chart-island tokens (--chart-*, ui/theme.css) and never theme ink
-   (fix 2026-09-10 F1-3 dark-island rule). Non-interactive by design: the chart
+   lines. Pinned INSIDE the chart viewport, so it wears the chart tokens
+   (--chart-*): the theme mirror keeps its plate + ink paired with the active
+   chart ground in every theme (visual campaign 2026-09-11; was the fixed
+   dark-island rule, fix 2026-09-10 F1-3). Non-interactive by design: the chart
    underneath must keep every pointer gesture. */
 
 .chart-legend {

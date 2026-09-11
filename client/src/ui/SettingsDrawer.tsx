@@ -48,6 +48,18 @@ const BAND_HINT_KEY: Record<PriceBand, string> = {
   deep: 'settings.bandHint.deep',
 };
 
+/**
+ * Colormap families (F6 chart harmony). `'theme'` first and default: the chart
+ * follows the active theme; the three legacy families pin the fixed dark chart.
+ */
+const COLORMAP_OPTIONS: readonly Colormap[] = ['theme', 'flow', 'inferno', 'classic'];
+const COLORMAP_LABELS: Record<Colormap, string> = {
+  theme: 'Theme',
+  flow: 'Flow',
+  inferno: 'Inferno',
+  classic: 'Classic',
+};
+
 /** i18n keys for the depth display channel (contract C2). */
 const CHANNEL_LABEL_KEY: Record<DepthChannelMode, string> = {
   sum: 'settings.channel.sum',
@@ -317,7 +329,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
           <div className="setting">
             <span className="setting__label">{t('settings.colormap')}</span>
             <div className="segrow" role="group" aria-label="colormap" data-testid="setting-colormap">
-              {(['flow', 'inferno', 'classic'] as Colormap[]).map((c) => (
+              {COLORMAP_OPTIONS.map((c) => (
                 <button
                   type="button"
                   key={c}
@@ -326,7 +338,7 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
                   data-testid={`colormap-${c}`}
                   onClick={() => onChange({ colormap: c })}
                 >
-                  {c === 'flow' ? 'Flow' : c === 'inferno' ? 'Inferno' : 'Classic'}
+                  {COLORMAP_LABELS[c]}
                 </button>
               ))}
             </div>

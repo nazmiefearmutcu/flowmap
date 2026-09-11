@@ -33,7 +33,7 @@ export const tr: Record<string, string> = {
   'drawer.sectionKeyboard': 'Klavye',
   'settings.colormap': 'Renk haritası',
   'settings.colormapHint':
-    'Flow alanı koyu tutar, duvarlar sıcak altın tonunu kazanır; Inferno büyüklüğü renk tonuyla ayırır (çivit → kırmızı → altın); Classic eski mavi→camgöbeği→sarı rampasıdır. Sentetik derinlik her zaman amber kalır.',
+    'Tema: grafik aktif temanın paletini izler. Flow / Inferno / Classic sabit koyu grafiği kullanır.',
   'settings.contrast': 'Kontrast',
   'settings.contrastHint':
     'Orta yoğunluk alanını en parlak duvarlara göre karartır — yükseldikçe daha vurucu olur.',

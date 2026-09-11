@@ -53,7 +53,12 @@ import {
   rampForMode,
   RAMP_FLOW,
   RAMP_SYNTH,
+  RAMP_THEME,
+  RAMP_THEME_SYNTH,
+  setThemeStops,
+  uploadLUTAtlas,
   type Colormap,
+  type RampStop,
 } from './lut';
 import { MipChain } from './mips';
 import { initGL, type GLContext } from './context';
@@ -229,6 +234,18 @@ const TICK_GROUPING_MAX = 16;
  */
 const OVERLAY_PRUNE_PAD = 64;
 
+/**
+ * A theme's chart ramps as the renderer consumes them (structural — the theme
+ * registry's `ChartPalette` satisfies this without a gl↔theme import).
+ * `id` drives the midnight identity path: midnight (and null) resolve to the
+ * frozen FLOW/SYNTH rows, any other theme to the theme-owned rows 5/6 (F3).
+ */
+export interface ChartThemeInput {
+  readonly id: string;
+  readonly density: readonly RampStop[];
+  readonly synth: readonly RampStop[];
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
@@ -332,6 +349,9 @@ export class Renderer {
   /** The user's colormap family. Remembered here, like {@link contrastGamma},
    *  so it survives Heatmap re-creation on session reset / context restore. */
   private colormap: Colormap = 'inferno';
+  /** Active chart theme for the `'theme'` colormap (F3). `null` (and the
+   *  midnight id) resolve to the frozen FLOW/SYNTH rows — the identity path. */
+  private chartTheme: ChartThemeInput | null = null;
   /** Render mode of the last column, for re-deriving the ramp on a knob change. */
   private lastColMode: number | null = null;
   /** Black point (§9 Tolerance), re-applied to every freshly built Heatmap. */
@@ -697,12 +717,45 @@ export class Renderer {
   private applyRamp(): void {
     const depthTier = (this.store.getState().capability as { depth?: unknown } | null)?.depth;
     const mode = this.lastColMode ?? MODE_SYNTH_PROFILE;
-    this.ramp = rampForMode(mode, depthTier, this.colormap);
+    // Theme rows only exist for a non-midnight theme: the midnight identity
+    // passes null, so `'theme'` resolves to RAMP_FLOW/RAMP_SYNTH and every
+    // frozen observable (currentRamp 3/synth 1, clear rgb(5,8,14)) holds.
+    const themed =
+      this.colormap === 'theme' && this.chartTheme !== null && this.chartTheme.id !== 'midnight'
+        ? { density: RAMP_THEME, synth: RAMP_THEME_SYNTH }
+        : null;
+    this.ramp = rampForMode(mode, depthTier, this.colormap, themed);
     if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
       this.heatmap.encoding = { ...this.heatmap.encoding, ramp: this.ramp };
     }
     // The channel follows the honesty ramp: a SYNTH session forces 'sum' (§7).
     this.applyChannel();
+  }
+
+  /**
+   * Active chart theme (F3): owns atlas rows 5/6 and the themable clear color.
+   * Pushes the stops into the lut store, re-uploads the atlas into the EXISTING
+   * texture (the Heatmap holds a readonly handle — re-specifying keeps every
+   * binding valid and leaks nothing), then re-derives the ramp and clears.
+   * Idempotent: a repeat call with the same ramps is a no-op (the App effect
+   * calls this on every settings change, like {@link setColormap}).
+   */
+  setChartTheme(theme: ChartThemeInput | null): void {
+    const prev = this.chartTheme;
+    const same =
+      prev === theme ||
+      (prev !== null &&
+        theme !== null &&
+        prev.id === theme.id &&
+        prev.density === theme.density &&
+        prev.synth === theme.synth);
+    if (same) return;
+    this.chartTheme = theme;
+    setThemeStops(theme ? { density: theme.density, synth: theme.synth } : null);
+    uploadLUTAtlas(this.ctx.gl, this.lut);
+    this.applyRamp();
+    this.clearBackground();
+    this.dirty = true;
   }
 
   /** Heatmap colormap family (§9). Honesty (§7) still wins: a SYNTH feed keeps
@@ -2700,6 +2753,15 @@ export class Renderer {
   /** The CPU viewport normalizer (test/e2e diagnostics: histogram totals). */
   get normalizerForTest(): ViewportNormalizer {
     return this.normalizer;
+  }
+
+  /**
+   * Test-only (R2-M2): pin the viewport norm so repeated grabs of a sealed
+   * frame cannot drift through the EMA glide. See
+   * {@link ViewportNormalizer.freezeForTest}; cleared by session reset.
+   */
+  freezeNormForTest(value?: number): void {
+    this.normalizer.freezeForTest(value);
   }
 
   /** The exact CPU column cache (test/e2e diagnostics). */

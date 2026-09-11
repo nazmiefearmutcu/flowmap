@@ -15,7 +15,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Renderer } from '../gl/renderer';
-import { CvdPane } from './CvdPane';
+import { OVERLAY } from '../gl/overlays/palette';
+import { CvdPane, resolveCvdInk } from './CvdPane';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -120,5 +121,49 @@ describe('CvdPane loop pacing', () => {
     expect(rafCount).toBeGreaterThan(idleWakeups);
     // And it actually repainted the changing series.
     expect(fillRect.mock.calls.length).toBeGreaterThan(1);
+  });
+});
+
+describe('CvdPane ink tokens (R1-H3)', () => {
+  it('dark ground keeps the shipped midnight/amber ink (byte-identical)', () => {
+    const ink = resolveCvdInk(
+      (name) =>
+        ({
+          '--chart-bg': '#05080e',
+          '--chart-axis': '#a3b0c2',
+          '--chart-grid': '#788496',
+          '--chart-price': '#f5f8fc',
+        })[name] ?? '',
+    );
+    expect(ink.ground).toBe('#05080e');
+    expect(ink.axis).toBe('rgba(163, 176, 194, 0.75)');
+    expect(ink.zero).toBe('rgba(120, 132, 150, 0.28)');
+    expect(ink.series).toBe(OVERLAY.cvd.css);
+    expect(ink.fillTop).toBe('rgba(232, 176, 74, 0.26)');
+    expect(ink.fillBottom).toBe('rgba(232, 176, 74, 0.02)');
+  });
+
+  it('light ground follows --chart-price / -axis / -grid', () => {
+    const ink = resolveCvdInk(
+      (name) =>
+        ({
+          '--chart-bg': '#f3f1ea',
+          '--chart-axis': '#3a414d',
+          '--chart-grid': '#5a6472',
+          '--chart-price': '#0a6158',
+        })[name] ?? '',
+    );
+    expect(ink.axis).toBe('rgba(58, 65, 77, 0.75)');
+    expect(ink.zero).toBe('rgba(90, 100, 114, 0.28)');
+    expect(ink.series).toBe('rgba(10, 97, 88, 1)');
+    expect(ink.fillTop).toBe('rgba(10, 97, 88, 0.26)');
+    expect(ink.fillBottom).toBe('rgba(10, 97, 88, 0.02)');
+  });
+
+  it('unresolvable tokens fall back to the shipped literals', () => {
+    const ink = resolveCvdInk(() => '');
+    expect(ink.axis).toBe('rgba(163, 176, 194, 0.75)');
+    expect(ink.zero).toBe('rgba(120, 132, 150, 0.28)');
+    expect(ink.series).toBe(OVERLAY.cvd.css);
   });
 });

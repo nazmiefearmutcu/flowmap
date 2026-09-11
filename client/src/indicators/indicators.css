@@ -40,6 +40,10 @@
 
 /* --- IndicatorPicker popover ----------------------------------------------------- */
 
+/* The picker lives INSIDE the chart viewport: it follows the chart-ground
+   tokens (--chart-*), whose per-theme mirror keeps plate + ink paired — the
+   old hardcoded dark plate + theme ink broke in every light theme. */
+
 .indi-picker {
   position: absolute;
   left: 10px;
@@ -50,11 +54,11 @@
   width: 300px;
   max-height: min(430px, calc(100% - 24px));
   padding: 10px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: var(--r-3, 6px);
-  background: rgba(10, 13, 19, 0.97);
+  background: var(--chart-chip-bg, rgba(8, 11, 17, 0.92));
   box-shadow: var(--shadow-pop, 0 4px 18px rgba(0, 0, 0, 0.5));
-  color: var(--text, #e6edf3);
+  color: var(--chart-ink, #e6edf3);
   font-size: var(--fs-md, 12px);
   pointer-events: auto;
   gap: 8px;
@@ -71,13 +75,13 @@
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-2, #93a1b4);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .indi-picker__close {
   border: none;
   background: none;
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
   font-size: 14px;
   line-height: 1;
   padding: 2px 6px;
@@ -85,8 +89,8 @@
   cursor: pointer;
 }
 .indi-picker__close:hover {
-  color: var(--text, #e6edf3);
-  background: var(--bg-3, #141a26);
+  color: var(--chart-ink, #e6edf3);
+  background: color-mix(in srgb, var(--chart-ink, #e6edf3) 10%, transparent);
 }
 
 .indi-picker__row {
@@ -94,15 +98,15 @@
   align-items: center;
   gap: 8px;
   font-size: var(--fs-xs, 10px);
-  color: var(--text-2, #93a1b4);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .indi-picker__select {
   flex: 1;
   min-width: 0;
-  background: var(--bg-2, #0e121a);
-  color: var(--text, #e6edf3);
-  border: 1px solid var(--line);
+  background: var(--chart-gutter-bg, #0e121a);
+  color: var(--chart-ink, #e6edf3);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: var(--r-1, 3px);
   font: inherit;
   font-size: var(--fs-xs, 10px);
@@ -122,12 +126,12 @@
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .indi-picker__empty {
   font-size: var(--fs-xs, 10px);
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .indi-picker__list {
@@ -148,7 +152,7 @@
   min-height: 24px;
 }
 .indi-row:hover {
-  background: var(--bg-3, #141a26);
+  background: color-mix(in srgb, var(--chart-ink, #e6edf3) 8%, transparent);
 }
 
 .indi-row__name {
@@ -161,9 +165,9 @@
 
 .indi-row__add,
 .indi-row__remove {
-  border: 1px solid var(--line);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   background: none;
-  color: var(--text-2, #93a1b4);
+  color: var(--chart-ink-dim, #93a1b4);
   border-radius: var(--r-1, 3px);
   font: inherit;
   font-size: var(--fs-xs, 10px);
@@ -173,8 +177,8 @@
 }
 .indi-row__add:hover,
 .indi-row__remove:hover {
-  color: var(--text, #e6edf3);
-  border-color: var(--line-2);
+  color: var(--chart-ink, #e6edf3);
+  border-color: var(--chart-accent, #33d6c4);
 }
 .indi-row__add:disabled {
   opacity: 0.45;
@@ -195,21 +199,21 @@
   align-items: center;
   gap: 4px;
   font-size: var(--fs-2xs, 9px);
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
 }
 
 .indi-param input {
   width: 52px;
-  background: var(--bg-inset, #080b11);
-  color: var(--text, #e6edf3);
-  border: 1px solid var(--line);
+  background: var(--chart-gutter-bg, #0e121a);
+  color: var(--chart-ink, #e6edf3);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: var(--r-1, 3px);
   font: inherit;
   font-size: var(--fs-xs, 10px);
   padding: 2px 4px;
 }
 .indi-param input:focus-visible {
-  outline: 1px solid var(--accent-bright, #33d6c4);
+  outline: 1px solid var(--chart-accent, #33d6c4);
   outline-offset: 0;
 }
 
@@ -223,7 +227,7 @@
   width: 18px;
   height: 18px;
   padding: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--chart-chip-border, #1a2030);
   border-radius: var(--r-1, 3px);
   background: none;
   cursor: pointer;
@@ -232,13 +236,13 @@
 .indi-color__reset {
   border: none;
   background: none;
-  color: var(--text-3, #6f7b8c);
+  color: var(--chart-ink-dim, #93a1b4);
   font-size: var(--fs-2xs, 9px);
   cursor: pointer;
   padding: 1px 2px;
 }
 .indi-color__reset:hover {
-  color: var(--text, #e6edf3);
+  color: var(--chart-ink, #e6edf3);
 }
 
 @media (prefers-reduced-motion: reduce) {

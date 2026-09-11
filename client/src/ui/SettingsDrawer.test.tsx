@@ -240,6 +240,38 @@ describe('SettingsDrawer depth channel (contract C2)', () => {
   });
 });
 
+describe('SettingsDrawer colormap (F6 theme ramp)', () => {
+  it('offers Theme first, marks the active family, and emits it on click', () => {
+    const patches: Array<Partial<FlowMapSettings>> = [];
+    const { container } = render(
+      <SettingsDrawer
+        settings={settings({ colormap: 'theme' })}
+        onChange={(p) => patches.push(p)}
+        onClose={() => {}}
+      />,
+    );
+    const group = container.querySelector('[data-testid="setting-colormap"]')!;
+    expect([...group.querySelectorAll('button')].map((b) => b.textContent)).toEqual([
+      'Theme',
+      'Flow',
+      'Inferno',
+      'Classic',
+    ]);
+    expect(container.querySelector('[data-testid="colormap-theme"]')!.getAttribute('aria-pressed')).toBe(
+      'true',
+    );
+    expect(container.querySelector('[data-testid="colormap-flow"]')!.getAttribute('aria-pressed')).toBe(
+      'false',
+    );
+
+    click(container.querySelector('[data-testid="colormap-theme"]')!);
+    expect(patches).toEqual([{ colormap: 'theme' }]);
+
+    click(container.querySelector('[data-testid="colormap-flow"]')!);
+    expect(patches).toEqual([{ colormap: 'theme' }, { colormap: 'flow' }]);
+  });
+});
+
 describe('SettingsDrawer appearance section (INT mount)', () => {
   afterEach(() => {
     setLocale('en');
