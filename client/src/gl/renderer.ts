@@ -212,6 +212,18 @@ const KEY_PAN_FRAC = 0.15;
 const STATS_EMA_ALPHA = 0.1;
 /** Above this many deferred splice columns, batch mip regen into range passes. */
 const MIP_BATCH_MIN_COLS = 8;
+/** Max tick-grouping request: 16 rows = mip level 2, the coarsest block the
+ *  SUM-mip chain can build (levels clamp further if the chain is shallower).
+ *  Clamping HERE (not only at shade time) keeps getTickGrouping() honest. */
+const TICK_GROUPING_MAX = 16;
+/**
+ * Slack (in columns) around the resident window for the per-window overlay
+ * prune (contract B-2). Re-pruning is a no-op until an edge has moved by more
+ * than this, so a live append burst costs ONE map scan per ~64 columns instead
+ * of one per column; the maps may hold up to this many extra columns between
+ * sweeps, which is exactly the pad the prune keeps anyway.
+ */
+const OVERLAY_PRUNE_PAD = 64;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -287,6 +299,7 @@ export class Renderer {
     price: null,
     columnArrays: (col) => this.columnCache.arrays(col),
     newestArrays: null,
+    mipLevel: 0,
   };
   private readonly overlayResident = { oldest: 0, newest: 0 };
   /** Column⇄time anchor for overlays: newest written column (any is valid). */
@@ -321,6 +334,16 @@ export class Renderer {
   private toleranceFloor = 0;
   /** Depth channel view (contract C2), re-applied like {@link toleranceFloor}. */
   private depthChannel: DepthChannel = DEFAULT_DEPTH_CHANNEL;
+  /** Tick-grouping request (1..{@link TICK_GROUPING_MAX}), re-applied like the
+   *  other knobs. 1 = today's rendering; see {@link setTickGrouping}. */
+  private tickGrouping = 1;
+  /** Last (oldest,newest) the overlay maps were pruned to; -1 = never. */
+  private lastPruneOldest = -1;
+  private lastPruneNewest = -1;
+  /** `onViewChanged` listeners (the renderer's view-moved seam; no consumers yet). */
+  private readonly viewChangedListeners = new Set<() => void>();
+  /** One-shot guard so a throwing view listener warns once, never per column. */
+  private viewChangedWarned = false;
 
   private newestSeq = -1;
   private view: HeatmapView;
@@ -675,6 +698,75 @@ export class Renderer {
   }
 
   /**
+   * Tick grouping (contract P1): group at least `n` price rows into one heatmap
+   * cell by imposing a LOWER BOUND on the SUM-mip level — the displayed block is
+   * 4^level ≥ n rows. `n` is clamped to [1, 16]; `n = 1` (the default) is the
+   * identity (the level comes from the pixel footprint exactly as before).
+   *
+   * The ceiling is 16 because mip level 2 is the coarsest block this build's
+   * chain can build, so a stored 17..32 is clamped to 16 up front and
+   * {@link getTickGrouping} never claims a grouping the chain cannot paint
+   * (R1-L2). Non-power-of-4 requests can NOT be represented (mips group in 4^k
+   * blocks and this build does not stack sub-blocks): they round UP to the next
+   * block (2..4 → 4 rows, 5..16 → 16 rows), so the guarantee is "≥ n", never
+   * fewer. The crosshair (`probeAt`) reports the true effective block, so the
+   * readout never claims a finer grouping than what is painted. With no mip
+   * chain (`maxLevel = 0`: float FBOs unavailable / rows % 4 !== 0) the floor is
+   * clamped away and rendering is unchanged — documented, not silent.
+   */
+  setTickGrouping(n: number): void {
+    const int = Number.isFinite(n) ? Math.floor(n) : 1;
+    this.tickGrouping = clamp(int, 1, TICK_GROUPING_MAX);
+    if (this.heatmap !== null) this.heatmap.levelFloor = this.tickGroupingLevel();
+    this.dirty = true;
+  }
+
+  /** The requested tick grouping (rows per cell target), 1 = off. Contract P1. */
+  getTickGrouping(): number {
+    return this.tickGrouping;
+  }
+
+  /**
+   * The mip level the tick grouping forces, BEFORE the chain clamp: the
+   * smallest L with 4^L ≥ n, i.e. ceil(log4 n) = ceil(log2 n / 2). 0 for n ≤ 1.
+   * `Math.log2` is exact for powers of two, so n = 4/16 land on exactly 1/2.
+   */
+  private tickGroupingLevel(): number {
+    const n = this.tickGrouping;
+    if (n <= 1) return 0;
+    return Math.ceil(Math.log2(n) / 2);
+  }
+
+  /**
+   * Subscribe to "the camera view moved" (design enabler for crosshair sync,
+   * survey #7). Fired synchronously whenever the view uniforms actually change:
+   * gestures/keyboard (onCameraChanged), the per-column time-follow reframe, the
+   * price-follow glide, resize, and the e2e setView hook. No consumers today;
+   * callbacks run on the hot path (per appended column while following), so they
+   * must stay cheap and must not throw — a throwing listener is isolated and
+   * warned once, exactly like the stream fanout.
+   */
+  onViewChanged(cb: () => void): () => void {
+    this.viewChangedListeners.add(cb);
+    return () => {
+      this.viewChangedListeners.delete(cb);
+    };
+  }
+
+  private notifyViewChanged(): void {
+    for (const cb of this.viewChangedListeners) {
+      try {
+        cb();
+      } catch (err) {
+        if (!this.viewChangedWarned) {
+          this.viewChangedWarned = true;
+          console.warn('[flowmap] onViewChanged listener failed (suppressed):', err);
+        }
+      }
+    }
+  }
+
+  /**
    * Render-health snapshot (contract C3): `{fps, frameMs, uploads, draws,
    * cacheBytes}`. O(1); the counters are maintained inside the existing rAF
    * frame (fps/frameMs EMA-smoothed with alpha ≈ 0.1); this call only copies
@@ -817,6 +909,8 @@ export class Renderer {
     this.normalizer.reset();
     this.columnCache.reset();
     this.overlays.reset();
+    this.lastPruneOldest = -1;
+    this.lastPruneNewest = -1;
     this.normSeeded = false;
     this.decodeScale = 1;
     this.ramp = RAMP_FLOW;
@@ -961,6 +1055,7 @@ export class Renderer {
     this.view = this.camera.toView();
     this.dirty = true;
     this.viewMoved = true;
+    this.notifyViewChanged();
   }
 
   // --- stream handling ----------------------------------------------------------
@@ -1172,7 +1267,33 @@ export class Renderer {
     this.overlayAnchorT0Ns = col.t0_ns;
     this.overlayAnchorEpoch = col.epoch;
     const r = ring.residentRange();
-    if (r !== null) this.overlays.prune(r.oldest, r.newest);
+    if (r !== null) this.pruneOverlayWindows(r.oldest, r.newest);
+  }
+
+  /**
+   * Bound the per-window overlay maps (VWAP / price line / CVD) to the resident
+   * range — but only when an edge actually moved beyond the prune's slack. This
+   * runs from `writeColumn`, i.e. for every appended column (4–20/s live, whole
+   * 256-column pages during scroll-back splices), and each call would otherwise
+   * be an O(resident) scan of three Maps. The resident window is contiguous, so
+   * a one-column slide cannot put any key more than one column outside the
+   * previously pruned window: re-pruning is a no-op until an edge has moved by
+   * more than the pad, at which point ONE scan re-bounds everything. The maps
+   * hold at most `pad` extra columns between sweeps — exactly the slack prune
+   * keeps anyway — so this trades a bounded amount of memory for turning
+   * O(columns × resident) work into O(resident × columns / pad).
+   */
+  private pruneOverlayWindows(oldest: number, newest: number): void {
+    if (
+      this.lastPruneOldest >= 0 &&
+      Math.abs(oldest - this.lastPruneOldest) <= OVERLAY_PRUNE_PAD &&
+      Math.abs(newest - this.lastPruneNewest) <= OVERLAY_PRUNE_PAD
+    ) {
+      return;
+    }
+    this.lastPruneOldest = oldest;
+    this.lastPruneNewest = newest;
+    this.overlays.prune(oldest, newest, OVERLAY_PRUNE_PAD);
   }
 
   // --- deferred SUM-mip batch (history-page splices) -----------------------------
@@ -1228,6 +1349,7 @@ export class Renderer {
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
     this.heatmap.gamma = this.contrastGamma;
     this.heatmap.floor = this.toleranceFloor;
+    this.heatmap.levelFloor = this.tickGroupingLevel();
     this.applyRamp();
     this.mips?.dispose();
     this.mips = this.createMips(rows, layers);
@@ -1378,9 +1500,21 @@ export class Renderer {
    * the uniform cache is refreshed.
    */
   private updateView(): void {
+    const before = this.view;
     if (this.camera.followTime) this.applyTimeFollowFrame();
     if (this.camera.followPrice === 'fit') this.applyPriceFitFrame();
     this.view = this.camera.toView();
+    // Fire the view-changed seam only when a uniform actually moved: updateView
+    // runs per appended column while following, and most appends reframe a
+    // sub-pixel delta that must not spam listeners (survey #7).
+    if (
+      this.view.colOffset !== before.colOffset ||
+      this.view.colScale !== before.colScale ||
+      this.view.rowOffset !== before.rowOffset ||
+      this.view.rowScale !== before.rowScale
+    ) {
+      this.notifyViewChanged();
+    }
   }
 
   /** Time half of the follow frame: right edge pinned to the newest column. */
@@ -1510,11 +1644,13 @@ export class Renderer {
       this.priceTarget = null;
       this.priceStalled = true;
       this.dirty = true;
+      this.notifyViewChanged();
       return;
     }
     this.camera.setRowCenter(next);
     this.view = this.camera.toView();
     this.dirty = true;
+    this.notifyViewChanged();
   }
 
   private resize(): void {
@@ -1545,8 +1681,14 @@ export class Renderer {
    *  suppression on deep zoom-out (§8.3: level-2 renders from mips). The TIME
    *  axis counts too: a time-zoomed-out + price-zoomed-in view renders from the
    *  mips exactly like a price zoom to the same block, so the no-backfill gate
-   *  stays consistent with what the heatmap actually samples. */
-  private currentLevel(): number {
+   *  stays consistent with what the heatmap actually samples.
+   *
+   * `includeFloor = false` reports the NATURAL level (no tick-grouping floor):
+   * the backfill gate uses it, because a forced coarse DISPLAY must not stop the
+   * CPU cache/profile/history from filling in — those still need full-res
+   * columns (mips are generated from them). The crosshair and the viewport
+   * normalizer use the floored level, exactly what is painted. */
+  private currentLevel(includeFloor = true): number {
     const m = this.mips;
     const maxLevel = m !== null && m.usable ? m.maxLevel : 0;
     const gl = this.ctx.gl;
@@ -1554,6 +1696,7 @@ export class Renderer {
       this.view.rowScale / Math.max(1, gl.drawingBufferHeight),
       maxLevel,
       this.view.colScale / Math.max(1, gl.drawingBufferWidth),
+      includeFloor ? this.tickGroupingLevel() : 0,
     ).level;
   }
 
@@ -1705,6 +1848,10 @@ export class Renderer {
     ctx.time = time;
     ctx.price = price;
     ctx.newestArrays = this.newestSeq >= 0 ? this.columnCache.arrays(this.newestSeq) : null;
+    // The mip block the heatmap will paint this frame (tick-grouping floor
+    // included) — the profile samples rows at that block so its bars never
+    // claim finer price resolution than the cells behind them (survey #4).
+    ctx.mipLevel = this.currentLevel();
     overlays.draw(ctx);
   }
 
@@ -1829,6 +1976,7 @@ export class Renderer {
       this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
       this.heatmap.gamma = this.contrastGamma;
       this.heatmap.floor = this.toleranceFloor;
+      this.heatmap.levelFloor = this.tickGroupingLevel();
       this.applyRamp();
       this.mips = this.createMips(this.ringRows, this.ringLayers);
       this.heatmap.mips = this.mips;
@@ -1838,11 +1986,14 @@ export class Renderer {
       this.extentSeq = new Int32Array(cap).fill(-1);
       this.history = this.createHistoryLoader();
       this.camera.setLimits(limitsFor(this.ringRows, cap));
-      // Recover by re-following the live edge: the ring came back empty and the
-      // live feed is still flowing, so live appends re-populate the visible
-      // range from the server within a couple of columns. (A deep-scroll-back
-      // view is re-fetched again by the loader as soon as the user pans.)
+      // Rebuild the empty ring's frame, then RESTORE the user's follow intent
+      // (survey #5): a context loss must not silently re-arm follow/fit while
+      // the UI still shows them off. With follow ON — the common case, and what
+      // the previous code hard-coded — this is byte-identical to the old
+      // recovery; with follow OFF the view stays user-owned and the loader
+      // re-fetches the visible range on the next pan.
       this.camera.reset(null, this.ringRows);
+      this.applyWantedFollow();
       this.updateView();
     }
   }
@@ -1894,7 +2045,10 @@ export class Renderer {
         this.history.ensureVisible({
           leftCol: Math.floor(this.view.colOffset),
           span: this.view.colScale,
-          level: this.currentLevel(),
+          // NATURAL level: the no-backfill gate tracks zoom-out, not the forced
+          // tick-grouping display — a grouped view still needs resident columns
+          // for the exact crosshair/profile and for its own mip generation.
+          level: this.currentLevel(false),
         });
       }
 
@@ -1907,8 +2061,16 @@ export class Renderer {
         this.updateNormalization();
         const t0 = performance.now();
         this.heatmap.draw(this.view);
-        // Live stats: EMA the draw cost (no gl.finish — the cheap sample; the
-        // perf-run path below still measures the true flushed cost).
+        // Overlays (T10) draw OVER the heatmap, O(visible). They are part of the
+        // frame the HUD reports (survey #9): the PerfHud chip is the campaign's
+        // own regression sensor, and overlays are on by default — measuring only
+        // the heatmap pass understates the real draw cost. Skipped during a perf
+        // run (the §10 gate measures the flushed heatmap pass alone) and when
+        // there is no epoch to map events/prices onto (perf preload). A throw
+        // here is surfaced once below, like any other frame error.
+        if (perf === null) this.drawOverlays();
+        // Live stats: EMA the FULL frame draw cost (no gl.finish — the cheap
+        // sample; the perf-run path below still measures the true flushed cost).
         const drawCost = performance.now() - t0;
         this.statsFrameMsEma =
           this.statsFrameMsEma > 0
@@ -1922,12 +2084,6 @@ export class Renderer {
         this.dirty = false;
         this.drawCountN++;
         this.lastDrawEndTsN = performance.now();
-
-        // Overlays (T10) draw OVER the heatmap, O(visible). Skipped during a perf
-        // run (the measured drawMs is heatmap-only) and when there is no epoch to
-        // map events/prices onto (perf preload) — so the §10 gate is untouched.
-        // A throw here is surfaced once below, like any other frame error.
-        if (perf === null) this.drawOverlays();
 
         // Keep redrawing until the viewport norm reaches its target so the
         // contrast glides into a new regime (~0.3 s) instead of snapping.
@@ -2044,6 +2200,7 @@ export class Renderer {
     const heatmap = new Heatmap(this.ctx, ring, this.lut);
     this.ring = ring;
     this.heatmap = heatmap;
+    heatmap.levelFloor = this.tickGroupingLevel();
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
@@ -2134,6 +2291,7 @@ export class Renderer {
     this.heatmap = new Heatmap(this.ctx, ring, this.lut);
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
+    this.heatmap.levelFloor = this.tickGroupingLevel();
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);
@@ -2204,6 +2362,7 @@ export class Renderer {
     this.view = this.camera.toView();
     this.dirty = true;
     this.viewMoved = true;
+    this.notifyViewChanged();
   }
 
   /** Forward map a grid cell CENTER to canvas CSS pixels (e2e crosshair hover). */
@@ -2350,6 +2509,7 @@ export class Renderer {
     this.heatmap = new Heatmap(this.ctx, ring, this.lut);
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
+    this.heatmap.levelFloor = this.tickGroupingLevel();
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
     this.extentHi = new Int32Array(cap).fill(-1);

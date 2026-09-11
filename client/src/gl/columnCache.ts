@@ -256,26 +256,6 @@ export class ColumnCache {
   }
 
   /**
-   * Drop every cached column outside `[oldest - pad, newest + pad]` — the renderer
-   * calls this with the resident window so the cache tracks the viewed region and
-   * far scroll-back / evicted-live columns are released. O(capacity) over the
-   * slot table (allocation-free; the renderer runs it per appended column).
-   */
-  prune(oldest: number, newest: number, pad = 0): void {
-    const lo = oldest - pad;
-    const hi = newest + pad;
-    for (let slot = 0; slot < this.capacity; slot++) {
-      const f = this.flags[slot];
-      if ((f & FLAG_PRESENT) === 0) continue;
-      const seq = this.seqs[slot];
-      if (seq < lo || seq > hi) {
-        this.flags[slot] = 0;
-        this.countN--;
-      }
-    }
-  }
-
-  /**
    * Drop every cached column and release ALL pool pages (the next `put`
    * re-allocates the touched pages at the new session's row count — a symbol
    * switch may change it).

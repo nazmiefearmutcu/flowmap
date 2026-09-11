@@ -24,6 +24,7 @@ import {
   type ConnStatus,
   type ConnectionOptions,
   type StreamMsg,
+  type SubscribeWindow,
 } from '../net/connection';
 import type { EpochParams, FeedState, HistoryResponse, StreamMode } from '../proto/types';
 
@@ -33,6 +34,15 @@ export interface Subscription {
   mode: StreamMode;
   /** Server price-grid coverage preset ('native' | 'wide' | 'full' | 'deep'). */
   band: string;
+  /**
+   * OPTIONAL replay window (contract P6): inclusive start / exclusive end in
+   * wall-clock ns. Absent (the default, and every pre-P6 caller) means the
+   * unbounded recording; the fields are only materialized when a caller actually
+   * supplies one, so the store's observable subscription shape is unchanged for
+   * existing consumers and tests.
+   */
+  startNs?: bigint | null;
+  endNs?: bigint | null;
 }
 
 /**
@@ -49,9 +59,16 @@ export interface Subscription {
  * HEIGHT (`deep` is 4096 rows against the default 2048). Keying only on
  * market:symbol left the renderer holding a ring sized for the old grid, which
  * is exactly the geometry mismatch gl/sessionGate.ts then has to survive.
+ *
+ * A replay WINDOW (contract P6) is included too: a different slice is a
+ * different server session whose col_seq restarts at 0, so it needs the same
+ * tear-down. An unbounded subscription (no window) keeps the exact pre-P6 key.
  */
 export function sessionResetKey(sub: Subscription | null): string | null {
-  return sub === null ? null : `${sub.market}:${sub.symbol}:${sub.band}`;
+  if (sub === null) return null;
+  const base = `${sub.market}:${sub.symbol}:${sub.band}`;
+  if (sub.startNs == null && sub.endNs == null) return base;
+  return `${base}:${sub.startNs ?? ''}-${sub.endNs ?? ''}`;
 }
 
 export interface FlowMapState {
@@ -108,6 +125,8 @@ export interface FlowMapState {
     symbol: string,
     mode?: StreamMode,
     band?: string,
+    /** Optional P6 replay window; omitted/null = unbounded (today's behavior). */
+    window?: SubscribeWindow,
   ) => void;
   requestHistory: (before_t: bigint, n: number) => Promise<HistoryResponse>;
   /** Replay transport controls — send the matching control message + track UI state. */
@@ -173,7 +192,9 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   speed: 1,
   paused: false,
 
-  connectAndSubscribe(market, symbol, mode = 'live', band = 'native') {
+  connectAndSubscribe(market, symbol, mode = 'live', band = 'native', window) {
+    const startNs = window?.startNs ?? null;
+    const endNs = window?.endNs ?? null;
     if (conn === null) {
       conn = new Connection({
         ...transportOverrides,
@@ -289,10 +310,19 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
       prev.market !== market ||
       prev.symbol !== symbol ||
       prev.mode !== mode ||
-      prev.band !== band
+      prev.band !== band ||
+      (prev.startNs ?? null) !== startNs ||
+      (prev.endNs ?? null) !== endNs
     ) {
+      // Materialize the window fields ONLY when one was supplied: an unbounded
+      // subscription keeps the exact pre-P6 state shape every consumer sees.
+      const subscription: Subscription = { market, symbol, mode, band };
+      if (startNs !== null || endNs !== null) {
+        subscription.startNs = startNs;
+        subscription.endNs = endNs;
+      }
       set({
-        subscription: { market, symbol, mode, band },
+        subscription,
         speed: 1,
         paused: false,
         feedState: null,
@@ -331,7 +361,7 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
         set({ replayUnavailable: false });
       }
     }
-    conn.subscribe(market, symbol, mode, band);
+    conn.subscribe(market, symbol, mode, band, window);
   },
 
   requestHistory(before_t, n) {

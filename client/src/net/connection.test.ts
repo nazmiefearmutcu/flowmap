@@ -262,6 +262,70 @@ describe('Connection — subscription lifecycle', () => {
     expect(frames[2].symbol).toBe('AAPL');
   });
 
+  // --- P6: the optional replay window (start_t/end_t) ---------------------------
+
+  it('carries a replay window on the wire and re-sends it across a reconnect', () => {
+    const { sockets, clock, makeConn } = harness();
+    const conn = makeConn();
+    const start = T0;
+    const end = T0 + 3_600_000_000_000n;
+
+    conn.subscribe('crypto', 'BTCUSDT', 'replay', 'native', { startNs: start, endNs: end });
+    sockets[0].open();
+    const first = decodeFrame(sockets[0].sent[0]);
+    assertType(first[0], MsgType.SUBSCRIBE);
+    expect(first[0].start_t).toBe(start);
+    expect(first[0].end_t).toBe(end);
+
+    // The desired subscription (window included) survives the reconnect.
+    sockets[0].drop();
+    clock.advance(500);
+    sockets[1].open();
+    const again = decodeFrame(sockets[1].sent[0]);
+    assertType(again[0], MsgType.SUBSCRIBE);
+    expect(again[0].start_t).toBe(start);
+    expect(again[0].end_t).toBe(end);
+  });
+
+  it('changing ONLY the window re-subscribes and rewinds the session cursors', () => {
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
+
+    conn.subscribe('crypto', 'BTCUSDT', 'replay', 'native', { startNs: T0 });
+    sockets[0].open();
+    sockets[0].deliver(buildEpochStart(0));
+    expect(conn.epochs.size).toBe(1);
+
+    // A different slice is a different server session (epoch 0, col_seq 0), so
+    // it must take the detach + cursor-rewind path a symbol switch takes.
+    conn.subscribe('crypto', 'BTCUSDT', 'replay', 'native', { startNs: T0, endNs: T0 + 1000n });
+    const frames = sockets[0].sent.map((b) => decodeFrame(b)[0]);
+    expect(frames.map((f) => f.type)).toEqual([
+      MsgType.SUBSCRIBE,
+      MsgType.UNSUBSCRIBE,
+      MsgType.SUBSCRIBE,
+    ]);
+    expect(conn.epochs.size).toBe(0);
+    const last = frames[2];
+    assertType(last, MsgType.SUBSCRIBE);
+    expect(last.end_t).toBe(T0 + 1000n);
+  });
+
+  it('an unbounded subscribe emits the exact legacy Subscribe bytes (no end_t key)', () => {
+    const { sockets, makeConn } = harness();
+    const conn = makeConn();
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    sockets[0].open();
+
+    const sent = sockets[0].sent[0];
+    const plen = new DataView(sent.buffer, sent.byteOffset, sent.byteLength).getUint32(4, true);
+    const payload = new TextDecoder().decode(sent.subarray(8, 8 + plen));
+    expect(payload).not.toContain('end_t');
+    expect(payload).toBe(
+      '{"market":"crypto","symbol":"BTCUSDT","mode":"live","source":null,"start_t":null,"band":"native"}',
+    );
+  });
+
   it('rewinds the per-session cursors when the stream changes', () => {
     const { sockets, makeConn } = harness();
     const onStream = vi.fn();

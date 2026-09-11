@@ -32,6 +32,13 @@ export interface OverlayFrame {
    * uncached columns (deep history not fetched).
    */
   columnArrays: (col: number) => { bid: Float32Array; ask: Float32Array | null } | null;
+  /**
+   * The SUM-mip level the heatmap paints this frame (0/1/2). The volume profile
+   * samples rows at 4^mipLevel granularity — the same block the heatmap shows —
+   * so it never claims price resolution the display cannot distinguish. Absent
+   * (direct unit tests) means 0 = every row, the exact legacy path.
+   */
+  mipLevel?: number;
 }
 
 /** The overlays a user can toggle; default all on except the profile. */

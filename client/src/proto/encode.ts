@@ -56,21 +56,37 @@ export interface SubscribeInit {
   mode: StreamMode;
   source?: string | null;
   start_t?: bigint | null;
-  /** Price-grid coverage preset ('native' | 'wide' | 'full'). */
+  /** Price-grid coverage preset ('native' | 'wide' | 'full' | 'deep'). */
   band?: string | null;
+  /**
+   * Optional EXCLUSIVE replay-window end (wall-clock ns), contract P6. Mirrors
+   * `events.Subscribe.end_t` (appended LAST there). Omitted from the wire when
+   * null/undefined so an unbounded subscribe stays BYTE-IDENTICAL to the
+   * pre-end_t encoder — the committed `cold_subscribe` golden pins exactly that.
+   * A supplied value is appended after `band`, matching the server struct order
+   * (the client does not send `client_ts_ns`, which sits between them server-side
+   * but is keyed JSON — msgspec decodes by key, so the omitted optional field
+   * decodes to its null default).
+   */
+  end_t?: bigint | null;
 }
 
 export function encodeSubscribe(s: SubscribeInit): Uint8Array {
   // Key order mirrors events.Subscribe: market, symbol, mode, source, start_t,
-  // band (appended LAST there, so the pre-band field order is unchanged).
-  return coldFrame(MsgType.SUBSCRIBE, {
+  // band (appended LAST there, so the pre-band field order is unchanged), then
+  // the optional end_t.
+  const base = {
     market: s.market,
     symbol: s.symbol,
     mode: s.mode,
     source: s.source ?? null,
     start_t: s.start_t ?? null,
     band: s.band ?? null,
-  });
+  };
+  if (s.end_t === undefined || s.end_t === null) {
+    return coldFrame(MsgType.SUBSCRIBE, base);
+  }
+  return coldFrame(MsgType.SUBSCRIBE, { ...base, end_t: s.end_t });
 }
 
 export function encodeUnsubscribe(): Uint8Array {

@@ -26,6 +26,15 @@ export interface ProfileResult {
   max: number;
   /** Absolute row of the POC (max), or -1 when empty. */
   pocRow: number;
+  /**
+   * True when the pass ran with `rowStride > 1`, i.e. the bins are a
+   * one-sample-per-mip-block SUBSAMPLE of the visible volume rather than the
+   * exact per-row sums. The POC readout must be marked approximate in that
+   * case (the block-sum winner can differ from the sampled winner — see the
+   * `accumulateProfile` doc). `stride === 1` is always exact and `sampled`
+   * is false.
+   */
+  sampled: boolean;
 }
 
 /**
@@ -46,6 +55,25 @@ export interface ProfileResult {
  * both a highlight and a printed price, so that would be a confidently wrong
  * quantitative claim. Omit it (the linear grid) and the raw sums are kept
  * bit-for-bit, so uniform-grid bar lengths and the POC row are unchanged.
+ *
+ * `rowStride` (survey #4, the row bound), when > 1, scans only every `stride`-th
+ * row — aligned to absolute grid rows (the first multiple of `stride` at or
+ * above `rowLo`). Callers pass the ACTIVE MIP BLOCK (4^level): at that level the
+ * heatmap already sums each block into one displayed cell, so the sub-block
+ * resolution is below what the display can show. The scanned work is then
+ * bounded by the mip level's own footprint (level 0 can only be selected while
+ * fewer than ~4 rows per device pixel are on screen), collapsing the old
+ * O(cols × grid-rows) pass to O(cols × 4 × viewport-pixels). `rowStride = 1`
+ * (the default) reproduces the legacy full scan bit-for-bit.
+ *
+ * **Honesty contract for stride > 1 (R1-M1).** The bins are a SUBSAMPLE, not
+ * block sums: each sampled row contributes only its own density, while the
+ * heatmap cell behind it is the SUM of its 4^L-row block. Consequently the
+ * sampled `pocRow`/`max` can disagree with the true block-sum POC (e.g. four
+ * quiet rows summing above one sampled loud row). The result therefore carries
+ * `sampled: true` and the overlay labels the POC readout "≈POC"; a precise POC
+ * claim is only made in the exact `stride === 1` pass. Bars keep the sampled
+ * relative shape (they are never presented as exact totals).
  */
 export function accumulateProfile(
   colLo: number,
@@ -55,15 +83,21 @@ export function accumulateProfile(
   getArrays: (col: number) => { bid: Float32Array; ask: Float32Array | null } | null,
   rowWidth?: (row: number) => number,
   out?: Float64Array,
+  rowStride = 1,
 ): ProfileResult {
   const nRows = Math.max(0, rowHi - rowLo + 1);
   const bins = out !== undefined && out.length >= nRows ? out.fill(0, 0, nRows) : new Float64Array(nRows);
+  const stride = Math.max(1, Math.floor(rowStride));
   for (let c = colLo; c <= colHi; c++) {
     const a = getArrays(c);
     if (a === null) continue;
     const { bid, ask } = a;
     const hi = Math.min(rowHi, bid.length - 1);
-    for (let r = Math.max(rowLo, 0); r <= hi; r++) {
+    const lo = Math.max(rowLo, 0);
+    // Absolute-row alignment: absolute rows that are multiples of `stride` are
+    // exactly the mip block starts (block L covers [k·4^L, (k+1)·4^L)).
+    const first = lo + ((stride - (lo % stride)) % stride);
+    for (let r = first; r <= hi; r += stride) {
       bins[r - rowLo] += bid[r] + (ask !== null ? ask[r] : 0);
     }
   }
@@ -84,7 +118,7 @@ export function accumulateProfile(
   // A view of EXACTLY nRows entries: a reused scratch may be longer than this
   // frame's window (the previous frame was taller), and callers iterate
   // `bins.length` when drawing.
-  return { bins: bins.subarray(0, nRows), rowLo, max, pocRow };
+  return { bins: bins.subarray(0, nRows), rowLo, max, pocRow, sampled: stride > 1 };
 }
 
 export interface ProfileOptions {
@@ -116,7 +150,6 @@ export class Profile {
     // Bound the column sweep (wide zoom-out) so the sum stays O(visible).
     const colLo = Math.max(range.lo, range.hi - this.opts.maxCols + 1);
     const colHi = range.hi;
-
     // Visible absolute row band from the view, clamped to the GRID on both ends.
     // The price camera can overscroll a full viewport past either edge (see
     // gl/camera.ts rowCenterBounds), and rows outside [0, rows) hold nothing —
@@ -134,7 +167,13 @@ export class Profile {
     // no width function and keep the raw sums exactly. The scratch buffer makes
     // the per-frame pass allocation-free (rows can only grow so much; the
     // helper regrows internally if the view gets taller).
+    //
+    // Row bound (survey #4): scan at the ACTIVE MIP BLOCK — the same 4^level
+    // block the heatmap collapses into one cell — so the pass never reads price
+    // resolution the display cannot show, and its cost is bounded by the mip
+    // level's own footprint instead of the grid height.
     const scale = gm.price?.scale;
+    const level = Math.max(0, Math.min(2, Math.floor(frame.mipLevel ?? 0)));
     const result = accumulateProfile(
       colLo,
       colHi,
@@ -143,6 +182,7 @@ export class Profile {
       frame.columnArrays,
       scale !== undefined && scale.kind !== 'linear' ? (row) => gm.stepAtRow(row) : undefined,
       this.scratch,
+      4 ** level,
     );
     this.scratch = result.bins;
     this.last = result;
@@ -166,7 +206,9 @@ export class Profile {
     }
     solid.flush();
 
-    // POC price label at the right edge.
+    // POC price label at the right edge. At stride > 1 this is a SUBSAMPLE
+    // maximum (see the accumulateProfile honesty contract) — it is labelled
+    // "≈POC" so the printed price is never presented as an exact claim.
     if (result.pocRow >= 0) {
       const price = gm.rowToPrice(result.pocRow + 0.5);
       // Decimals from the POC row's OWN height — a wing row is worth hundreds
@@ -175,7 +217,8 @@ export class Profile {
       const decimals =
         localStep > 0 ? Math.min(8, Math.max(0, Math.ceil(-Math.log10(localStep)))) : 2;
       const y = gm.cssY(result.pocRow + 0.5);
-      text.badge(cssW - 3, y, `POC ${price.toFixed(decimals)}`, {
+      const prefix = result.sampled ? '≈POC' : 'POC';
+      text.badge(cssW - 3, y, `${prefix} ${price.toFixed(decimals)}`, {
         align: 'right',
         color: OVERLAY.poc.css,
         size: 10,

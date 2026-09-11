@@ -85,6 +85,106 @@ describe('accumulateProfile (volume-by-price over columns)', () => {
   });
 });
 
+describe('accumulateProfile — mip-block row bound (survey #4)', () => {
+  const ROWS = 16;
+
+  /** A uniform background of 1 with a wall at `wallRow` in every column. */
+  function wallGrid(
+    cols: number,
+    wallRow: number,
+    wallVal: number,
+  ): (c: number) => { bid: Float32Array; ask: Float32Array | null } | null {
+    const perCol = new Map<number, { bid: Float32Array; ask: Float32Array | null }>();
+    for (let c = 0; c < cols; c++) {
+      const bid = new Float32Array(ROWS).fill(1);
+      bid[wallRow] = wallVal;
+      perCol.set(c, { bid, ask: null });
+    }
+    return (c) => perCol.get(c) ?? null;
+  }
+
+  it('scans one row per stride and keeps the POC on a block-aligned wall', () => {
+    const get = wallGrid(2, 8, 99); // wall at absolute row 8 = a 4-block start
+    const full = accumulateProfile(0, 1, 0, ROWS - 1, get);
+    expect(full.pocRow).toBe(8);
+    expect(full.max).toBe(2 * 99); // two columns — the wall row (background replaced)
+    expect(full.sampled, 'stride=1 is the exact pass').toBe(false);
+
+    const sampled = accumulateProfile(0, 1, 0, ROWS - 1, get, undefined, undefined, 4);
+    expect(sampled.pocRow).toBe(8); // the max SCANNED cell - the shown profile
+    expect(sampled.max).toBe(2 * 99);
+    expect(sampled.sampled, 'stride>1 is a subsample (R1-M1 honesty flag)').toBe(true);
+    // Unscanned rows stay zero (they are never drawn); the scanned rows are the
+    // absolute 4-block starts.
+    const nonzero = Array.from(sampled.bins)
+      .map((v, i) => (v > 0 ? i : -1))
+      .filter((i) => i >= 0);
+    expect(nonzero).toEqual([0, 4, 8, 12]);
+  });
+
+  it('aligns sampled rows to the ABSOLUTE grid when rowLo is not a multiple', () => {
+    const r = accumulateProfile(0, 0, 2, 9, wallGrid(1, 8, 5), undefined, undefined, 4);
+    // Window [2,9], stride 4 → absolute rows 4 and 8, NOT 2 + k·4.
+    const sampledRows = Array.from(r.bins)
+      .map((v, i) => (v > 0 ? i + 2 : -1))
+      .filter((i) => i >= 0);
+    expect(sampledRows).toEqual([4, 8]);
+  });
+
+  it('bounds scanned cells to ceil(span/stride) per column (cost envelope)', () => {
+    // A read-counting Float32Array proxy: every numeric index read is one cell.
+    let reads = 0;
+    const countingCol = (): { bid: Float32Array; ask: Float32Array | null } => {
+      const bid = new Float32Array(ROWS).fill(1);
+      const proxied = new Proxy(bid, {
+        get(target, prop) {
+          if (typeof prop === 'string' && /^\d+$/.test(prop)) reads += 1;
+          // `target` as the receiver: TypedArray integer-index getters reject a
+          // Proxy receiver, and the test only needs the read COUNT.
+          return Reflect.get(target, prop, target);
+        },
+      }) as unknown as Float32Array;
+      return { bid: proxied, ask: null };
+    };
+
+    reads = 0;
+    accumulateProfile(0, 9, 0, ROWS - 1, countingCol); // 10 cols × 16 rows
+    expect(reads).toBe(160);
+
+    reads = 0;
+    accumulateProfile(0, 9, 0, ROWS - 1, countingCol, undefined, undefined, 4);
+    expect(reads).toBe(40); // 10 cols × 4 block-start samples — the display resolution
+  });
+
+  it('stride=1 (the default) is bit-identical to the historical full scan', () => {
+    const get = wallGrid(3, 7, 42);
+    expect(accumulateProfile(0, 2, 0, ROWS - 1, get, undefined, undefined, 1)).toEqual(
+      accumulateProfile(0, 2, 0, ROWS - 1, get),
+    );
+  });
+
+  it('documents the subsample limit: a quiet block can lose to a sampled loud row (R1-M1)', () => {
+    // Rows 0..3 each density 1 (true 4-row block sum 4); row 4 density 3
+    // (block sum 3). A true block-sum profile would put the POC in the row-0
+    // block; the sampled pass sees row 0 (=1) < row 4 (=3) and reports row 4.
+    // The divergence is exactly why the result is flagged `sampled` and the
+    // overlay prints "≈POC" instead of an exact price claim.
+    const bid = Float32Array.from([1, 1, 1, 1, 3, 0, 0, 0]);
+    const sampled = accumulateProfile(
+      0,
+      0,
+      0,
+      7,
+      () => ({ bid, ask: null }),
+      undefined,
+      undefined,
+      4,
+    );
+    expect(sampled.sampled).toBe(true);
+    expect(sampled.pocRow).toBe(4); // sampled winner, NOT the block-sum winner (0)
+  });
+});
+
 describe('deriveL2Bbo (inside quote from the L2 book)', () => {
   it('picks the highest bid row and lowest ask row', () => {
     const bid = Float32Array.from([1, 2, 0, 0, 0]);

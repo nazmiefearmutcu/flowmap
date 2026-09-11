@@ -445,4 +445,63 @@ describe('encode ↔ decode round-trip (control messages)', () => {
     const encoded = encodeSubscribe({ market: 'crypto', symbol: 'BTCUSDT', mode: 'live', source: 'crypcodile' });
     expect(encoded).toEqual(new Uint8Array(goldenAB('cold_subscribe')));
   });
+
+  // --- P6: the replay window (end_t) ------------------------------------------
+
+  it('Subscribe (end_t replay window survives as bigint; start_t preserved)', () => {
+    const start = T0 + 100n;
+    const end = T0 + 3_600_000_000_000n;
+    const msg = roundTrip(
+      encodeSubscribe({
+        market: 'crypto',
+        symbol: 'BTCUSDT',
+        mode: 'replay',
+        source: null,
+        start_t: start,
+        end_t: end,
+      }),
+    );
+    assertType(msg, MsgType.SUBSCRIBE);
+    expect(msg.start_t).toBe(start);
+    expect(msg.end_t).toBe(end);
+  });
+
+  it('an unbounded Subscribe OMITS end_t entirely (pre-P6 bytes preserved)', () => {
+    const encoded = encodeSubscribe({
+      market: 'crypto',
+      symbol: 'BTCUSDT',
+      mode: 'live',
+      source: 'crypcodile',
+      end_t: null,
+    });
+    const plen = new DataView(encoded.buffer).getUint32(4, true);
+    const payload = new TextDecoder().decode(encoded.subarray(8, 8 + plen));
+    expect(payload).not.toContain('end_t');
+    // The committed golden pins the exact default bytes (asserted above).
+    expect(encoded).toEqual(new Uint8Array(goldenAB('cold_subscribe')));
+  });
+
+  it('encoded end_t Subscribe mirrors the server end_t golden (client_ts_ns omitted)', () => {
+    // Cross-language check: the server's committed golden carries the SAME
+    // field values/order, plus the client_ts_ns optional the client does not
+    // send (msgspec decodes the absent optional key to its null default).
+    const serverGolden = readFileSync(
+      join(GOLDEN_DIR, '..', '..', '..', 'server', 'tests', 'proto', 'golden', 'cold_subscribe_end_t.bin'),
+    );
+    const goldenLen = serverGolden.readUInt32LE(4);
+    const goldenPayload = serverGolden.subarray(8, 8 + goldenLen).toString('utf8');
+
+    const encoded = encodeSubscribe({
+      market: 'crypto',
+      symbol: 'BTCUSDT',
+      mode: 'replay',
+      source: null,
+      start_t: T0,
+      end_t: T0 + 3_600_000_000_000n,
+    });
+    const plen = new DataView(encoded.buffer).getUint32(4, true);
+    const payload = new TextDecoder().decode(encoded.subarray(8, 8 + plen));
+
+    expect(goldenPayload.replace(',"client_ts_ns":null', '')).toBe(payload);
+  });
 });

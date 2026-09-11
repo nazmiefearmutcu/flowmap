@@ -272,6 +272,45 @@ describe('selectLevel — the TIME axis counts (survey #3)', () => {
   });
 });
 
+describe('selectLevel — tick-grouping floor (contract P1)', () => {
+  it('levelFloor=0 (the default) is bit-identical to the pre-P1 selector', () => {
+    for (const rpp of [0.25, 1, 2.5, 4, 8, 64, 4096]) {
+      for (const cpp of [0.5, 1, 3, 16]) {
+        expect(selectLevel(rpp, 2, cpp, 0)).toEqual(selectLevel(rpp, 2, cpp));
+      }
+    }
+  });
+
+  it('lifts the level to the floor while price is zoomed IN', () => {
+    expect(selectLevel(1, 2, 1)).toEqual({ level: 0, blk: 1, nRowTaps: 1 });
+    expect(selectLevel(1, 2, 1, 1)).toEqual({ level: 1, blk: 4, nRowTaps: 1 });
+    expect(selectLevel(1, 2, 1, 2)).toEqual({ level: 2, blk: 16, nRowTaps: 1 });
+  });
+
+  it('never lowers the axis-driven level (the floor is a lower bound)', () => {
+    // Rows already need level 2: a level-1 floor changes nothing.
+    expect(selectLevel(16, 2, 1, 1).level).toBe(2);
+    // The floor composes with a col-driven level the same way.
+    expect(selectLevel(1, 2, 16, 1).level).toBe(2);
+    expect(selectLevel(0.5, 2, 8, 1).level).toBe(1);
+  });
+
+  it('clamps the floor to maxLevel and ignores it with no mip chain', () => {
+    expect(selectLevel(1, 1, 1, 2).level).toBe(1);
+    expect(selectLevel(1, 0, 1, 2)).toEqual({ level: 0, blk: 1, nRowTaps: 1 });
+  });
+
+  it('keeps the row-tap footprint consistent at a forced level', () => {
+    // Forced level 2 with price zoomed in: one 16-row tap, same as if the pixel
+    // had demanded it — intensity/floor semantics do not fork.
+    expect(selectLevel(1, 2, 1, 2)).toEqual({ level: 2, blk: 16, nRowTaps: 1 });
+    // Forced level 1 but the pixel already covers 8 rows → 2 taps of 4.
+    expect(selectLevel(8, 2, 1, 1)).toEqual({ level: 1, blk: 4, nRowTaps: 2 });
+    // Non-finite floors degrade to no floor.
+    expect(selectLevel(1, 2, 1, Number.NaN)).toEqual(selectLevel(1, 2, 1));
+  });
+});
+
 describe('depth channel modes (contract C2) — the intensity chain', () => {
   // A fixed synthetic column: a bid-heavy wall low in the grid, an ask band
   // higher up, mirrored here exactly as the fragment shader computes it.

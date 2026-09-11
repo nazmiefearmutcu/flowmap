@@ -164,11 +164,20 @@ interface LevelSel {
  *
  * `colPerPixel` defaults to 1 so every historical 2-arg call — and every
  * row-driven selection — produces EXACTLY the pre-axis output.
+ *
+ * `levelFloor` (contract P1, tick grouping) is a LOWER BOUND on the chosen
+ * level: `Renderer.setTickGrouping(n)` passes the smallest level whose block
+ * already groups at least `n` rows (`ceil(log4(n))`), so the displayed cell is
+ * 4^level ≥ n rows. The floor is clamped to `maxLevel`; with no mips
+ * (`maxLevel === 0`) it is ignored (there is no coarser texture to sample).
+ * `levelFloor = 0` — the default, and every pre-tickGrouping call — reproduces
+ * the exact previous output.
  */
 export function selectLevel(
   rowsPerPixel: number,
   maxLevel: number,
   colPerPixel = 1,
+  levelFloor = 0,
 ): LevelSel {
   if (maxLevel <= 0) return { level: 0, blk: 1, nRowTaps: 1 };
   const rpp = Number.isFinite(rowsPerPixel) ? rowsPerPixel : 1;
@@ -177,7 +186,10 @@ export function selectLevel(
   // level boundary at exact 4^k footprints no longer rides on log/log rounding.
   const rowLevel = rpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(rpp) / 2)) : 0;
   const colLevel = cpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(cpp) / 2)) : 0;
-  const level = Math.max(0, Math.max(rowLevel, colLevel));
+  const floorLevel = Number.isFinite(levelFloor)
+    ? Math.max(0, Math.min(maxLevel, Math.floor(levelFloor)))
+    : 0;
+  const level = Math.max(floorLevel, Math.max(0, Math.max(rowLevel, colLevel)));
   const blk = 4 ** level;
   const nRowTaps = Math.max(1, Math.min(4, Math.round(rpp / blk)));
   return { level, blk, nRowTaps };
@@ -280,6 +292,17 @@ export class Heatmap {
    * depth never wears the directional bid/ask colors).
    */
   channel = DEPTH_CHANNEL_CODE.sum;
+
+  /**
+   * Tick-grouping floor on the SUM-mip level (contract P1):
+   * `Renderer.setTickGrouping(n)` sets this to the smallest level whose 4^level
+   * block already groups ≥ n rows (`ceil(log4(n))`), clamped to `maxLevel` at
+   * draw time. 0 (the default) is a no-op — every draw selects EXACTLY the
+   * level the pre-tickGrouping code picked. Kept outside {@link encoding}, like
+   * {@link gamma}, so a re-creation on session reset / context restore can
+   * re-apply the user's setting.
+   */
+  levelFloor = 0;
 
   constructor(ctx: GLContext, tileRing: TileRing, lut: WebGLTexture) {
     const gl = ctx.gl;
@@ -424,7 +447,7 @@ export class Heatmap {
     const maxLevel = mips ? mips.maxLevel : 0;
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
     const colsPerPixel = view.colScale / Math.max(1, gl.drawingBufferWidth);
-    const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel);
+    const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel, this.levelFloor);
     gl.uniform1i(this.u.u_level, sel.level);
     gl.uniform1i(this.u.u_blk, sel.blk);
     gl.uniform1i(this.u.u_nRowTaps, sel.nRowTaps);

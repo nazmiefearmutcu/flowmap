@@ -382,6 +382,63 @@ describe('FlowMap store — replay transport', () => {
     expect(store.getState().speed).toBe(1);
     expect(store.getState().paused).toBe(false);
   });
+
+  it('plumbs an optional replay window through connectAndSubscribe (P6)', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    const start = 1_752_710_400_000_000_000n;
+    const end = start + 3_600_000_000_000n;
+
+    store
+      .getState()
+      .connectAndSubscribe('binance-spot', 'BTCUSDT', 'replay', 'native', { startNs: start, endNs: end });
+    // The window is materialized on the subscription identity…
+    expect(store.getState().subscription).toEqual({
+      market: 'binance-spot',
+      symbol: 'BTCUSDT',
+      mode: 'replay',
+      band: 'native',
+      startNs: start,
+      endNs: end,
+    });
+    sockets[0].open();
+    const first = sentMsg(sockets[0].sent[0]);
+    expect(first.type).toBe(MsgType.SUBSCRIBE);
+    const sub = first as Extract<Msg, { type: MsgType.SUBSCRIBE }>;
+    expect(sub.start_t).toBe(start);
+    expect(sub.end_t).toBe(end);
+
+    // A window-only change is a NEW server session: the Hello-asserted fields
+    // are cleared exactly like a symbol switch (the recording slice restarts at
+    // epoch 0 / col_seq 0).
+    sockets[0].deliver(goldenU8('cold_hello'));
+    expect(store.getState().sessionId).toBe('golden-session-0001');
+    store
+      .getState()
+      .connectAndSubscribe('binance-spot', 'BTCUSDT', 'replay', 'native', { startNs: start });
+    expect(store.getState().sessionId).toBeNull();
+    expect(store.getState().subscription).toEqual({
+      market: 'binance-spot',
+      symbol: 'BTCUSDT',
+      mode: 'replay',
+      band: 'native',
+      startNs: start,
+      endNs: null,
+    });
+  });
+
+  it('an unbounded subscribe keeps the exact pre-P6 subscription shape', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT');
+    // No window keys at all (not even nulls) — existing consumers untouched.
+    expect(Object.keys(store.getState().subscription ?? {}).sort()).toEqual([
+      'band',
+      'market',
+      'mode',
+      'symbol',
+    ]);
+  });
 });
 
 // The key App.tsx uses to decide whether a subscription change must tear the GL
@@ -414,6 +471,17 @@ describe('sessionResetKey', () => {
 
   it('is stable for an identical subscription', () => {
     expect(sessionResetKey({ ...sub })).toBe(sessionResetKey(sub));
+  });
+
+  it('changes on a replay WINDOW (P6) but not when no window is set', () => {
+    // An unbounded replay subscription is the SAME grid as today: key unchanged.
+    expect(sessionResetKey({ ...sub, mode: 'replay' })).toBe(sessionResetKey(sub));
+    const start = 1_752_710_400_000_000_000n;
+    // A window is a different recording slice (col_seq restarts) → new key.
+    expect(sessionResetKey({ ...sub, mode: 'replay', startNs: start })).not.toBe(sessionResetKey(sub));
+    expect(sessionResetKey({ ...sub, startNs: start, endNs: start + 1000n })).not.toBe(
+      sessionResetKey({ ...sub, startNs: start }),
+    );
   });
 });
 

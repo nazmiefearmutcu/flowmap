@@ -131,7 +131,7 @@ assertLosslessJsonSupport();
 // enough to be a safe Number — so consumers never hit a number-vs-bigint type
 // mismatch (a small `Marker.ts_ns` as a plain number crashes BigInt64Array
 // writes / `=== …n` comparisons). Keys ending in `_ns` are covered by suffix.
-const NS_KEYS = new Set(['t', 'before_t', 'start_t', 'next_open_ts']);
+const NS_KEYS = new Set(['t', 'before_t', 'start_t', 'end_t', 'next_open_ts']);
 function isNsKey(key: string): boolean {
   // `dt_ns` is an INTERVAL (≈250e6), not an absolute timestamp — it fits a
   // double and the renderer does column-index arithmetic on it as a `number`

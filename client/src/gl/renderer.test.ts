@@ -402,4 +402,189 @@ describe('Renderer (fake GL harness)', () => {
     pump(220);
     expect(norm.mergeCount).toBeGreaterThan(mergesAfterFold);
   });
+
+  // --- campaign 4: tick grouping, prune guard, restore, frame ms, view seam -----
+
+  /** The value of the LAST uniform1i call for a named uniform (GL transcript). */
+  function lastUniform(name: string): unknown {
+    const calls = gl
+      .callsOf('uniform1i')
+      .filter((c) => (c.args[0] as { uniform?: string } | null)?.uniform === name);
+    return calls.length > 0 ? calls[calls.length - 1].args[1] : undefined;
+  }
+
+  /** A 512-row epoch so the mip-capable (rows % 16 === 0) path is active. */
+  function setEpochRows(store: FakeStore, rows: number): void {
+    (store.state as unknown as { epochs: Map<number, Record<string, unknown>> }).epochs.set(0, {
+      epoch: 0,
+      tick: 0.5,
+      tick_multiple: 1,
+      dt_ns: DT_NS,
+      p0: 100,
+      rows,
+    });
+  }
+
+  it('P1: tickGrouping floors the mip level; n=1 restores the natural selection', () => {
+    gl = makeFakeGL({ colorBufferFloat: true }); // mips exist → levels 0/1/2
+    const { r, store } = makeRenderer();
+    setEpochRows(store, 512);
+    store.emit(makeCol(0, true, 512));
+    pump(16);
+    // Default: the natural selection (rowsPerPixel ≈ 2.1 → level 0).
+    expect(r.getTickGrouping()).toBe(1);
+    expect(lastUniform('u_level')).toBe(0);
+    expect(lastUniform('u_blk')).toBe(1);
+
+    // n=4 → the 4-row block; n=16 → the 16-row block.
+    r.setTickGrouping(4);
+    store.emit(makeCol(1, true, 512));
+    pump(32);
+    expect(lastUniform('u_level')).toBe(1);
+    expect(lastUniform('u_blk')).toBe(4);
+
+    r.setTickGrouping(16);
+    store.emit(makeCol(2, true, 512));
+    pump(48);
+    expect(lastUniform('u_level')).toBe(2);
+    expect(lastUniform('u_blk')).toBe(16);
+    expect(r.currentMipLevel).toBe(2);
+
+    // The crosshair reports the TRUE displayed block (group-consistent).
+    r.setViewForTest(0, 64, 0, 512);
+    const px = r.cellToCanvasCss(10, 200);
+    expect(r.probeAt(px.x, px.y)?.group).toBe(16);
+
+    // Non-power-of-4 requests round UP to the next mip block (4^k only): 2 → 4.
+    r.setTickGrouping(2);
+    store.emit(makeCol(3, true, 512));
+    pump(64);
+    expect(lastUniform('u_level')).toBe(1);
+    expect(lastUniform('u_blk')).toBe(4);
+
+    // Clamp + n=1 identity: the coarsest representable block wins (R1-L2).
+    r.setTickGrouping(999);
+    expect(r.getTickGrouping()).toBe(16);
+    r.setTickGrouping(1);
+    store.emit(makeCol(4, true, 512));
+    pump(80);
+    expect(lastUniform('u_level')).toBe(0);
+    expect(lastUniform('u_blk')).toBe(1);
+  });
+
+  it('P1: the tick-grouping floor does NOT suppress history backfill', () => {
+    gl = makeFakeGL({ colorBufferFloat: true });
+    const { r, store } = makeRenderer();
+    setEpochRows(store, 512);
+    for (let s = 0; s < 8; s++) store.emit(makeCol(s, true, 512));
+    pump(16);
+    // `history` is private; a spy on ensureVisible is the only way to observe
+    // the O(1) backfill gate's level argument.
+    const hist = (
+      r as unknown as { history: { ensureVisible: (v: { level: number }) => void } }
+    ).history;
+    const ensure = vi.spyOn(hist, 'ensureVisible');
+
+    r.setTickGrouping(16); // display level 2
+    r.setViewForTest(0, 64, 0, 512); // natural level 0 (rowsPerPixel ≈ 2.1)
+    pump(32);
+
+    expect(ensure).toHaveBeenCalled();
+    const lastCall = ensure.mock.calls[ensure.mock.calls.length - 1][0];
+    // The gate tracks the NATURAL zoom level, not the forced display block: a
+    // grouped view still needs resident columns for the crosshair/profile and
+    // for its own mip generation.
+    expect(lastCall.level).toBe(0);
+    // …while the display (and probeAt) really are at the forced level.
+    expect(r.currentMipLevel).toBe(2);
+  });
+
+  it('B-2: overlay prune is skipped until the window edge moves beyond the pad', () => {
+    const { r, store } = makeRenderer();
+    const overlays = (r as unknown as { overlays: { prune: (...a: number[]) => void } }).overlays;
+    const spy = vi.spyOn(overlays, 'prune');
+
+    store.emit(makeCol(0, true));
+    expect(spy).toHaveBeenCalledTimes(1); // first window: one sweep
+
+    // The forming edge re-sends the SAME column: the window is static → skip.
+    for (let i = 0; i < 40; i++) store.emit(makeCol(0, false));
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // Slide the newest edge past the pad (64) → exactly one more sweep.
+    for (let s = 1; s <= 65; s++) store.emit(makeCol(s, true));
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[1][2]).toBe(64); // the pad is passed explicitly
+  });
+
+  it('B-4: context restore keeps the user follow intent instead of re-arming it', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    pump(16);
+
+    r.setFollowTime(false);
+    pump(32);
+    expect(r.following).toBe(false);
+    expect(r.priceFollow).toBe('track'); // time release promotes fit → track
+
+    // The webglcontextrestored handler (private; e2e drives it via loseContextForTest).
+    (r as unknown as { onContextRestored(): void }).onContextRestored();
+    expect(r.contextRestoredCount).toBe(1);
+    // Before the fix this was silently true again while the UI showed OFF.
+    expect(r.following).toBe(false);
+    expect(r.priceFollow).toBe('track');
+  });
+
+  it('B-5: stats().frameMs measures the FULL frame — the overlay pass included', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+    const overlays = (r as unknown as { overlays: { draw: (ctx: unknown) => void } }).overlays;
+    const drawSpy = vi.spyOn(overlays, 'draw');
+
+    let reads = 0;
+    let overlaysDrawnBySpanEnd = false;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+      reads += 1;
+      if (reads === 1) return 1000; // t0
+      // The span END read: the overlay pass must already have run for the HUD
+      // sample to include it (reverting to the old order makes this false).
+      overlaysDrawnBySpanEnd = drawSpy.mock.calls.length > 0;
+      return 1007;
+    });
+    pump(16);
+    nowSpy.mockRestore();
+
+    expect(drawSpy).toHaveBeenCalled(); // overlays actually drew
+    expect(overlaysDrawnBySpanEnd).toBe(true);
+    expect(r.stats().frameMs).toBeCloseTo(7, 5); // the whole frame, not just the heatmap
+  });
+
+  it('stretch: onViewChanged fires on camera moves, isolates throws, unsubscribes', () => {
+    const { r, store } = makeRenderer();
+    store.emit(makeCol(0, true));
+
+    let fired = 0;
+    const off = r.onViewChanged(() => {
+      fired += 1;
+    });
+    r.panColumnsForTest(-5);
+    expect(fired).toBe(1);
+    r.setViewForTest(0, 32, 0, 32);
+    expect(fired).toBe(2);
+
+    off();
+    r.panColumnsForTest(-5);
+    expect(fired).toBe(2);
+
+    // A throwing listener is warned once and never breaks the camera move.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const off2 = r.onViewChanged(() => {
+      throw new Error('bad listener');
+    });
+    expect(() => r.panColumnsForTest(-5)).not.toThrow();
+    r.panColumnsForTest(-5);
+    expect(warn).toHaveBeenCalledTimes(1); // report-once guard
+    off2();
+    warn.mockRestore();
+  });
 });

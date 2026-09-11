@@ -253,19 +253,6 @@ describe('paged pool — lazy per-page allocation (fix 2026-09-10 F1-1)', () => 
   });
 });
 
-describe('prune to the resident window', () => {
-  it('drops columns outside [oldest - pad, newest + pad]', () => {
-    const c = new ColumnCache({ capacity: 100 });
-    for (let s = 0; s < 20; s++) c.put(s, new Float32Array([s]), null, BigInt(s));
-    c.prune(5, 12, 1); // keep [4, 13]
-    expect(c.has(3)).toBe(false);
-    expect(c.has(4)).toBe(true);
-    expect(c.has(13)).toBe(true);
-    expect(c.has(14)).toBe(false);
-    expect(c.size).toBe(10); // cols 4..13
-  });
-});
-
 describe('reset', () => {
   it('empties the cache and releases the pool (session switch re-allocates)', () => {
     const c = new ColumnCache();

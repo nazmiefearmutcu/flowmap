@@ -145,6 +145,19 @@ export interface ConnectionOptions extends ConnectionHandlers {
   historyTimeoutMs?: number;
 }
 
+/**
+ * OPTIONAL replay subscribe window (contract P6; server `Subscribe.start_t` /
+ * `Subscribe.end_t`). `startNs` is inclusive, `endNs` EXCLUSIVE. Both default to
+ * null → the pre-P6 unbounded subscribe (today's behavior, byte-identical on
+ * the wire). The window is part of the stream's IDENTITY: changing it detects
+ * as a new server session (Unsubscribe → Subscribe, cursors reset), because the
+ * server builds a different recording slice whose grid restarts at epoch 0.
+ */
+export interface SubscribeWindow {
+  startNs?: bigint | null;
+  endNs?: bigint | null;
+}
+
 interface Subscription {
   market: string;
   symbol: string;
@@ -152,6 +165,9 @@ interface Subscription {
   /** Server price-grid coverage preset — part of the stream's IDENTITY, since
    *  it changes the grid geometry the columns arrive in. */
   band: string;
+  /** Replay window (P6): part of the identity, nullable for "unbounded". */
+  startNs: bigint | null;
+  endNs: bigint | null;
 }
 
 interface HistoryWaiter {
@@ -176,7 +192,9 @@ function sameSub(a: Subscription, b: Subscription): boolean {
     a.market === b.market &&
     a.symbol === b.symbol &&
     a.mode === b.mode &&
-    a.band === b.band
+    a.band === b.band &&
+    a.startNs === b.startNs &&
+    a.endNs === b.endNs
   );
 }
 
@@ -288,14 +306,25 @@ export class Connection {
    * Set the desired subscription. If the socket is open the swap happens now
    * (Unsubscribe → Subscribe when it differs); otherwise it is sent on the next
    * open. Connects automatically when there is no socket yet.
+   *
+   * `window` (contract P6) narrows a replay subscription to `[startNs, endNs)`;
+   * omitted/null keeps the unbounded behavior and the byte-identical wire form.
    */
   subscribe(
     market: string,
     symbol: string,
     mode: StreamMode = 'live',
     band = 'native',
+    window?: SubscribeWindow,
   ): void {
-    const next: Subscription = { market, symbol, mode, band };
+    const next: Subscription = {
+      market,
+      symbol,
+      mode,
+      band,
+      startNs: window?.startNs ?? null,
+      endNs: window?.endNs ?? null,
+    };
     // A different stream is a different SERVER session, and this is the only
     // place that knows it: reconnects re-enter through sendSubscribe(), where a
     // rewind would be WRONG (same session, and the cursor is exactly what
@@ -573,8 +602,9 @@ export class Connection {
         symbol: next.symbol,
         mode: next.mode,
         source: null,
-        start_t: null,
+        start_t: next.startNs,
         band: next.band,
+        end_t: next.endNs,
       }),
     );
     this.activeSub = next;

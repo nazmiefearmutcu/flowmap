@@ -44,6 +44,14 @@ export interface FlowmapTestApi {
   residentRange(): ResidentRange | null;
   /** The SUM-mip level the current view+canvas would sample (T7 diagnostics). */
   levelInfo(): { rowsPerPixel: number; level: number; blk: number; nRowTaps: number };
+  /**
+   * Set the tick-grouping mip floor (contract P1; campaign 4) on the hook's
+   * Heatmap: 0 = off, 1 = 4-row cells, 2 = 16-row cells (clamped to the chain).
+   * Lets the e2e lane pixel-probe that a forced level actually SUMS rows.
+   */
+  setLevelFloor(levelFloor: number): void;
+  /** `levelInfo` evaluated WITH a candidate floor (no mutation). */
+  levelInfoWithFloor(levelFloor: number): { rowsPerPixel: number; level: number; blk: number; nRowTaps: number };
   dispose(): void;
 }
 
@@ -147,6 +155,19 @@ export function installHeatmapTestHook(canvas: HTMLCanvasElement): void {
       const maxLevel = state.mips ? state.mips.maxLevel : 0;
       const rowsPerPixel = state.view.rowScale / Math.max(1, state.ctx.gl.drawingBufferHeight);
       return { rowsPerPixel, ...selectLevel(rowsPerPixel, maxLevel) };
+    },
+
+    setLevelFloor(levelFloor) {
+      if (!state) throw new Error('__flowmapTest: init() first');
+      const maxLevel = state.mips ? state.mips.maxLevel : 0;
+      state.heatmap.levelFloor = Math.max(0, Math.min(maxLevel, Math.floor(levelFloor) || 0));
+    },
+
+    levelInfoWithFloor(levelFloor) {
+      if (!state) throw new Error('__flowmapTest: init() first');
+      const maxLevel = state.mips ? state.mips.maxLevel : 0;
+      const rowsPerPixel = state.view.rowScale / Math.max(1, state.ctx.gl.drawingBufferHeight);
+      return { rowsPerPixel, ...selectLevel(rowsPerPixel, maxLevel, 1, levelFloor) };
     },
 
     dispose() {

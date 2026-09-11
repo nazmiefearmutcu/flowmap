@@ -214,6 +214,13 @@ export interface Subscribe {
   start_t: bigint | null;
   /** Server price-grid coverage preset ('native' | 'wide' | 'full' | 'deep'); null = server default. */
   band: string | null;
+  /**
+   * Exclusive replay-window end (ns), or null when unbounded. Optional on the
+   * wire: a payload from a pre-end_t client omits the key entirely and this
+   * decodes to `undefined` at runtime (the loose cold-JSON spread), which every
+   * consumer must treat exactly like null.
+   */
+  end_t?: bigint | null;
 }
 
 export interface Unsubscribe {

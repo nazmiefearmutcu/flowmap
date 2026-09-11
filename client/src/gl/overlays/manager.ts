@@ -49,6 +49,12 @@ export interface OverlayDrawContext {
   columnArrays: (col: number) => { bid: Float32Array; ask: Float32Array | null } | null;
   /** Newest column's book (for the L2-derived BBO fallback), or null. */
   newestArrays: { bid: Float32Array; ask: Float32Array | null } | null;
+  /**
+   * The SUM-mip level the heatmap paints this frame (tick-grouping floor
+   * included). The profile samples rows at 4^level granularity so it never
+   * out-resolves the cells behind it. Optional for direct unit tests: absent = 0.
+   */
+  mipLevel?: number;
 }
 
 export class OverlayManager {
@@ -225,6 +231,7 @@ export class OverlayManager {
     resident: null,
     capability: null,
     columnArrays: null as unknown as OverlayFrame['columnArrays'],
+    mipLevel: 0,
   };
   private readonly badgeOpts: Array<{ align: 'left' | 'right'; color: string; size: number; bg: string }> = [
     { align: 'left', color: '', size: 9, bg: OVERLAY.badgeBg },
@@ -240,6 +247,7 @@ export class OverlayManager {
     frame.resident = ctx.resident;
     frame.capability = ctx.capability;
     frame.columnArrays = ctx.columnArrays;
+    frame.mipLevel = ctx.mipLevel ?? 0;
 
     // Text layer: size to the viewport, clear once, draw faint gridlines behind.
     this.text.syncSize(ctx.dims.cssW, ctx.dims.cssH, ctx.dpr);
