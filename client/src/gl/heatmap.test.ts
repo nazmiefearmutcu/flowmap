@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_CONTRAST,
+  DEFAULT_DISPLAY_GAMMA,
   DEFAULT_TOLERANCE,
   DEFAULT_DEPTH_CHANNEL,
   DEPTH_CHANNEL_CODE,
@@ -114,8 +115,8 @@ describe('the black-point remap the fragment shader applies', () => {
 
 describe('gammaForContrast', () => {
   it('spans the legible band', () => {
-    expect(gammaForContrast(0)).toBeCloseTo(0.28, 12);
-    expect(gammaForContrast(100)).toBeCloseTo(0.72, 12);
+    expect(gammaForContrast(0)).toBeCloseTo(0.5, 12);
+    expect(gammaForContrast(100)).toBeCloseTo(1.4, 12);
   });
 
   it('is monotonic and clamps out-of-range input', () => {
@@ -124,13 +125,15 @@ describe('gammaForContrast', () => {
     expect(gammaForContrast(500)).toBe(gammaForContrast(100));
   });
 
-  it('puts the default slider position inside the band', () => {
-    // NOTE deliberately NOT asserted equal to DEFAULT_DISPLAY_GAMMA: the real
-    // value is 0.456, not 0.45. The module docblock used to claim otherwise.
+  it('puts the default slider position at the dark-field default', () => {
+    // Campaign 4.1 (Bookmap-class look): the default flips from a LIFTING
+    // curve (0.456 — small orders painted mid-ramp = rainbow barcode) to a
+    // dark-field curve, pinned equal to DEFAULT_DISPLAY_GAMMA.
     const g = gammaForContrast(DEFAULT_CONTRAST);
-    expect(g).toBeGreaterThan(0.28);
-    expect(g).toBeLessThan(0.72);
-    expect(g).toBeCloseTo(0.456, 6);
+    expect(g).toBeGreaterThan(0.5);
+    expect(g).toBeLessThan(1.4);
+    expect(g).toBeCloseTo(0.86, 6);
+    expect(g).toBeCloseTo(DEFAULT_DISPLAY_GAMMA, 6);
   });
 });
 
@@ -181,13 +184,17 @@ describe('default visibility — the boxed heatmap must show the field, not just
     expect(after).toBeGreaterThan(before * 2);
   });
 
-  it('lifts the median cell off background while the bottom quartile stays suppressed', () => {
+  it('keeps the median a dark visible indigo while the bottom quartile stays suppressed', () => {
     const floor = floorForTolerance(DEFAULT_TOLERANCE);
     const gamma = gammaForContrast(DEFAULT_CONTRAST);
     const medianLut = lut(cell(0), P97, floor, gamma);
     const lowLut = lut(cell(-0.6745), P97, floor, gamma); // 25th percentile
-    expect(medianLut).toBeGreaterThanOrEqual(40); // ≈LUT 51 — visible dark indigo
-    expect(lowLut).toBeLessThanOrEqual(15); // ≈LUT 10 — still ~background
+    // Campaign 4.1 dark-field default: the median active cell paints in the
+    // DARK head of the ramp (≈LUT 13) — visible structure, not confetti. The
+    // old lifting curve painted it at ≈LUT 51 (bright indigo => barcode).
+    expect(medianLut).toBeGreaterThanOrEqual(8);
+    expect(medianLut).toBeLessThanOrEqual(30);
+    expect(lowLut).toBeLessThanOrEqual(15); // still ≈background
     // Pre-fix regression pin: with floor ≈0.06 + p99 the median maps to LUT 0.
     expect(lut(cell(0), P99, floorForTolerance(15), gamma)).toBe(0);
   });
@@ -229,8 +236,16 @@ describe('selectLevel (SUM-mip selection) — unchanged by the tolerance work', 
     // far past where log/log drifting could bite (level 4+ = 256+ rows/px).
     for (let k = 0; k <= 13; k++) {
       expect(selectLevel(4 ** k, 16).level).toBe(k);
-      expect(selectLevel(4 ** k - 1, 16).level).toBe(Math.max(0, k - 1));
     }
+    for (let k = 2; k <= 13; k++) {
+      expect(selectLevel(4 ** k - 1, 16).level).toBe(k - 1);
+    }
+    // Campaign-4.1: the ROW axis reaches level 1 at rpp ≥ 2.5 (footprint
+    // smoothing on the SUM mip instead of an aliasing level-0 single sample).
+    expect(selectLevel(2.4, 16).level).toBe(0);
+    expect(selectLevel(2.5, 16).level).toBe(1);
+    expect(selectLevel(3, 16).level).toBe(1);
+    expect(selectLevel(3.99, 16).level).toBe(1);
   });
 });
 

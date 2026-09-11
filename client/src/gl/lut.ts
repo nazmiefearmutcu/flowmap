@@ -136,30 +136,34 @@ const SYNTH_STOPS: Stop[] = [
   { t: 1.0, rgb: [255, 240, 200] },
 ];
 
-// Flow (the DEFAULT ramp): a restrained "deep water" thermal — near-black slate
-// → dark navy → deep teal → sage → sand → bright gold. Designed against the two
-// failure modes that made the old default read as "colour soup":
-//   1. The field stays DARK and DESATURATED through its lower half — the median
-//      resting cell (a few % of the p97 white point, gamma-lifted into the
-//      mid-ramp) lands in quiet slate/teal instead of inferno's loud
-//      violet/magenta, so the ladder no longer screams at baseline.
-//   2. Warmth is EARNED: hue only turns warm in the top ~28% of the ramp, so a
-//      sand/gold pixel is unambiguous density signal, not ambient noise.
-// Rec.601 luma at the stops: 8.3 → 26.1 → 44.5 → 63.9 → 86.9 → 126.9 → 170.6 →
-// 209.6 — strictly increasing, so the rasterized ramp is luminance-monotone.
-// The endpoint is bright gold (blue-starved, luma > 200, never white), so the
-// e2e "wall is bright gold, distinct from the white price line" contract still
-// holds, and the low half stays COOL (B ≥ G up to index ≈147) keeping the §7
-// cool-pixel probe sound exactly like inferno's band did.
+// Flow (the DEFAULT ramp) — the Bookmap-class "aurora" thermal (campaign 4.1):
+// near-black slate → deep navy → blue → indigo → violet → magenta-orange →
+// amber → gold. Redesigned against what the previous teal/sage ramp still got
+// wrong on real crypto books:
+//   1. The cool head is BLUE/INDIGO (no green): teal lines over a dark field
+//      read as cheap phosphor; blue-violet is the ordered-book vocabulary
+//      traders already know from Bookmap.
+//   2. The field stays DARK through its lower ~55% — with the dark-field gamma
+//      default (gl/heatmap DEFAULT_DISPLAY_GAMMA ≈ 0.86) the median resting
+//      cell paints in the near-black head, so the ladder does not scream.
+//   3. Warmth is EARNED and arrives FAST: hue crosses from violet to amber
+//      between index ≈146 and ≈152, so an orange/gold pixel is unambiguous
+//      "size worth reading", not ambient noise.
+// Rec.601 luma at the stops: 7.8 → 22.9 → 47.8 → 63.2 → 100.1 → 141.7 →
+// 179.2 → 218.5 — strictly increasing, so the rasterized ramp is
+// luminance-monotone. The endpoint is bright gold (blue-starved, luma > 200,
+// never white), so the e2e "wall is bright gold, distinct from the white price
+// line" contract still holds; the low half stays COOL (B ≥ G) through index
+// 146, so the §7 synthetic-depth cool-pixel probe stays sound.
 const FLOW_STOPS: Stop[] = [
   { t: 0.0, rgb: [5, 8, 14] },
-  { t: 0.14, rgb: [17, 27, 43] },
-  { t: 0.3, rgb: [25, 48, 68] },
-  { t: 0.46, rgb: [26, 74, 88] },
-  { t: 0.6, rgb: [43, 104, 101] },
-  { t: 0.72, rgb: [112, 138, 104] },
-  { t: 0.85, rgb: [210, 172, 82] },
-  { t: 1.0, rgb: [255, 216, 104] },
+  { t: 0.16, rgb: [10, 22, 60] },
+  { t: 0.34, rgb: [20, 48, 120] },
+  { t: 0.5, rgb: [60, 48, 150] },
+  { t: 0.55, rgb: [160, 60, 150] },
+  { t: 0.59, rgb: [232, 112, 58] },
+  { t: 0.8, rgb: [250, 170, 40] },
+  { t: 1.0, rgb: [255, 225, 90] },
 ];
 
 // Imbalance (the DIVERGENT row): signed order-flow imbalance d=(bid−ask)/(bid+ask)

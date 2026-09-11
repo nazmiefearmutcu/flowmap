@@ -187,13 +187,13 @@ test('SUM-mips keep a liquidity wall bright when zoomed out (not diluted ~1/16)'
   // The wall is genuinely bright at native zoom (baseline). The display path
   // samples the field with row-bilinear interpolation, and this wall is ONE row:
   // the brightest pixel straddles the wall row and its zero neighbour, landing
-  // at ~0.5 × wall density → t ≈ 0.375 of NORM → the sage/sand mid-ramp
-  // (~149 luma on the flow ramp). That is the energy-preserving spread of the
-  // wall over its 2 device pixels, not dilution — the SUM assertions below
-  // compare against THIS measured native brightness, so the invariant (zoomed
-  // ≥ 0.8 × native) is unchanged. The threshold only has to separate the wall
-  // from the average-mip control (~11 luma, near the black floor).
-  expect(bNative, `native wall luma ${bNative.toFixed(1)}`).toBeGreaterThan(100);
+  // at ~0.5 × wall density → t ≈ 0.375 of NORM → the aurora ramp's BLUE/INDIGO
+  // head (campaign 4.1: ~98 luma measured at this probe). That is the
+  // energy-preserving spread of the wall over its 2 device pixels, not dilution
+  // — the SUM assertions below compare against THIS measured native brightness,
+  // so the invariant (zoomed ≥ 0.8 × native) is unchanged. The absolute floor
+  // only has to separate the wall from the average-mip control (~11 luma).
+  expect(bNative, `native wall luma ${bNative.toFixed(1)}`).toBeGreaterThan(60);
 
   // THE POINT: zoomed out the wall stays bright — SUM-preserved, not ~1/16.
   expect(

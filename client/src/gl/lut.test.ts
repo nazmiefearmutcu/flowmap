@@ -180,9 +180,13 @@ describe('flow LUT (the default ramp)', () => {
   });
 
   it('earns its warmth: hue turns warm only in the top of the ramp', () => {
-    // Just below the crossover the pixel is still green-dominant-over-red.
-    expect(lut[178 * 4 + 1]).toBeGreaterThan(lut[178 * 4]);
-    // At the sand stop it is unmistakably warm: red over green over blue.
+    // Campaign 4.1: the crossover moved earlier (≈index 147) — below it the
+    // band is pinned COOL by the probe test above; at 178 the pixel must be
+    // unmistakably warm already (the old ramp was still sage there).
+    const [r178, g178, b178] = rgb(lut, 178);
+    expect(r178).toBeGreaterThan(g178); // warm by 178
+    expect(g178).toBeGreaterThan(b178);
+    // At the amber stop it is unmistakably warm: red over green over blue.
     const [r, g, b] = rgb(lut, 224);
     expect(r).toBeGreaterThan(200);
     expect(g).toBeGreaterThan(170);
@@ -431,10 +435,10 @@ describe('atlas golden bytes — rows 0..3 are BIT-IDENTICAL to pre-channel rele
       '255,228,32,255', '255,228,32,255',
     ],
     row3: [
-      '5,8,14,255', '5,9,15,255', '10,17,27,255', '16,25,40,255', '23,42,60,255',
-      '25,60,78,255', '31,83,92,255', '40,99,99,255', '42,101,100,255',
-      '59,112,102,255', '137,147,98,255', '219,180,86,255', '237,199,95,255',
-      '254,215,103,255', '255,216,104,255',
+      '5,8,14,255', '5,8,15,255', '7,13,32,255', '9,19,50,255', '15,35,90,255',
+      '29,48,127,255', '64,48,150,255', '208,94,89,255', '229,110,62,255',
+      '235,122,55,255', '246,157,44,255', '252,192,60,255', '254,209,75,255',
+      '255,224,89,255', '255,225,90,255',
     ],
   };
   const SAMPLES = [0, 1, 16, 32, 64, 96, 128, 147, 150, 160, 192, 224, 240, 254, 255];

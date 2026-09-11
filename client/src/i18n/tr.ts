@@ -36,7 +36,7 @@ export const tr: Record<string, string> = {
     'Flow alanı koyu tutar, duvarlar sıcak altın tonunu kazanır; Inferno büyüklüğü renk tonuyla ayırır (çivit → kırmızı → altın); Classic eski mavi→camgöbeği→sarı rampasıdır. Sentetik derinlik her zaman amber kalır.',
   'settings.contrast': 'Kontrast',
   'settings.contrastHint':
-    'Orta yoğunluk alanını en parlak duvarlara göre yükseltir — yükseldikçe daha vurucu olur.',
+    'Orta yoğunluk alanını en parlak duvarlara göre karartır — yükseldikçe daha vurucu olur.',
   'settings.tolerance': 'Tolerans',
   'settings.toleranceHint':
     'Siyah noktası: görünümün yoğunluk yüzdelik diliminin bu payının altındaki hücreleri gizler; böylece yalnızca okunmaya değer likidite boyanır. Sabit bir lot büyüklüğüne değil, ekranda olana görecelidir.',

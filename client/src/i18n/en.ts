@@ -39,7 +39,7 @@ export const en: Record<string, string> = {
   'settings.colormapHint':
     'Flow keeps the field dark and lets walls earn warm gold; Inferno separates size by hue (indigo → red → gold); Classic is the legacy blue→cyan→yellow ramp. Synthetic depth always stays amber.',
   'settings.contrast': 'Contrast',
-  'settings.contrastHint': 'Lifts the mid-density field vs. the brightest walls — higher is punchier.',
+  'settings.contrastHint': 'Darkens the mid-density field against the brightest walls — higher is punchier.',
   'settings.tolerance': 'Tolerance',
   'settings.toleranceHint':
     'Black point: hides cells below this share of the viewport’s density percentile, so only liquidity worth reading paints. It is relative to what is on screen, not a fixed lot size.',

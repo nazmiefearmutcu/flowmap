@@ -91,14 +91,16 @@ test('level-0 field renders the FULL resident window — no fade past tile layer
 
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(' | ')}`).toEqual([]);
   // EVERY probed column across all four tile layers renders at wall brightness —
-  // including the very last column (the blank-strip failure mode reads ~2.7).
+  // including the very last column (the blank-strip failure mode reads ~2.7
+  // luma; the campaign-4.1 dark-field default maps this probe's wall into the
+  // blue/indigo head, so the floor is 60 rather than the old 100).
   for (const [label, luma] of Object.entries({
     left: result.left,
     mid: result.mid,
     nearEnd: result.nearEnd,
     last: result.last,
   })) {
-    expect(luma, `${label} column wall luma`).toBeGreaterThan(100);
+    expect(luma, `${label} column wall luma`).toBeGreaterThan(60);
   }
   // And they agree within noise — column position must not affect brightness.
   expect(Math.abs(result.last - result.left)).toBeLessThan(5);

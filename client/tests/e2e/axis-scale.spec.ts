@@ -134,6 +134,10 @@ test('§9 price gutter scales price like TradingView, and never touches time', a
     .toBeLessThan(1e-6);
 
   // --- (d) a plain click does not scale and does not claim the axis ----------
+  // Re-settle immediately before the measured gestures: the eager history
+  // backfill lands in batches and can widen colScale on its own mid-gesture
+  // (same race the earlier settles guard — this one bit under full-suite load).
+  await settleTimeFrame(page);
   const preClick = await view(page);
   await page.mouse.move(cx, cy);
   await page.mouse.down();
@@ -143,6 +147,7 @@ test('§9 price gutter scales price like TradingView, and never touches time', a
   expect((await follow(page)).priceFollow, 'a click never claims the axis').toBe('track');
 
   // --- (c) a vertical drag scales price, leaving time alone ------------------
+  await settleTimeFrame(page);
   const preDrag = await view(page);
   await page.mouse.move(cx, cy - 60);
   await page.mouse.down();

@@ -209,7 +209,11 @@ void main() {
 
   vec2 acc;
   if (u_level == 0) {
-    // Smooth continuous field (see sampleField0).
+    // Smooth continuous field (see sampleField0). The 2-4 rows/pixel band is
+    // handled one level up (selectLevel switches to the 4-row SUM mip at
+    // rpp >= 2.5) precisely so this path stays the CHEAP single-pass sampler —
+    // a per-pixel multi-tap sum here measurably blew the SwiftShader §10 draw
+    // budget while the mip gives the same smoothing for one texel fetch.
     acc = sampleField0(colf, rowf);
   } else {
     // Zoomed out: exact SUM path over the coarse level (unchanged).

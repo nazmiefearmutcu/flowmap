@@ -57,25 +57,29 @@ const MIP1_UNIT = 2;
 const MIP2_UNIT = 3;
 
 /**
- * Default perceptual display gamma (§8.3). Order-flow density is heavy-tailed;
- * a linear tone map buries the mid-field in the near-black ramp floor. ~0.45
- * lifts the mids while fixing black/white, making the continuous thermal field
- * legible (the settings drawer can override this — see the "Contrast" control).
+ * Default perceptual display gamma (§8.3). Order-flow density is heavy-tailed:
+ * the median active cell is a few percent of the viewport white point while
+ * walls sit at 10-100×. A LIFTING curve (~0.45) paints every one of those
+ * small orders at mid-ramp brightness and the field reads as a rainbow
+ * barcode; the Bookmap-class default therefore sits at ~0.86, which keeps the
+ * small sizes near the dark head of the ramp and reserves the warm top for
+ * size worth reading. Walls and the white point stay pinned (pow fixes both
+ * ends). The settings drawer can override this — see the "Contrast" control.
+ * Pinned equal to gammaForContrast(DEFAULT_CONTRAST) by the tests.
  */
-export const DEFAULT_DISPLAY_GAMMA = 0.45;
+export const DEFAULT_DISPLAY_GAMMA = 0.86;
 
 /**
  * Map a 0–100 "Contrast" slider to a display gamma. HIGHER contrast → HIGHER
  * gamma → a darker mid-field with punchier walls (more separation); LOWER
  * contrast → lower gamma → the field is lifted flat/bright (washed, less
- * separation). The default ({@link DEFAULT_CONTRAST}) lands on 0.456 — CLOSE to
- * but not equal to {@link DEFAULT_DISPLAY_GAMMA}; the two are independent
- * defaults and the identity is deliberately not asserted anywhere. Clamped to
- * the legible band [0.28, 0.72].
+ * separation). The default ({@link DEFAULT_CONTRAST}) lands on 0.86 — the
+ * Bookmap-class dark-field default (see {@link DEFAULT_DISPLAY_GAMMA}).
+ * Clamped to the legible band [0.5, 1.4].
  */
 export function gammaForContrast(contrast: number): number {
   const c = Math.min(100, Math.max(0, contrast));
-  return 0.28 + (c / 100) * 0.44;
+  return 0.5 + (c / 100) * 0.9;
 }
 
 /** Slider position (0–100) whose gamma equals the default — the reset point. */
@@ -184,7 +188,14 @@ export function selectLevel(
   const cpp = Number.isFinite(colPerPixel) ? colPerPixel : 1;
   // log4 via log2/2: Math.log2 is exact for powers of two on V8, so the
   // level boundary at exact 4^k footprints no longer rides on log/log rounding.
-  const rowLevel = rpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(rpp) / 2)) : 0;
+  //
+  // Campaign 4.1: the ROW axis switches to the 4-row SUM mip at rpp >= 2.5.
+  // The old floor-at-4 left a 2-4 rows/pixel band on the level-0 single-row
+  // sampler, which aliased into a hard per-price "barcode" on real books; the
+  // mip gives the same footprint smoothing for ONE texel fetch, whereas a
+  // per-pixel multi-tap sum measured over the §10 SwiftShader draw budget.
+  // Below 2.5 the level-0 bilinear field is smooth (several pixels per row).
+  const rowLevel = rpp >= 2.5 ? Math.max(1, Math.min(maxLevel, Math.floor(Math.log2(rpp) / 2))) : 0;
   const colLevel = cpp > 1 ? Math.min(maxLevel, Math.floor(Math.log2(cpp) / 2)) : 0;
   const floorLevel = Number.isFinite(levelFloor)
     ? Math.max(0, Math.min(maxLevel, Math.floor(levelFloor)))
