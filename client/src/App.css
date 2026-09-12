@@ -1153,6 +1153,17 @@ body,
   border-bottom: 1px solid var(--line-soft);
 }
 
+/* Row rhythm: a barely-there zebra band (theme ink at 3.5%) plus no divider on
+   the last rung, so the rungs read as a ladder instead of a grid. The best-quote
+   rules below overpaint the band with their own wash. */
+.ladder__row:nth-child(even) {
+  background-color: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+.ladder__row:last-child {
+  border-bottom-color: transparent;
+}
+
 .ladder__cell {
   position: relative;
   display: flex;
@@ -1179,12 +1190,18 @@ body,
 
 .ladder__bar--bid {
   right: 0;
-  background: var(--bid-bar);
+  /* Depth: the price-adjacent anchor edge sits slightly deeper than the tip,
+     derived from the SAME bar token (hue untouched) by layering it on itself. */
+  background:
+    linear-gradient(to left, color-mix(in srgb, var(--bid-bar) 45%, transparent), transparent),
+    var(--bid-bar);
 }
 
 .ladder__bar--ask {
   left: 0;
-  background: var(--ask-bar);
+  background:
+    linear-gradient(to right, color-mix(in srgb, var(--ask-bar) 45%, transparent), transparent),
+    var(--ask-bar);
 }
 
 .ladder__bar--profile {
@@ -1229,7 +1246,10 @@ body,
 }
 
 .ladder__row.is-bestbid {
-  background: rgba(31, 182, 166, 0.08);
+  background: rgba(31, 182, 166, 0.11);
+  box-shadow:
+    inset 0 1px 0 rgba(31, 182, 166, 0.30),
+    inset 0 -1px 0 rgba(31, 182, 166, 0.30);
 }
 
 .ladder__row.is-bestbid .ladder__px {
@@ -1238,7 +1258,10 @@ body,
 }
 
 .ladder__row.is-bestask {
-  background: rgba(211, 82, 79, 0.08);
+  background: rgba(211, 82, 79, 0.11);
+  box-shadow:
+    inset 0 1px 0 rgba(211, 82, 79, 0.30),
+    inset 0 -1px 0 rgba(211, 82, 79, 0.30);
 }
 
 .ladder__row.is-bestask .ladder__px {

@@ -16,6 +16,7 @@
 import { toBigNs } from './coords';
 import type { OverlayFrame } from './frame';
 import { OVERLAY } from './palette';
+import type { RGBA } from './primitives';
 import type { Trade } from '../../proto/types';
 import { SIDE_BUY, SIDE_SELL } from '../../proto/types';
 
@@ -55,12 +56,26 @@ export function bubbleRadiusPx(size: number, opts: Required<BubbleOptions>): num
   return Math.max(opts.minRadiusPx, Math.min(opts.maxRadiusPx, r));
 }
 
+/**
+ * Hard cap on the bubble ink alpha. The palette path (`applyOverlayPalette`)
+ * owns the hue AND the base alpha per theme; the overlay clamps it so a dense
+ * tape can never bury the field — bubbles stay context, not the protagonist.
+ * Pure; rgb is never touched.
+ */
+export const BUBBLE_MAX_ALPHA = 0.9;
+
+export function bubbleAlpha(c: RGBA): number {
+  return Math.min(c[3], BUBBLE_MAX_ALPHA);
+}
+
 export class Bubbles {
   private opts: Required<BubbleOptions>;
   private readonly ts: BigInt64Array;
   private readonly price: Float64Array;
   private readonly size: Float32Array;
   private readonly side: Uint8Array;
+  /** Reused per-point ink tuple — the draw pass must not allocate per bubble. */
+  private readonly ink: [number, number, number, number] = [0, 0, 0, 0];
   private head = 0;
   private count = 0;
 
@@ -119,13 +134,19 @@ export class Bubbles {
       const cy = gm.clipY(rowf);
       if (cy < -1.04 || cy > 1.04) continue;
       const rPx = bubbleRadiusPx(size, this.opts);
-      const color =
+      const base =
         this.side[idx] === SIDE_BUY
           ? OVERLAY.buy.gl
           : this.side[idx] === SIDE_SELL
             ? OVERLAY.sell.gl
             : OVERLAY.unknown.gl;
-      points.add(cx, cy, gm.pxToDevice(rPx * 2), color);
+      // Theme-aware ink: rgb from the palette path, alpha capped (≤ 0.9).
+      const ink = this.ink;
+      ink[0] = base[0];
+      ink[1] = base[1];
+      ink[2] = base[2];
+      ink[3] = bubbleAlpha(base);
+      points.add(cx, cy, gm.pxToDevice(rPx * 2), ink);
     }
     points.flush();
   }

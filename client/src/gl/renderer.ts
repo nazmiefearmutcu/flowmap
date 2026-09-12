@@ -237,8 +237,8 @@ const OVERLAY_PRUNE_PAD = 64;
 /**
  * A theme's chart ramps as the renderer consumes them (structural — the theme
  * registry's `ChartPalette` satisfies this without a gl↔theme import).
- * `id` drives the midnight identity path: midnight (and null) resolve to the
- * frozen FLOW/SYNTH rows, any other theme to the theme-owned rows 5/6 (F3).
+ * Every theme (midnight included, S2-Q1) resolves its density through the
+ * theme-owned row 5; only midnight's synth keeps resolving to the frozen row 1.
  */
 export interface ChartThemeInput {
   readonly id: string;
@@ -349,8 +349,9 @@ export class Renderer {
   /** The user's colormap family. Remembered here, like {@link contrastGamma},
    *  so it survives Heatmap re-creation on session reset / context restore. */
   private colormap: Colormap = 'inferno';
-  /** Active chart theme for the `'theme'` colormap (F3). `null` (and the
-   *  midnight id) resolve to the frozen FLOW/SYNTH rows — the identity path. */
+  /** Active chart theme for the `'theme'` colormap (F3/S2-Q1). `null` resolves
+   *  to the frozen FLOW/SYNTH rows; every non-null theme (midnight included)
+   *  serves its density from the theme-owned row 5. */
   private chartTheme: ChartThemeInput | null = null;
   /** Render mode of the last column, for re-deriving the ramp on a knob change. */
   private lastColMode: number | null = null;
@@ -717,12 +718,18 @@ export class Renderer {
   private applyRamp(): void {
     const depthTier = (this.store.getState().capability as { depth?: unknown } | null)?.depth;
     const mode = this.lastColMode ?? MODE_SYNTH_PROFILE;
-    // Theme rows only exist for a non-midnight theme: the midnight identity
-    // passes null, so `'theme'` resolves to RAMP_FLOW/RAMP_SYNTH and every
-    // frozen observable (currentRamp 3/synth 1, clear rgb(5,8,14)) holds.
+    // S2-Q1 decoupling: midnight+`'theme'` now serves its OWN density ramp from
+    // RAMP_THEME (row 5) — the old `id !== 'midnight'` alias to the frozen FLOW
+    // row is retired. The synth side keeps resolving to the frozen §7 amber row
+    // (RAMP_SYNTH) for midnight: `midnight.synth` is a byte-copy of SYNTH_STOPS
+    // and the equity honesty observables (`currentRamp === RAMP_SYNTH`) pin it,
+    // so only the density row moved (3 → 5).
     const themed =
-      this.colormap === 'theme' && this.chartTheme !== null && this.chartTheme.id !== 'midnight'
-        ? { density: RAMP_THEME, synth: RAMP_THEME_SYNTH }
+      this.colormap === 'theme' && this.chartTheme !== null
+        ? {
+            density: RAMP_THEME,
+            synth: this.chartTheme.id === 'midnight' ? RAMP_SYNTH : RAMP_THEME_SYNTH,
+          }
         : null;
     this.ramp = rampForMode(mode, depthTier, this.colormap, themed);
     if (this.heatmap !== null && this.heatmap.encoding.ramp !== this.ramp) {
@@ -1570,6 +1577,7 @@ export class Renderer {
     this.ringLayers = layers;
     this.ring = new TileRing(this.ctx.gl, rows, layers);
     this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+    this.heatmap.normalizer = this.normalizer;
     this.heatmap.gamma = this.contrastGamma;
     this.heatmap.floor = this.toleranceFloor;
     this.heatmap.levelFloor = this.tickGroupingLevel();
@@ -2336,6 +2344,7 @@ export class Renderer {
       this.heatmap = null;
       this.ring = new TileRing(gl, this.ringRows, this.ringLayers);
       this.heatmap = new Heatmap(this.ctx, this.ring, this.lut);
+      this.heatmap.normalizer = this.normalizer;
       this.heatmap.gamma = this.contrastGamma;
       this.heatmap.floor = this.toleranceFloor;
       this.heatmap.levelFloor = this.tickGroupingLevel();
@@ -2565,6 +2574,7 @@ export class Renderer {
     const heatmap = new Heatmap(this.ctx, ring, this.lut);
     this.ring = ring;
     this.heatmap = heatmap;
+    heatmap.normalizer = this.normalizer;
     heatmap.levelFloor = this.tickGroupingLevel();
     const cap = ring.capacityCols;
     this.extentLo = new Int32Array(cap).fill(-1);
@@ -2657,6 +2667,7 @@ export class Renderer {
     const ring = new TileRing(this.ctx.gl, rows, layers);
     this.ring = ring;
     this.heatmap = new Heatmap(this.ctx, ring, this.lut);
+    this.heatmap.normalizer = this.normalizer;
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
     this.heatmap.levelFloor = this.tickGroupingLevel();
@@ -2893,6 +2904,7 @@ export class Renderer {
     const ring = new TileRing(this.ctx.gl, rows, layers);
     this.ring = ring;
     this.heatmap = new Heatmap(this.ctx, ring, this.lut);
+    this.heatmap.normalizer = this.normalizer;
     this.mips = this.createMips(rows, layers);
     this.heatmap.mips = this.mips;
     this.heatmap.levelFloor = this.tickGroupingLevel();

@@ -18,22 +18,45 @@
  * It draws on the 2D text layer (NOT the GL batches): canvas stroking gives
  * anti-aliased joins and a gradient wash that raw GL triangles cannot, which is
  * the difference between a chart-grade line and a jagged one. Three passes — a
- * soft area wash under the line, a wide translucent glow, then the bright core.
- * It also paints the dashed last-price level marker across the chart (the
- * TradingView signature) and exposes {@link last} so the price axis can draw
- * the matching right-edge price pill.
+ * soft area wash under the line, a wide translucent glow, then the bright core —
+ * plus a short solid stub that carries the trace to the right gutter. It also
+ * paints the dashed last-price level marker across the chart (the TradingView
+ * signature) and exposes {@link last} so the price axis can draw the matching
+ * right-edge price pill.
  */
 
 import type { OverlayFrame } from './frame';
-import { OVERLAY } from './palette';
+import { OVERLAY, parseCssColor } from './palette';
 import type { BarColumn } from '../../proto/types';
 import { visibleColRange } from './coords';
 import type { Pt } from '../textLayer';
 
 /** CSS-px width of the bright price-line core. */
-export const PRICE_LINE_WIDTH = 1.8;
+export const PRICE_LINE_WIDTH = 2.0;
 /** CSS-px width of the translucent glow drawn underneath the core. */
-export const PRICE_GLOW_WIDTH = 5.5;
+export const PRICE_GLOW_WIDTH = 6.0;
+/** Alpha of the wide glow pass (over the near-white core color). */
+export const PRICE_GLOW_ALPHA = 0.22;
+/** Alpha of the area wash's TOP stop (the bottom stop stays transparent).
+ *  `OVERLAY.priceFillTop` / `OVERLAY.priceLevel` are palette-lane owned; the
+ *  price-line slice re-stamps their alpha here so hues stay palette-owned. */
+export const PRICE_FILL_TOP_ALPHA = 0.09;
+/** Alpha of the dashed last-price level marker (quieter than the trace). */
+export const PRICE_LEVEL_ALPHA = 0.30;
+/** CSS-px length of the solid stub bridging the trace to the right gutter. */
+export const PRICE_STUB_PX = 10;
+/** Alpha of the right-edge stub (subtle; the core pass stays the brightest ink). */
+export const PRICE_STUB_ALPHA = 0.7;
+
+/**
+ * Re-stamp a css color's alpha, keeping its rgb (hue) untouched. Pure; an
+ * unparseable input passes through unchanged. Used for the price-line family
+ * whose rgb is owned by the palette bridge while the alpha is tuned here.
+ */
+export function withAlpha(css: string, alpha: number): string {
+  const rgb = parseCssColor(css);
+  return rgb === null ? css : `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+}
 
 /** The most recent close: the column with the highest col_seq ever added. */
 export interface LastClose {
@@ -118,7 +141,7 @@ export class PriceLine {
     text.fillUnder(
       pts,
       gm.dims.cssH,
-      OVERLAY.priceFillTop.css,
+      withAlpha(OVERLAY.priceFillTop.css, PRICE_FILL_TOP_ALPHA),
       OVERLAY.priceFillBottom.css,
     );
 
@@ -127,8 +150,21 @@ export class PriceLine {
     text.polyline(pts, {
       width: PRICE_GLOW_WIDTH,
       color: OVERLAY.price.css,
-      alpha: 0.18,
+      alpha: PRICE_GLOW_ALPHA,
     });
+    // Right-edge solid stub: carries the trace the last few px into the gutter
+    // so the line reads where it meets the axis pill. Drawn BEFORE the core so
+    // the core owns the joint; clamped to the chart surface (the pill lives in
+    // the gutter canvas, so the two can never overlap).
+    const newest = pts[pts.length - 1];
+    const stubEnd = Math.min(gm.dims.cssW, newest.x + PRICE_STUB_PX);
+    if (stubEnd - newest.x >= 1) {
+      text.polyline([newest, { x: stubEnd, y: newest.y }], {
+        width: PRICE_LINE_WIDTH,
+        color: OVERLAY.price.css,
+        alpha: PRICE_STUB_ALPHA,
+      });
+    }
     // Bright core pass.
     text.polyline(pts, { width: PRICE_LINE_WIDTH, color: OVERLAY.price.css });
     // A single visible vertex: draw a short dash so it's still visible.
@@ -143,7 +179,15 @@ export class PriceLine {
     if (last !== null && gm.price !== null) {
       const y = gm.cssY(gm.priceToRow(last.price) + 0.5);
       if (y >= -1 && y <= gm.dims.cssH + 1) {
-        text.dashedLine(0, y, gm.dims.cssW, y, OVERLAY.priceLevel.css, [2, 4], 1);
+        text.dashedLine(
+          0,
+          y,
+          gm.dims.cssW,
+          y,
+          withAlpha(OVERLAY.priceLevel.css, PRICE_LEVEL_ALPHA),
+          [2, 4],
+          1,
+        );
       }
     }
   }

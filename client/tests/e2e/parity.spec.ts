@@ -19,7 +19,7 @@ import { expect, test, type Page } from '@playwright/test';
  * injected data). Per §7:
  *
  *   feature      crypto (L2/tick)            equity keyless (SYNTH/poll)
- *   heatmap      RAMP_FLOW (default)         RAMP_SYNTH (amber) — ramps DIFFER
+ *   heatmap      RAMP_THEME (row 5, default) RAMP_SYNTH (amber) — ramps DIFFER
  *   DOM ladder   full bid/ask book, L2      SYNTH profile, SYNTH badge, no bid/ask
  *   tape         TAPE TICK                  TAPE POLL
  *   CVD / side   SIDE EXCHANGE (real)       SIDE NA (keyless)
@@ -52,7 +52,7 @@ const SIDE_SELL = 1;
 const SIDE_UNKNOWN = 2;
 const SIDE_SRC_EXCHANGE = 0;
 const SIDE_SRC_NA = 2;
-const RAMP_FLOW = 3;
+const RAMP_THEME = 5;
 const RAMP_SYNTH = 1;
 
 const TAGS = {
@@ -389,8 +389,11 @@ async function assertCrosshairAndReplay(page: Page): Promise<void> {
 
 /** Assert the crypto column of the §7 table (full-fidelity L2/tick). */
 async function assertCryptoCells(page: Page, cap: Captured): Promise<void> {
-  // heatmap: thermal ramp.
-  expect(cap.ramp, 'crypto heatmap is RAMP_FLOW (the default real-depth ramp)').toBe(RAMP_FLOW);
+  // heatmap: theme density ramp (midnight's own row 5 — S2-Q1 decoupling).
+  expect(
+    cap.ramp,
+    'crypto heatmap is RAMP_THEME (the default theme real-depth ramp)',
+  ).toBe(RAMP_THEME);
 
   // Wait for the throttled (~10 Hz) bookStore flush to paint the L2 ladder.
   await page.waitForFunction(() => !!document.querySelector('[data-testid="ladder-row"]'), undefined, {
@@ -543,7 +546,7 @@ test('§7 parity — both markets through ONE renderer: ramps differ + matrix', 
   );
 
   // The headline honest-parity claim: the SAME renderer paints DIFFERENT ramps.
-  expect(crypto.ramp, 'crypto → flow (real depth)').toBe(RAMP_FLOW);
+  expect(crypto.ramp, 'crypto → theme row 5 (real depth)').toBe(RAMP_THEME);
   expect(equity.ramp, 'equity → SYNTH amber').toBe(RAMP_SYNTH);
   expect(crypto.ramp, 'ramps differ across markets').not.toBe(equity.ramp);
 
@@ -557,7 +560,7 @@ test('§7 parity — both markets through ONE renderer: ramps differ + matrix', 
     spec: '§7 capability model — honest dual-market parity',
     renderer: 'one market-agnostic WebGL2 renderer (crypto + equity, same instance)',
     features: {
-      heatmap: { crypto: 'inferno (RAMP_INFERNO)', equity_keyless: 'SYNTH amber (RAMP_SYNTH)', differ: crypto.ramp !== equity.ramp },
+      heatmap: { crypto: 'midnight density (RAMP_THEME=5)', equity_keyless: 'SYNTH amber (RAMP_SYNTH)', differ: crypto.ramp !== equity.ramp },
       dom_ladder: { crypto: 'L2 full book (bid+ask columns)', equity_keyless: 'SYNTH volume-at-price profile, no bid/ask' },
       tape: { crypto: 'TAPE TICK', equity_keyless: 'TAPE POLL (display-only)' },
       cvd_side: { crypto: 'SIDE EXCHANGE (real)', equity_keyless: 'SIDE NA (explicit N/A)' },

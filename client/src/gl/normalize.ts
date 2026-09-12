@@ -17,12 +17,13 @@
  *      p99 lands on a meaningful bin instead of saturating the top linear bin.
  *
  *   2. On pan/zoom (or every dirty frame) the tiles covering the visible column
- *      range have their histograms **summed** (a few × 256 adds, <1 ms) and the
- *      configured percentile (p97 by default — see {@link DEFAULT_PERCENTILE}) is
- *      read off the merged CDF with
- *      in-bin log interpolation. This is `O(tiles in view)`, not `O(columns)`:
- *      the merge touches ~`colSpan/colsPerTile` histograms regardless of how many
- *      columns those tiles hold.
+ *      range have their histograms **summed** (a few × 256 adds, <1 ms) and TWO
+ *      ranks are read off the ONE merged CDF with in-bin log interpolation: the
+ *      KNEE ({@link DEFAULT_PERCENTILE}, p97) and the WHITE
+ *      ({@link DEFAULT_WHITE_PERCENTILE}, p99.7 — what feeds `u_norm`). This is
+ *      `O(tiles in view)`, not `O(columns)`: the merge touches
+ *      ~`colSpan/colsPerTile` histograms regardless of how many columns those
+ *      tiles hold, and the memo makes it once per dirty key.
  *
  *   3. The raw percentile is **EMA-smoothed** frame-to-frame (~0.3 s settle at
  *      60 fps) so the divisor glides into a new regime instead of flickering.
@@ -49,16 +50,23 @@
 
 export const DEFAULT_BINS = 256;
 /**
- * Default viewport white point. p99 was the first-run "empty heatmap" culprit:
- * order-flow density is so heavy-tailed (the median active cell sits at ~2% of
- * the p99 white point) that p99 normalization put the whole ladder BELOW the
- * default black point (~1.3% of norm, heatmap.ts DEFAULT_TOLERANCE) — only the
- * walls painted. p97 cuts the white point to ≈0.47× the p99 value on that tail
- * shape, lifting the median cell to ~4% of norm (above the floor) while cells
- * ≥ p97 — the walls — still saturate to LUT entry 255. The exact ratio is pinned
- * by the "p97 vs p99 headroom" test in normalize.test.ts.
+ * Default viewport KNEE percentile (Bookmap-class overhaul, lane F). The knee is
+ * the transfer curve's segment boundary — below it the field is lifted by the
+ * display gamma, above it log-compressed so wall cores differentiate instead of
+ * all clamping to the same top. p97 was the historical white point; it stays the
+ * KNEE while the new {@link DEFAULT_WHITE_PERCENTILE} carries the white endpoint.
+ * The p97/p99 headroom ratio is pinned by the "p97 vs p99 headroom" test.
  */
 export const DEFAULT_PERCENTILE = 97;
+/**
+ * Default viewport WHITE point (Bookmap-class overhaul, lane F): what feeds the
+ * EMA → `u_norm`. p99.7 makes the top of the ramp reachable only around the
+ * heavy-tail's p99.7, so the wall band (p97..p99.7) spreads across LUT entries
+ * instead of clamping early. `Hello.norm_seed` is still p99 (server, untouched)
+ * — the EMA settles the ~0.3 s gap. The knee fraction uploaded to the shader is
+ * `knee / white` from the SAME merged CDF (u_knee, clamped [0.05, 0.95]).
+ */
+export const DEFAULT_WHITE_PERCENTILE = 99.7;
 /** Log-bin range low edge (density below this clamps into bin 0). */
 export const DEFAULT_HIST_MIN = 1 / 64; // 0.015625
 /** Log-bin range high edge (density above this clamps into the top bin). */
@@ -89,6 +97,8 @@ export interface RowRange {
 export interface NormalizeConfig {
   bins?: number;
   percentile?: number;
+  /** White-point percentile (default {@link DEFAULT_WHITE_PERCENTILE} = 99.7). */
+  whitePercentile?: number;
   colsPerTile?: number;
   histMin?: number;
   histMax?: number;
@@ -126,9 +136,15 @@ export function normMipScale(level: number): number {
 
 export class ViewportNormalizer {
   readonly bins: number;
-  /** Target percentile (§8.3 white-point). Mutable — the Settings "Saturation"
-   *  control retunes it live; it is read fresh off the CDF every frame. */
+  /** KNEE percentile (lane F): the transfer curve's segment boundary. Mutable —
+   *  the Settings "Saturation" control retunes it live; read fresh off the CDF
+   *  every frame. The historical white point (p99) semantics moved to
+   *  {@link whitePercentile}. */
   percentile: number;
+  /** WHITE-point percentile (lane F, default {@link DEFAULT_WHITE_PERCENTILE}):
+   *  the rank that feeds the EMA → `u_norm`. Mutable like {@link percentile};
+   *  included in the memo key so a change re-merges. */
+  whitePercentile: number;
   readonly colsPerTile: number;
   readonly floor: number;
   readonly alpha: number;
@@ -153,14 +169,24 @@ export class ViewportNormalizer {
    * frame; the merge was the only O(tiles·bins) part of it).
    */
   private versionN = 0;
-  /** Memo key of the last {@link viewportPercentile} merge. */
-  private memoKey = { oldest: Number.NaN, newest: Number.NaN, percentile: -1, level: -1, version: -1 };
-  /** Memoized merge result (raw percentile, pre-EMA). */
-  private memoRaw = 0;
+  /** Memo key of the last {@link viewportPercentiles} merge. */
+  private memoKey = {
+    oldest: Number.NaN,
+    newest: Number.NaN,
+    percentile: -1,
+    whitePercentile: -1,
+    level: -1,
+    version: -1,
+  };
+  /** Memoized merge result (raw knee + white ranks, pre-EMA). */
+  private memoRanks = { knee: 0, white: 0 };
   /** Actual merges performed (diagnostics/tests: the memo-hit counter's twin). */
   private mergeCountN = 0;
 
+  /** EMA of the WHITE rank — what `u_norm` is fed. */
   private ema = 0;
+  /** EMA of the KNEE rank (same alpha), for the per-frame `u_knee = knee/white`. */
+  private emaKnee = 0;
   private seeded = false;
   /** Last raw viewport percentile computed (pre-EMA); for the settle test. */
   private lastRaw = 0;
@@ -174,6 +200,7 @@ export class ViewportNormalizer {
   constructor(cfg: NormalizeConfig = {}) {
     this.bins = cfg.bins ?? DEFAULT_BINS;
     this.percentile = cfg.percentile ?? DEFAULT_PERCENTILE;
+    this.whitePercentile = cfg.whitePercentile ?? DEFAULT_WHITE_PERCENTILE;
     this.colsPerTile = cfg.colsPerTile ?? 256;
     this.floor = cfg.floor ?? DEFAULT_NORM_FLOOR;
     this.alpha = cfg.emaAlpha ?? DEFAULT_EMA_ALPHA;
@@ -187,10 +214,13 @@ export class ViewportNormalizer {
     this.merged = new Int32Array(this.bins);
   }
 
-  /** Seed the EMA (frame 0) from `Hello.norm_seed`. Floored, no-op if ≤0. */
+  /** Seed the EMA (frame 0) from `Hello.norm_seed`. Floored, no-op if ≤0. The
+   *  knee EMA is seeded to the same value (ratio 1 until the first real merge —
+   *  the shader clamp keeps that harmless and the settle takes ~0.3 s). */
   seed(norm: number): void {
     if (!(norm > 0)) return;
     this.ema = Math.max(norm, this.floor);
+    this.emaKnee = this.ema;
     this.lastRaw = this.ema;
     this.seeded = true;
     this.versionN++; // the empty-window fallback reads `ema` — re-merge once
@@ -229,6 +259,17 @@ export class ViewportNormalizer {
   /** Current EMA-smoothed norm (what was last fed to `u_norm`), floored. */
   get current(): number {
     return Math.max(this.ema, this.floor);
+  }
+
+  /**
+   * Current EMA-smoothed KNEE/WHITE pair (lane F) for the per-frame shader
+   * `u_knee = clamp(knee / white, 0.05, 0.95)`. Both ranks share the same merge
+   * and EMA alpha, so the ratio is a stable per-frame constant; `white` equals
+   * {@link current}. Before the first real merge (seed only) the pair is the
+   * seed value — the shader clamp absorbs the ratio-1 frames.
+   */
+  get currentPercentiles(): { knee: number; white: number } {
+    return { knee: Math.max(this.emaKnee, this.floor), white: Math.max(this.ema, this.floor) };
   }
 
   /** Map a strictly-positive density to a log bin index in [0, bins-1]. */
@@ -314,47 +355,82 @@ export class ViewportNormalizer {
   }
 
   /**
-   * RAW merged viewport percentile (no EMA), already multiplied by the mip
-   * scaling ({@link normMipScale}, = 1). MEMOIZED on {visible col range,
+   * RAW merged viewport KNEE percentile (no EMA) — the historical single-read
+   * API, kept as a thin alias of {@link viewportPercentiles}.knee so existing
+   * callers keep reading the configured (`percentile`) rank.
+   */
+  viewportPercentile(col: ColRange, row: RowRange, mipLevel: number): number {
+    return this.viewportPercentiles(col, row, mipLevel).knee;
+  }
+
+  /**
+   * RAW merged viewport KNEE + WHITE percentiles (lane F): TWO rank reads off
+   * ONE merged CDF. MEMOIZED on {visible col range, knee percentile, white
    * percentile, mip level, tilesVersion}: repeated calls with an unchanged
    * window and no histogram mutation (the every-dirty-frame case while columns
-   * stream in elsewhere, or while the norm EMA settles) return the cached value
-   * WITHOUT re-merging the covered tiles' histograms. Identical output — the
-   * merge is a pure function of exactly those keys.
+   * stream in elsewhere, or while the norm EMA settles) return the cached pair
+   * WITHOUT re-merging the covered tiles' histograms — `mergeCount` increments
+   * exactly once per memo-key change, never once per read. Identical output —
+   * the merge is a pure function of exactly those keys.
    *
-   * Sums the histograms of every retained tile that overlaps
-   * `[col.oldest, col.newest]` and reads the percentile off the merged CDF with
-   * in-bin log interpolation. `O(tiles in view)`, executed at most once per
-   * memo-key change.
+   * Both ranks carry the mip scaling ({@link normMipScale}, = 1) and the norm
+   * floor. `O(tiles in view)`, executed at most once per memo-key change.
    *
    * `row` is accepted per the T9 contract but NOT used to sub-filter: the coarse
    * per-tile histograms are deliberately not row-partitioned (that would cost
    * O(rows) storage per tile and break the O(tiles) budget), and non-zero-only
    * binning already restricts the distribution to the active price band.
    */
-  viewportPercentile(col: ColRange, _row: RowRange, mipLevel: number): number {
+  viewportPercentiles(
+    col: ColRange,
+    _row: RowRange,
+    mipLevel: number,
+  ): { knee: number; white: number } {
     const m = this.memoKey;
     if (
       m.version === this.versionN &&
       m.oldest === col.oldest &&
       m.newest === col.newest &&
       m.percentile === this.percentile &&
+      m.whitePercentile === this.whitePercentile &&
       m.level === mipLevel
     ) {
-      return this.memoRaw;
+      return { knee: this.memoRanks.knee, white: this.memoRanks.white };
     }
-    const raw = this.mergePercentile(col, mipLevel);
+    const ranks = this.mergePercentiles(col, mipLevel);
     m.oldest = col.oldest;
     m.newest = col.newest;
     m.percentile = this.percentile;
+    m.whitePercentile = this.whitePercentile;
     m.level = mipLevel;
     m.version = this.versionN;
-    this.memoRaw = raw;
-    return raw;
+    this.memoRanks = ranks;
+    return { knee: ranks.knee, white: ranks.white };
   }
 
-  /** The unmemoized merge: sum covered tiles' histograms, read the percentile. */
-  private mergePercentile(col: ColRange, mipLevel: number): number {
+  /**
+   * Read one percentile rank off the merged CDF with in-bin log interpolation.
+   * Pure w.r.t. the histogram: the caller reuses ONE merged accumulator for
+   * every rank it needs (two reads, one merge).
+   */
+  private readRank(merged: Int32Array, total: number, percentile: number): number {
+    const rank = (percentile / 100) * total;
+    let cum = 0;
+    for (let b = 0; b < this.bins; b++) {
+      const next = cum + merged[b];
+      if (next >= rank) {
+        // Fraction through this bin's count where the rank falls.
+        const inBin = merged[b] > 0 ? (rank - cum) / merged[b] : 0;
+        const logv = this.logMin + (b + inBin) / this.binScale;
+        return Math.exp(logv);
+      }
+      cum = next;
+    }
+    return Math.exp(this.logMin + this.bins / this.binScale);
+  }
+
+  /** The unmemoized merge: sum covered tiles' histograms ONCE, read both ranks. */
+  private mergePercentiles(col: ColRange, mipLevel: number): { knee: number; white: number } {
     this.mergeCountN++;
     const merged = this.merged;
     merged.fill(0);
@@ -372,40 +448,36 @@ export class ViewportNormalizer {
         }
       }
     }
-    if (total === 0) return Math.max(this.ema, this.floor);
-
-    const rank = (this.percentile / 100) * total;
-    let cum = 0;
-    let bin = this.bins - 1;
-    for (let b = 0; b < this.bins; b++) {
-      const next = cum + merged[b];
-      if (next >= rank) {
-        bin = b;
-        // Fraction through this bin's count where the rank falls.
-        const inBin = merged[b] > 0 ? (rank - cum) / merged[b] : 0;
-        const logv = this.logMin + (bin + inBin) / this.binScale;
-        return Math.max(Math.exp(logv), this.floor) * normMipScale(mipLevel);
-      }
-      cum = next;
+    if (total === 0) {
+      const hold = Math.max(this.ema, this.floor);
+      return { knee: hold, white: hold };
     }
-    const logv = this.logMin + (bin + 1) / this.binScale;
-    return Math.max(Math.exp(logv), this.floor) * normMipScale(mipLevel);
+    const scale = normMipScale(mipLevel);
+    return {
+      knee: Math.max(this.readRank(merged, total, this.percentile), this.floor) * scale,
+      white: Math.max(this.readRank(merged, total, this.whitePercentile), this.floor) * scale,
+    };
   }
 
   /**
-   * Recompute the raw viewport percentile and EMA-step toward it, returning the
-   * smoothed, floored norm to feed `u_norm`. Call once per dirty frame (or on
-   * view-settle). O(tiles in view).
+   * Recompute the raw viewport KNEE+WHITE pair (one memoized merge) and
+   * EMA-step BOTH toward it, returning the smoothed, floored WHITE norm to feed
+   * `u_norm` (lane F: `updateNorm` keeps returning the EMA of the white value).
+   * The knee EMA rides the same alpha so {@link currentPercentiles} gives a
+   * stable per-frame ratio for the shader's `u_knee`. Call once per dirty frame
+   * (or on view-settle). O(tiles in view).
    */
   updateNorm(col: ColRange, row: RowRange, mipLevel: number): number {
     if (this.frozen) return Math.max(this.ema, this.floor);
-    const raw = this.viewportPercentile(col, row, mipLevel);
-    this.lastRaw = raw;
+    const raw = this.viewportPercentiles(col, row, mipLevel);
+    this.lastRaw = raw.white;
     if (!this.seeded) {
-      this.ema = raw;
+      this.ema = raw.white;
+      this.emaKnee = raw.knee;
       this.seeded = true;
     } else {
-      this.ema += this.alpha * (raw - this.ema);
+      this.ema += this.alpha * (raw.white - this.ema);
+      this.emaKnee += this.alpha * (raw.knee - this.emaKnee);
     }
     return Math.max(this.ema, this.floor);
   }
@@ -419,6 +491,7 @@ export class ViewportNormalizer {
   freezeForTest(value?: number): void {
     const v = Math.max(value ?? this.current, this.floor);
     this.ema = v;
+    this.emaKnee = v;
     this.lastRaw = v;
     this.seeded = true;
     this.frozen = true;
@@ -435,6 +508,7 @@ export class ViewportNormalizer {
     this.foldedWatermark.clear();
     this.merged.fill(0);
     this.ema = 0;
+    this.emaKnee = 0;
     this.lastRaw = 0;
     this.seeded = false;
     this.frozen = false;

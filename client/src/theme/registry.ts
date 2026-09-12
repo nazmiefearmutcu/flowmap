@@ -20,9 +20,10 @@
  *
  * Chart palette (campaign 2026-09-11): {@link ThemeMeta.chart} carries the
  * chart-surface ink, chip plate and the per-theme density/synth RAMPS the GL
- * renderer uploads when the `theme` colormap is active. `midnight` holds a
- * structural copy of the shipped `gl/lut.ts` FLOW/SYNTH stop tables (no gl
- * import — chart.test.ts pins the rasterized byte-identity instead).
+ * renderer uploads when the `theme` colormap is active. Since the bookmap
+ * overhaul (S2-Q1) midnight's density is its OWN theme row (no longer a copy of
+ * the frozen `gl/lut.ts` FLOW row); its `synth` stays a byte-copy of the frozen
+ * SYNTH §7 row (no gl import — chart.test.ts pins both behaviors).
  */
 
 export type ThemeId =
@@ -165,17 +166,25 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       price: '#f5f8fc',
       sell: '#e8635f',
       warn: '#d6a13a',
-      // Structural copy of gl/lut.ts FLOW_STOPS (no gl import). chart.test.ts
-      // rasterizes this and pins the byte-identity with buildFlowLUT().
+      // S2-Q1 decoupling (bookmap overhaul): midnight no longer aliases the
+      // frozen FLOW row — this is its own Bookmap-class density ramp, served
+      // from the THEME row (gl/lut RAMP_THEME 5). Sequence: near-black navy →
+      // azure → indigo (long COOL band, b ≥ g through t ≤ 0.5), a purple/
+      // magenta knee at t 0.54–0.66, then a short warm band to a cream/gold
+      // core (max channel ≤ 235, never white — the price-line contract).
+      // Rec.601 stop luma: 7.8 → 26.8 → 61.6 → 78.1 → 109.5 → 134.5 → 175.0 →
+      // 206.5 (strictly increasing ⇒ luminance-monotone raster). The F
+      // transfer curve (white point p99.7, log-compress above the knee) is
+      // what the field maps through; this ramp is authored against it.
       density: [
         { t: 0.0, rgb: [5, 8, 14] },
-        { t: 0.16, rgb: [10, 22, 60] },
-        { t: 0.34, rgb: [20, 48, 120] },
-        { t: 0.5, rgb: [60, 48, 150] },
-        { t: 0.55, rgb: [160, 60, 150] },
-        { t: 0.59, rgb: [232, 112, 58] },
-        { t: 0.8, rgb: [250, 170, 40] },
-        { t: 1.0, rgb: [255, 225, 90] },
+        { t: 0.18, rgb: [11, 26, 72] },
+        { t: 0.4, rgb: [24, 64, 148] },
+        { t: 0.54, rgb: [64, 64, 188] },
+        { t: 0.6, rgb: [168, 66, 180] },
+        { t: 0.66, rgb: [222, 92, 124] },
+        { t: 0.84, rgb: [246, 162, 56] },
+        { t: 1.0, rgb: [235, 205, 130] },
       ],
       // Structural copy of gl/lut.ts SYNTH_STOPS (frozen §7 amber row).
       synth: [

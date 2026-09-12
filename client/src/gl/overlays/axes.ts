@@ -14,20 +14,29 @@
  */
 
 import {
-  fmtClock,
-  fmtClockMs,
   logPriceTickModel,
   priceDecimals,
   priceTickModel,
+  timeLabelFormatter,
   timeTickModel,
 } from './axisTicks';
 import type { GridMap } from './coords';
 import type { LastClose } from './priceLine';
 import { OVERLAY } from './palette';
-import type { TextLayer } from '../textLayer';
+import { DEFAULT_TEXT_SIZE, type TextLayer } from '../textLayer';
 
 const PRICE_TARGET = 8;
 const TIME_TARGET = 7;
+
+/** Price-axis tick-label size (CSS px) — the text layer's standard size, hoisted
+ *  so axis typography reads as a named constant, not a scattered literal. */
+export const AXIS_LABEL_SIZE = DEFAULT_TEXT_SIZE;
+/** Price-axis tick-label weight (medium: the ladder reads as data, not chrome). */
+export const AXIS_LABEL_WEIGHT = 500;
+/** Price-axis major tick mark length (CSS px, 1 px wide). */
+export const AXIS_TICK_LEN = 6;
+/** Approximate advance width of the mono axis font (JetBrains Mono ≈ 0.6 em). */
+const MONO_ADVANCE_EM = 0.6;
 
 export interface AxisLabel {
   /** CSS-px position along the gutter (y for price, x for time). */
@@ -35,15 +44,38 @@ export interface AxisLabel {
   label: string;
 }
 
-/** Price ticks with their gutter y (CSS px). Empty when no price affine. */
-export function priceAxisModel(gm: GridMap, cssH: number): AxisLabel[] {
+/**
+ * Price ticks with their gutter y (CSS px). Empty when no price affine.
+ *
+ * `labelWidthPx` (optional): usable label width in the gutter. When given and
+ * a tick label would overflow it, decimals are reduced globally (never
+ * per-label, so the ladder keeps one scale) down to 0 — review R2-M2: the
+ * 11 px label on the frozen 62 px gutter clipped ≥9-char values (large
+ * prices). Omitted → historical `toFixed(dec)` formatting exactly.
+ */
+export function priceAxisModel(gm: GridMap, cssH: number, labelWidthPx?: number): AxisLabel[] {
   if (gm.price === null) return [];
   const pLo = gm.rowToPrice(gm.view.rowOffset);
   const pHi = gm.rowToPrice(gm.view.rowOffset + gm.view.rowScale);
   const { step, ticks } = axisTicks(gm, pLo, pHi);
   // Decimals from the TICK step, not the finer grid step, so whole-number ticks
   // don't show a spurious '.00'.
-  const dec = priceDecimals(step > 0 ? step : localStep(gm));
+  let dec = priceDecimals(step > 0 ? step : localStep(gm));
+  if (
+    labelWidthPx !== undefined &&
+    Number.isFinite(labelWidthPx) &&
+    labelWidthPx > 0 &&
+    ticks.length > 0
+  ) {
+    const maxChars = Math.max(4, Math.floor(labelWidthPx / (AXIS_LABEL_SIZE * MONO_ADVANCE_EM)));
+    // Global (uniform) decimal reduction: one ladder scale, no mixed readouts.
+    while (dec > 0) {
+      let longest = 0;
+      for (const price of ticks) longest = Math.max(longest, price.toFixed(dec).length);
+      if (longest <= maxChars) break;
+      dec--;
+    }
+  }
   const out: AxisLabel[] = [];
   for (const price of ticks) {
     const y = gm.cssY(gm.priceToRow(price));
@@ -86,9 +118,10 @@ export function timeAxisModel(gm: GridMap, cssW: number): AxisLabel[] {
   const tHi = gm.colToTsNs(gm.view.colOffset + gm.view.colScale);
   if (tLo === null || tHi === null) return [];
   const { step, ticks } = timeTickModel(tLo, tHi, TIME_TARGET);
-  // Sub-second cadences (250 ms / 25 ms) need the millisecond format, else every
-  // row collapses to the same HH:MM:SS label.
-  const fmt = step > 0n && step < 1_000_000_000n ? fmtClockMs : fmtClock;
+  // S4-Q5 adaptive labels: the millisecond format is reserved for genuinely
+  // sub-second ladders (< 0.5 s) — 0.5 s ticks already read as clock seconds at
+  // a glance, and every 1 s+ ladder before this change paid invisible `.mmm`.
+  const fmt = timeLabelFormatter(step);
   const out: AxisLabel[] = [];
   for (const t of ticks) {
     const x = gm.cssX(gm.tsToCol(t));
@@ -99,8 +132,11 @@ export function timeAxisModel(gm: GridMap, cssW: number): AxisLabel[] {
 }
 
 /**
- * Price tick gutter-y positions only (no label strings). For {@link drawGridlines},
- * which needs positions but throws labels away — this avoids the per-dirty-frame
+ * Price tick gutter-y positions only (no label strings) — the string-free twin
+ * of {@link priceAxisModel}: EXACTLY the labeled major ticks (same ladder, same
+ * viewport filter), which is the gridline-coverage contract (lane C: no minor
+ * tick may draw a line the axis does not label). For {@link drawGridlines},
+ * which needs positions but throws labels away, this avoids the per-dirty-frame
  * toFixed allocation.
  */
 export function priceTickPositions(gm: GridMap, cssH: number): number[] {
@@ -117,8 +153,10 @@ export function priceTickPositions(gm: GridMap, cssH: number): number[] {
 }
 
 /**
- * Time tick gutter-x positions only (no label strings). For {@link drawGridlines};
- * avoids building/discarding fmtClock strings every dirty frame.
+ * Time tick gutter-x positions only (no label strings) — the string-free twin of
+ * {@link timeAxisModel}: EXACTLY the labeled time ticks. For
+ * {@link drawGridlines}; avoids building/discarding fmtClock strings every
+ * dirty frame.
  */
 export function timeTickPositions(gm: GridMap, cssW: number): number[] {
   if (!gm.hasEvents) return [];
@@ -146,10 +184,16 @@ export function timeTickPositions(gm: GridMap, cssW: number): number[] {
 export function drawPriceAxis(layer: TextLayer, gm: GridMap, last: LastClose | null = null): void {
   layer.clear();
   const cssW = layer.width;
-  const model = priceAxisModel(gm, layer.height);
+  const model = priceAxisModel(gm, layer.height, cssW - 6 - AXIS_TICK_LEN - 2);
   for (const t of model) {
-    layer.line(0, t.pos, 4, t.pos, OVERLAY.axis.css, 1);
-    layer.text(cssW - 6, t.pos, t.label, { align: 'right', baseline: 'middle', color: OVERLAY.axis.css, size: 10 });
+    layer.line(0, t.pos, AXIS_TICK_LEN, t.pos, OVERLAY.axis.css, 1);
+    layer.text(cssW - 6, t.pos, t.label, {
+      align: 'right',
+      baseline: 'middle',
+      color: OVERLAY.axis.css,
+      size: AXIS_LABEL_SIZE,
+      weight: AXIS_LABEL_WEIGHT,
+    });
   }
   if (last === null || gm.price === null) return;
   const step = localStep(gm) || gm.price.step;
@@ -192,16 +236,37 @@ export function drawTimeAxis(layer: TextLayer, gm: GridMap): void {
   }
 }
 
-/** Faint gridlines over the heatmap at the price/time ticks (orientation aid). */
+/**
+ * Coincidence test for gridlines: two gutter positions rasterize onto the same
+ * CSS-pixel row/column when their rounded values match (NaN never matches, so
+ * the first iteration always draws).
+ */
+function sameGridline(a: number, b: number): boolean {
+  return Math.round(a) === Math.round(b);
+}
+
+/**
+ * Faint gridlines over the heatmap — LABELED ticks only (lane C coverage
+ * contract): exactly one horizontal line per price-axis label and one vertical
+ * line per time-axis label, at the label's own position. The position helpers
+ * are the string-free twins of the label models, so no minor tick can produce a
+ * line the axis does not label. Coincident positions (ticks rasterizing onto
+ * one pixel row, e.g. an edge tick landing on a major) are drawn once.
+ * Color/width stay `OVERLAY.grid` / 1 px (alpha is owned by the palette lane).
+ */
 export function drawGridlines(text: TextLayer, gm: GridMap): void {
   const cssW = text.width;
   const cssH = text.height;
-  // Use the label-free position variants: gridlines only need pixel positions, so
-  // building/discarding toFixed/fmtClock strings every dirty frame is wasted work.
+  let prev = Number.NaN;
   for (const y of priceTickPositions(gm, cssH)) {
+    if (sameGridline(y, prev)) continue;
+    prev = y;
     text.line(0, y, cssW, y, OVERLAY.grid.css, 1);
   }
+  prev = Number.NaN;
   for (const x of timeTickPositions(gm, cssW)) {
+    if (sameGridline(x, prev)) continue;
+    prev = x;
     text.line(x, 0, x, cssH, OVERLAY.grid.css, 1);
   }
 }

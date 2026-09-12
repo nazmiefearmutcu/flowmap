@@ -18,13 +18,16 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
+import pytest
 
 from flowmap_server.config import Config
 from flowmap_server.core.backfill import (
     BACKFILL_DENSITY_GAIN,
+    BAND_WEIGHT_FLOOR,
     DEFAULT_BACKFILL_STRETCH,
     DENSITY_SAFETY_MAX,
     Candle,
+    _band_weights,
     columns_from_candles,
 )
 from flowmap_server.core.grid import Grid, GridCfg
@@ -40,6 +43,12 @@ from flowmap_server.proto.events import (
 
 DT = 250_000_000  # 250 ms
 _MINUTE = 60 * 10**9
+
+
+@pytest.fixture(autouse=True)
+def _shape_env_default(monkeypatch):
+    """Tests run with the shaping gate at its shipped default unless they opt in."""
+    monkeypatch.delenv("FLOWMAP_BACKFILL_SHAPE", raising=False)
 
 
 def _cfg(rows: int = 256, ring_columns: int = 1024) -> GridCfg:
@@ -108,21 +117,114 @@ def test_columns_contiguous_and_monotonic():
     assert abs(epoch.p0 - (ref - cfg.rows * cfg.tick / 2.0)) <= cfg.tick
 
 
-def test_density_bounded_peak_and_two_sided_split():
-    cfg = _cfg()
-    cols, _ = columns_from_candles(_candles(6), cfg)
-    combined_peak = max(
+def _band_rows(cd: Candle, epoch, cfg: GridCfg) -> tuple[int, int, int]:
+    """Mirror of the converter's row math: (lo_r, hi_r, close_r)."""
+    step = cfg.tick * cfg.tick_multiple
+    lo_r = int(round((min(cd.l, cd.h) - epoch.p0) / step))
+    hi_r = int(round((max(cd.l, cd.h) - epoch.p0) / step))
+    lo_r, hi_r = max(lo_r, 0), min(hi_r, cfg.rows - 1)
+    close_r = int(round((cd.c - epoch.p0) / step))
+    return lo_r, hi_r, close_r
+
+
+def _combined_peak(cols) -> float:
+    return max(
         max(float(c.bid.astype(np.float64).max()), float(c.ask.astype(np.float64).max()))
         for c in cols
     )
+
+
+def test_density_bounded_peak_and_two_sided_split():
+    cfg = _cfg()
+    candles = _candles(6)
+    cols, epoch = columns_from_candles(candles, cfg)
+    combined_peak = _combined_peak(cols)
     # TRUE size units scaled by the documented display gain (no old fixed-1000
-    # inflation): these candles carry ~100 volume over a ~4-row band, so the raw
-    # per-row value is ~25 and the emitted peak sits at ~25 x gain.
-    expected = 25.0 * BACKFILL_DENSITY_GAIN
+    # inflation). Shape-aware: the erode band's peak row carries
+    # volume x max(_band_weights), then rides the SAME scale x gain pipeline;
+    # these candles stay far below DENSITY_SAFETY_MAX, so scale == 1 here.
+    expected = (
+        max(
+            float(cd.volume) * float(_band_weights(*_band_rows(cd, epoch, cfg)).max())
+            for cd in candles
+        )
+        * BACKFILL_DENSITY_GAIN
+    )
     assert 0.5 * expected < combined_peak < 2.0 * expected
+    assert combined_peak == pytest.approx(expected, rel=0.005)  # f16 cast only
     # split at the candle close leaves mass on BOTH channels for a ranged candle.
     assert any(float(c.ask.astype(np.float64).max()) > 0.0 for c in cols)
     assert any(float(c.bid.astype(np.float64).max()) > 0.0 for c in cols)
+
+
+def test_band_weights_exact_profile_floor_and_monotone_erosion():
+    # Symmetric 5-row band with the close at the centre: hand-computable weights
+    # (kernel [0, .5, 1, .5, 0], floor .15 -> unnormalized sum 2.45).
+    w = _band_weights(100, 104, 102)
+    assert w.shape == (5,)
+    assert w.sum() == pytest.approx(1.0, rel=0, abs=1e-12)
+    assert w == pytest.approx(
+        [0.15 / 2.45, 0.575 / 2.45, 1.0 / 2.45, 0.575 / 2.45, 0.15 / 2.45],
+        rel=1e-12,
+    )
+    peak = int(np.argmax(w))
+    assert peak == 2  # profile peak row == close row
+    # erosion monotone away from the peak (rising to it, falling after it);
+    # the floor keeps every in-band row strictly positive.
+    assert np.all(np.diff(w[: peak + 1]) >= 0.0)
+    assert np.all(np.diff(w[peak:]) <= 0.0)
+    assert (w > 0.0).all()
+    assert w.min() == pytest.approx(BAND_WEIGHT_FLOOR / 2.45, rel=1e-12)
+    # asymmetric band: the peak index tracks the close row (index = row - lo_r).
+    assert int(np.argmax(_band_weights(100, 110, 104))) == 104 - 100
+    # close outside the band clamps to the nearest edge; single row == mass 1.
+    assert int(np.argmax(_band_weights(100, 104, 200))) == 104 - 100
+    assert _band_weights(105, 105, 100) == pytest.approx([1.0], rel=1e-12)
+
+
+def test_erode_profile_peaks_at_close_row():
+    cfg = _cfg()
+    candles = [Candle(t0_ns=0, o=100.0, h=101.0, l=99.0, c=100.0, volume=100.0)]
+    cols, epoch = columns_from_candles(candles, cfg, stretch=1)
+    _, _, close_r = _band_rows(candles[0], epoch, cfg)
+    combined = cols[0].bid.astype(np.float64) + cols[0].ask.astype(np.float64)
+    assert int(np.argmax(combined)) == close_r
+    # mass lands on both channels: the close row is bid, rows above it ask.
+    assert combined[close_r] > 0.0
+    assert combined[:close_r].sum() > 0.0
+    assert combined[close_r + 1 :].sum() > 0.0
+
+
+def test_erode_mass_preserved_before_gain_scale(monkeypatch):
+    # The converter casts to float16 for the ring; patch that cast so the raw
+    # float64 band masses are directly observable — this asserts the shaping's
+    # mass preservation (volume x sum(w) == volume), not the storage format.
+    monkeypatch.setattr(np, "float16", np.float64)
+    cfg = _cfg()
+    candles = [Candle(t0_ns=0, o=100.0, h=101.0, l=99.0, c=100.0, volume=100.0)]
+    cols, _ = columns_from_candles(candles, cfg, stretch=1)
+    total = float(cols[0].bid.astype(np.float64).sum() + cols[0].ask.astype(np.float64).sum())
+    # scale == 1 on these small volumes; divide the display gain back out.
+    assert total / BACKFILL_DENSITY_GAIN == pytest.approx(100.0, rel=1e-6)
+
+
+def test_flat_env_restores_legacy_flat_fill_exactly(monkeypatch):
+    cfg = _cfg()
+    candles = _candles(6)
+    shaped, _ = columns_from_candles(candles, cfg)
+    monkeypatch.setenv("FLOWMAP_BACKFILL_SHAPE", "flat")
+    flat, _ = columns_from_candles(candles, cfg)
+    # Legacy formula: volume / band-row-count on every in-band row. The densest
+    # candle is the last (volume 105 over a 5-row band) -> 21 per row x gain;
+    # 21 x 12 = 252 is exactly representable in float16, so this pins the old
+    # BYTES, not a tolerance band.
+    assert _combined_peak(flat) == 21.0 * BACKFILL_DENSITY_GAIN
+    assert _combined_peak(shaped) > _combined_peak(flat)
+    # unknown/unset values fall back to erode (shipped default).
+    monkeypatch.setenv("FLOWMAP_BACKFILL_SHAPE", "bogus")
+    again, _ = columns_from_candles(candles, cfg)
+    assert np.array_equal(again[-1].bid, shaped[-1].bid)
+    assert np.array_equal(again[-1].ask, shaped[-1].ask)
 
 
 def test_pathological_doji_is_scaled_below_f16_max():
@@ -156,6 +258,12 @@ def test_stretch_repeats_each_candle_as_a_contiguous_band():
         # t0 spans the minute in equal dt-aligned steps (15 s each at stretch 4).
         assert [c.t0_ns - base.t0_ns for c in group] == [0, 60 * DT, 120 * DT, 180 * DT]
     assert [cols[i].bar.col_seq for i in range(0, 16, 4)] == [0, 4, 8, 12]
+    # Shipped default (stretch 16 on a 1 m candle) -> 3.75 s column steps: the
+    # exact delta the reconstructed-history e2e pin (chart-reconstructed.spec)
+    # tolerates as >= dt and < 60 s.
+    cols16, _ = columns_from_candles(_candles(2), cfg, stretch=DEFAULT_BACKFILL_STRETCH)
+    assert len(cols16) == 32
+    assert cols16[1].t0_ns - cols16[0].t0_ns == 15 * DT  # 3_750_000_000 ns
 
 
 def test_reconstructed_cvd_from_taker_split():

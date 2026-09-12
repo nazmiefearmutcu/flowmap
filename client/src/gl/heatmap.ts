@@ -12,6 +12,7 @@
 import { checkGLError, type GLContext } from './context';
 import { RAMP_FLOW } from './lut';
 import type { MipChain } from './mips';
+import type { ViewportNormalizer } from './normalize';
 import { HEATMAP_FRAG, HEATMAP_VERT } from './shaders/heatmap';
 import { TileRing } from './tileRing';
 
@@ -87,11 +88,56 @@ export function gammaForContrast(contrast: number): number {
 export const DEFAULT_CONTRAST = 40;
 
 /**
+ * Above-knee log-compression strength of the two-segment transfer curve
+ * (Bookmap-class overhaul, lane F). `u_gamma` owns the below-knee lift; this
+ * constant owns the upper segment: the wall band (p97..p99.7) no longer clamps
+ * into the top few LUT entries but spreads across `log1p` space. Fixed (not a
+ * user setting) — the Contrast slider keeps its single below-knee-gamma meaning.
+ */
+export const TRANSFER_LOG_SCALE = 6.0;
+
+/**
+ * Knee fraction used when no {@link ViewportNormalizer} is attached (unit tests,
+ * the synthetic e2e hook): `u_knee = 0.55`. With a normalizer attached the draw
+ * uploads the live `knee / white` ratio (clamped [0.05, 0.95]) instead.
+ */
+export const DEFAULT_KNEE_FRACTION = 0.55;
+
+/** Clamp the per-frame knee fraction into the legible, division-safe band. */
+function clampKneeFraction(v: number): number {
+  return Math.min(0.95, Math.max(0.05, Number.isFinite(v) ? v : DEFAULT_KNEE_FRACTION));
+}
+
+/**
+ * The two-segment transfer curve (Bookmap-class overhaul, lane F) — the TS
+ * mirror of the fragment shader's post-floor mapping, for tests:
+ *
+ *   t <= k : t = k * pow(t / k, gamma)                                 // lift
+ *   t >  k : t = k + (1-k) * log(1 + L*(t-k)/(1-k)) / log(1 + L)      // compress
+ *
+ * Endpoints are exact (f(0) = 0 → background, f(1) = 1 → LUT 255) and the two
+ * segments meet continuously at the knee (both equal `k`). Gaussian-free, pure.
+ */
+export function transferCurve(
+  t: number,
+  { knee, gamma, logScale }: { knee: number; gamma: number; logScale: number },
+): number {
+  const tc = Number.isFinite(t) ? Math.min(1, Math.max(0, t)) : 0;
+  const k = Number.isFinite(knee)
+    ? Math.min(0.999999, Math.max(0.000001, knee))
+    : DEFAULT_KNEE_FRACTION;
+  const g = Number.isFinite(gamma) ? Math.max(1e-6, gamma) : 1;
+  const L = Number.isFinite(logScale) && logScale > 0 ? logScale : TRANSFER_LOG_SCALE;
+  if (tc <= k) return k * Math.pow(tc / k, g);
+  return k + (1 - k) * (Math.log1p((L * (tc - k)) / (1 - k)) / Math.log1p(L));
+}
+
+/**
  * Largest black point the Tolerance slider can reach. Raised from 0.5 to 0.85 so
  * the control has real reach — at the top of the slider it hides sub-threshold
  * density up to 85% of the white point, cutting a genuinely noisy field down to
  * just the walls. Still capped well below 1: at `floor → 1` the `1/(1-floor)`
- * re-expansion (scale = 6.67× here) degenerates and even the p99 white point
+ * re-expansion (scale = 6.67× here) degenerates and even the white percentile
  * maps to LUT entry 0 — a black screen — which would break the "both endpoints
  * stay fixed" promise rather than implement it.
  */
@@ -109,13 +155,14 @@ export const TOLERANCE_CURVE = 1.4;
  * remains an exact algebraic no-op for anyone who wants every speck back.
  *
  * 15 (floor ≈ 0.060) was the "empty heatmap" default: order-flow density is
- * heavy-tailed, and with the p99 white point the MEDIAN active cell sat at ~2%
- * of norm — a third of the floor — so out of the box the whole ladder painted
- * background and only the walls showed. 5 maps to a floor of ≈ 0.013, which on
- * the same tail shape suppresses just the bottom quartile (the specks) while
- * the median cell (~4% of the p97 norm) clears the floor and reads as dark
- * indigo. The math is pinned by the "default visibility" test in
- * heatmap.test.ts (≈76% of active cells visible vs ≈26% before).
+ * heavy-tailed, and with the old p99 white point the MEDIAN active cell sat at
+ * ~2% of norm — a third of the floor — so out of the box the whole ladder
+ * painted background and only the walls showed. 5 maps to a floor of ≈ 0.013,
+ * which on the same tail shape suppresses just the quiet end while the p75+
+ * cells clear the floor and read as dark indigo. Lane F moved the white point
+ * to p99.7, so on the heavy-tail model the floor now cuts ≈56% of active cells
+ * (≈44% visible). The math is pinned by the "default visibility" test in
+ * heatmap.test.ts.
  */
 export const DEFAULT_TOLERANCE = 5;
 
@@ -123,12 +170,11 @@ export const DEFAULT_TOLERANCE = 5;
  * Map a 0–100 "Tolerance" slider to the shader's black point.
  *
  * Eased (exponent {@link TOLERANCE_CURVE}), not linear, because the useful floors
- * are small: order-flow density is heavy-tailed and with the p97 white point the
- * median active cell lands near 4% of norm, so a floor around 1–2% separates the
- * real ladder from the specks without hiding the field (at the default floor of
- * ≈0.013 a cell needs ~1.3% of the white point to paint at all). The eased curve
- * gives fine control at the low end and meaningful bite through the middle,
- * reaching the cap at 100.
+ * are small: order-flow density is heavy-tailed, so a floor around 1–2% of the
+ * white point separates the real ladder from the specks without hiding the field
+ * (at the default floor of ≈0.013 a cell needs ~1.3% of the white point to paint
+ * at all). The eased curve gives fine control at the low end and meaningful bite
+ * through the middle, reaching the cap at 100.
  *
  * Non-finite input yields 0 rather than NaN — a NaN floor would blank the entire
  * heatmap, and this is reachable from `window.__flowmapLive` in dev/e2e builds.
@@ -304,35 +350,105 @@ export function levelBlendFor(
 }
 
 /**
- * Zoom-aware level-0 sampler mix (campaign 5, contract F4). The historical
- * level-0 kernel (bilinear + 0.25/0.5/0.25 column blur) spans ~4 columns; while
- * a column is sub-pixel that blur is the right anti-confetti filter, but at
- * deep zoom (one column over many pixels) it smears cell edges over 40–200 px
- * and never sharpens (S3 measurement).
+ * Gaussian field-sampler law (Bookmap-class overhaul, lane F; replaces the
+ * crisp/3-tap-blur cross-fade). The historical kernel was either a fixed
+ * 3-column blur (sub-pixel columns) or hard nearest-cell sampling (deep zoom);
+ * both produced artifacts at their opposite ends (confetti vs 40–200 px
+ * smear/step aliasing). The new sampler is one width-scaled Gaussian on the
+ * TIME axis, `sigma` pinned in SCREEN pixels:
  *
- * `colsPerPixel = view.colScale / drawingBufferWidth`:
- *   - cpp >= 1.5 → full blur, crisp off — columns are (sub-)pixel wide.
- *   - cpp <= 0.5 → blur off, full crisp cell sampling — flat data plateaus
- *     with hard time edges.
- *   - smoothstep cross-fade in between, so the two filters never pop while
- *     zooming; the weights always sum to 1.
+ *   sigmaCols = clamp(SMOOTH_SIGMA_PX * colsPerPixel, 0.12, 2.0)
+ *   taps      = 9 (offsets −4..+4) when sigmaCols > 0.12, else 1 (pure bilinear)
  *
- * Non-finite input degrades to the conservative historical output (full blur).
+ * so the edge response stays ~`2.563 * 2.5 ≈ 6.4 px` (10–90) at deep zoom and
+ * only sharpens as columns become sub-pixel (the 2.0-column cap). The vertical
+ * axis is untouched — price stays crisp. Non-finite input degrades to the
+ * minimum plan (single bilinear tap).
  */
-export function sampleMix(colsPerPixel: number): { blur: number; cell: number } {
-  if (!Number.isFinite(colsPerPixel)) return { blur: 1, cell: 0 };
-  if (colsPerPixel >= 1.5) return { blur: 1, cell: 0 };
-  if (colsPerPixel <= 0.5) return { blur: 0, cell: 1 };
-  // Resolution-transition polish (lane P): smoothstep the cross-fade instead of
-  // the historical linear ramp, so the crisp/blur handoff has zero derivative at
-  // BOTH ends — a zoom series through cpp 0.5..1.5 no longer shows the subtle
-  // slope discontinuity the zoom-ladder probe caught at the crossover. `t` is
-  // the complementary fraction (1 at cpp 0.5 → crisp, 0 at cpp 1.5 → blur), so
-  // cell stays monotone decreasing as columns grow; 1.0 still lands exactly on
-  // {0.5, 0.5}, and the endpoint branches above stay bit-exact.
-  const t = (1.5 - colsPerPixel) / (1.5 - 0.5);
-  const cell = t * t * (3 - 2 * t);
-  return { blur: 1 - cell, cell };
+export const SMOOTH_SIGMA_PX = 2.5;
+/** Odd tap budget baked into the GLSL loop bound (offsets −4..+4). */
+export const SMOOTH_MAX_TAPS = 9;
+/** Sigma floor in column units — guards the div-by-zero / one-column smear. */
+const SMOOTH_SIGMA_COLS_MIN = 0.12;
+/** Sigma ceiling in column units — beyond this the edge smears multi-cell. */
+const SMOOTH_SIGMA_COLS_MAX = 2.0;
+/**
+ * Tap-count tiers (perf calibration, lane F): the frame uploads only the taps
+ * whose Gaussian weight is non-negligible at its sigma — the full 9-tap table
+ * failed the SwiftShader p10 draw gate (33.7 ms). Boundaries in COLUMN units:
+ * σ ≤ 0.35 → 1 tap, ≤ 0.75 → 3, ≤ 1.25 → 5, else 9. HONESTY (review R1-M1):
+ * these are ±1.3–1.6σ truncations, so the effective second moment is NOT
+ * preserved — measured σ_eff shifts ~11–13% downward at tier boundaries
+ * (0.35→0.18, 0.75→0.67, 1.25→1.11). The tiers are a perf trade, not a claim
+ * of sigma preservation; the visual acceptance bars (smooth-zoom spec) are
+ * the arbiter.
+ */
+const SMOOTH_TAPS_TIERS: readonly { maxSigma: number; taps: number }[] = [
+  { maxSigma: 0.35, taps: 1 },
+  { maxSigma: 0.75, taps: 3 },
+  { maxSigma: 1.25, taps: 5 },
+  { maxSigma: Number.POSITIVE_INFINITY, taps: 9 },
+];
+
+export interface SmoothPlan {
+  /** Gaussian sigma in COLUMN units (never 0 — 1-tap plans keep the min). */
+  sigmaCols: number;
+  /** Odd tap count, one of 1/3/5/9, ≤ {@link SMOOTH_MAX_TAPS}. */
+  taps: number;
+}
+
+/**
+ * Map the time-axis footprint (`colsPerPixel = view.colScale /
+ * drawingBufferWidth`, always `> 0` in the time-grid convention) to the
+ * frame's sampler plan. Pure and monotone in `colsPerPixel`; non-finite input
+ * (and negatives) degrade to the minimum plan. `taps` follows the tier table
+ * above; the truncation is honest about its cost (see {@link SMOOTH_TAPS_TIERS}
+ * — effective σ shifts ≲13% downward at tier boundaries, a perf trade whose
+ * result the smooth-zoom pixel bars enforce).
+ */
+export function smoothPlanFor(colsPerPixel: number): SmoothPlan {
+  const cpp = Number.isFinite(colsPerPixel) ? Math.max(0, colsPerPixel) : 0;
+  const sigmaCols = Math.min(
+    SMOOTH_SIGMA_COLS_MAX,
+    Math.max(SMOOTH_SIGMA_COLS_MIN, SMOOTH_SIGMA_PX * cpp),
+  );
+  let taps = SMOOTH_MAX_TAPS;
+  for (const tier of SMOOTH_TAPS_TIERS) {
+    if (sigmaCols <= tier.maxSigma) {
+      taps = tier.taps;
+      break;
+    }
+  }
+  return { sigmaCols, taps };
+}
+
+/**
+ * CPU Gaussian tap table for a plan: `taps` symmetric offsets centered on 0
+ * (so the shader's fixed `for t < u_smoothTaps` loop reads the CENTERED
+ * subset) and `exp(-0.5 * (off / sigma)^2)` weights, normalized to sum 1 here
+ * — the shader re-normalizes over the VALID taps only, so window edges fold
+ * to the core. Uploaded as uniforms (padded to 9): no per-fragment `exp`
+ * (driver determinism across SwiftShader/GPU).
+ */
+function gaussianTaps(
+  sigmaCols: number,
+  taps: number,
+): { offsets: Float32Array; weights: Float32Array } {
+  const offsets = new Float32Array(SMOOTH_MAX_TAPS);
+  const weights = new Float32Array(SMOOTH_MAX_TAPS);
+  const count = Math.max(1, Math.min(SMOOTH_MAX_TAPS, Math.round(taps)));
+  const half = (count - 1) / 2;
+  let sum = 0;
+  for (let i = 0; i < count; i++) {
+    const off = i - half;
+    const rel = off / sigmaCols;
+    const w = Math.exp(-0.5 * rel * rel);
+    offsets[i] = off;
+    weights[i] = w;
+    sum += w;
+  }
+  for (let i = 0; i < count; i++) weights[i] /= sum;
+  return { offsets, weights };
 }
 
 /**
@@ -428,6 +544,24 @@ function linkProgram(gl: WebGL2RenderingContext, vert: string, frag: string): We
   return prog;
 }
 
+/**
+ * Upload a float uniform array. Real WebGL2 contexts always expose
+ * `uniform1fv`; the optional-call guard lets the jsdom FakeGL (which predates
+ * array uniforms) degrade to a no-op instead of throwing mid-draw.
+ */
+function uploadFloatArray(
+  gl: WebGL2RenderingContext,
+  location: WebGLUniformLocation | null,
+  data: Float32Array,
+): void {
+  const fn = (
+    gl as unknown as {
+      uniform1fv?: (loc: WebGLUniformLocation | null, v: Float32Array) => void;
+    }
+  ).uniform1fv;
+  if (typeof fn === 'function') fn.call(gl, location, data);
+}
+
 type UniformName =
   | 'u_tiles'
   | 'u_mip1'
@@ -457,8 +591,11 @@ type UniformName =
   | 'u_nRowTapsFine'
   | 'u_rowOnly'
   | 'u_rowFade'
-  | 'u_colBlur'
-  | 'u_colCell';
+  | 'u_knee'
+  | 'u_logScale'
+  | 'u_smoothTaps'
+  | 'u_smoothOffsets'
+  | 'u_smoothWeights';
 
 export class Heatmap {
   readonly gl: WebGL2RenderingContext;
@@ -512,15 +649,31 @@ export class Heatmap {
   levelFloor = 0;
 
   /**
-   * Scale-aware sampler state from the LAST {@link draw} (campaign 5, F4 + lane
-   * P): `colsPerPixel` (time-axis footprint), the blur/cell weights, and the
-   * row-mip cross-fade weight that were uploaded. Defaults to the zoomed-out
-   * historical blur before the first draw.
+   * Knee fraction uploaded when {@link normalizer} is NOT attached (unit tests,
+   * synthetic e2e hook): {@link DEFAULT_KNEE_FRACTION}. With a normalizer
+   * attached the draw computes `clamp(knee/white, 0.05, 0.95)` from the live
+   * EMA pair instead (Bookmap-class overhaul, lane F).
+   */
+  knee = DEFAULT_KNEE_FRACTION;
+
+  /**
+   * Optional viewport normalizer attachment (lane F): when set, the draw reads
+   * `currentPercentiles` (the same EMA the renderer feeds `u_norm`) for the
+   * per-frame `u_knee = clamp(knee/white, 0.05, 0.95)`. The renderer wires this
+   * on creation; without it the {@link knee} fallback is used.
+   */
+  normalizer: ViewportNormalizer | null = null;
+
+  /**
+   * Gaussian sampler + cross-fade diagnostics from the LAST {@link draw} (lane
+   * F): the time-axis footprint, the sampler plan, and the row/level fade
+   * weights that were uploaded. Defaults to the plan at `colsPerPixel = 1`
+   * before the first draw.
    */
   private lastSample = {
     colsPerPixel: 1,
-    colBlur: 1,
-    colCell: 0,
+    smoothSigma: smoothPlanFor(1).sigmaCols,
+    smoothTaps: smoothPlanFor(1).taps,
     rowFade: 0,
     levelFade: 0,
     finerLevel: -1,
@@ -560,7 +713,7 @@ export class Heatmap {
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    const loc = (n: UniformName) => gl.getUniformLocation(this.program, n);
+    const loc = (n: string) => gl.getUniformLocation(this.program, n);
     this.u = {
       u_tiles: loc('u_tiles'),
       u_mip1: loc('u_mip1'),
@@ -590,8 +743,11 @@ export class Heatmap {
       u_nRowTapsFine: loc('u_nRowTapsFine'),
       u_rowOnly: loc('u_rowOnly'),
       u_rowFade: loc('u_rowFade'),
-      u_colBlur: loc('u_colBlur'),
-      u_colCell: loc('u_colCell'),
+      u_knee: loc('u_knee'),
+      u_logScale: loc('u_logScale'),
+      u_smoothTaps: loc('u_smoothTaps'),
+      u_smoothOffsets: loc('u_smoothOffsets[0]'),
+      u_smoothWeights: loc('u_smoothWeights[0]'),
     };
     checkGLError(gl, 'Heatmap.ctor');
   }
@@ -669,6 +825,17 @@ export class Heatmap {
     gl.uniform1f(this.u.u_decodeScale, this.encoding.decodeScale);
     gl.uniform1f(this.u.u_norm, this.encoding.norm);
     gl.uniform1f(this.u.u_gamma, this.gamma);
+    // Two-segment transfer curve (lane F): the knee fraction comes from the
+    // normalizer's EMA pair when attached (the SAME merged CDF the renderer
+    // feeds `u_norm` from), else the module-default fallback. The log scale is
+    // the fixed module constant; both are per-draw constants — coherent branch.
+    const pcts = this.normalizer !== null ? this.normalizer.currentPercentiles : null;
+    const kneeFraction =
+      pcts !== null && Number.isFinite(pcts.white) && pcts.white > 0
+        ? clampKneeFraction(pcts.knee / pcts.white)
+        : clampKneeFraction(this.knee);
+    gl.uniform1f(this.u.u_knee, kneeFraction);
+    gl.uniform1f(this.u.u_logScale, TRANSFER_LOG_SCALE);
     gl.uniform1i(this.u.u_ramp, this.encoding.ramp);
     gl.uniform1i(this.u.u_channel, this.channel);
 
@@ -741,20 +908,23 @@ export class Heatmap {
     gl.uniform1i(this.u.u_rowOnly, rowFade > 0 ? 1 : 0);
     gl.uniform1f(this.u.u_rowFade, rowFade);
 
-    // Scale-aware level-0 sampler mix (campaign 5, F4; see sampleMix). Always
-    // uploaded, so the zoomed-out path stays EXACTLY the historical filter and
-    // the deep-zoom path switches to crisp cells without a shader recompile.
-    const mix = sampleMix(colsPerPixel);
+    // Gaussian field sampler (lane F; see smoothPlanFor): one width-scaled
+    // kernel on the TIME axis, per-draw constants (sigma/weights computed here,
+    // no per-fragment exp). The plan covers the whole zoom range coherently —
+    // no recompile, no crisp/blur handoff.
+    const plan = smoothPlanFor(colsPerPixel);
+    const taps = gaussianTaps(plan.sigmaCols, plan.taps);
     this.lastSample = {
       colsPerPixel,
-      colBlur: mix.blur,
-      colCell: mix.cell,
+      smoothSigma: plan.sigmaCols,
+      smoothTaps: plan.taps,
       rowFade,
       levelFade,
       finerLevel,
     };
-    gl.uniform1f(this.u.u_colBlur, mix.blur);
-    gl.uniform1f(this.u.u_colCell, mix.cell);
+    gl.uniform1i(this.u.u_smoothTaps, plan.taps);
+    uploadFloatArray(gl, this.u.u_smoothOffsets, taps.offsets);
+    uploadFloatArray(gl, this.u.u_smoothWeights, taps.weights);
 
     // Scale the black point by the pixel's ROW footprint. `intensity` sums
     // nRowTaps rows of a blk-row block and divides only the COLUMN dimension by
@@ -774,19 +944,19 @@ export class Heatmap {
   }
 
   /**
-   * The level-0 sampler mix the LAST {@link draw} uploaded — `colsPerPixel`
-   * plus the blur/cell weights (see {@link sampleMix}), the effective row-mip
-   * cross-fade weight (see {@link effectiveRowMode}) and the SUM-mip level
-   * cross-fade (see {@link levelBlendFor}; `finerLevel` is -1 whenever no
-   * second sample exists). Defaults to the zoomed-out historical blur
-   * `{ colsPerPixel: 1, colBlur: 1, colCell: 0, rowFade: 0, levelFade: 0,
-   * finerLevel: -1 }` before the first draw. Diagnostics/tests only
-   * (testHook.levelInfo).
+   * The sampler plan + cross-fade weights the LAST {@link draw} uploaded —
+   * `colsPerPixel`, the Gaussian plan (see {@link smoothPlanFor}), the effective
+   * row-mip cross-fade weight (see {@link effectiveRowMode}) and the SUM-mip
+   * level cross-fade (see {@link levelBlendFor}; `finerLevel` is -1 whenever no
+   * second sample exists). Defaults to the `colsPerPixel = 1` plan
+   * (`{ colsPerPixel: 1, smoothSigma: 2, smoothTaps: 9, rowFade: 0,
+   * levelFade: 0, finerLevel: -1 }`) before the first draw. Diagnostics/tests
+   * only (testHook.levelInfo).
    */
   sampleInfo(): {
     colsPerPixel: number;
-    colBlur: number;
-    colCell: number;
+    smoothSigma: number;
+    smoothTaps: number;
     rowFade: number;
     levelFade: number;
     finerLevel: number;

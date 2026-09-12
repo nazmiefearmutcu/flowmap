@@ -12,8 +12,10 @@ import { expect, test } from '@playwright/test';
  * history zone were scattered. CP2's piecewise per-slot t0 table fixes the map.
  *
  * Assertions (all through the public `__flowmapLive.renderer` getters):
- *  - the reconstructed→live cadence transition exists: a 60 s column delta
- *    followed by sub-second (250 ms) deltas;
+ *  - the reconstructed→live cadence transition exists: a reconstructed column
+ *    delta (sub-minute; 3.75 s at the shipped stretch=16, which spreads each
+ *    1 m candle over 16 columns on the 250 ms grid) followed by sub-second
+ *    (250 ms) live deltas;
  *  - `colForTsForTest(colToTsForTest(k))` round-trips to the candle column k;
  *  - an overlay point at the candle's t0 maps to the SAME canvas x as the cell
  *    centre for that column (the ts→col transform the glyphs consume).
@@ -77,13 +79,15 @@ test('BTC native: reconstructed history maps real candle times (network-dependen
     // server rehydrates it instead of reconstructing candles (by design), so
     // this is expected on dev stacks that have recorded BTC before.
     const diag = await page.evaluate(() => {
-      const live = (window as unknown as { __flowmapLive: any }).__flowmapLive;
-      const st = live.store.getState();
+      // Dev-stack HMR can reload the page mid-test, dropping __flowmapLive;
+      // degrade to the honest skip (status 'unavailable') instead of throwing.
+      const live = (window as unknown as { __flowmapLive?: any }).__flowmapLive;
+      const st = live?.store?.getState();
       return {
-        status: st.status as string,
-        symbol: (st.subscription?.symbol ?? null) as string | null,
-        newest: (live.renderer?.newestColSeq ?? -1) as number,
-        capability: st.capability as unknown,
+        status: (st?.status ?? 'unavailable') as string,
+        symbol: (st?.subscription?.symbol ?? null) as string | null,
+        newest: (live?.renderer?.newestColSeq ?? -1) as number,
+        capability: (st?.capability ?? null) as unknown,
       };
     });
     const reason = `binance-spot:BTCUSDT reconstructed history unavailable (status=${diag.status}, symbol=${diag.symbol}, newest=${diag.newest}, capability=${JSON.stringify(
@@ -100,7 +104,8 @@ test('BTC native: reconstructed history maps real candle times (network-dependen
     const newest = r.newestColSeq as number;
 
     // Find the reconstructed→live boundary: the LAST column whose next-column
-    // delta is a 60 s candle step (scanning back from the live edge).
+    // delta exceeds the live cadence (scanning back from the live edge). The
+    // reconstructed step is stretch-aware (3.75 s at stretch=16), not 60 s.
     let boundary = -1;
     for (let c = newest - 1; c >= 1; c--) {
       const a = t(c);
@@ -139,10 +144,17 @@ test('BTC native: reconstructed history maps real candle times (network-dependen
     return;
   }
 
-  // (a) reconstructed cadence: exactly 60 s between 1 m candle columns.
-  expect(BigInt(probe.candleDelta), 'reconstructed columns step by one minute').toBe(
-    60_000_000_000n,
-  );
+  // (a) reconstructed cadence: stretch-aware sub-minute step (>= one dt, and
+  // below the 60 s candle span) — distinct from the sub-second live cadence.
+  const candleDeltaNs = BigInt(probe.candleDelta);
+  expect(
+    candleDeltaNs,
+    `reconstructed columns step at least one dt (got ${probe.candleDelta} ns)`,
+  ).toBeGreaterThanOrEqual(250_000_000n);
+  expect(
+    candleDeltaNs,
+    `reconstructed columns step sub-minute (got ${probe.candleDelta} ns)`,
+  ).toBeLessThan(60_000_000_000n);
   // (b) live cadence right after the boundary: the 250 ms epoch, NOT 60 s.
   expect(
     BigInt(probe.liveDelta),
@@ -157,6 +169,6 @@ test('BTC native: reconstructed history maps real candle times (network-dependen
 
   test.info().annotations.push({
     type: 'reconstructed',
-    description: `boundary col ${probe.boundary}: 60s candle step ${probe.candleDelta}ns → live ${probe.liveDelta}ns`,
+    description: `boundary col ${probe.boundary}: reconstructed step ${probe.candleDelta}ns → live ${probe.liveDelta}ns`,
   });
 });

@@ -15,6 +15,7 @@ import {
   effectiveRowMode,
   levelBlendFor,
   selectLevel,
+  smoothPlanFor,
   type HeatmapView,
 } from './heatmap';
 import {
@@ -33,11 +34,13 @@ import { MipChain } from './mips';
 import { MODE_L2 } from '../proto/types';
 import { COLS_PER_TILE, TileRing, type ResidentRange } from './tileRing';
 
-/** Additive per-draw sampler diagnostics (campaign visual 2026-09-11). */
+/** Additive per-draw sampler diagnostics (campaign visual 2026-09-11; lane F). */
 export interface HeatmapSampleInfo {
   colsPerPixel: number;
-  colBlur: number;
-  colCell: number;
+  /** Gaussian sigma of the last draw's field sampler, in COLUMN units. */
+  smoothSigma: number;
+  /** Tap count of the last draw's field sampler (1 or 9). */
+  smoothTaps: number;
   /** Row-mip cross-fade weight of the last draw (lane P; 0..1). */
   rowFade: number;
   /** SUM-mip level cross-fade weight of the last draw (wave P2; 0..1). */
@@ -47,9 +50,9 @@ export interface HeatmapSampleInfo {
 }
 
 /**
- * L3's `Heatmap.sampleInfo()` — read through an optional handle so this lane
- * type-checks before/after that method lands; values default 1/1/0/0 (before
- * the first draw) exactly as the contract specifies.
+ * Lane F's `Heatmap.sampleInfo()` — read through an optional handle so this
+ * lane type-checks before/after that method lands; before the first draw the
+ * values mirror the `colsPerPixel = 1` plan exactly as the contract specifies.
  */
 function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
   const fn = (
@@ -58,7 +61,15 @@ function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
     }
   ).sampleInfo;
   if (typeof fn === 'function') return fn.call(heatmap);
-  return { colsPerPixel: 1, colBlur: 1, colCell: 0, rowFade: 0, levelFade: 0, finerLevel: -1 };
+  const plan = smoothPlanFor(1);
+  return {
+    colsPerPixel: 1,
+    smoothSigma: plan.sigmaCols,
+    smoothTaps: plan.taps,
+    rowFade: 0,
+    levelFade: 0,
+    finerLevel: -1,
+  };
 }
 
 export interface FlowmapTestApi {
@@ -98,13 +109,13 @@ export interface FlowmapTestApi {
   residentRange(): ResidentRange | null;
   /**
    * The SUM-mip level the current view+canvas would sample (T7 diagnostics),
-   * plus (campaign visual 2026-09-11) the last-draw level-0 sampler weights:
-   * `colsPerPixel` (view scale), `colBlur` (3-tap column blend amount) and
-   * `colCell` (crisp nearest-column cell weight). Defaults 1/1/0 before a draw.
-   * `rowOnly`/`rowFade` mirror the real draw's lane-P row-mip selection: they
-   * come from the SAME {@link effectiveRowMode} helper the draw calls (fade > 0
-   * && a usable row chain), so the report can never drift from the paint.
-   * `levelFade`/`finerLevel` likewise mirror the wave-P2 SUM-mip level
+   * plus (lane F) the last-draw Gaussian sampler plan: `colsPerPixel` (view
+   * scale), `smoothSigma` (sigma in column units) and `smoothTaps` (1 or 9),
+   * both uploaded through the SAME {@link smoothPlanFor} helper the draw uses —
+   * the report can never drift from the paint. `rowOnly`/`rowFade` mirror the
+   * real draw's lane-P row-mip selection: they come from the SAME
+   * {@link effectiveRowMode} helper the draw calls (fade > 0 && a usable row
+   * chain). `levelFade`/`finerLevel` likewise mirror the wave-P2 SUM-mip level
    * cross-fade through the SAME {@link levelBlendFor} helper: fade 0 means the
    * legacy level upload (no second sample, finerLevel -1); inside a transition
    * band `finerLevel` is the level blended in (k-1). The row path never blends
@@ -116,8 +127,8 @@ export interface FlowmapTestApi {
     blk: number;
     nRowTaps: number;
     colsPerPixel: number;
-    colBlur: number;
-    colCell: number;
+    smoothSigma: number;
+    smoothTaps: number;
     rowOnly: boolean;
     rowFade: number;
     levelFade: number;

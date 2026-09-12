@@ -138,6 +138,22 @@ test('default midnight + theme colormap keeps the shipped dark chart ground', as
   expect(await chartVar(page, '--chart-bg')).toBe('rgb(5, 8, 14)');
   expect(await chartVar(page, '--chart-ink')).toBe('rgb(230, 237, 243)');
 
+  // S2-Q1 decoupling check: midnight's OWN density ramp is served from the
+  // theme row now — the renderer must report RAMP_THEME (5), not the frozen
+  // FLOW row 3. This is the user-visible shorthand for "midnight got its
+  // Bookmap-class ramp" (the row-5 bytes are pinned by chart.test.ts).
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const live = (window as unknown as { __flowmapLive?: { renderer?: { currentRamp?: number } } })
+            .__flowmapLive;
+          return typeof live?.renderer?.currentRamp === 'number' ? live.renderer.currentRamp : null;
+        }),
+      { timeout: 15_000 },
+    )
+    .toBe(5);
+
   // Canvas ground ~ the midnight ramp head (5, 8, 14). Soft: only meaningful
   // when the live canvas is reachable (it is under the sim feed). The dominant
   // color includes the near-black low-density field, so allow a dark-bucket

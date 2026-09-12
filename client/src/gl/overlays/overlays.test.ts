@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
-import { bubbleRadiusPx, type BubbleOptions } from './bubbles';
+import { Bubbles, bubbleAlpha, bubbleRadiusPx, type BubbleOptions } from './bubbles';
+import { GridMap, type TimeMap } from './coords';
+import type { OverlayFrame } from './frame';
+import {
+  PRICE_FILL_TOP_ALPHA,
+  PRICE_GLOW_ALPHA,
+  PRICE_GLOW_WIDTH,
+  PRICE_LINE_WIDTH,
+  PRICE_LEVEL_ALPHA,
+  PRICE_STUB_ALPHA,
+  PriceLine,
+  withAlpha,
+} from './priceLine';
 import { deriveL2Bbo } from './manager';
 import { accumulateProfile } from './profile';
 import { sessionVwap } from './vwap';
@@ -222,5 +234,86 @@ describe('deriveL2Bbo (inside quote from the L2 book)', () => {
     expect(b.askPx).not.toBeCloseTo(price.p0 + wingRow * price.step, 0);
     // ...while inside the core both agree.
     expect(b.bidPx).toBeCloseTo(price.p0 + (bidRow - s.dnRows) * price.step, 6);
+  });
+});
+
+describe('L6 price-line ink tuning', () => {
+  // Shipped constants this lane intentionally moved (brief L6 §1).
+  const VIEW = { colOffset: 0, colScale: 10, rowOffset: 0, rowScale: 100 };
+  const DIMS = { drawW: 800, drawH: 400, cssW: 800, cssH: 400 };
+  const PRICE = { p0: 0, step: 0.5 };
+  const TIME: TimeMap = { anchorSeq: 5, anchorT0Ns: 5n * 250_000_000n, dtNs: 250_000_000 };
+
+  it('pins the tightened widths/alphas', () => {
+    expect(PRICE_LINE_WIDTH).toBe(2.0);
+    expect(PRICE_GLOW_WIDTH).toBe(6.0);
+    expect(PRICE_GLOW_ALPHA).toBe(0.22);
+    expect(PRICE_FILL_TOP_ALPHA).toBe(0.09);
+    expect(PRICE_LEVEL_ALPHA).toBe(0.3);
+    expect(PRICE_STUB_ALPHA).toBe(0.7);
+  });
+
+  it('withAlpha re-stamps alpha and keeps the rgb channels', () => {
+    expect(withAlpha('rgba(210, 225, 245, 0.07)', 0.09)).toBe('rgba(210, 225, 245, 0.09)');
+    expect(withAlpha('#ff00aa', 0.3)).toBe('rgba(255, 0, 170, 0.3)');
+    expect(withAlpha('not-a-color', 0.5)).toBe('not-a-color');
+  });
+
+  it('draw paints the wash/glow/stub/core/level with the tuned alphas (order kept)', () => {
+    const g = new GridMap(VIEW, DIMS, TIME, PRICE);
+    const pl = new PriceLine();
+    pl.add({ col_seq: 4, c: 5 } as never);
+    pl.add({ col_seq: 5, c: 7 } as never);
+    const fill: string[] = [];
+    const dash: string[] = [];
+    const lines: Array<{ width: number; alpha?: number }> = [];
+    const text = {
+      fillUnder: (_p: unknown[], _yBase: number, top: string) => {
+        fill.push(top);
+      },
+      polyline: (_p: unknown[], o: { width: number; alpha?: number }) => {
+        lines.push({ width: o.width, alpha: o.alpha });
+      },
+      dashedLine: (_x0: number, _y0: number, _x1: number, _y1: number, color: string) => {
+        dash.push(color);
+      },
+    };
+    pl.draw({ gm: g, text, resident: null } as unknown as OverlayFrame);
+
+    expect(fill[0]).toBe('rgba(210, 225, 245, 0.09)'); // wash top (palette rgb kept)
+    expect(lines[0]).toEqual({ width: 6, alpha: 0.22 }); // glow
+    expect(lines[1]).toEqual({ width: 2, alpha: 0.7 }); // right-edge stub
+    expect(lines[2]).toEqual({ width: 2, alpha: undefined }); // bright core
+    expect(dash[0]).toBe('rgba(245, 248, 252, 0.3)'); // quieter level
+  });
+});
+
+describe('L6 bubble ink (alpha cap via the palette path)', () => {
+  it('caps the palette alpha at 0.9, hue untouched, and leaves low alphas alone', () => {
+    expect(bubbleAlpha([0.12, 0.71, 0.65, 0.95])).toBe(0.9);
+    expect(bubbleAlpha([0.88, 0.33, 0.33, 0.8])).toBe(0.8);
+  });
+
+  it('draw emits the capped alpha into the point batch', () => {
+    const g = new GridMap(
+      { colOffset: 0, colScale: 10, rowOffset: 0, rowScale: 100 },
+      { drawW: 800, drawH: 400, cssW: 800, cssH: 400 },
+      { anchorSeq: 5, anchorT0Ns: 5n * 250_000_000n, dtNs: 250_000_000 },
+      { p0: 0, step: 0.5 },
+    );
+    const ink: number[][] = [];
+    const points = {
+      begin: () => {},
+      add: (_x: number, _y: number, _s: number, c: readonly number[]) => {
+        ink.push([...c]);
+      },
+      flush: () => {},
+    };
+    const b = new Bubbles();
+    b.add({ ts_ns: 5n * 250_000_000n, price: 5, size: 60, side: 1 } as never);
+    b.draw({ gm: g, points, resident: null } as unknown as OverlayFrame);
+    expect(ink).toHaveLength(1);
+    expect(ink[0][3]).toBeLessThanOrEqual(0.9);
+    expect(ink[0][3]).toBeGreaterThan(0);
   });
 });

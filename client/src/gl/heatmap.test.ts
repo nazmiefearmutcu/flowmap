@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONTRAST,
   DEFAULT_DISPLAY_GAMMA,
+  DEFAULT_KNEE_FRACTION,
   DEFAULT_TOLERANCE,
   DEFAULT_DEPTH_CHANNEL,
   DEPTH_CHANNEL_CODE,
@@ -13,13 +14,18 @@ import {
   Heatmap,
   levelBlendFor,
   rowFadeFor,
-  sampleMix,
   selectLevel,
+  SMOOTH_MAX_TAPS,
+  SMOOTH_SIGMA_PX,
+  smoothPlanFor,
   TOLERANCE_MAX_FLOOR,
+  transferCurve,
+  TRANSFER_LOG_SCALE,
 } from './heatmap';
 import { buildImbalanceLUT, buildFlowLUT, LUT_SIZE } from './lut';
 import { MipChain } from './mips';
 import { makeFakeGL, type FakeGL } from './mockGL';
+import { ViewportNormalizer } from './normalize';
 import type { GLContext } from './context';
 import { COLS_PER_TILE, TileRing } from './tileRing';
 import { HEATMAP_FRAG } from './shaders/heatmap';
@@ -149,10 +155,14 @@ describe('gammaForContrast', () => {
 describe('default visibility â€” the boxed heatmap must show the field, not just walls', () => {
   // Heavy-tail model: log-normal with Ïƒ chosen so the MEDIAN active cell is 2% of
   // the p99 white point (observed order-flow shape: a handful of walls dwarf the
-  // ladder). All quantiles below are derived from that one shape assumption.
+  // ladder). Lane F moved the WHITE point to p99.7 while p97 stays the KNEE, so
+  // every quantile below is derived from the same shape at the NEW white point.
   const SIGMA = Math.log(50) / 2.3263; // p99/median = exp(2.3263Â·Ïƒ) = 50 â†’ Ïƒ â‰ˆ 1.68
   const P99 = Math.exp(2.3263 * SIGMA);
   const P97 = Math.exp(1.8808 * SIGMA); // standard-normal quantile for 97%
+  const P99_7 = Math.exp(2.7478 * SIGMA); // standard-normal quantile for 99.7%
+  /** The live knee fraction once the normalizer is attached: p97 / p99.7. */
+  const KNEE = P97 / P99_7;
 
   /** Standard-normal CDF (Abramowitzâ€“Stegun 26.2.17, |err| < 7.5e-8). */
   function phi(z: number): number {
@@ -171,11 +181,13 @@ describe('default visibility â€” the boxed heatmap must show the field, not
     return 0.02 * P99 * Math.exp(z * SIGMA);
   }
 
-  /** The fragment shader chain: normalize â†’ black point â†’ gamma â†’ LUT index. */
+  /** The fragment shader chain: normalize â†’ black point â†’ transfer â†’ LUT index. */
   function lut(cellDensity: number, norm: number, floor: number, gamma: number): number {
     const t = Math.min(1, Math.max(0, cellDensity / norm));
     const remapped = Math.min(1, Math.max(0, (t - floor) / Math.max(1 - floor, 1e-6)));
-    return Math.round(Math.pow(remapped, gamma) * 255);
+    return Math.round(
+      transferCurve(remapped, { knee: KNEE, gamma, logScale: TRANSFER_LOG_SCALE }) * 255,
+    );
   }
 
   /** Share of active cells above the floor (visible) on the model distribution. */
@@ -184,35 +196,48 @@ describe('default visibility â€” the boxed heatmap must show the field, not
     return 1 - phi(z);
   }
 
-  it('keeps ~3Ã— more of the field visible than the pre-fix defaults', () => {
+  it('keeps the upper field visible while the floor still cuts the quiet tail', () => {
     const floor = floorForTolerance(DEFAULT_TOLERANCE);
+    const after = visibleFraction(floor, P99_7); // now: tol 5 + p99.7 white
     const before = visibleFraction(floorForTolerance(15), P99); // pre-fix: tol 15 + p99
-    const after = visibleFraction(floor, P97); // now: tol 5 + p97
-    expect(after).toBeGreaterThan(0.6); // â‰ˆ76% of active cells paint
-    expect(before).toBeLessThan(0.35); // â‰ˆ26% before â€” walls only
-    expect(after).toBeGreaterThan(before * 2);
+    // The new white point is ~2.03Ã— the old one, so the same slider fraction
+    // hides a lower quantile: â‰ˆ44% of active cells paint (vs â‰ˆ26% pre-fix); the
+    // old >0.6 band belonged to the p97 white point and is deliberately gone.
+    expect(after).toBeGreaterThan(0.35);
+    expect(after).toBeLessThan(0.55);
+    expect(before).toBeLessThan(0.35);
+    expect(after).toBeGreaterThan(before * 1.5);
   });
 
-  it('keeps the median a dark visible indigo while the bottom quartile stays suppressed', () => {
+  it('separates the wall band instead of clamping it (the point of the change)', () => {
     const floor = floorForTolerance(DEFAULT_TOLERANCE);
     const gamma = gammaForContrast(DEFAULT_CONTRAST);
-    const medianLut = lut(cell(0), P97, floor, gamma);
-    const lowLut = lut(cell(-0.6745), P97, floor, gamma); // 25th percentile
-    // Campaign 4.1 dark-field default: the median active cell paints in the
-    // DARK head of the ramp (â‰ˆLUT 13) â€” visible structure, not confetti. The
-    // old lifting curve painted it at â‰ˆLUT 51 (bright indigo => barcode).
-    expect(medianLut).toBeGreaterThanOrEqual(8);
-    expect(medianLut).toBeLessThanOrEqual(30);
-    expect(lowLut).toBeLessThanOrEqual(15); // still â‰ˆbackground
+    const kneeLut = lut(P97, P99_7, floor, gamma); // p97 == knee
+    const p99Lut = lut(P99, P99_7, floor, gamma);
+    const whiteLut = lut(P99_7, P99_7, floor, gamma);
+    // The wall band spreads across the ramp instead of all clamping to the top:
+    // p97 lands on the knee (â‰ˆLUT 57), p99 mid-high (â‰ˆLUT 169), p99.7 white.
+    expect(kneeLut).toBeGreaterThanOrEqual(40);
+    expect(kneeLut).toBeLessThanOrEqual(90);
+    expect(p99Lut).toBeGreaterThanOrEqual(140);
+    expect(p99Lut).toBeLessThanOrEqual(200);
+    expect(whiteLut).toBe(255);
+    expect(whiteLut - kneeLut).toBeGreaterThan(150); // real spread, no flat band
+  });
+
+  it('hides everything below the floor exactly (LUT 0 == background)', () => {
+    const floor = floorForTolerance(DEFAULT_TOLERANCE);
+    const gamma = gammaForContrast(DEFAULT_CONTRAST);
+    // At p99.7 white the median..p70 of the heavy model sits under the default
+    // floor (the tolerance's job); p90 is the first decile of the field that
+    // reads as dark indigo.
+    expect(lut(cell(0), P99_7, floor, gamma)).toBe(0); // median
+    expect(lut(cell(0.5244), P99_7, floor, gamma)).toBeLessThanOrEqual(8); // p70
+    const p90Lut = lut(cell(1.2816), P99_7, floor, gamma);
+    expect(p90Lut).toBeGreaterThanOrEqual(10);
+    expect(p90Lut).toBeLessThanOrEqual(40);
     // Pre-fix regression pin: with floor â‰ˆ0.06 + p99 the median maps to LUT 0.
     expect(lut(cell(0), P99, floorForTolerance(15), gamma)).toBe(0);
-  });
-
-  it('keeps the walls saturated at the default white point', () => {
-    const floor = floorForTolerance(DEFAULT_TOLERANCE);
-    const gamma = gammaForContrast(DEFAULT_CONTRAST);
-    expect(lut(P97, P97, floor, gamma)).toBeGreaterThanOrEqual(250); // p97 â†’ white
-    expect(lut(P99, P97, floor, gamma)).toBe(255); // p99 clamps to full brightness
   });
 });
 
@@ -382,7 +407,11 @@ describe('depth channel modes (contract C2) â€” the intensity chain', () =>
     const t1 = Math.min(1, Math.max(0, intensity / Math.max(NORM, 1e-9)));
     const scale = 1 / Math.max(1 - FLOOR, 1e-6);
     const t2 = Math.min(1, Math.max(0, (t1 - FLOOR) * scale));
-    const t3 = Math.pow(t2, GAMMA);
+    const t3 = transferCurve(t2, {
+      knee: DEFAULT_KNEE_FRACTION,
+      gamma: GAMMA,
+      logScale: TRANSFER_LOG_SCALE,
+    });
     return toIdx(t3);
   }
 
@@ -397,20 +426,19 @@ describe('depth channel modes (contract C2) â€” the intensity chain', () =>
     expect(depthChannelOf('ask')).toBe('ask');
   });
 
-  it('mode 0 computes the EXACT historical expression (bit-identity contract)', () => {
+  it('mode 0 computes the EXACT historical intensity expression', () => {
     // The shader's intensity expression for mode 0 must remain the shipped
-    // string â€” the golden pixel parity e2e depends on it verbatim.
+    // string â€” the golden pixel parity e2e depends on it verbatim. The transfer
+    // AFTER it (lane F) is mirrored 1:1 in `lutIndex`.
     expect(HEATMAP_FRAG).toContain(
       'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
     );
-    // And the mirrored chain maps the fixed columns to the same indices the
-    // pre-channel math produces ((bid+ask)/norm â†’ floor â†’ gamma â†’ 0..255).
     const toIdx = (t: number): number => Math.trunc(t * 255 + 0.5);
     for (let r = 0; r < 16; r++) {
       const expected = toIdx(
-        Math.pow(
+        transferCurve(
           Math.min(1, Math.max(0, ((bid[r] + ask[r]) / NORM - FLOOR) / (1 - FLOOR))),
-          GAMMA,
+          { knee: DEFAULT_KNEE_FRACTION, gamma: GAMMA, logScale: TRANSFER_LOG_SCALE },
         ),
       );
       expect(lutIndex(bid[r], ask[r], 0)).toBe(expected);
@@ -470,44 +498,85 @@ describe('depth channel modes (contract C2) â€” the intensity chain', () =>
   });
 });
 
-describe('sampleMix â€” zoom-aware level-0 sampler mix (campaign 5, contract F4)', () => {
-  it('is full blur at/above 1.5 cpp and full crisp at/below 0.5 cpp', () => {
-    expect(sampleMix(1.5)).toEqual({ blur: 1, cell: 0 });
-    expect(sampleMix(4)).toEqual({ blur: 1, cell: 0 });
-    expect(sampleMix(0.5)).toEqual({ blur: 0, cell: 1 });
-    expect(sampleMix(0.1)).toEqual({ blur: 0, cell: 1 });
+describe('smoothPlanFor â€” the width-scaled Gaussian sampler plan (lane F)', () => {
+  it('pins the law: sigma = clamp(2.5 * cpp, 0.12, 2.0) with 3-sigma tap tiers', () => {
+    // Deep zoom: sigma in PIXELS is the constant 2.5 â†’ sigmaCols = 2.5 * cpp.
+    expect(SMOOTH_SIGMA_PX).toBe(2.5);
+    expect(SMOOTH_MAX_TAPS).toBe(9);
+    expect(smoothPlanFor(0.5)).toEqual({ sigmaCols: 1.25, taps: 5 });
+    expect(smoothPlanFor(0.25)).toEqual({ sigmaCols: 0.625, taps: 3 });
+    expect(smoothPlanFor(0.125)).toEqual({ sigmaCols: 0.3125, taps: 1 });
+    expect(smoothPlanFor(0.6)).toEqual({ sigmaCols: 1.5, taps: 9 });
   });
 
-  it('is the smoothstep cross-fade between the two regimes (lane P)', () => {
-    const mid = sampleMix(1.0);
-    expect(mid.blur).toBeCloseTo(0.5, 12);
-    expect(mid.cell).toBeCloseTo(0.5, 12);
-    // t is the complementary fraction (1 at 0.5 cpp â†’ crisp, 0 at 1.5 â†’ blur),
-    // so smoothstep tÂ²(3âˆ’2t) at cpp 0.75 (t = 0.75) = 0.84375 and at cpp 1.25
-    // (t = 0.25) = 0.15625. Zero derivative at both endpoints â€” no pop.
-    expect(sampleMix(0.75).cell).toBeCloseTo(0.84375, 12);
-    expect(sampleMix(0.75).blur).toBeCloseTo(0.15625, 12);
-    expect(sampleMix(1.25).cell).toBeCloseTo(0.15625, 12);
-    expect(sampleMix(1.25).blur).toBeCloseTo(0.84375, 12);
+  it('clamps the sigma into [0.12, 2.0] columns and drops to 1 tap at the floor', () => {
+    expect(smoothPlanFor(0)).toEqual({ sigmaCols: 0.12, taps: 1 });
+    expect(smoothPlanFor(0.04)).toEqual({ sigmaCols: 0.12, taps: 1 }); // 0.1 < min
+    expect(smoothPlanFor(0.06)).toEqual({ sigmaCols: 0.15, taps: 1 }); // above the floor, dead tail
+    expect(smoothPlanFor(4)).toEqual({ sigmaCols: 2, taps: 9 });
+    expect(smoothPlanFor(64)).toEqual({ sigmaCols: 2, taps: 9 });
   });
 
-  it('keeps the weights summing to 1 and monotone across the band', () => {
-    let prevBlur = -1;
-    let prevCell = 2;
-    for (let cpp = 0.1; cpp <= 4; cpp += 0.1) {
-      const m = sampleMix(cpp);
-      expect(m.blur + m.cell).toBeCloseTo(1, 12);
-      expect(m.blur).toBeGreaterThanOrEqual(prevBlur);
-      expect(m.cell).toBeLessThanOrEqual(prevCell);
-      prevBlur = m.blur;
-      prevCell = m.cell;
+  it('is monotone non-decreasing in colsPerPixel and never leaves the band', () => {
+    let prev = -1;
+    let prevTaps = 0;
+    for (let cpp = 0; cpp <= 4; cpp += 0.05) {
+      const p = smoothPlanFor(cpp);
+      expect(p.sigmaCols).toBeGreaterThanOrEqual(prev);
+      expect(p.sigmaCols).toBeGreaterThanOrEqual(0.12);
+      expect(p.sigmaCols).toBeLessThanOrEqual(2);
+      expect([1, 3, 5, SMOOTH_MAX_TAPS]).toContain(p.taps);
+      expect(p.taps).toBeGreaterThanOrEqual(prevTaps); // tiers never shrink
+      prev = p.sigmaCols;
+      prevTaps = p.taps;
+    }
+    expect(prev).toBe(2);
+    expect(prevTaps).toBe(9);
+  });
+
+  it('falls back to the minimum plan on non-finite/negative input', () => {
+    for (const v of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -3]) {
+      expect(smoothPlanFor(v)).toEqual({ sigmaCols: 0.12, taps: 1 });
     }
   });
+});
 
-  it('falls back to the conservative historical blur on non-finite input', () => {
-    expect(sampleMix(Number.NaN)).toEqual({ blur: 1, cell: 0 });
-    expect(sampleMix(Number.POSITIVE_INFINITY)).toEqual({ blur: 1, cell: 0 });
-    expect(sampleMix(Number.NEGATIVE_INFINITY)).toEqual({ blur: 1, cell: 0 });
+describe('transferCurve â€” the two-segment transfer (lane F)', () => {
+  const K = 0.4;
+  const base = { knee: K, gamma: 0.86, logScale: TRANSFER_LOG_SCALE };
+  const above = (t: number): number =>
+    K +
+    (1 - K) *
+      (Math.log1p((TRANSFER_LOG_SCALE * (t - K)) / (1 - K)) / Math.log1p(TRANSFER_LOG_SCALE));
+
+  it('pins both endpoints exactly (f(0)=0 â†’ background, f(1)=1 â†’ LUT 255)', () => {
+    expect(transferCurve(0, base)).toBe(0);
+    expect(transferCurve(1, base)).toBe(1);
+    expect(TRANSFER_LOG_SCALE).toBe(6.0);
+  });
+
+  it('is continuous at the knee and matches both analytic branches', () => {
+    expect(transferCurve(K, base)).toBeCloseTo(K, 12);
+    expect(transferCurve(K - 1e-9, base)).toBeCloseTo(K, 6);
+    expect(transferCurve(0.2, base)).toBeCloseTo(K * Math.pow(0.2 / K, 0.86), 12);
+    expect(transferCurve(0.7, base)).toBeCloseTo(above(0.7), 12);
+  });
+
+  it('is monotone non-decreasing across [0,1]', () => {
+    let prev = -1;
+    for (let i = 0; i <= 100; i++) {
+      const v = transferCurve(i / 100, base);
+      expect(v).toBeGreaterThanOrEqual(prev);
+      prev = v;
+    }
+    expect(prev).toBe(1);
+  });
+
+  it('clamps out-of-range t and degrades non-finite input safely', () => {
+    expect(transferCurve(-1, base)).toBe(0);
+    expect(transferCurve(2, base)).toBe(1);
+    expect(transferCurve(Number.NaN, base)).toBe(0);
+    expect(transferCurve(Number.POSITIVE_INFINITY, base)).toBe(0);
   });
 });
 
@@ -610,35 +679,49 @@ describe('the row-mip cross-fade in the fragment shader source (lane P)', () => 
   });
 });
 
-describe('the scale-aware sampler in the fragment shader source', () => {
-  it('declares the two mix uniforms', () => {
-    expect(HEATMAP_FRAG).toContain('uniform float u_colBlur;');
-    expect(HEATMAP_FRAG).toContain('uniform float u_colCell;');
+describe('the Gaussian sampler + transfer curve in the fragment shader source (lane F)', () => {
+  it('declares the sampler/transfer uniforms and retires blur/crisp', () => {
+    expect(HEATMAP_FRAG).toContain('uniform int u_smoothTaps;');
+    expect(HEATMAP_FRAG).toContain('uniform float u_smoothOffsets[9];');
+    expect(HEATMAP_FRAG).toContain('uniform float u_smoothWeights[9];');
+    expect(HEATMAP_FRAG).toContain('uniform float u_knee;');
+    expect(HEATMAP_FRAG).toContain('uniform float u_logScale;');
+    expect(HEATMAP_FRAG).not.toContain('u_colBlur');
+    expect(HEATMAP_FRAG).not.toContain('u_colCell');
+    expect(HEATMAP_FRAG).not.toContain('crisp0');
   });
 
-  it('scales the sampleField0 side weights by u_colBlur (validity checks kept)', () => {
-    // Both side taps must keep their valid-window condition and multiply it by
-    // the blur weight; wC closes the sum back to 1.
-    expect(HEATMAP_FRAG).toContain('? 0.25 : 0.0) * u_colBlur');
-    expect(HEATMAP_FRAG).toContain('1.0 - wL - wR');
-  });
-
-  it('cross-fades a crisp nearest-column sampler on the level-0 path only', () => {
-    expect(HEATMAP_FRAG).toContain('int cx = int(floor(colf));');
+  it('loops the fixed 9-tap table, gating out-of-window taps and renormalizing', () => {
+    expect(HEATMAP_FRAG).toContain('for (int t = 0; t < 9; t++) {');
+    expect(HEATMAP_FRAG).toContain('if (t >= u_smoothTaps) break;');
+    expect(HEATMAP_FRAG).toContain('float colAt = colf + off;');
     expect(HEATMAP_FRAG).toContain(
-      'acc = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);',
+      'colAt < float(u_validFrom) - 0.5 || colAt > float(u_residentNewest) + 0.5',
     );
-    // The SUM path's COARSE sample stays texelFetch-only; crisp0 appears there
-    // solely as the FINER (level-0) side of the level cross-fade, so the fade's
-    // zero endpoint reproduces the legacy level-0 display output exactly.
-    const mipBranch = HEATMAP_FRAG.slice(HEATMAP_FRAG.indexOf('} else {'));
-    const coarseLoop = mipBranch.slice(0, mipBranch.indexOf('if (u_levelFade > 0.001)'));
-    expect(coarseLoop).not.toContain('crisp0(');
-    expect(mipBranch).toContain('if (u_colCell >= 0.999) accF = crisp0(colf, rowf);');
+    expect(HEATMAP_FRAG).toContain('acc += bilinear0(colAt, rowf) * w;');
+    expect(HEATMAP_FRAG).toContain('acc /= wsum;');
+    expect(HEATMAP_FRAG).toContain(
+      'bilinear0(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf)',
+    );
   });
 
-  it('L1: full-crisp short-circuits the blur fetches (no lazy mix in GLSL)', () => {
-    expect(HEATMAP_FRAG).toContain('if (u_colCell >= 0.999) acc = crisp0(colf, rowf);');
+  it('applies the transfer AFTER the black point with exact endpoints', () => {
+    expect(HEATMAP_FRAG).toContain('t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);');
+    expect(HEATMAP_FRAG).toContain('if (t <= k) {');
+    expect(HEATMAP_FRAG).toContain('t = k * pow(t / k, u_gamma);');
+    expect(HEATMAP_FRAG).toContain(
+      'log(1.0 + u_logScale * (t - k) / (1.0 - k)) / log(1.0 + u_logScale)',
+    );
+    // The pinned historical intensity expression is untouched.
+    expect(HEATMAP_FRAG).toContain(
+      'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
+    );
+  });
+
+  it('level-0 and the SUM finer side both sample the Gaussian (one kernel)', () => {
+    expect(HEATMAP_FRAG).toContain('acc = sampleField0(colf, rowf);');
+    const mipBranch = HEATMAP_FRAG.slice(HEATMAP_FRAG.indexOf('} else {'));
+    expect(mipBranch).toContain('accF = sampleField0(colf, rowf);');
   });
 });
 
@@ -906,6 +989,67 @@ describe('Heatmap.draw â€” SUM-path level cross-fade uniform wiring (wave P
     expect(info.rowFade).toBeGreaterThan(0);
     expect(info.levelFade).toBe(0);
     expect(info.finerLevel).toBe(-1);
+  });
+
+  it('lane F: uploads the knee fallback, log scale and the CPU Gaussian tap table', () => {
+    const { heatmap, gl } = makeMipHeatmap();
+    // The jsdom FakeGL predates array uniforms; record the optional call so the
+    // tap table can be asserted. Real WebGL2 always exposes uniform1fv.
+    (gl as unknown as { uniform1fv: (...a: unknown[]) => void }).uniform1fv = (...a: unknown[]) =>
+      gl.calls.push({ name: 'uniform1fv', args: a });
+    heatmap.draw({ colOffset: 0, colScale: 0.5 * 320, rowOffset: 0, rowScale: 240 });
+    // No normalizer attached: the module fallback fraction.
+    expect(lastFloat(gl, 'u_knee')).toBeCloseTo(DEFAULT_KNEE_FRACTION, 12);
+    expect(lastFloat(gl, 'u_logScale')).toBeCloseTo(TRANSFER_LOG_SCALE, 12);
+    // cpp 0.5 → sigma 1.25 columns → the 5-tap tier (≥3σ truncation).
+    expect(lastInt(gl, 'u_smoothTaps')).toBe(5);
+    const arrays = gl.callsOf('uniform1fv');
+    const weights = arrays.find(
+      (c) => (c.args[0] as { uniform?: string }).uniform === 'u_smoothWeights[0]',
+    );
+    const offsets = arrays.find(
+      (c) => (c.args[0] as { uniform?: string }).uniform === 'u_smoothOffsets[0]',
+    );
+    expect(weights).toBeDefined();
+    expect(offsets).toBeDefined();
+    const o = offsets!.args[1] as Float32Array;
+    const w = weights!.args[1] as Float32Array;
+    // Centered subset: the shader's fixed loop reads [0..taps) = [-2,-1,0,1,2].
+    expect(Array.from(o).slice(0, 5)).toEqual([-2, -1, 0, 1, 2]);
+    expect(Array.from(o).slice(5)).toEqual([0, 0, 0, 0]);
+    expect(w[2]).toBeGreaterThan(w[1]); // the core tap is the heaviest
+    expect(Array.from(w).reduce((a, b) => a + b, 0)).toBeCloseTo(1, 6);
+    const info = heatmap.sampleInfo();
+    expect(info.smoothSigma).toBeCloseTo(1.25, 12); // 2.5 * cpp 0.5
+    expect(info.smoothTaps).toBe(5);
+  });
+
+  it('lane F: with a normalizer attached, uploads the clamped knee/white ratio', () => {
+    const { heatmap, gl } = makeMipHeatmap();
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    n.addColumn(0, new Float32Array(100).fill(10), null);
+    n.updateNorm({ oldest: 0, newest: 255 }, { lo: 0, hi: 2047 }, 0);
+    heatmap.normalizer = n;
+    heatmap.draw({ colOffset: 0, colScale: 320, rowOffset: 0, rowScale: 240 });
+    const pcts = n.currentPercentiles;
+    // Flat fixture: knee/white ≈ 1 → clamped to the top of the band.
+    expect(lastFloat(gl, 'u_knee')).toBeCloseTo(
+      Math.min(0.95, Math.max(0.05, pcts.knee / pcts.white)),
+      12,
+    );
+    expect(lastFloat(gl, 'u_knee')).toBeCloseTo(0.95, 12);
+  });
+
+  it('lane F: a seeded-only normalizer still yields a safe in-band knee', () => {
+    const { heatmap, gl } = makeMipHeatmap();
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    n.seed(42);
+    heatmap.normalizer = n;
+    heatmap.knee = 0.3; // must be ignored while a normalizer is attached
+    heatmap.draw({ colOffset: 0, colScale: 320, rowOffset: 0, rowScale: 240 });
+    const knee = lastFloat(gl, 'u_knee')!;
+    expect(knee).toBeGreaterThanOrEqual(0.05);
+    expect(knee).toBeLessThanOrEqual(0.95);
   });
 });
 

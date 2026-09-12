@@ -77,6 +77,15 @@ uniform float u_norm;
 // no per-column CPU cost, the O(1)-in-history invariant is untouched.
 uniform float u_gamma;
 
+// Two-segment transfer curve (Bookmap-class overhaul, lane F). u_knee is the
+// CPU's clamp(kneeNorm / white, 0.05, 0.95) — the fraction of u_norm where the
+// curve switches from the below-knee gamma lift to the above-knee log
+// compression (wall cores differentiate instead of clamping into the top few
+// LUT entries). u_logScale is the fixed module constant TRANSFER_LOG_SCALE.
+// Endpoints stay exact: f(0) = 0 (background), f(1) = 1 (LUT 255).
+uniform float u_knee;
+uniform float u_logScale;
+
 // Black point (§9 "Tolerance"). Density below u_floor collapses to LUT entry 0 —
 // bit-identical to what background() returns — so small resting size falls back
 // to background instead of painting, and only liquidity worth reading survives.
@@ -154,16 +163,16 @@ uniform int u_rowOnly;
 // skipping the level-0 sampler — both stay bit-exact to their historical paths.
 uniform float u_rowFade;
 
-// Scale-aware level-0 sampler mix (campaign 5, contract F4). Per-draw constants
-// derived from the view's cols-per-pixel (columns / drawingBufferWidth):
-//   u_colBlur : weight of the historical 3-tap column blur (1 = full
-//               0.25/0.5/0.25, used while a column is sub-pixel / anti-confetti).
-//   u_colCell : weight of the crisp cell sampler below (1 = one column spans
-//               several device pixels, where the fixed-width blur would smear
-//               cell edges over 40–200 px and never sharpen).
-// The two always sum to 1, so the field cross-fades continuously while zooming.
-uniform float u_colBlur;
-uniform float u_colCell;
+// Gaussian field sampler (Bookmap-class overhaul, lane F). Per-draw constants
+// derived from the view's cols-per-pixel (columns / drawingBufferWidth): a
+// symmetric tap table around the sample column, sigma pinned in screen pixels
+// (2.5 px → ~6.4 px 10–90 edge) and capped at 2 columns as columns become
+// sub-pixel. Taps outside [u_validFrom, u_residentNewest] contribute NOTHING
+// and their weight is dropped from the normalizer, so window edges fold into
+// the core and the newest column keeps full weight (tail-columns contract).
+uniform int u_smoothTaps;
+uniform float u_smoothOffsets[9];
+uniform float u_smoothWeights[9];
 
 vec4 background() {
   // LUT entry 0 is the near-black floor — reuse it so out-of-range and
@@ -223,37 +232,31 @@ vec2 bilinear0(float colf, float rowf) {
   return mix(mix(a, b, fx), mix(c, d, fx), fy);
 }
 
-// The level-0 field sample: bilinear + a light 1-texel column blur
-// (0.25 / 0.5 / 0.25). Per-interval book noise is exactly ONE column wide, so
-// the blur collapses the confetti while a wall — present in all three columns —
-// keeps its true magnitude. Row resolution is untouched: price structure stays
-// crisp, time gets the smoothing. Blur neighbours that fall outside the VALID
-// window (the live edge's not-yet-written future column, the oldest valid
-// edge) are dropped and their weight folded into the core, so the newest column
-// paints at full weight instead of blending against an empty slot. u_colBlur
-// scales both side taps (0 = core bilinear only); wC still closes the sum to 1.
+// The level-0 field sample: a symmetric Gaussian on the TIME axis (uniform
+// offsets/weights, lane F) over the SAME vertical bilinear as bilinear0 — row
+// resolution is untouched, so price structure stays crisp. Taps that fall
+// outside the VALID window (the live edge's not-yet-written future column, the
+// oldest valid edge) are skipped and contribute NOTHING; the surviving weights
+// re-normalize (wsum below), so the newest column paints at full weight instead
+// of blending against an empty slot, and the kernel folds to the core at edges.
 vec2 sampleField0(float colf, float rowf) {
-  float wL = (colf - 1.0 >= float(u_validFrom) ? 0.25 : 0.0) * u_colBlur;
-  float wR = (colf + 1.0 <= float(u_residentNewest) ? 0.25 : 0.0) * u_colBlur;
-  float wC = 1.0 - wL - wR;
-  return bilinear0(colf - 1.0, rowf) * wL
-       + bilinear0(colf, rowf) * wC
-       + bilinear0(colf + 1.0, rowf) * wR;
-}
-
-// Crisp cell sampler (campaign 5, contract F4): horizontal NEAREST column at
-// the pixel center — the column whose [c, c+1) span contains colf, i.e. the
-// flat data cell as sampled — plus the SAME vertical bilinear conventions as
-// bilinear0 (identical y0/fy), so the price-axis response is unchanged. At deep
-// zoom, where one column spans many pixels, this paints hard cell edges instead
-// of the fixed 4-column smear; at sub-pixel column widths the CPU folds it out
-// (u_colCell → 0) in favour of the blur above.
-vec2 crisp0(float colf, float rowf) {
-  float yf = rowf - 0.5;
-  int y0 = int(floor(yf));
-  float fy = yf - float(y0);
-  int cx = int(floor(colf));
-  return mix(fetchCol(cx, y0), fetchCol(cx, y0 + 1), fy);
+  vec2 acc = vec2(0.0);
+  float wsum = 0.0;
+  for (int t = 0; t < 9; t++) {
+    if (t >= u_smoothTaps) break;
+    float off = u_smoothOffsets[t];
+    float colAt = colf + off;
+    if (colAt < float(u_validFrom) - 0.5 || colAt > float(u_residentNewest) + 0.5) continue;
+    float w = u_smoothWeights[t];
+    acc += bilinear0(colAt, rowf) * w;
+    wsum += w;
+  }
+  if (wsum <= 0.0) {
+    acc = bilinear0(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf);
+  } else {
+    acc /= wsum;
+  }
+  return acc;
 }
 
 void main() {
@@ -294,11 +297,9 @@ void main() {
       acc += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
     }
   } else if (u_level == 0) {
-    // Scale-aware cross-fade (campaign 5): zoomed out → smooth continuous field
-    // (see sampleField0); deep zoom → crisp data cells (see crisp0). L1:
-    // full-crisp skips the 12 blur fetches.
-    if (u_colCell >= 0.999) acc = crisp0(colf, rowf);
-    else acc = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);
+    // Width-scaled Gaussian field sampler (lane F; see sampleField0): one
+    // continuous kernel across the whole zoom range — no crisp/blur handoff.
+    acc = sampleField0(colf, rowf);
     // Row-mip cross-fade (lane P): inside the row-mip regime the CPU ramps a
     // weight from 0 at the old rpp 2.5 switch edge to full row sums by rpp 3.2,
     // so the hard LOD switch becomes a smooth, step-free ramp. The legacy
@@ -331,15 +332,14 @@ void main() {
     // Finer-level sample (u_level-1), scaled by 4.0 so the pinned /float(blk)
     // intensity below is exact at both endpoints (fade 0 → pure finer, fade 1 →
     // pure coarse; ×4 and ÷4 cancel in powers of two). When the finer level IS
-    // level 0 the DISPLAY sampler (blur/crisp mix) is the right source: the
+    // level 0 the DISPLAY sampler (the Gaussian above) is the right source: the
     // draw switches to the level-0 branch at fade 0, so a raw texelFetch sum
     // here left a visible band-entry step (coordinator amendment on P2).
     // fade <= 0.001 skips these fetches entirely.
     if (u_levelFade > 0.001) {
       vec2 accF;
       if (u_level == 1) {
-        if (u_colCell >= 0.999) accF = crisp0(colf, rowf);
-        else accF = mix(sampleField0(colf, rowf), crisp0(colf, rowf), u_colCell);
+        accF = sampleField0(colf, rowf);
       } else {
         int blkF = blk / 4;
         int xLf = x0 / blkF;
@@ -392,12 +392,20 @@ void main() {
   // it so a row-mip view reads exactly like the SUM path at the same footprint.
   if (u_rowOnly == 1) intensity *= float(blk);
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
-  // Black point, then the perceptual display curve. Order matters: clipping
-  // AFTER gamma would clip a curve, not a density, and the floor would mean a
+  // Black point, then the transfer curve. Order matters: clipping AFTER the
+  // curve would clip a curve, not a density, and the floor would mean a
   // different amount of size at every contrast setting.
   t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);
-  // Perceptual display curve: brighten the mid-field, keep black + white fixed.
-  t = pow(t, u_gamma);
+  // Two-segment transfer (lane F): below the knee the display gamma lifts the
+  // mid-field; above it log compression spreads the wall band so cores
+  // differentiate instead of clamping. Both endpoints stay fixed (f(0)=0,
+  // f(1)=1) because 1 + u_logScale*(1-k)/(1-k) = 1 + u_logScale.
+  float k = u_knee;
+  if (t <= k) {
+    t = k * pow(t / k, u_gamma);
+  } else {
+    t = k + (1.0 - k) * log(1.0 + u_logScale * (t - k) / (1.0 - k)) / log(1.0 + u_logScale);
+  }
 
   int li = int(t * 255.0 + 0.5);
   fragColor = texelFetch(u_lut, ivec2(li, u_ramp), 0);

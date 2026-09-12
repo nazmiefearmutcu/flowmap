@@ -112,7 +112,7 @@ export interface TimeTickModel {
 /**
  * Ascending time ticks (ns) spanning `[tLo, tHi]`, ≈`targetCount` of them, snapped
  * to a human interval and aligned to multiples of that interval, together with the
- * chosen step (so the axis can pick a sub-second format when step < 1 s).
+ * chosen step (so the axis can pick a format — see {@link timeLabelFormatter}).
  */
 export function timeTickModel(
   tLoNs: bigint,
@@ -161,6 +161,19 @@ export function fmtClock(ns: bigint): string {
 export function fmtClockMs(ns: bigint): string {
   const ms = Number((ns / 1_000_000n) % 1000n);
   return `${fmtClock(ns)}.${String(((ms % 1000) + 1000) % 1000).padStart(3, '0')}`;
+}
+
+/**
+ * The time-axis label formatter for a chosen tick step (S4-Q5, amended by
+ * review R2-M1): millisecond precision at or below a 0.5 s step (the 250 ms /
+ * 100 ms / 25 ms cadences AND the 0.5 s ladder itself — at exactly 0.5 s two
+ * consecutive labels would otherwise both truncate to the same HH:MM:SS
+ * second, a duplicated-label readout); coarser steps read as clean HH:MM:SS.
+ * `fmtClockMs` itself is unchanged: the crosshair readout keeps
+ * `HH:MM:SS.mmm` precision.
+ */
+export function timeLabelFormatter(stepNs: bigint): (ns: bigint) => string {
+  return stepNs > 0n && stepNs <= 500_000_000n ? fmtClockMs : fmtClock;
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   priceDecimals,
   priceTickModel,
   priceTicks,
+  timeLabelFormatter,
   timeTickModel,
   timeTicks,
   logPriceTickModel,
@@ -110,6 +111,32 @@ describe('timeTickModel', () => {
 
   it('is empty (step 0) for a zero span', () => {
     expect(timeTickModel(100n, 100n, 5)).toEqual({ step: 0n, ticks: [] });
+  });
+});
+
+describe('timeLabelFormatter — adaptive ms selector (S4-Q5, amended R2-M1)', () => {
+  it('uses the ms format at or below a 0.5 s step', () => {
+    expect(timeLabelFormatter(100_000_000n)).toBe(fmtClockMs); // 100 ms cadence
+    expect(timeLabelFormatter(250_000_000n)).toBe(fmtClockMs); // 250 ms crypto cadence
+    expect(timeLabelFormatter(499_999_999n)).toBe(fmtClockMs); // just below the cutoff
+    expect(timeLabelFormatter(500_000_000n)).toBe(fmtClockMs); // EXACTLY 0.5 s → ms (duplicate-second guard)
+    expect(timeLabelFormatter(1_000_000_000n)).toBe(fmtClock); // 1 s
+    expect(timeLabelFormatter(10_000_000_000n)).toBe(fmtClock); // coarse spans
+    expect(timeLabelFormatter(0n)).toBe(fmtClock); // degenerate (no ticks render)
+  });
+
+  it('picks the format from the step the time model actually chose', () => {
+    const sub = timeTickModel(0n, 1_000_000_000n, 5); // want 0.2 s → 250 ms ladder
+    expect(sub.step).toBe(250_000_000n);
+    expect(timeLabelFormatter(sub.step)).toBe(fmtClockMs);
+
+    const half = timeTickModel(0n, 5_000_000_000n, 10); // want 0.5 s → exactly 0.5 s
+    expect(half.step).toBe(500_000_000n);
+    // Amended R2-M1: at exactly 0.5 s the ms form keeps consecutive labels
+    // distinct (HH:MM:SS would read 00:00:00 / 00:00:00 for .0 and .5).
+    expect(timeLabelFormatter(half.step)).toBe(fmtClockMs);
+    expect(timeLabelFormatter(half.step)(0n)).toBe('00:00:00.000');
+    expect(timeLabelFormatter(half.step)(500_000_000n)).toBe('00:00:00.500');
   });
 });
 

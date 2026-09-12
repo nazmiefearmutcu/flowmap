@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NORM_FLOOR,
   DEFAULT_PERCENTILE,
+  DEFAULT_WHITE_PERCENTILE,
   mipSumFactor,
   normMipScale,
   t7ShaderRescale,
@@ -481,5 +482,70 @@ describe('freezeForTest — pinned norm for deterministic e2e grabs (R2-M2)', ()
     n.percentile = 99;
     const b = n.updateNorm(tilesRange(0, 1), ALL_ROWS, 0);
     expect(b).toBeGreaterThan(a);
+  });
+});
+
+describe('two-read percentiles â€” knee + white from ONE merged CDF (lane F)', () => {
+  it('defaults the white point to 99.7 while p97 stays the knee', () => {
+    expect(DEFAULT_WHITE_PERCENTILE).toBe(99.7);
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    expect(n.percentile).toBe(DEFAULT_PERCENTILE);
+    expect(n.whitePercentile).toBe(DEFAULT_WHITE_PERCENTILE);
+    const custom = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, whitePercentile: 99.9 });
+    expect(custom.whitePercentile).toBe(99.9);
+  });
+
+  it('reads BOTH ranks off one merge (mergeCount grows once per memo key)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    addConst(n, 0, 10, 900);
+    addConst(n, 1, 100, 100);
+    const range = tilesRange(0, 1);
+    const before = n.mergeCount;
+    const pair = n.viewportPercentiles(range, ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(before + 1);
+    expect(pair.white).toBeGreaterThan(pair.knee);
+    // Repeated reads (both APIs) with the same key: memo hit — no extra merge.
+    for (let i = 0; i < 5; i++) {
+      expect(n.viewportPercentiles(range, ALL_ROWS, 0)).toEqual(pair);
+      expect(n.viewportPercentile(range, ALL_ROWS, 0)).toBe(pair.knee);
+    }
+    expect(n.mergeCount).toBe(before + 1);
+  });
+
+  it('re-merges when whitePercentile changes (it is in the memo key)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    addConst(n, 0, 10, 900);
+    addConst(n, 1, 100, 100);
+    const range = tilesRange(0, 1);
+    n.viewportPercentiles(range, ALL_ROWS, 0);
+    const merges = n.mergeCount;
+    n.whitePercentile = 99.9;
+    const after = n.viewportPercentiles(range, ALL_ROWS, 0);
+    expect(n.mergeCount).toBe(merges + 1);
+    expect(after.white).toBeGreaterThanOrEqual(after.knee);
+  });
+
+  it('keeps white >= knee and feeds the WHITE rank into the u_norm EMA', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE, floor: 0 });
+    addConst(n, 0, 10, 900);
+    addConst(n, 1, 100, 100);
+    const range = tilesRange(0, 1);
+    const pair = n.viewportPercentiles(range, ALL_ROWS, 0);
+    expect(pair.white).toBeGreaterThanOrEqual(pair.knee);
+    // Unseeded first update jumps straight to the white rank (the u_norm feed),
+    // and the knee EMA rides the same merge.
+    const first = n.updateNorm(range, ALL_ROWS, 0);
+    expect(first).toBeCloseTo(pair.white, 12);
+    const pcts = n.currentPercentiles;
+    expect(pcts.white).toBe(first);
+    expect(pcts.knee).toBeGreaterThan(0);
+    expect(pcts.knee).toBeLessThanOrEqual(pcts.white);
+  });
+
+  it('holds both ranks at the seed on an empty viewport (no flicker to zero)', () => {
+    const n = new ViewportNormalizer({ colsPerTile: COLS_PER_TILE });
+    n.seed(42);
+    const pair = n.viewportPercentiles(tilesRange(100, 100), ALL_ROWS, 0);
+    expect(pair).toEqual({ knee: 42, white: 42 });
   });
 });

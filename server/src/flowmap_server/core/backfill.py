@@ -33,7 +33,13 @@ Conversion rules (mirrors :meth:`Grid.preload`'s contract):
   with ``tick``/``tick_multiple``/``dt_ns``/``rows`` equal to the grid cfg;
 - each candle's volume spread across its ``[low, high]`` row band and split at
   the candle close into the bid channel (``price <= close``) and the ask
-  channel (``price > close``) — a two-sided volume-at-price profile;
+  channel (``price > close``) — a two-sided volume-at-price profile. The band
+  SHAPE is a display rendering policy (``FLOWMAP_BACKFILL_SHAPE``, default
+  ``erode``; ``flat`` restores the legacy flat fill byte-for-byte): the mass is
+  preserved exactly and peaks at the close row, eroding toward the band edges
+  with a floor. A 1 m candle carries no intra-candle distribution, so the
+  profile claims nothing about where inside the band the volume actually traded
+  — the ``history: 'reconstructed'`` badge is unaffected;
 - one global scale factor normalizes the densest bucket across ALL columns to
   ``PEAK_TARGET`` (bounded far below float16's ceiling, so a liquid name's
   volume cannot overflow the ring — spec §8.1 — while cross-column and
@@ -51,6 +57,7 @@ default ``native`` band (the first-launch default) is always eligible.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Awaitable, Callable, Sequence
 
 import msgspec
@@ -82,6 +89,21 @@ DENSITY_SAFETY_MAX = 60_000.0
 # reconstructed data is coarser, and the gain never moves the live feed's own
 # values). Tuned against a live BTCUSDT measurement; 1 = raw true units.
 BACKFILL_DENSITY_GAIN = 12.0
+
+# Band shaping for reconstructed candles (display policy, env-gated). Instead of
+# the flat ``volume / len(band)`` fill, the volume is distributed over the
+# candle's ``[low, high]`` rows along a normalized profile peaking at the close
+# row and eroding toward the band edges, softened by BAND_WEIGHT_FLOOR so no
+# in-band row is empty. A 1 m candle carries no intra-candle distribution, so
+# this shapes the DISPLAY only (it claims nothing about where inside the band
+# the volume traded) and the weights sum to 1, preserving the candle's mass
+# exactly; the ``history: 'reconstructed'`` honesty badge is unaffected.
+# ``FLOWMAP_BACKFILL_SHAPE=flat`` restores the previous byte-identical flat
+# fill for A/B comparison and golden escapes; any other value (or unset) means
+# the default ``erode``.
+BACKFILL_SHAPE_ENV = "FLOWMAP_BACKFILL_SHAPE"
+BACKFILL_SHAPE_DEFAULT = "erode"
+BAND_WEIGHT_FLOOR = 0.15
 
 # How many depth columns each reconstructed candle becomes. The candle's
 # density band is repeated across this many consecutive columns with the t0
@@ -124,6 +146,40 @@ BackfillFn = Callable[..., Awaitable[Sequence[Candle]]]
 
 def _finite(*vals: float) -> bool:
     return all(v is not None and np.isfinite(v) for v in vals)
+
+
+def _backfill_shape() -> str:
+    """Active band shape: ``erode`` (default) or ``flat`` (legacy bytes).
+
+    Read at call time (not import time) so a running server can A/B overrides
+    and tests can pin both paths without a module reload; unrecognized values
+    fall back to ``erode``.
+    """
+    raw = os.environ.get(BACKFILL_SHAPE_ENV, BACKFILL_SHAPE_DEFAULT)
+    return "flat" if raw.strip().lower() == "flat" else "erode"
+
+
+def _band_weights(lo_r: int, hi_r: int, close_r: int) -> np.ndarray:
+    """Normalized display weights over rows ``[lo_r, hi_r]`` inclusive.
+
+    Triangular kernel peaking at the close row (clamped into the band), eroding
+    linearly with row distance toward both edges, softened by
+    ``BAND_WEIGHT_FLOOR`` (``w = floor + (1 - floor) * kernel``) and normalized
+    to sum 1, so ``volume * w`` spreads the candle's volume across the band
+    without changing its total mass.
+    """
+    n = hi_r - lo_r + 1
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    peak = min(max(int(close_r), lo_r), hi_r)
+    rows = np.arange(lo_r, hi_r + 1, dtype=np.float64)
+    span = float(max(peak - lo_r, hi_r - peak))
+    if span <= 0.0:
+        kernel = np.ones(n, dtype=np.float64)
+    else:
+        kernel = 1.0 - np.abs(rows - float(peak)) / span
+    w = BAND_WEIGHT_FLOOR + (1.0 - BAND_WEIGHT_FLOOR) * kernel
+    return w / w.sum()
 
 
 def columns_from_candles(
@@ -189,6 +245,7 @@ def columns_from_candles(
     bars: list[BarColumn] = []
     prev_t0 = None
     global_peak = 0.0
+    shape = _backfill_shape()
     for cd in clean:
         t0 = (cd.t0_ns // dt) * dt
         if prev_t0 is not None and t0 <= prev_t0:
@@ -207,11 +264,22 @@ def columns_from_candles(
         hi_r = min(hi_r, rows - 1)
         band = list(range(lo_r, hi_r + 1)) if lo_r <= hi_r else []
         if band:
-            per = float(cd.volume) / len(band)
             close_r = row_of(cd.c)
-            for r in band:
-                # price(row) <= close -> bid channel, else ask channel.
-                dens[0 if r <= close_r else 1, r] += per
+            if shape == "flat":
+                # Legacy byte-exact escape (FLOWMAP_BACKFILL_SHAPE=flat): the
+                # pre-campaign flat fill, kept untouched for A/B + golden runs.
+                per = float(cd.volume) / len(band)
+                for r in band:
+                    # price(row) <= close -> bid channel, else ask channel.
+                    dens[0 if r <= close_r else 1, r] += per
+            else:
+                # Display policy: mass-preserving profile over the band, peak at
+                # the close row (see _band_weights). The bid/ask split row is
+                # the raw close row, exactly as the flat fill used it.
+                w = _band_weights(lo_r, hi_r, close_r)
+                vol = float(cd.volume)
+                for i, r in enumerate(band):
+                    dens[0 if r <= close_r else 1, r] += vol * w[i]
         raw.append(dens)
         t0s.append(t0)
         global_peak = max(global_peak, float(dens.max()) if dens.size else 0.0)

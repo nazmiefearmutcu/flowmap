@@ -64,19 +64,30 @@ void main() {
   gl_Position = vec4(a_pos, 0.0, 1.0);
 }`;
 
-// Round mask + a soft 1px edge so bubbles read as dots, not squares.
+// Round mask + a soft 1px edge so bubbles read as dots, not squares, plus a
+// slightly darker outer rim (Bookmap-style). fwidth(r) is ~one fragment wide in
+// r-space at the rim (~1-2 px), so the existing POINTS pass carries the ring
+// with no second draw call and no extra attributes.
 const POINT_FRAG = `#version 300 es
 precision highp float;
 in vec4 v_color;
 out vec4 o_color;
+const float RIM_DARKEN = 0.32;
 void main() {
   vec2 d = gl_PointCoord * 2.0 - 1.0;
   float r = dot(d, d);
   if (r > 1.0) discard;
   float edge = smoothstep(1.0, 1.0 - fwidth(r) * 2.0, r);
+  // Darker rim: a ~1-2 px band ENDING where the soft AA fade starts, so the
+  // shading lands on visible pixels (peaking at the half-alpha edge) instead of
+  // hiding inside the fade. Fractions clamp so tiny dots stay mostly solid.
+  float fw = fwidth(r);
+  float rim = smoothstep(max(1.0 - 3.5 * fw, 0.55), max(1.0 - 0.75 * fw, 0.80), r);
   float a = v_color.a * edge;
-  // Premultiplied output (see SolidBatch's fragment shader).
+  // Premultiplied output (see SolidBatch's fragment shader); the outer rim is
+  // darkened afterwards — still premultiplied (rgb ≤ a).
   o_color = vec4(v_color.rgb * a, a);
+  o_color.rgb *= (1.0 - RIM_DARKEN * rim);
 }`;
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {

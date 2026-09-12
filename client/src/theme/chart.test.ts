@@ -14,12 +14,21 @@
  *     the one intended coincidence);
  *   - price ink is ≥ 48 Chebyshev from every density stop and from the bg,
  *     and clears 3:1 on light grounds;
- *   - midnight's ramps rasterize BYTE-IDENTICAL to the shipped gl/lut.ts
- *     FLOW/SYNTH rows (cross-import is test-only — production is structural).
+ *   - midnight's density ramp is the REGISTRY stub uploaded to the THEME row
+ *     (S2-Q1 — it no longer aliases the frozen FLOW row); its synth stays a
+ *     byte-copy of the shipped gl/lut.ts SYNTH row (§7 must not drift).
  */
 import { describe, expect, it } from 'vitest';
 
-import { buildFlowLUT, buildSynthLUT, LUT_SIZE } from '../gl/lut';
+import {
+  buildLUTAtlas,
+  buildRamp,
+  buildSynthLUT,
+  LUT_SIZE,
+  RAMP_THEME,
+  RAMP_THEME_SYNTH,
+  setThemeStops,
+} from '../gl/lut';
 import { THEMES, THEME_IDS, type ChartStop, type ThemeId } from './registry';
 
 /** Rec.601 luma — the perceptual scale gl/lut.test.ts pins. */
@@ -251,7 +260,7 @@ describe('theme chart ramps (F1)', () => {
 
   it('every themed synth stop sits ≥48 Chebyshev from the nearest density stop', () => {
     for (const id of THEME_IDS) {
-      if (id === 'midnight') continue; // frozen legacy pair — §7 proof is hue-based (e2e)
+      if (id === 'midnight') continue; // midnight's §7 proof is hue-based (e2e): its synth row is the frozen amber byte-copy, its density warms to gold only at the top
       const { density, synth } = THEMES[id].chart;
       for (let i = 1; i < synth.length; i++) {
         const stop = synth[i];
@@ -316,8 +325,27 @@ describe('theme chart ramps (F1)', () => {
     }
   });
 
-  it('midnight ramps rasterize byte-identical to the shipped FLOW / SYNTH LUTs', () => {
-    expect(rasterize(THEMES.midnight.chart.density)).toEqual(buildFlowLUT());
+  it('midnight density is served from the THEME row (row-5 upload path)', () => {
+    // S2-Q1 decoupling: midnight no longer aliases the frozen FLOW row. The
+    // renderer uploads THEMES.midnight.chart.density into RAMP_THEME via
+    // setThemeStops; pin the row-5 bytes against buildRamp(registry stub) so
+    // the registry and the upload path can never drift. The synth side keeps
+    // the frozen §7 byte-copy (rows 6 and the shipped SYNTH row agree).
+    setThemeStops({
+      density: THEMES.midnight.chart.density,
+      synth: THEMES.midnight.chart.synth,
+    });
+    try {
+      const atlas = buildLUTAtlas();
+      expect(
+        atlas.slice(RAMP_THEME * LUT_SIZE * 4, (RAMP_THEME + 1) * LUT_SIZE * 4),
+      ).toEqual(buildRamp(THEMES.midnight.chart.density));
+      expect(
+        atlas.slice(RAMP_THEME_SYNTH * LUT_SIZE * 4, (RAMP_THEME_SYNTH + 1) * LUT_SIZE * 4),
+      ).toEqual(buildRamp(THEMES.midnight.chart.synth));
+    } finally {
+      setThemeStops(null);
+    }
     expect(rasterize(THEMES.midnight.chart.synth)).toEqual(buildSynthLUT());
   });
 });

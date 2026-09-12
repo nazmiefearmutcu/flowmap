@@ -15,6 +15,14 @@
 
 const FONT_STACK = "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
+/** Default font size (CSS px) for {@link TextLayer.text} — exported so callers
+ *  (e.g. the price axis) can name the standard size instead of re-declaring the
+ *  literal; the method default is unchanged. */
+export const DEFAULT_TEXT_SIZE = 11;
+/** Default font size (CSS px) for {@link TextLayer.badge} plates (unused by axis
+ *  pills today, which pass their own size; exported for the same reason). */
+export const DEFAULT_BADGE_SIZE = 11;
+
 export interface TextOpts {
   /** Font size in CSS px (default 11). */
   size?: number;
@@ -120,7 +128,7 @@ export class TextLayer {
   /** Draw a single line of text at CSS `(x, y)`. */
   text(x: number, y: number, str: string, opts: TextOpts = {}): void {
     const ctx = this.ctx;
-    ctx.font = `${opts.weight ?? 400} ${opts.size ?? 11}px ${FONT_STACK}`;
+    ctx.font = `${opts.weight ?? 400} ${opts.size ?? DEFAULT_TEXT_SIZE}px ${FONT_STACK}`;
     ctx.textAlign = opts.align ?? 'left';
     ctx.textBaseline = opts.baseline ?? 'alphabetic';
     ctx.fillStyle = opts.color ?? 'rgba(163, 176, 194, 1)';
@@ -130,7 +138,7 @@ export class TextLayer {
   /** A filled background badge with centered text — for price/BBO/marker labels. */
   badge(x: number, y: number, str: string, opts: BadgeOpts = {}): void {
     const ctx = this.ctx;
-    const size = opts.size ?? 11;
+    const size = opts.size ?? DEFAULT_BADGE_SIZE;
     const pad = opts.pad ?? 3;
     const align = opts.align ?? 'left';
     const baseline = opts.baseline ?? 'middle';
