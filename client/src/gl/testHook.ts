@@ -41,6 +41,8 @@ export interface HeatmapSampleInfo {
   smoothSigma: number;
   /** Tap count of the last draw's field sampler (1 or 9). */
   smoothTaps: number;
+  /** Vertical softening offset of the last draw, in ROW units (0 = legacy). */
+  rowDy: number;
   /** Row-mip cross-fade weight of the last draw (lane P; 0..1). */
   rowFade: number;
   /** SUM-mip level cross-fade weight of the last draw (wave P2; 0..1). */
@@ -66,6 +68,7 @@ function sampleInfoOf(heatmap: Heatmap): HeatmapSampleInfo {
     colsPerPixel: 1,
     smoothSigma: plan.sigmaCols,
     smoothTaps: plan.taps,
+    rowDy: 0,
     rowFade: 0,
     levelFade: 0,
     finerLevel: -1,

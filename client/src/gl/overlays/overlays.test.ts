@@ -9,6 +9,7 @@ import {
   PRICE_GLOW_WIDTH,
   PRICE_LINE_WIDTH,
   PRICE_LEVEL_ALPHA,
+  PRICE_LEVEL_DASH,
   PRICE_STUB_ALPHA,
   PriceLine,
   withAlpha,
@@ -22,28 +23,29 @@ const BUBBLE_DEFAULTS: Required<BubbleOptions> = {
   capacity: 120_000,
   minSize: 0,
   refSize: 4,
-  baseRadiusPx: 4.5,
-  minRadiusPx: 2.5,
+  baseRadiusPx: 5,
+  minRadiusPx: 3,
   maxRadiusPx: 20,
 };
 
 describe('bubbleRadiusPx (√-area scaling, clamped)', () => {
   it('maps the reference size to the base radius', () => {
-    expect(bubbleRadiusPx(4, BUBBLE_DEFAULTS)).toBeCloseTo(4.5);
+    expect(bubbleRadiusPx(4, BUBBLE_DEFAULTS)).toBeCloseTo(5);
   });
   it('scales with √size', () => {
-    expect(bubbleRadiusPx(16, BUBBLE_DEFAULTS)).toBeCloseTo(9); // 4.5·√(16/4)
+    expect(bubbleRadiusPx(16, BUBBLE_DEFAULTS)).toBeCloseTo(10); // 5·√(16/4)
   });
   it('clamps to the min/max radius', () => {
-    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(2.5);
+    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(3);
     expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(20);
   });
   it('keeps small trades as dots and big prints under the cap', () => {
-    // size=1: raw 4.5·√(1/4)=2.25 → clamped to the 2.5px minimum (5px dot).
-    expect(bubbleRadiusPx(1, BUBBLE_DEFAULTS)).toBe(2.5);
-    // size=10: 4.5·√(10/4) ≈ 7.1px.
-    expect(bubbleRadiusPx(10, BUBBLE_DEFAULTS)).toBeCloseTo(4.5 * Math.sqrt(10 / 4));
-    // size=100: raw 4.5·√(100/4)=22.5 → capped at 20px (40px diameter, was 88px).
+    // size=1: raw 5·√(1/4)=2.5 → clamped to the 3px minimum (6px dot) — the
+    // W6 swarm2 visibility floor at live BTC sizes.
+    expect(bubbleRadiusPx(1, BUBBLE_DEFAULTS)).toBe(3);
+    // size=10: 5·√(10/4) ≈ 7.9px.
+    expect(bubbleRadiusPx(10, BUBBLE_DEFAULTS)).toBeCloseTo(5 * Math.sqrt(10 / 4));
+    // size=100: raw 5·√(100/4)=25 → capped at 20px (40px diameter, was 88px).
     expect(bubbleRadiusPx(100, BUBBLE_DEFAULTS)).toBe(20);
   });
 });
@@ -247,10 +249,11 @@ describe('L6 price-line ink tuning', () => {
   it('pins the tightened widths/alphas', () => {
     expect(PRICE_LINE_WIDTH).toBe(2.0);
     expect(PRICE_GLOW_WIDTH).toBe(6.0);
-    expect(PRICE_GLOW_ALPHA).toBe(0.22);
+    expect(PRICE_GLOW_ALPHA).toBe(0.16);
     expect(PRICE_FILL_TOP_ALPHA).toBe(0.09);
-    expect(PRICE_LEVEL_ALPHA).toBe(0.3);
+    expect(PRICE_LEVEL_ALPHA).toBe(0.28);
     expect(PRICE_STUB_ALPHA).toBe(0.7);
+    expect(PRICE_LEVEL_DASH).toEqual([3, 6]);
   });
 
   it('withAlpha re-stamps alpha and keeps the rgb channels', () => {
@@ -265,7 +268,7 @@ describe('L6 price-line ink tuning', () => {
     pl.add({ col_seq: 4, c: 5 } as never);
     pl.add({ col_seq: 5, c: 7 } as never);
     const fill: string[] = [];
-    const dash: string[] = [];
+    const dash: Array<{ color: string; pattern?: number[] }> = [];
     const lines: Array<{ width: number; alpha?: number }> = [];
     const text = {
       fillUnder: (_p: unknown[], _yBase: number, top: string) => {
@@ -274,23 +277,34 @@ describe('L6 price-line ink tuning', () => {
       polyline: (_p: unknown[], o: { width: number; alpha?: number }) => {
         lines.push({ width: o.width, alpha: o.alpha });
       },
-      dashedLine: (_x0: number, _y0: number, _x1: number, _y1: number, color: string) => {
-        dash.push(color);
+      dashedLine: (
+        _x0: number,
+        _y0: number,
+        _x1: number,
+        _y1: number,
+        color: string,
+        pattern?: number[],
+      ) => {
+        dash.push({ color, pattern });
       },
     };
     pl.draw({ gm: g, text, resident: null } as unknown as OverlayFrame);
 
     expect(fill[0]).toBe('rgba(210, 225, 245, 0.09)'); // wash top (palette rgb kept)
-    expect(lines[0]).toEqual({ width: 6, alpha: 0.22 }); // glow
+    expect(lines[0]).toEqual({ width: 6, alpha: 0.16 }); // glow (softened W6 swarm2)
     expect(lines[1]).toEqual({ width: 2, alpha: 0.7 }); // right-edge stub
     expect(lines[2]).toEqual({ width: 2, alpha: undefined }); // bright core
-    expect(dash[0]).toBe('rgba(245, 248, 252, 0.3)'); // quieter level
+    expect(dash[0].color).toBe('rgba(245, 248, 252, 0.28)'); // quieter level
+    expect(dash[0].pattern).toEqual([3, 6]); // calmer long-dash texture
+    // The call must hand the layer a FRESH array — canvas dash state is sticky,
+    // and the exported readonly const must never be mutated by a caller.
+    expect(dash[0].pattern).not.toBe(PRICE_LEVEL_DASH);
   });
 });
 
 describe('L6 bubble ink (alpha cap via the palette path)', () => {
-  it('caps the palette alpha at 0.9, hue untouched, and leaves low alphas alone', () => {
-    expect(bubbleAlpha([0.12, 0.71, 0.65, 0.95])).toBe(0.9);
+  it('caps the palette alpha at 0.85, hue untouched, and leaves low alphas alone', () => {
+    expect(bubbleAlpha([0.12, 0.71, 0.65, 0.95])).toBe(0.85);
     expect(bubbleAlpha([0.88, 0.33, 0.33, 0.8])).toBe(0.8);
   });
 
@@ -313,7 +327,7 @@ describe('L6 bubble ink (alpha cap via the palette path)', () => {
     b.add({ ts_ns: 5n * 250_000_000n, price: 5, size: 60, side: 1 } as never);
     b.draw({ gm: g, points, resident: null } as unknown as OverlayFrame);
     expect(ink).toHaveLength(1);
-    expect(ink[0][3]).toBeLessThanOrEqual(0.9);
+    expect(ink[0][3]).toBeLessThanOrEqual(0.85);
     expect(ink[0][3]).toBeGreaterThan(0);
   });
 });

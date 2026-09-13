@@ -228,6 +228,34 @@ describe('Renderer (fake GL harness)', () => {
     warn.mockRestore();
   });
 
+  // --- W2 SEAMS: forward col_seq skips must not blank the whole chart -----------
+
+  it('repairs a small forward skip by zeroing the band and keeping validFrom', () => {
+    const { r, store } = makeRenderer();
+    for (let s = 10; s <= 14; s++) store.emit(makeCol(s, true));
+    expect(r.validFromSeq).toBe(10);
+    const uploadsBefore = gl.callsOf('texSubImage3D').length;
+
+    // A server tx_lag drop burst: cols 15..17 are gone; 18 arrives.
+    store.emit(makeCol(18, true));
+
+    expect(r.residentRange()).toEqual({ oldest: 10, newest: 18, count: 9 });
+    expect(r.validFromSeq).toBe(10); // NOT 18 — the old behavior blacked out [10..17]
+    const zeroUploads = gl.callsOf('texSubImage3D').slice(uploadsBefore, uploadsBefore + 3);
+    expect(zeroUploads.length).toBe(3); // one zero texel column per skipped seq
+    for (const call of zeroUploads) {
+      const data = call.args[10] as Float32Array;
+      expect(Array.from(data).every((v) => v === 0)).toBe(true);
+    }
+  });
+
+  it('keeps the conservative gate for a skip larger than the repair cap', () => {
+    const { r, store } = makeRenderer(); // capacity 512
+    for (let s = 0; s <= 4; s++) store.emit(makeCol(s, true));
+    store.emit(makeCol(1000, true)); // band 995 > GAP_ZERO_MAX_COLS
+    expect(r.validFromSeq).toBe(1000);
+  });
+
   // --- B-7(d): the CPU column cache covers the ring (profile window honesty) ----
 
   it('keeps every resident column cached so the profile window matches residency', () => {

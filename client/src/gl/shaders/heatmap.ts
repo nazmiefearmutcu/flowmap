@@ -178,6 +178,25 @@ uniform int u_smoothTaps;
 uniform float u_smoothOffsets[9];
 uniform float u_smoothWeights[9];
 
+// Vertical softening offset in ROW units (barcode fix 2026-09-13, CPU:
+// rowSmoothDyFor). ~0 = single-sample legacy path; > 0 blends a 0.25/0.5/0.25
+// vertical triple around each sample so single-row liquidity reads as a soft
+// band instead of a hard hairline (the owner's default-look complaint). The
+// offset scales with the row footprint, so the softening is ~constant in
+// screen pixels.
+uniform float u_rowSmoothDy;
+
+// Deep-row softening (barcode fix 2026-09-13, CPU: rowMipSoftenFor +
+// rowMipWeightsFor). 1 inside the row-mip regime (rpp >= 2.5). The row-mip
+// texel is a 4-ROW density sum; a Gaussian across the MIP row axis (integer
+// taps with manual bilinear reconstruction between texels, weights for the
+// current rows-per-pixel uploaded as uniforms) spreads a price-level band over
+// ~4 texels (~5 px at the default book zoom) so sub-pixel-row hairlines read
+// as soft bands with a smooth 10-90 falloff. 0 keeps the historical
+// single-fetch row path byte-exact.
+uniform float u_rowMipSoften;
+uniform float u_rowMipWeights[7];
+
 vec4 background() {
   // LUT entry 0 is the near-black floor — reuse it so out-of-range and
   // zero-density read identically.
@@ -197,6 +216,45 @@ vec2 fetchLevel(int x, int y, int layer) {
 vec2 fetchFine(int x, int y, int layer) {
   if (u_level == 1) return texelFetch(u_tiles, ivec3(x, y, layer), 0).rg;
   return texelFetch(u_mip1, ivec3(x, y, layer), 0).rg;
+}
+
+// Deep-row Gaussian fetch (barcode fix): a Gaussian across the MIP row axis
+// around the continuous mip coordinate yMip. Taps sit on integer mip texels
+// with a manual bilinear reconstruction between neighbours, so the vertical
+// profile is smooth (no box steps) and the 10-90 edge widens as intended. The
+// weights come from rowMipWeightsFor (CPU) for the current rows-per-pixel;
+// texels outside [0, rowsR) are reached through a clamped coordinate, so the
+// price-grid edge behaves like an edge-replicated tap.
+//
+// EDGE-AWARE blend: a Gaussian alone spreads an ISOLATED single-level wall
+// into a faint glow, which the SUM-mip contract forbids (a 500-lot wall must
+// read at its true size — see tests/e2e/mips.spec.ts: the wall peak must stay
+// comparable to native at every row footprint). keep = clamp(1 - 2·maxNbr/
+// center, 0, 1) is a STRICT wall detector: a texel whose strongest vertical
+// neighbour is under half its size (an isolated wall) keeps its own texel
+// exactly; any level that is part of a stack (neighbour >= half) takes the
+// full smooth Gaussian — those stacks are exactly the owner's "barcode".
+vec2 fetchRowMipGauss(int x, int layer, float yMip) {
+  int rowsR = u_rows / 4;
+  vec2 acc = vec2(0.0);
+  vec2 center = vec2(0.0);
+  vec2 neighborMax = vec2(0.0);
+  for (int k = -3; k <= 3; k++) {
+    float yc = clamp(yMip + float(k), 0.0, float(rowsR - 1));
+    int y0 = int(floor(yc));
+    float fy = yc - float(y0);
+    int y1 = min(y0 + 1, rowsR - 1);
+    vec2 v = mix(
+      texelFetch(u_rowMip1, ivec3(x, y0, layer), 0).rg,
+      texelFetch(u_rowMip1, ivec3(x, y1, layer), 0).rg,
+      fy
+    );
+    acc += v * u_rowMipWeights[k + 3];
+    if (k == 0) center = v;
+    else neighborMax = max(neighborMax, v);
+  }
+  vec2 keep = clamp(1.0 - 2.0 * neighborMax / max(center, vec2(1e-6)), 0.0, 1.0);
+  return mix(acc, center, keep);
 }
 
 // One level-0 texel at an ABSOLUTE column, clamped into the VALID resident
@@ -236,13 +294,23 @@ vec2 bilinear0(float colf, float rowf) {
   return mix(mix(a, b, fx), mix(c, d, fx), fy);
 }
 
+// Vertical-softened field sample (barcode fix): the 0.25/0.5/0.25 row triple
+// around rowf when u_rowSmoothDy > 0, else the exact single bilinear sample.
+vec2 fieldAt(float colf, float rowf) {
+  if (u_rowSmoothDy <= 0.0) return bilinear0(colf, rowf);
+  return 0.25 * bilinear0(colf, rowf - u_rowSmoothDy)
+       + 0.50 * bilinear0(colf, rowf)
+       + 0.25 * bilinear0(colf, rowf + u_rowSmoothDy);
+}
+
 // The level-0 field sample: a symmetric Gaussian on the TIME axis (uniform
-// offsets/weights, lane F) over the SAME vertical bilinear as bilinear0 — row
-// resolution is untouched, so price structure stays crisp. Taps that fall
-// outside the VALID window (the live edge's not-yet-written future column, the
-// oldest valid edge) are skipped and contribute NOTHING; the surviving weights
-// re-normalize (wsum below), so the newest column paints at full weight instead
-// of blending against an empty slot, and the kernel folds to the core at edges.
+// offsets/weights, lane F) over the vertically-softened field (barcode fix) —
+// time gets the width-scaled kernel, price gets the small screen-scaled
+// triple. Taps that fall outside the VALID window (the live edge's
+// not-yet-written future column, the oldest valid edge) are skipped and
+// contribute NOTHING; the surviving weights re-normalize (wsum below), so the
+// newest column paints at full weight instead of blending against an empty
+// slot, and the kernel folds to the core at edges.
 vec2 sampleField0(float colf, float rowf) {
   vec2 acc = vec2(0.0);
   float wsum = 0.0;
@@ -252,11 +320,11 @@ vec2 sampleField0(float colf, float rowf) {
     float colAt = colf + off;
     if (colAt < float(u_validFrom) - 0.5 || colAt > float(u_residentNewest) + 0.5) continue;
     float w = u_smoothWeights[t];
-    acc += bilinear0(colAt, rowf) * w;
+    acc += fieldAt(colAt, rowf) * w;
     wsum += w;
   }
   if (wsum <= 0.0) {
-    acc = bilinear0(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf);
+    acc = fieldAt(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf);
   } else {
     acc /= wsum;
   }
@@ -291,14 +359,22 @@ void main() {
     // axis still groups rows, but the time axis keeps hard cell edges (no
     // 4-column block average). Bounds-clamped like the SUM path (a tap outside
     // the grid contributes nothing). No level-0 fetches at this endpoint.
-    int rowsR = u_rows / 4;
-    int yBase = (row / 4) - (u_nRowTaps / 2);
-    acc = vec2(0.0);
-    for (int t = 0; t < 4; t++) {
-      if (t >= u_nRowTaps) break;
-      int y = yBase + t;
-      if (y < 0 || y >= rowsR) continue;
-      acc += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+    // Deep-row barcode fix: with a 1-tap footprint the sum is replaced by the
+    // vertical Gaussian reconstruction (fetchRowMipGauss) — same 4-row mip
+    // source, smooth falloff. Larger footprints (rpp > 4) keep the exact
+    // historical tap loop (byte-identical endpoint).
+    if (u_rowMipSoften > 0.0 && u_nRowTaps == 1) {
+      acc = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);
+    } else {
+      int rowsR = u_rows / 4;
+      int yBase = (row / 4) - (u_nRowTaps / 2);
+      acc = vec2(0.0);
+      for (int t = 0; t < 4; t++) {
+        if (t >= u_nRowTaps) break;
+        int y = yBase + t;
+        if (y < 0 || y >= rowsR) continue;
+        acc += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+      }
     }
   } else if (u_level == 0) {
     // Width-scaled Gaussian field sampler (lane F; see sampleField0): one
@@ -312,14 +388,21 @@ void main() {
     // accRow is a 4-row sum; u_blk == 4 during the fade, so the /blk * blk
     // correction below leaves this raw-scale mix magnitude-correct.
     if (u_rowFade > 0.001) {
-      int rowsR = u_rows / 4;
-      int yBase = (row / 4) - (u_nRowTaps / 2);
-      vec2 accRow = vec2(0.0);
-      for (int t = 0; t < 4; t++) {
-        if (t >= u_nRowTaps) break;
-        int y = yBase + t;
-        if (y < 0 || y >= rowsR) continue;
-        accRow += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+      vec2 accRow;
+      // Deep-row barcode fix: 1-tap footprints use the smooth Gaussian
+      // reconstruction; wider footprints keep the historical tap loops.
+      if (u_rowMipSoften > 0.0 && u_nRowTaps == 1) {
+        accRow = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);
+      } else {
+        int rowsR = u_rows / 4;
+        int yBase = (row / 4) - (u_nRowTaps / 2);
+        accRow = vec2(0.0);
+        for (int t = 0; t < 4; t++) {
+          if (t >= u_nRowTaps) break;
+          int y = yBase + t;
+          if (y < 0 || y >= rowsR) continue;
+          accRow += texelFetch(u_rowMip1, ivec3(x0, y, layer), 0).rg;
+        }
       }
       acc = mix(acc, accRow, clamp(u_rowFade, 0.0, 1.0));
     }

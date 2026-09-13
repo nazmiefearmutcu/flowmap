@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { Residency } from './tileRing';
+import { Residency, TileRing } from './tileRing';
+import { makeFakeGL } from './mockGL';
 
 /**
  * Pure full-res residency book-keeping (T8) — the addressing/eviction logic the
@@ -207,5 +208,72 @@ describe('Residency validFrom — the stale-slot gate across a gap', () => {
     r.note(40); // gap → window [33, 40], validFrom 40
     r.note(35); // one stray backfilled column inside the claimed band
     expect(r.validFromSeq()).toBe(40);
+  });
+});
+
+describe('Residency gapZeroed — the repaired-skip fast path', () => {
+  /**
+   * `note(colSeq, true)` is the caller's assertion that `TileRing.zeroColumns`
+   * physically filled the skipped band `[newest+1, colSeq-1]` with zero density.
+   * The band is then honest empty texture, so validity is continuous and the
+   * pre-gap columns stay paintable — the difference between a one-column server
+   * lag-drop blanking the whole chart and it costing one blank seam column.
+   */
+  it('keeps validFrom on a repaired forward skip', () => {
+    const r = make(); // cap 8
+    for (let s = 10; s <= 12; s++) r.note(s);
+    r.note(16, true); // band 13..15 zeroed by the caller
+    expect(r.range()).toEqual({ oldest: 10, newest: 16, count: 7 });
+    expect(r.validFromSeq()).toBe(10); // NOT 16 — no blackout
+  });
+
+  it('clamps validFrom up to the window oldest when the budget forces a slide', () => {
+    const r = make(); // cap 8
+    for (let s = 10; s <= 12; s++) r.note(s);
+    r.note(20, true); // window [13, 20]: the clamp evicts 10..12
+    expect(r.range()).toEqual({ oldest: 13, newest: 20, count: 8 });
+    // The oldest surviving valid column, never the gap edge.
+    expect(r.validFromSeq()).toBe(13);
+  });
+
+  it('still jumps to the gap edge for an UNREPAIRED skip (band too big)', () => {
+    const r = make();
+    for (let s = 10; s <= 12; s++) r.note(s);
+    r.note(20); // default: no zeroing happened
+    expect(r.validFromSeq()).toBe(20);
+  });
+});
+
+describe('TileRing.zeroColumns — physical repair uploads', () => {
+  it('uploads one zeroed column per seq and never touches residency', () => {
+    const gl = makeFakeGL();
+    const ring = new TileRing(gl as unknown as WebGL2RenderingContext, /* rows */ 4, /* layers */ 2);
+    ring.append(0, 0, new Float32Array(4).fill(5), new Float32Array(4).fill(6), 4);
+    const before = ring.residentRange();
+    const uploadsBefore = gl.callsOf('texSubImage3D').length;
+
+    ring.zeroColumns(1, 3);
+
+    const uploads = gl.callsOf('texSubImage3D').slice(uploadsBefore);
+    expect(uploads.length).toBe(3);
+    for (const call of uploads) {
+      const data = call.args[10] as Float32Array;
+      expect(data.length).toBe(8); // rows * 2 channels
+      expect(Array.from(data).every((v) => v === 0)).toBe(true);
+    }
+    // Not real columns: the window and the eviction bookkeeping are untouched.
+    expect(ring.residentRange()).toEqual(before);
+    expect(ring.validFromSeq()).toBe(0);
+  });
+
+  it('append(..., gapZeroed=true) keeps validFrom across a repaired skip', () => {
+    const gl = makeFakeGL();
+    const ring = new TileRing(gl as unknown as WebGL2RenderingContext, 4, 2);
+    const bid = new Float32Array(4).fill(1);
+    for (let s = 10; s <= 12; s++) ring.append(s, 0, bid, bid, 4);
+    ring.zeroColumns(13, 15);
+    ring.append(16, 0, bid, bid, 4, true);
+    expect(ring.residentRange()).toEqual({ oldest: 10, newest: 16, count: 7 });
+    expect(ring.validFromSeq()).toBe(10);
   });
 });

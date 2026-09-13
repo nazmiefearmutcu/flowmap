@@ -47,7 +47,7 @@
   /* --- text --- */
   --text: #e6edf3;
   --text-2: #93a1b4;
-  --text-3: #6f7b8c;
+  --text-3: #77839c;
   --text-4: #545e6d;
   --text-money: #f2f6fa;
 
@@ -143,7 +143,7 @@
   /* --- text --- */
   --text: #24272d;
   --text-2: #57606c;
-  --text-3: #6d7683;
+  --text-3: #5f6875;
   --text-4: #8d949e;
   --text-money: #101318;
 
@@ -159,7 +159,7 @@
   --sell-line: #e4bcb9;
 
   /* --- semantic channels --- */
-  --warn: #8a6410;
+  --warn: #87610d;
   --warn-dim: #f1e7cd;
   --warn-line: #ddcea0;
   --replay: var(--warn);
@@ -199,8 +199,8 @@
   --r-1: 3px;
   --r-2: 4px;
   --r-3: 6px;
-  --shadow-pop: 0 4px 18px rgba(0, 0, 0, 0.5);
-  --shadow-drop: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --shadow-pop: 0 4px 18px rgba(40, 36, 24, 0.18);
+  --shadow-drop: 0 12px 40px rgba(40, 36, 24, 0.22);
   --t-fast: 0.12s ease;
   --t-med: 0.2s ease;
 
@@ -428,7 +428,7 @@
   /* --- text --- */
   --text: #e6edf3;
   --text-2: #93a1b4;
-  --text-3: #6f7b8c;
+  --text-3: #77839c;
   --text-4: #545e6d;
   --text-money: #f2f6fa;
 
@@ -525,7 +525,7 @@
   /* --- text --- */
   --text: #24272d;
   --text-2: #57606c;
-  --text-3: #6d7683;
+  --text-3: #5f6875;
   --text-4: #8d949e;
   --text-money: #101318;
 

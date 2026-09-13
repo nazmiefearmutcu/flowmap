@@ -447,6 +447,31 @@ export function smoothPlanFor(colsPerPixel: number): SmoothPlan {
   return { sigmaCols, taps };
 }
 
+/** Vertical softening target in SCREEN pixels (barcode fix, 2026-09-13). */
+export const SMOOTH_ROW_SIGMA_PX = 2.2;
+/** Cap on the vertical blend offset in ROW units (perf + band-width bound). */
+const SMOOTH_ROW_DY_MAX = 1.2;
+
+/**
+ * Vertical (price-axis) softening offset in ROW units for a draw — the
+ * barcode fix (owner: "barkod görünüm var hala default olarak"). A live
+ * book concentrates liquidity on single price ROWS; at ~2 px per row the
+ * field paints as hard hairlines. The shader blends a 0.25/0.5/0.25 triple at
+ * ±dy rows around each sample, turning each level into a soft band (the
+ * Bookmap look). dy scales with the row footprint so the softening is a
+ * constant ~{@link SMOOTH_ROW_SIGMA_PX}px: dy = sigma_px * rowsPerPixel,
+ * capped; sub-pixel rows (rpp >= 2) and non-finite inputs return 0 — the
+ * exact legacy single-sample path (byte-identical endpoints).
+ */
+export function rowSmoothDyFor(rowsPerPixel: number): number {
+  if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 0) return 0;
+  if (rowsPerPixel >= 2.0) return 0;
+  return Math.min(SMOOTH_ROW_DY_MAX, SMOOTH_ROW_SIGMA_PX * rowsPerPixel);
+}
+
+/** Deep-row softening enable (see {@link rowMipSoftenFor}) — 1 mip-row step. */
+export const SMOOTH_ROW_MIP_DY = 1;
+
 /**
  * CPU Gaussian tap table for a plan: `taps` symmetric offsets centered on 0
  * (so the shader's fixed `for t < u_smoothTaps` loop reads the CENTERED
@@ -485,8 +510,17 @@ function gaussianTaps(
  * band where row aggregation flips). This ramps the handoff instead:
  *
  *   - rpp <= 2.0  → 0 (pure level-0 rows, EXACT legacy output)
- *   - rpp >= 3.2  → 1 (pure row-mip sums, EXACT post-4.1 output)
- *   - in between  → smoothstep((rpp-2.0)/1.2), zero derivative at both ends
+ *   - rpp >= 3.0  → 1 (pure row-mip sums, EXACT post-4.1 output)
+ *   - in between  → linear (rpp-2.0)/1.0
+ *
+ * The 3.0 upper edge is a W1 barcode-fix decision (2026-09-13): the widened
+ * 4.5 edge (lane P) left ~72% raw single-row weight at the DEFAULT book zoom
+ * (rpp ~3.05), which kept the owner's "barkod" hairlines alive even with the
+ * deep-row Gaussian active — the raw side is a single-row sample and its
+ * 1-px core caps the composite 10-90 edge at ~2.5 px. Completing the handoff
+ * by rpp 3.0 makes the deep-row regime pure Gaussian (soft bands), while both
+ * endpoints stay exact and the blend stays a continuous ramp (~1.1 wheel
+ * notches at ~19%/notch, no step).
  *
  * Non-finite input degrades to 0 (the legacy level-0 path) rather than
  * poisoning the blend weight. NOTE the DRAW applies this only inside the
@@ -496,10 +530,10 @@ function gaussianTaps(
  */
 export function rowFadeFor(rowsPerPixel: number): number {
   if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 2.0) return 0;
-  if (rowsPerPixel >= 4.5) return 1;
+  if (rowsPerPixel >= 3.0) return 1;
   // Linear ramp (see levelBlendFor): uniform weight deltas minimize the max
   // per-step pop; the regime edges are renormalized by effectiveRowMode anyway.
-  return (rowsPerPixel - 2.0) / (4.5 - 2.0);
+  return (rowsPerPixel - 2.0) / (3.0 - 2.0);
 }
 
 /** `selectLevel`'s row-mip threshold (rpp >= 2.5) — the fade's eligibility edge. */
@@ -518,8 +552,8 @@ const ROW_MIP_EDGE = 2.5;
  * historical output. Inside the regime the weight from {@link rowFadeFor} is
  * RENORMALIZED to 0 at the regime edge (rpp 2.5) — the draw switches from the
  * legacy level-0 sample to the row-mip mix with a zero-weight blend, so there is
- * no step at the edge — and reaches 1 at rpp 3.2, fully continuous across the
- * measured 2.4–3.9 pop band.
+ * no step at the edge — and reaches 1 at rpp 3.0 (W1 barcode-fix edge; lane P
+ * spread it to 4.5 for pop reasons, but that left the default zoom ~72% raw).
  *
  * Without a usable row-mip chain (`rowUsable` false) the weight is 0: the
  * legacy selection is used verbatim.
@@ -534,6 +568,56 @@ export function effectiveRowMode(
   const knee = rowFadeFor(ROW_MIP_EDGE);
   const rowFade = raw <= knee ? 0 : (raw - knee) / (1 - knee);
   return { rowOnly: rowFade > 0, rowFade };
+}
+
+/**
+ * Deep-row softening enable for a draw (barcode fix, 2026-09-13). When the
+ * price axis collapses rows into sub-pixel footprints (the row-mip regime,
+ * rpp >= 2.5 — the same {@link ROW_MIP_EDGE} {@link effectiveRowMode} uses), a
+ * single price level paints as a ~1-px hairline at the DEFAULT book zoom
+ * (rpp ~3): the owner's "barkod" look. The shader then blends each 4-row mip
+ * texel with its MIP-row neighbours (0.25/0.5/0.25), spreading a level over
+ * ~12 rows — ~4 px at rpp 3 — so levels read as soft bands while staying
+ * distinguishable. Returns exactly 0 outside the regime so the historical
+ * single-fetch row path stays byte-exact, and it only affects the row-mip
+ * fetch — {@link rowSmoothDyFor}'s dy=0 endpoint is untouched (the two
+ * mechanisms are disjoint by construction).
+ */
+export function rowMipSoftenFor(rowsPerPixel: number): number {
+  if (!Number.isFinite(rowsPerPixel)) return 0;
+  return rowsPerPixel >= ROW_MIP_EDGE ? SMOOTH_ROW_MIP_DY : 0;
+}
+
+/** Deep-row Gaussian target in SCREEN pixels (barcode fix, 2026-09-13). */
+export const SMOOTH_ROW_MIP_SIGMA_PX = 2.0;
+/** Deep-row Gaussian tap count (offsets -3..3 in 4-row mip texels). */
+export const SMOOTH_ROW_MIP_TAPS = 7;
+
+/**
+ * The deep-row Gaussian weights for a draw — the vertical counterpart of
+ * {@link smoothPlanFor}'s column kernel. Taps sit on integer 4-row mip texels
+ * (offset -3..3); the Gaussian sigma is pinned in SCREEN pixels and converted
+ * to texel units by 4/rowsPerPixel (one mip texel = 4 rows), clamped to
+ * [0.4, 2.5] texels so the kernel stays inside the 7-tap support at both ends
+ * of the regime. Normalized to sum 1 (edge taps clamp to the grid edge in the
+ * shader). At the rpp ~3.05 default zoom sigma ≈ 1.2 texels → a ~5 px soft
+ * band with a smooth falloff (the shader reconstructs between texels
+ * bilinearly), replacing the hard 1-px hairline the owner reported.
+ */
+export function rowMipWeightsFor(rowsPerPixel: number): Float32Array {
+  const w = new Float32Array(SMOOTH_ROW_MIP_TAPS);
+  const half = (SMOOTH_ROW_MIP_TAPS - 1) / 2;
+  const rpp = Number.isFinite(rowsPerPixel) ? Math.max(1e-6, rowsPerPixel) : 1;
+  const sigmaTexels = Math.min(2.5, Math.max(0.4, (SMOOTH_ROW_MIP_SIGMA_PX * rpp) / 4));
+  let sum = 0;
+  for (let i = 0; i < SMOOTH_ROW_MIP_TAPS; i++) {
+    const off = (i - half) / sigmaTexels;
+    const val = Math.exp(-0.5 * off * off);
+    w[i] = val;
+    sum += val;
+  }
+  for (let i = 0; i < w.length; i++) w[i] /= sum;
+  return w;
 }
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -621,7 +705,10 @@ type UniformName =
   | 'u_lowSpan'
   | 'u_smoothTaps'
   | 'u_smoothOffsets'
-  | 'u_smoothWeights';
+  | 'u_smoothWeights'
+  | 'u_rowSmoothDy'
+  | 'u_rowMipSoften'
+  | 'u_rowMipWeights';
 
 export class Heatmap {
   readonly gl: WebGL2RenderingContext;
@@ -707,6 +794,9 @@ export class Heatmap {
     colsPerPixel: 1,
     smoothSigma: smoothPlanFor(1).sigmaCols,
     smoothTaps: smoothPlanFor(1).taps,
+    rowDy: 0,
+    rowMipSoften: 0,
+    rowMipSigma: 0,
     rowFade: 0,
     levelFade: 0,
     finerLevel: -1,
@@ -782,6 +872,9 @@ export class Heatmap {
       u_smoothTaps: loc('u_smoothTaps'),
       u_smoothOffsets: loc('u_smoothOffsets[0]'),
       u_smoothWeights: loc('u_smoothWeights[0]'),
+      u_rowSmoothDy: loc('u_rowSmoothDy'),
+      u_rowMipSoften: loc('u_rowMipSoften'),
+      u_rowMipWeights: loc('u_rowMipWeights[0]'),
     };
     checkGLError(gl, 'Heatmap.ctor');
   }
@@ -950,10 +1043,23 @@ export class Heatmap {
     // no recompile, no crisp/blur handoff.
     const plan = smoothPlanFor(colsPerPixel);
     const taps = gaussianTaps(plan.sigmaCols, plan.taps);
+    // Vertical softening (barcode fix): a per-draw constant from the row
+    // footprint — see rowSmoothDyFor. 0 keeps the exact legacy path.
+    const rowDy = rowSmoothDyFor(rowsPerPixel);
+    // Deep-row softening (barcode fix): 1 inside the row-mip regime so the
+    // 4-row texel fetch gains the vertical Gaussian (see rowMipWeightsFor /
+    // rowMipSoftenFor). Only the row-mip branches read it; 0 keeps their exact
+    // historical single-fetch output.
+    const rowMipSoften = rowMipSoftenFor(rowsPerPixel);
+    const rowMipWeights = rowMipWeightsFor(rowsPerPixel);
+    const rowMipSigma = rowMipSoften > 0 ? SMOOTH_ROW_MIP_SIGMA_PX * rowsPerPixel / 4 : 0;
     this.lastSample = {
       colsPerPixel,
       smoothSigma: plan.sigmaCols,
       smoothTaps: plan.taps,
+      rowDy,
+      rowMipSoften,
+      rowMipSigma,
       rowFade,
       levelFade,
       finerLevel,
@@ -961,6 +1067,9 @@ export class Heatmap {
     gl.uniform1i(this.u.u_smoothTaps, plan.taps);
     uploadFloatArray(gl, this.u.u_smoothOffsets, taps.offsets);
     uploadFloatArray(gl, this.u.u_smoothWeights, taps.weights);
+    gl.uniform1f(this.u.u_rowSmoothDy, rowDy);
+    gl.uniform1f(this.u.u_rowMipSoften, rowMipSoften);
+    uploadFloatArray(gl, this.u.u_rowMipWeights, rowMipWeights);
 
     // Scale the black point by the pixel's ROW footprint. `intensity` sums
     // nRowTaps rows of a blk-row block and divides only the COLUMN dimension by
@@ -981,11 +1090,12 @@ export class Heatmap {
 
   /**
    * The sampler plan + cross-fade weights the LAST {@link draw} uploaded —
-   * `colsPerPixel`, the Gaussian plan (see {@link smoothPlanFor}), the effective
+   * `colsPerPixel`, the Gaussian plan (see {@link smoothPlanFor}), the
+   * vertical softening offset (see {@link rowSmoothDyFor}), the effective
    * row-mip cross-fade weight (see {@link effectiveRowMode}) and the SUM-mip
    * level cross-fade (see {@link levelBlendFor}; `finerLevel` is -1 whenever no
    * second sample exists). Defaults to the `colsPerPixel = 1` plan
-   * (`{ colsPerPixel: 1, smoothSigma: 2, smoothTaps: 9, rowFade: 0,
+   * (`{ colsPerPixel: 1, smoothSigma: 2, smoothTaps: 9, rowDy: 0, rowFade: 0,
    * levelFade: 0, finerLevel: -1 }`) before the first draw. Diagnostics/tests
    * only (testHook.levelInfo).
    */
@@ -993,6 +1103,9 @@ export class Heatmap {
     colsPerPixel: number;
     smoothSigma: number;
     smoothTaps: number;
+    rowDy: number;
+    rowMipSoften: number;
+    rowMipSigma: number;
     rowFade: number;
     levelFade: number;
     finerLevel: number;

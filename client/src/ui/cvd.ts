@@ -24,9 +24,16 @@ interface RawBounds {
 function boundsFromRaw(raw: RawBounds): CvdBounds {
   let { min, max } = raw;
   if (min === 0 && max === 0) return { min: -1, max: 1 };
-  const pad = (max - min) * 0.08;
-  min -= pad;
-  max += pad;
+  const range = max - min;
+  // Asymmetric headroom (Bookmap-class sub-pane): the side the series is pinned
+  // to gets 15% of the raw range, while the zero-baseline side keeps the
+  // standard 8%. An intraday-accumulating CVD rides its running extreme for
+  // hours, so without this the line glues to the pane edge and the strip reads
+  // as one flat slab; the extra air keeps the line a line.
+  const padHi = max > 0 ? range * 0.15 : range * 0.08;
+  const padLo = min < 0 ? range * 0.15 : range * 0.08;
+  min -= padLo;
+  max += padHi;
   return { min, max };
 }
 

@@ -35,6 +35,14 @@ export const AXIS_LABEL_SIZE = DEFAULT_TEXT_SIZE;
 export const AXIS_LABEL_WEIGHT = 500;
 /** Price-axis major tick mark length (CSS px, 1 px wide). */
 export const AXIS_TICK_LEN = 6;
+/** Tick-mark opacity — deliberately below the label ink so the ticks read as
+ *  subtle guides, not a second ladder (Bookmap-class axis: data is the ink). */
+export const AXIS_TICK_ALPHA = 0.55;
+/** Time-axis tick-label size (CSS px). Kept one step under the price ladder's
+ *  11 px: the gutter is 22 px tall, and 11 px ms-precision labels ("00:00:00.000")
+ *  would crowd the slot at narrow viewports (measured 10 px min gap at 640 px
+ *  wide, deep-zoom ms regime — 11 px labels would close it). */
+export const AXIS_TIME_LABEL_SIZE = 10;
 /** Approximate advance width of the mono axis font (JetBrains Mono ≈ 0.6 em). */
 const MONO_ADVANCE_EM = 0.6;
 
@@ -186,7 +194,7 @@ export function drawPriceAxis(layer: TextLayer, gm: GridMap, last: LastClose | n
   const cssW = layer.width;
   const model = priceAxisModel(gm, layer.height, cssW - 6 - AXIS_TICK_LEN - 2);
   for (const t of model) {
-    layer.line(0, t.pos, AXIS_TICK_LEN, t.pos, OVERLAY.axis.css, 1);
+    layer.line(0, t.pos, AXIS_TICK_LEN, t.pos, OVERLAY.axis.css, 1, AXIS_TICK_ALPHA);
     layer.text(cssW - 6, t.pos, t.label, {
       align: 'right',
       baseline: 'middle',
@@ -220,7 +228,7 @@ export function drawTimeAxis(layer: TextLayer, gm: GridMap): void {
   const last = model.length - 1;
   for (let i = 0; i < model.length; i++) {
     const t = model[i];
-    layer.line(t.pos, 0, t.pos, 4, OVERLAY.axis.css, 1);
+    layer.line(t.pos, 0, t.pos, AXIS_TICK_LEN, OVERLAY.axis.css, 1, AXIS_TICK_ALPHA);
     // Clamp the edge labels inward so the first/last time isn't half-clipped by
     // the gutters (the tick mark itself stays at t.pos).
     let x = t.pos;
@@ -232,7 +240,13 @@ export function drawTimeAxis(layer: TextLayer, gm: GridMap): void {
       align = 'right';
       x = Math.min(t.pos, cssW - 2);
     }
-    layer.text(x, 15, t.label, { align, baseline: 'alphabetic', color: OVERLAY.axis.css, size: 10 });
+    layer.text(x, 15, t.label, {
+      align,
+      baseline: 'alphabetic',
+      color: OVERLAY.axis.css,
+      size: AXIS_TIME_LABEL_SIZE,
+      weight: AXIS_LABEL_WEIGHT,
+    });
   }
 }
 

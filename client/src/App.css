@@ -998,8 +998,8 @@ body,
    ========================================================================= */
 
 :root {
-  --bid-bar: rgba(31, 182, 166, 0.28);
-  --ask-bar: rgba(211, 82, 79, 0.28);
+  --bid-bar: rgba(31, 182, 166, 0.42);
+  --ask-bar: rgba(211, 82, 79, 0.42);
 }
 
 .right-rail {
@@ -1141,14 +1141,29 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: center;
+  position: relative;
+}
+
+/* Spread separator: a dashed rule at the FRACTIONAL mid (between the best bid
+   and best ask rungs), so the spread reads as its own band even when the two
+   best rows sit several ticks apart. Positioned inline from the live mid row;
+   never a hard opaque hairline (44% ink) — a marker, not a grid edge. */
+.ladder__mid {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1px dashed color-mix(in srgb, var(--accent) 44%, transparent);
+  pointer-events: none;
+  z-index: 2;
 }
 
 .ladder__row {
   display: grid;
-  grid-template-columns: 1fr 58px 1fr;
+  grid-template-columns: 1fr 62px 1fr;
   align-items: stretch;
   height: 17px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-variant-numeric: tabular-nums;
   border-bottom: 1px solid var(--line-soft);
 }
@@ -1186,33 +1201,53 @@ body,
   top: 1px;
   bottom: 1px;
   z-index: 0;
+  border-radius: 1px;
+}
+
+/* A nonzero level never renders narrower than a 3px stub (a sub-1% size must
+   stay readable); genuinely empty levels keep width 0 and vanish. */
+.ladder__bar:not(.is-empty) {
+  min-width: 3px;
 }
 
 .ladder__bar--bid {
   right: 0;
-  /* Depth: the price-adjacent anchor edge sits slightly deeper than the tip,
-     derived from the SAME bar token (hue untouched) by layering it on itself. */
-  background:
-    linear-gradient(to left, color-mix(in srgb, var(--bid-bar) 45%, transparent), transparent),
-    var(--bid-bar);
+  /* Depth histogram read (Bookmap depth rows): a bright cap on the
+     price-adjacent edge, solid body, soft tip — same token hue throughout. */
+  background: linear-gradient(
+    to left,
+    color-mix(in srgb, var(--accent) 60%, transparent) 0,
+    var(--bid-bar) 2px,
+    color-mix(in srgb, var(--bid-bar) 55%, transparent) 100%
+  );
 }
 
 .ladder__bar--ask {
   left: 0;
-  background:
-    linear-gradient(to right, color-mix(in srgb, var(--ask-bar) 45%, transparent), transparent),
-    var(--ask-bar);
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--sell) 60%, transparent) 0,
+    var(--ask-bar) 2px,
+    color-mix(in srgb, var(--ask-bar) 55%, transparent) 100%
+  );
 }
 
 .ladder__bar--profile {
   left: 0;
-  background: rgba(120, 130, 220, 0.3);
+  background: rgba(120, 130, 220, 0.34);
 }
 
 .ladder__sz {
   position: relative;
-  z-index: 1;
+  /* Above the depth bar (z0) AND the dashed spread rule (z2): a drifting mid
+     line under a LOCKED window must never overpaint a printed size. */
+  z-index: 3;
   color: var(--text);
+  /* Halo in the panel ground so a coloured size stays crisply legible where it
+     overlaps its own depth bar (contrast over the bar, not just the row). */
+  text-shadow:
+    0 0 3px color-mix(in srgb, var(--bg-1) 90%, transparent),
+    0 0 1px color-mix(in srgb, var(--bg-1) 80%, transparent);
 }
 
 .ladder__cell--bid .ladder__sz {
@@ -1227,7 +1262,9 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-3);
+  color: var(--text-2);
+  font-weight: 500;
+  letter-spacing: -0.01em;
   background: var(--bg-inset);
   border-left: 1px solid var(--line-soft);
   border-right: 1px solid var(--line-soft);
@@ -1246,10 +1283,10 @@ body,
 }
 
 .ladder__row.is-bestbid {
-  background: rgba(31, 182, 166, 0.11);
+  background: rgba(31, 182, 166, 0.14);
   box-shadow:
-    inset 0 1px 0 rgba(31, 182, 166, 0.30),
-    inset 0 -1px 0 rgba(31, 182, 166, 0.30);
+    inset 0 1px 0 rgba(31, 182, 166, 0.42),
+    inset 0 -1px 0 rgba(31, 182, 166, 0.42);
 }
 
 .ladder__row.is-bestbid .ladder__px {
@@ -1258,10 +1295,16 @@ body,
 }
 
 .ladder__row.is-bestask {
-  background: rgba(211, 82, 79, 0.11);
+  background: rgba(211, 82, 79, 0.14);
   box-shadow:
-    inset 0 1px 0 rgba(211, 82, 79, 0.30),
-    inset 0 -1px 0 rgba(211, 82, 79, 0.30);
+    inset 0 1px 0 rgba(211, 82, 79, 0.42),
+    inset 0 -1px 0 rgba(211, 82, 79, 0.42);
+}
+
+/* Row tracking for the eye: a whisper of paper under the cursor on ordinary
+   rungs only (the best-quote washes keep their semantic colour on hover). */
+.ladder__body .ladder__row:hover:not(.is-bestbid):not(.is-bestask) {
+  background-color: color-mix(in srgb, var(--text) 6.5%, transparent);
 }
 
 .ladder__row.is-bestask .ladder__px {
@@ -1841,16 +1884,32 @@ body,
   margin-left: var(--sp-2);
   font-size: var(--fs-2xs);
   letter-spacing: 0.04em;
-  color: var(--text-3);
+  color: var(--text-2);
+  padding: 1px 5px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-1);
   font-variant-numeric: tabular-nums;
 }
 
 /* Synthetic depth ladder: recolour the bid/ask bars amber so fabricated
-   volume-at-price reads as synthetic here exactly as it does on the heatmap. */
-.dom-ladder--synth .ladder__bar--bid,
+   volume-at-price reads as synthetic here exactly as it does on the heatmap.
+   Same depth-histogram shape as the real bars (cap→body→soft tip). */
+.dom-ladder--synth .ladder__bar--bid {
+  background: linear-gradient(
+    to left,
+    color-mix(in srgb, var(--warn) 70%, transparent) 0,
+    color-mix(in srgb, var(--warn) 52%, transparent) 2px,
+    color-mix(in srgb, var(--warn) 28%, transparent) 100%
+  );
+}
 .dom-ladder--synth .ladder__bar--ask {
-  background: var(--warn);
-  opacity: 0.62;
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--warn) 70%, transparent) 0,
+    color-mix(in srgb, var(--warn) 52%, transparent) 2px,
+    color-mix(in srgb, var(--warn) 28%, transparent) 100%
+  );
 }
 .dom-ladder--synth .ladder__row.is-bestbid,
 .dom-ladder--synth .ladder__row.is-bestask {

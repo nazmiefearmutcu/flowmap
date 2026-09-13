@@ -22,6 +22,13 @@ import {
   transferCurve,
   TRANSFER_LOG_SCALE,
   TRANSFER_LOW_SPAN,
+  rowSmoothDyFor,
+  rowMipSoftenFor,
+  rowMipWeightsFor,
+  SMOOTH_ROW_MIP_DY,
+  SMOOTH_ROW_MIP_SIGMA_PX,
+  SMOOTH_ROW_MIP_TAPS,
+  SMOOTH_ROW_SIGMA_PX,
 } from './heatmap';
 import { buildImbalanceLUT, buildFlowLUT, LUT_SIZE } from './lut';
 import { MipChain } from './mips';
@@ -500,7 +507,7 @@ describe('depth channel modes (contract C2) â€” the intensity chain', () =>
   });
 });
 
-describe('smoothPlanFor â€” the width-scaled Gaussian sampler plan (lane F)', () => {
+describe('smoothPlanFor — the width-scaled Gaussian sampler plan (lane F)', () => {
   it('pins the law: sigma = clamp(2.5 * cpp, 0.12, 2.0) with 3-sigma tap tiers', () => {
     // Deep zoom: sigma in PIXELS is the constant 2.5 â†’ sigmaCols = 2.5 * cpp.
     expect(SMOOTH_SIGMA_PX).toBe(2.5);
@@ -539,6 +546,73 @@ describe('smoothPlanFor â€” the width-scaled Gaussian sampler plan (lane F)
   it('falls back to the minimum plan on non-finite/negative input', () => {
     for (const v of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -3]) {
       expect(smoothPlanFor(v)).toEqual({ sigmaCols: 0.12, taps: 1 });
+    }
+  });
+});
+
+describe('rowSmoothDyFor — the vertical barcode-fix softening (2026-09-13)', () => {
+  it('pins the screen-pixel target and the sub-pixel no-op endpoint', () => {
+    expect(SMOOTH_ROW_SIGMA_PX).toBe(2.2);
+    // rpp 0.43 (~2.3 px rows, the live-book default): soft band.
+    expect(rowSmoothDyFor(0.43)).toBeCloseTo(2.2 * 0.43, 12);
+    // Sub-pixel rows: exact legacy path (no soften).
+    expect(rowSmoothDyFor(2.0)).toBe(0);
+    expect(rowSmoothDyFor(3.5)).toBe(0);
+    // Cap.
+    expect(rowSmoothDyFor(1.0)).toBe(1.2);
+    expect(rowSmoothDyFor(1.9)).toBe(1.2);
+  });
+
+  it('degrades non-finite / non-positive input to the legacy path', () => {
+    expect(rowSmoothDyFor(0)).toBe(0);
+    expect(rowSmoothDyFor(-2)).toBe(0);
+    expect(rowSmoothDyFor(Number.NaN)).toBe(0);
+    expect(rowSmoothDyFor(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+});
+
+describe('rowMipSoftenFor — deep-row (row-mip) softening gate (2026-09-13)', () => {
+  it('pins the enable value and the sub-regime no-op endpoint', () => {
+    expect(SMOOTH_ROW_MIP_DY).toBe(1);
+    // Inside the row-mip regime (rpp >= 2.5): the vertical Gaussian that turns
+    // the default-view sub-pixel-row hairlines into soft bands.
+    expect(rowMipSoftenFor(2.5)).toBe(1);
+    expect(rowMipSoftenFor(3.05)).toBe(1); // the live-book default zoom
+    expect(rowMipSoftenFor(8)).toBe(1);
+    // Outside: exact 0 — the historical single-fetch row path stays byte-exact.
+    expect(rowMipSoftenFor(2.4999)).toBe(0);
+    expect(rowMipSoftenFor(2.0)).toBe(0);
+    expect(rowMipSoftenFor(0.5)).toBe(0);
+    expect(rowMipSoftenFor(Number.NaN)).toBe(0);
+    expect(rowMipSoftenFor(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  it('rowMipWeightsFor: normalized, symmetric, screen-sigma pinned', () => {
+    expect(SMOOTH_ROW_MIP_TAPS).toBe(7);
+    expect(SMOOTH_ROW_MIP_SIGMA_PX).toBe(2.0);
+    const w = rowMipWeightsFor(3.05);
+    expect(w.length).toBe(7);
+    const sum = Array.from(w).reduce((a, b) => a + b, 0);
+    expect(sum).toBeCloseTo(1, 6);
+    // Symmetric around the center tap; center is the largest.
+    for (let i = 0; i < 3; i++) expect(w[i]).toBeCloseTo(w[6 - i], 12);
+    for (let i = 0; i < 7; i++) if (i !== 3) expect(w[3]).toBeGreaterThan(w[i]);
+    // Sigma in texels = 1.6 * rpp / 4 (rpp 3.05 -> 1.22): the ±1 tap carries
+    // exp(-0.5/sigma^2) of the center BEFORE normalization — bounded and > 0.5.
+    const sigma = (SMOOTH_ROW_MIP_SIGMA_PX * 3.05) / 4;
+    const ratio = Math.exp(-0.5 / (sigma * sigma));
+    expect(w[2] / w[3]).toBeCloseTo(ratio, 6);
+    // Clamps: tiny rpp -> sigma floor 0.4 (narrow kernel, center dominant);
+    // huge rpp -> sigma ceiling 2.5 (near-uniform kernel).
+    const narrow = rowMipWeightsFor(0.01);
+    expect(narrow[3]).toBeGreaterThan(0.9);
+    const wide = rowMipWeightsFor(512);
+    expect(wide[0] / wide[3]).toBeGreaterThan(0.4);
+    // Non-finite degrades to the rpp=1 kernel, never NaN.
+    for (const v of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const f = rowMipWeightsFor(v);
+      expect(Array.from(f).some((x) => Number.isNaN(x))).toBe(false);
+      expect(Array.from(f).reduce((a, b) => a + b, 0)).toBeCloseTo(1, 6);
     }
   });
 });
@@ -602,24 +676,25 @@ describe('rowFadeFor / effectiveRowMode â€” the smooth row-mip cross-fade (
     expect(rowFadeFor(Number.NEGATIVE_INFINITY)).toBe(0);
   });
 
-  it('is exactly 1 at/above 4.5 rows-per-pixel (the post-4.1 row-only regime)', () => {
+  it('is exactly 1 at/above 3.0 rows-per-pixel (the completed row-mip regime)', () => {
+    expect(rowFadeFor(3.0)).toBe(1);
+    expect(rowFadeFor(3.2)).toBe(1);
     expect(rowFadeFor(4.5)).toBe(1);
     expect(rowFadeFor(6)).toBe(1);
     expect(rowFadeFor(8)).toBe(1);
     expect(rowFadeFor(64)).toBe(1);
   });
 
-  it('smoothsteps the middle: 0.5 at 3.25, zero slope at both ends', () => {
-    // Widened band [2.0, 4.5] (coordinator): the LOD brightness ramp is spread
-    // over ~4x more zoom range so no wheel step lands a concentrated step.
-    expect(rowFadeFor(3.25)).toBeCloseTo(0.5, 12);
-    // t = (rppâˆ’2.0)/2.5; quarter points of the smoothstep.
-    expect(rowFadeFor(2.625)).toBeCloseTo(0.25, 12); // t = 0.25
-    expect(rowFadeFor(3.875)).toBeCloseTo(0.75, 12); // t = 0.75
-    // The e2e gesture (rpp â‰ˆ 3.05) sits in the band's lower half.
-    const atGesture = rowFadeFor(3.05);
-    expect(atGesture).toBeGreaterThan(0.3);
-    expect(atGesture).toBeLessThan(0.5);
+  it('ramps linearly through the middle (band [2.0, 3.0])', () => {
+    expect(rowFadeFor(2.5)).toBeCloseTo(0.5, 12);
+    // t = (rpp-2.0)/1.0; quarter points.
+    expect(rowFadeFor(2.25)).toBeCloseTo(0.25, 12);
+    expect(rowFadeFor(2.75)).toBeCloseTo(0.75, 12);
+    // W1 2026-09-13: the upper edge moved 4.5 -> 3.0. At the rpp ~3.05 default
+    // zoom the old band left ~72% raw single-row weight, which kept hairlines
+    // alive; 3.0 completes the mip handoff exactly at the default (both
+    // endpoints exact). The e2e gesture now reads 1.0.
+    expect(rowFadeFor(3.05)).toBe(1);
   });
 
   it('is monotonically non-decreasing across the band', () => {
@@ -643,22 +718,20 @@ describe('rowFadeFor / effectiveRowMode â€” the smooth row-mip cross-fade (
   });
 
   it('renormalizes the fade at the row-mip eligibility edge (continuous handoff)', () => {
-    // The raw rowFadeFor knee at 2.5 is ~0.104; the draw starts the blend at
+    // The raw rowFadeFor knee at 2.5 is 0.5; the draw starts the blend at
     // weight 0 there so the switch from the level-0 sample to the row mix has
-    // no step, then ramps to full row sums at 4.5. Both endpoints are exact.
+    // no step, then ramps to full row sums at 3.0. Both endpoints are exact.
     const knee = rowFadeFor(2.5);
     expect(knee).toBeGreaterThan(0);
     expect(knee).toBeLessThan(1);
     expect(effectiveRowMode(2.5, true).rowFade).toBe(0);
+    expect(effectiveRowMode(3.0, true).rowFade).toBe(1);
     expect(effectiveRowMode(4.5, true).rowFade).toBe(1);
-    expect(effectiveRowMode(3.2, true).rowFade).toBeCloseTo(
-      (rowFadeFor(3.2) - knee) / (1 - knee),
+    expect(effectiveRowMode(2.8, true).rowFade).toBeCloseTo(
+      (rowFadeFor(2.8) - knee) / (1 - knee),
       12,
     );
-    expect(effectiveRowMode(3.05, true).rowFade).toBeCloseTo(
-      (rowFadeFor(3.05) - knee) / (1 - knee),
-      12,
-    );
+    expect(effectiveRowMode(3.05, true).rowFade).toBe(1);
   });
 
   it('is monotone in rpp and keeps rowOnly === (rowFade > 0)', () => {
@@ -710,10 +783,26 @@ describe('the Gaussian sampler + transfer curve in the fragment shader source (l
     expect(HEATMAP_FRAG).toContain(
       'colAt < float(u_validFrom) - 0.5 || colAt > float(u_residentNewest) + 0.5',
     );
-    expect(HEATMAP_FRAG).toContain('acc += bilinear0(colAt, rowf) * w;');
+    expect(HEATMAP_FRAG).toContain('acc += fieldAt(colAt, rowf) * w;');
     expect(HEATMAP_FRAG).toContain('acc /= wsum;');
     expect(HEATMAP_FRAG).toContain(
-      'bilinear0(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf)',
+      'fieldAt(clamp(colf, float(u_validFrom), float(u_residentNewest)), rowf)',
+    );
+  });
+
+  it('softens the price axis vertically (barcode fix) with a 0-endpoint legacy path', () => {
+    // The uniform + helper exist…
+    expect(HEATMAP_FRAG).toContain('uniform float u_rowSmoothDy;');
+    expect(HEATMAP_FRAG).toContain('vec2 fieldAt(float colf, float rowf) {');
+    expect(HEATMAP_FRAG).toContain('if (u_rowSmoothDy <= 0.0) return bilinear0(colf, rowf);');
+    expect(HEATMAP_FRAG).toContain(
+      '0.25 * bilinear0(colf, rowf - u_rowSmoothDy)',
+    );
+    expect(HEATMAP_FRAG).toContain(
+      '0.50 * bilinear0(colf, rowf)',
+    );
+    expect(HEATMAP_FRAG).toContain(
+      '0.25 * bilinear0(colf, rowf + u_rowSmoothDy)',
     );
   });
 
@@ -779,6 +868,27 @@ describe('the row-only mip path in the fragment shader source', () => {
     expect(HEATMAP_FRAG).toContain(
       'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
     );
+  });
+
+  it('applies the deep-row Gaussian through fetchRowMipGauss at BOTH row-mip sites', () => {
+    expect(HEATMAP_FRAG).toContain('uniform float u_rowMipSoften;');
+    expect(HEATMAP_FRAG).toContain('uniform float u_rowMipWeights[7];');
+    expect(HEATMAP_FRAG).toContain('vec2 fetchRowMipGauss(int x, int layer, float yMip) {');
+    // The bilinear reconstruction between mip texels + the uniform weights.
+    expect(HEATMAP_FRAG).toContain('acc += v * u_rowMipWeights[k + 3];');
+    // Edge-aware: isolated walls keep their own texel (SUM-mip contract — see
+    // mips.spec.ts), dense level-stacks get the soft Gaussian (barcode fix).
+    expect(HEATMAP_FRAG).toContain(
+      'vec2 keep = clamp(1.0 - 2.0 * neighborMax / max(center, vec2(1e-6)), 0.0, 1.0);',
+    );
+    expect(HEATMAP_FRAG).toContain('return mix(acc, center, keep);');
+    // Both the full row endpoint and the lane-P fade branch gate on the
+    // 1-tap footprint; wider footprints keep the historical single-fetch loop.
+    expect(HEATMAP_FRAG).toContain('if (u_rowMipSoften > 0.0 && u_nRowTaps == 1) {');
+    expect(HEATMAP_FRAG).toContain('acc = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);');
+    expect(HEATMAP_FRAG).toContain('accRow = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);');
+    // The legacy row fetch still exists (byte-exact endpoint when soften is 0).
+    expect(HEATMAP_FRAG).toMatch(/texelFetch\(u_rowMip1,\s*ivec3\(x0,\s*y,\s*layer\),\s*0\)/);
   });
 });
 
@@ -966,6 +1076,18 @@ describe('Heatmap.draw â€” SUM-path level cross-fade uniform wiring (wave P
     expect(heatmap.sampleInfo().finerLevel).toBe(-1);
   });
 
+  it('uploads u_rowMipSoften only inside the row-mip regime (barcode fix)', () => {
+    const { heatmap, gl } = makeMipHeatmap();
+    // rpp 3.05 (the live-book default zoom), cpp 0.25: inside the regime.
+    heatmap.draw({ colOffset: 0, colScale: 0.25 * 320, rowOffset: 600, rowScale: 3.05 * 240 });
+    expect(lastFloat(gl, 'u_rowMipSoften')).toBe(SMOOTH_ROW_MIP_DY);
+    expect(lastInt(gl, 'u_rowOnly')).toBe(1);
+    // rpp 2.0: outside -> 0 (legacy level-0 path, dy=0 endpoint untouched).
+    heatmap.draw({ colOffset: 0, colScale: 2.1 * 320, rowOffset: 0, rowScale: 2 * 240 });
+    expect(lastFloat(gl, 'u_rowMipSoften')).toBe(0);
+    expect(lastInt(gl, 'u_rowOnly')).toBe(0);
+  });
+
   it('uploads the blend inside the band: coarse k=1 with the finer taps', () => {
     const { heatmap, gl } = makeMipHeatmap();
     // rpp 2, cpp 3.2 -> fp 3.2: k=1, linear fade = (3.2-2.2)/1.8 = 0.556.
@@ -1017,6 +1139,8 @@ describe('Heatmap.draw â€” SUM-path level cross-fade uniform wiring (wave P
     expect(lastFloat(gl, 'u_knee')).toBeCloseTo(DEFAULT_KNEE_FRACTION, 12);
     expect(lastFloat(gl, 'u_logScale')).toBeCloseTo(TRANSFER_LOG_SCALE, 12);
     expect(lastFloat(gl, 'u_lowSpan')).toBeCloseTo(TRANSFER_LOW_SPAN, 12);
+    // Vertical barcode-fix soften: rpp = 240/240 = 1 → capped 1.2 rows.
+    expect(lastFloat(gl, 'u_rowSmoothDy')).toBeCloseTo(1.2, 12);
     // cpp 0.5 → sigma 1.25 columns → the 5-tap tier (≥3σ truncation).
     expect(lastInt(gl, 'u_smoothTaps')).toBe(5);
     const arrays = gl.callsOf('uniform1fv');

@@ -40,12 +40,14 @@ const DEFAULTS: Required<BubbleOptions> = {
   capacity: 120_000,
   minSize: 0,
   // √-area scaling with deliberately restrained radii: bubbles mark the tape
-  // without burying the price line. A median trade is a small solid dot
-  // (refSize=4 → baseRadiusPx=4.5), and the biggest prints cap at a 40px
-  // diameter (was 88px), so far more of the heatmap stays readable.
+  // without burying the price line. W6 swarm2 judgement: at live BTC sizes
+  // (0.001-1 BTC) the old floor (2.5px → 5px dot) read as near-invisible
+  // specks at 1:1; the floor is now 3px (6px dot) and a reference trade is a
+  // 10px dot, while the biggest prints still cap at a 40px diameter (was 88px),
+  // so the tape stays legible without burying the heatmap.
   refSize: 4,
-  baseRadiusPx: 4.5,
-  minRadiusPx: 2.5,
+  baseRadiusPx: 5,
+  minRadiusPx: 3,
   maxRadiusPx: 20,
 };
 
@@ -60,9 +62,10 @@ export function bubbleRadiusPx(size: number, opts: Required<BubbleOptions>): num
  * Hard cap on the bubble ink alpha. The palette path (`applyOverlayPalette`)
  * owns the hue AND the base alpha per theme; the overlay clamps it so a dense
  * tape can never bury the field — bubbles stay context, not the protagonist.
- * Pure; rgb is never touched.
+ * W6 swarm2: paired with the larger minimum dot (6px), 0.85 keeps the denser
+ * tape from stacking into noise along the price line. Pure; rgb never touched.
  */
-export const BUBBLE_MAX_ALPHA = 0.9;
+export const BUBBLE_MAX_ALPHA = 0.85;
 
 export function bubbleAlpha(c: RGBA): number {
   return Math.min(c[3], BUBBLE_MAX_ALPHA);

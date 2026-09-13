@@ -35,14 +35,21 @@ import type { Pt } from '../textLayer';
 export const PRICE_LINE_WIDTH = 2.0;
 /** CSS-px width of the translucent glow drawn underneath the core. */
 export const PRICE_GLOW_WIDTH = 6.0;
-/** Alpha of the wide glow pass (over the near-white core color). */
-export const PRICE_GLOW_ALPHA = 0.22;
+/** Alpha of the wide glow pass (over the near-white core color). Bookmap-class
+ *  judgement (W6, swarm2): the halo must seat the trace, not fatten it — 0.22
+ *  read as a ~5px-thick line at 1:1; 0.16 keeps the depth cue while the 2px
+ *  core stays the crisp protagonist. */
+export const PRICE_GLOW_ALPHA = 0.16;
 /** Alpha of the area wash's TOP stop (the bottom stop stays transparent).
  *  `OVERLAY.priceFillTop` / `OVERLAY.priceLevel` are palette-lane owned; the
  *  price-line slice re-stamps their alpha here so hues stay palette-owned. */
 export const PRICE_FILL_TOP_ALPHA = 0.09;
 /** Alpha of the dashed last-price level marker (quieter than the trace). */
-export const PRICE_LEVEL_ALPHA = 0.30;
+export const PRICE_LEVEL_ALPHA = 0.28;
+/** Dash pattern of the last-price level (on/off CSS px). W6 swarm2: [2,4] read
+ *  as a fine dotted texture at 1:1 (223 dashes across the chart); the calmer
+ *  long-dash [3,6] keeps the same duty ratio with a third fewer dashes. */
+export const PRICE_LEVEL_DASH: readonly number[] = [3, 6];
 /** CSS-px length of the solid stub bridging the trace to the right gutter. */
 export const PRICE_STUB_PX = 10;
 /** Alpha of the right-edge stub (subtle; the core pass stays the brightest ink). */
@@ -185,7 +192,7 @@ export class PriceLine {
           gm.dims.cssW,
           y,
           withAlpha(OVERLAY.priceLevel.css, PRICE_LEVEL_ALPHA),
-          [2, 4],
+          [...PRICE_LEVEL_DASH],
           1,
         );
       }

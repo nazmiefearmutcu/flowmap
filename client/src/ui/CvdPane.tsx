@@ -34,6 +34,7 @@ const AXIS_FAINT = 'rgba(120, 132, 150, 0.28)';
 const BG_FALLBACK = 'rgba(9, 12, 16, 1)';
 /** Shipped amber fade of the CVD area fill (midnight/dark grounds). */
 const AMBER_FILL_TOP = 'rgba(232, 176, 74, 0.26)';
+const AMBER_FILL_MID = 'rgba(232, 176, 74, 0.10)';
 const AMBER_FILL_BOTTOM = 'rgba(232, 176, 74, 0.02)';
 
 /** Parse `#rgb` / `#rrggbb` / `#rrggbbaa` / `rgb()` / `rgba()` to sRGB bytes. */
@@ -88,7 +89,15 @@ export interface CvdInk {
   zero: string;
   series: string;
   fillTop: string;
+  fillMid: string;
   fillBottom: string;
+  /** Ground-colored halo under the series stroke — separates the line from the
+   *  same-hue fill (Bookmap "line over area" casing). */
+  lineCasing: string;
+  /** Last-value pill: solid series plate + ground text (the axis-pill grammar). */
+  pillText: string;
+  /** Small ground plate behind the top-left `CVD` tag + the baseline `0` label. */
+  tagPlate: string;
 }
 
 /**
@@ -111,7 +120,11 @@ export function resolveCvdInk(getVar: (name: string) => string): CvdInk {
     zero: withAlpha(raw('--chart-grid'), 0.28) ?? AXIS_FAINT,
     series: withAlpha(price, 1) ?? OVERLAY.cvd.css,
     fillTop: withAlpha(price, 0.26) ?? AMBER_FILL_TOP,
+    fillMid: withAlpha(price, 0.1) ?? AMBER_FILL_MID,
     fillBottom: withAlpha(price, 0.02) ?? AMBER_FILL_BOTTOM,
+    lineCasing: withAlpha(ground, 0.55) ?? 'rgba(9, 12, 16, 0.55)',
+    pillText: withAlpha(ground, 1) ?? 'rgba(9, 12, 16, 1)',
+    tagPlate: withAlpha(ground, 0.72) ?? 'rgba(9, 12, 16, 0.72)',
   };
 }
 
@@ -179,12 +192,14 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.fillStyle = ink.ground;
       ctx.fillRect(0, 0, cssW, cssH);
 
-      // Top-left tag.
+      // Top-left tag on a small ground plate so it stays legible over the fill.
       ctx.font = '10px ui-monospace, monospace';
       ctx.textBaseline = 'top';
       ctx.textAlign = 'left';
+      ctx.fillStyle = ink.tagPlate;
+      ctx.fillRect(4, 2, 28, 13);
       ctx.fillStyle = ink.series;
-      ctx.fillText('CVD', 6, 4);
+      ctx.fillText('CVD', 7, 4);
 
       // Honesty: no usable aggressor side → don't draw a fake flat zero.
       if (cap === 'na') {
@@ -221,12 +236,14 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
 
       // Build the polyline in the shared x transform (already projected above).
 
-      // Filled area between the line and the zero baseline — a vertical fade
-      // (strongest at the line, gone at the baseline) so the pane reads as one
-      // polished series instead of a flat brown slab.
+      // Filled area between the line and the zero baseline — a three-stop
+      // vertical fade (strongest at the line, already quiet by mid-pane, gone
+      // at the baseline) so the strip reads as an under-line wash instead of a
+      // flat muddy slab.
       const yMin = xy.reduce((m, p) => Math.min(m, p.y), xy[0].y);
       const grad = ctx.createLinearGradient(0, yMin, 0, zeroY);
       grad.addColorStop(0, ink.fillTop);
+      grad.addColorStop(0.4, ink.fillMid);
       grad.addColorStop(1, ink.fillBottom);
       ctx.beginPath();
       ctx.moveTo(xy[0].x, zeroY);
@@ -236,26 +253,63 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
       ctx.fillStyle = grad;
       ctx.fill();
 
-      // The CVD line itself.
+      // The CVD line itself, stroked twice over one path: a ground-colored
+      // casing first (invisible over the ground, separates the line from the
+      // same-hue fill), then the series stroke.
       ctx.beginPath();
       ctx.moveTo(xy[0].x, xy[0].y);
       for (let i = 1; i < xy.length; i++) ctx.lineTo(xy[i].x, xy[i].y);
-      ctx.strokeStyle = ink.series;
-      ctx.lineWidth = 1.8;
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
+      ctx.strokeStyle = ink.lineCasing;
+      ctx.lineWidth = 3.4;
+      ctx.stroke();
+      ctx.strokeStyle = ink.series;
+      ctx.lineWidth = 1.8;
       ctx.stroke();
 
-      // Latest value marker + label on the right.
+      // Baseline "0" marker on a small ground plate (drawn over the fill, so it
+      // stays readable when the wash covers the baseline side).
+      ctx.fillStyle = ink.tagPlate;
+      ctx.fillRect(3, zeroY - 13, 13, 12);
+      ctx.fillStyle = ink.axis;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('0', 6, zeroY - 2);
+
+      // Latest value pill pinned to the right edge at the line end (the axis
+      // pill grammar: solid series plate, ground text) — readable over both the
+      // fill and the ground, unlike the old free-floating corner text.
       const last = pts[pts.length - 1];
       const lastXY = xy[xy.length - 1];
       ctx.fillStyle = ink.series;
       ctx.beginPath();
       ctx.arc(lastXY.x, lastXY.y, 2.4, 0, Math.PI * 2);
       ctx.fill();
-      ctx.textAlign = 'right';
-      ctx.textBaseline = 'top';
-      ctx.fillText(fmtCvd(last.cvd), cssW - 6, 4);
+
+      const label = fmtCvd(last.cvd);
+      const tw = label.length * 6.2 + 12; // 10px mono advance ≈ 6.2px
+      const ph = 14;
+      const cr = 3;
+      const px = cssW - tw - 2;
+      const py = Math.min(Math.max(lastXY.y - ph / 2, 2), cssH - ph - 2);
+      ctx.beginPath();
+      ctx.moveTo(px + cr, py);
+      ctx.lineTo(px + tw - cr, py);
+      ctx.arc(px + tw - cr, py + cr, cr, -Math.PI / 2, 0);
+      ctx.lineTo(px + tw, py + ph - cr);
+      ctx.arc(px + tw - cr, py + ph - cr, cr, 0, Math.PI / 2);
+      ctx.lineTo(px + cr, py + ph);
+      ctx.arc(px + cr, py + ph - cr, cr, Math.PI / 2, Math.PI);
+      ctx.lineTo(px, py + cr);
+      ctx.arc(px + cr, py + cr, cr, Math.PI, 1.5 * Math.PI);
+      ctx.closePath();
+      ctx.fillStyle = ink.series;
+      ctx.fill();
+      ctx.fillStyle = ink.pillText;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, px + tw / 2, py + ph / 2 + 0.5);
     };
 
     const draw = (): void => {
@@ -270,11 +324,14 @@ export function CvdPane({ rendererRef }: CvdPaneProps): JSX.Element {
         // The newest (forming) column's CVD mutates while every view field stays
         // fixed in follow mode, so fold its value into the signature — otherwise
         // the live tip + readout freeze until the next column is born. O(1) map
-        // lookup. Signature: repaint only when something visible changed.
+        // lookup. Signature: repaint only when something visible changed. The
+        // applied theme is part of the signature so a theme switch re-inks a
+        // quiet pane immediately (the tokens live on documentElement).
+        const themeKey = document.documentElement.dataset.theme ?? '';
         const tipCvd = tl && r ? r.cvdValueAt(tl.newestSeq) : Number.NaN;
         const sig = tl
-          ? `${cssW}x${cssH}|${dpr}|${cap}|${tl.viewStartCol.toFixed(2)}|${tl.viewEndCol.toFixed(2)}|${tl.newestSeq}|${Number.isFinite(tipCvd) ? tipCvd : ''}`
-          : `${cssW}x${cssH}|${dpr}|${cap}|empty`;
+          ? `${cssW}x${cssH}|${dpr}|${cap}|${themeKey}|${tl.viewStartCol.toFixed(2)}|${tl.viewEndCol.toFixed(2)}|${tl.newestSeq}|${Number.isFinite(tipCvd) ? tipCvd : ''}`
+          : `${cssW}x${cssH}|${dpr}|${cap}|${themeKey}|empty`;
         if (sig !== lastSig) {
           lastSig = sig;
           paint(r, tl, cap, cssW, cssH, dpr);

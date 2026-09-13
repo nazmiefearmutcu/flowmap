@@ -21,6 +21,18 @@ describe('cvdBounds — signed value range always spanning zero', () => {
     const b = cvdBounds([10, Number.NaN, 20]);
     expect(b.max).toBeGreaterThan(20);
   });
+  it('gives the pinned (extreme) side more headroom than the zero-baseline side', () => {
+    // All-positive series: the running max rides the top → extra air above it,
+    // standard 8% below the 0 baseline.
+    const pos = cvdBounds([10, 20, 30]);
+    expect(pos.max - 30).toBeGreaterThan(0 - pos.min);
+    // All-negative: mirrored.
+    const neg = cvdBounds([-20, -5]);
+    expect(-20 - neg.min).toBeGreaterThan(neg.max - 0);
+    // A straddling series keeps the same pad on both extremes.
+    const mid = cvdBounds([-10, 10]);
+    expect(mid.max - 10).toBeCloseTo(-10 - mid.min);
+  });
 });
 
 describe('cvdValueToY — higher value is higher on screen (smaller y)', () => {

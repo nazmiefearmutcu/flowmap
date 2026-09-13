@@ -246,9 +246,14 @@ export class TextLayer {
    *  fractional coordinate covers two physical pixel rows at 50% alpha each,
    *  which is exactly why unaligned gridlines look fuzzy (worst at DPR 1).
    *  Snapping only the CONSTANT axis of an axis-aligned run keeps every other
-   *  shape's anti-aliasing untouched. */
-  line(x0: number, y0: number, x1: number, y1: number, color: string, width = 1): void {
+   *  shape's anti-aliasing untouched. `alpha` (default 1) is for chrome that
+   *  must read quieter than the labels it serves — e.g. the axis tick marks,
+   *  which are deliberately dimmer than the tick text (§9 Bookmap-class axis:
+   *  the ladder data is the ink, the ticks are guides). */
+  line(x0: number, y0: number, x1: number, y1: number, color: string, width = 1, alpha = 1): void {
     const ctx = this.ctx;
+    ctx.save();
+    if (alpha !== 1) ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
     ctx.beginPath();
@@ -267,6 +272,7 @@ export class TextLayer {
       ctx.lineTo(x1, y1);
     }
     ctx.stroke();
+    ctx.restore();
   }
 
   dispose(): void {

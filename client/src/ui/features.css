@@ -320,3 +320,43 @@
 .perfhud__v {
   color: var(--chart-ink, #e6edf3);
 }
+
+/* --- W4 TAPE: Bookmap-grade scanability (additive over App.css) ------------ */
+/* The base row grid lives in App.css (lane W3); these are the tape-side layers.
+   All tints are color-mix of the theme ink, so every preset (paper, swiss…)
+   gets the same reading without hardcoding a palette.
+   NOTE on specificity: App.css/features.css bundle order is import-graph
+   dependent, so these rules carry `section.tape` prefixes to outrank the base
+   rules deterministically (the :not(:hover) keeps zebra clear of the hover). */
+
+/* Zebra: one faint step so the eye tracks a row across three numeric columns.
+   Scoped OFF the emphasis rows — is-large keeps its side-channel tint and
+   is-big its gutter bar; the stripe is never read as a data claim. */
+.tape__rows .tape__row:nth-child(even):not(.is-large):not(.is-big):not(:hover) {
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+}
+
+/* Row-level hover twin of the HELD badge: the print under the cursor lifts one
+   step and its muted timestamp comes up to reading ink. */
+section.tape .tape__row:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+section.tape .tape__row:hover .tape__time {
+  color: var(--text-2);
+}
+
+/* Big-trade gutter bar takes the ROW's side channel (same hue family as the
+   chart's buy/sell ink): a big sell is red-barred, a big buy teal-barred —
+   the old fixed teal bar contradicted the sell row cue. 3px for read-at-a-
+   glance, weight stays from App.css. The *-bright variants separate the bar
+   from the dim is-large tint (they are the high-contrast ink in every theme,
+   including the light ones where "bright" is the deeper tone). */
+section.tape .tape__row.is-big {
+  box-shadow: inset 3px 0 0 var(--accent-bright, var(--accent));
+}
+section.tape .tape__row--sell.is-big {
+  box-shadow: inset 3px 0 0 var(--sell-bright, var(--sell));
+}
+section.tape .tape__row.is-big:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}

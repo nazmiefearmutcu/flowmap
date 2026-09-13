@@ -16,8 +16,12 @@ import { expect, test } from '@playwright/test';
  *       3-tap kernel smeared edges over 40–200 px at deep zoom;
  *   (c) the row-only path (rpp 3.05, cpp 0.25) keeps the time-axis stripe
  *       structure (no 4-column block averaging) with luma variance ≫ flat;
- *   (d) the vertical (row) convention is untouched: price stays crisp (≤3 px
- *       across a half-row boundary).
+ *   (d) the vertical (row) convention, POST barcode-fix (W1 2026-09-13): the
+ *       dy=0 endpoint (rpp 2.2 — rowSmoothDyFor returns 0 there) stays crisp
+ *       (≤3 px across a half-row boundary), while dy>0 (rpp 0.5) deliberately
+ *       widens the same boundary into a soft band (≥2.5 px) that still stays
+ *       inside the mush bar (≤8 px). The deep-row Gaussian's isolated-wall
+ *       exemption is covered by mips.spec.ts.
  *
  * All fixtures are synthetic, driven through the ?test=heatmap hook
  * (window.__flowmapTest) and read back with gl.readPixels — deterministic.
@@ -224,7 +228,7 @@ test('row-only path (rpp 3.05, cpp 0.25) keeps the time-axis stripe structure', 
   expect(variance, `row-only strip luma variance ${variance.toFixed(1)}`).toBeGreaterThan(150);
 });
 
-test('vertical half-row boundary stays ≤ 3 px (price axis crisp)', async ({ page }) => {
+test('vertical endpoint: dy=0 (rpp 2.2) keeps the half-row boundary ≤ 3 px', async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on('console', (m) => {
     if (m.type() === 'error') consoleErrors.push(m.text());
@@ -235,10 +239,11 @@ test('vertical half-row boundary stays ≤ 3 px (price axis crisp)', async ({ pa
   await page.waitForFunction(() => '__flowmapTest' in window, undefined, { timeout: 30_000 });
 
   // One column profile: dim lower half (rows 0..31), bright upper half (32..63).
-  // rpp 1 (64 rows / 64 px) keeps the level-0 path; reading a VERTICAL line
-  // across the half boundary catches a y0/fy half-row shift that every
-  // horizontal-uniform test would miss. The Gaussian only touches the time
-  // axis — this must stay a hard ~1-px edge.
+  // rpp 2.2 (> the 2.0 soften ceiling) keeps the EXACT legacy level-0 path:
+  // rowSmoothDyFor returns 0 there, so this end of the barcode fix must stay a
+  // hard ~1-px edge (the "dy=0 endpoint exact" contract; larger rpp also stays
+  // crisp through the row-mip Gaussian, which only kicks in at rpp >= 2.5 with
+  // a 1-tap footprint — here the draw is still level-0).
   const strip = await page.evaluate(
     (cfg) => {
       const api = (window as unknown as { __flowmapTest: any }).__flowmapTest;
@@ -250,15 +255,58 @@ test('vertical half-row boundary stays ≤ 3 px (price axis crisp)', async ({ pa
       for (let s = 0; s < cfg.nCols; s++) api.appendColumn(s, bid, zeros);
       api.setEncoding(1, cfg.norm, false);
 
-      // rpp 1; cpp 0.25 (64 columns / 256 px) → level 0, Gaussian halo active.
-      api.setView({ colOffset: 0, colScale: 64, rowOffset: 0, rowScale: cfg.rows });
+      // rpp 2.2; cpp 0.25 (64 columns / 256 px). Boundary row 32 sits at
+      // y = 32/2.2 ≈ 14.5 px (bottom-up readback): read a 22-px window around
+      // it, strictly inside the 0..64-row visible span (no background rows).
+      api.setView({ colOffset: 0, colScale: 64, rowOffset: 0, rowScale: 2.2 * 64 });
       api.render();
-      return api.readPixels(1, 0, 1, cfg.height);
+      return api.readPixels(1, 4, 1, 22);
     },
     { rows: 64, layers: 1, width: 256, height: 64, nCols: 70, norm: 1.2 },
   );
 
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(' | ')}`).toEqual([]);
   const edge = transition10to90(strip as number[]);
-  expect(edge, `vertical 10-90 edge ${edge} px`).toBeLessThanOrEqual(3);
+  expect(edge, `vertical 10-90 edge ${edge} px (dy=0 endpoint must stay crisp)`).toBeLessThanOrEqual(3);
+});
+
+test('vertical soft band: dy>0 (rpp 0.5) widens the half-row boundary but never mushes', async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on('console', (m) => {
+    if (m.type() === 'error') consoleErrors.push(m.text());
+  });
+  page.on('pageerror', (e) => consoleErrors.push(String(e)));
+
+  await page.goto('/?test=heatmap');
+  await page.waitForFunction(() => '__flowmapTest' in window, undefined, { timeout: 30_000 });
+
+  // Same dim/bright half-row boundary at rpp 0.5 (dy = 2.2 × 0.5 = 1.1 rows ≈
+  // 2.2 px): the barcode fix turns the hard 1-px step into a soft band. The
+  // 10-90 edge must widen past the hairline regime yet stay inside the mush
+  // bar (< 8 px) — price levels stay distinguishable.
+  const strip = await page.evaluate(
+    (cfg) => {
+      const api = (window as unknown as { __flowmapTest: any }).__flowmapTest;
+      api.init(cfg.rows, cfg.layers, cfg.width, cfg.height, /* mips */ false);
+
+      const bid = new Array(cfg.rows).fill(0);
+      for (let r = 0; r < cfg.rows; r++) bid[r] = r < cfg.rows / 2 ? 0.2 : 1.0;
+      const zeros = new Array(cfg.rows).fill(0);
+      for (let s = 0; s < cfg.nCols; s++) api.appendColumn(s, bid, zeros);
+      api.setEncoding(1, cfg.norm, false);
+
+      // rpp 0.5 over rows 16..48; boundary row 32 at y = (32-16)/0.5 = 32 px.
+      api.setView({ colOffset: 0, colScale: 64, rowOffset: 16, rowScale: 0.5 * 64 });
+      api.render();
+      return api.readPixels(1, 20, 1, 24);
+    },
+    { rows: 64, layers: 1, width: 256, height: 64, nCols: 70, norm: 1.2 },
+  );
+
+  expect(consoleErrors, `console/page errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+  const edge = transition10to90(strip as number[]);
+  expect(edge, `vertical 10-90 edge ${edge} px (soft band, no hairline)`).toBeGreaterThanOrEqual(2.5);
+  expect(edge, `vertical 10-90 edge ${edge} px (no mush > 8 px)`).toBeLessThanOrEqual(8);
 });

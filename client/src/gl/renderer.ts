@@ -221,6 +221,16 @@ const KEY_PAN_FRAC = 0.15;
 const STATS_EMA_ALPHA = 0.1;
 /** Above this many deferred splice columns, batch mip regen into range passes. */
 const MIP_BATCH_MIN_COLS = 8;
+/**
+ * Largest forward col_seq skip (in columns) the renderer repairs by ZEROING the
+ * skipped band instead of letting {@link Residency} gate every older column to
+ * background (the "heatmap bir anda yok oluyor" blackout: ONE server tx_lag
+ * drop — LAG_DROP_NS=2 s of backlog — would blank up to the full 16 k ring for
+ * minutes). At 4–20 cols/s a 512-column band is ~30–120 s of dropped stream —
+ * past that the conservative gate is both cheaper and more honest. The band
+ * costs one `texSubImage3D` + a mip re-bake per column, a rare one-off.
+ */
+const GAP_ZERO_MAX_COLS = 512;
 /** Max tick-grouping request: 16 rows = mip level 2, the coarsest block the
  *  SUM-mip chain can build (levels clamp further if the chain is shallower).
  *  Clamping HERE (not only at shade time) keeps getTickGrouping() honest. */
@@ -544,6 +554,17 @@ export class Renderer {
   /** Newest absolute col_seq appended (or -1 before any column). Diagnostics. */
   get newestColSeq(): number {
     return this.newestSeq;
+  }
+
+  /**
+   * First resident col_seq whose ring slot provably holds THAT column (-1
+   * before any append). Normally the window oldest; it sits higher only when a
+   * forward skip's band could NOT be repaired (band > {@link GAP_ZERO_MAX_COLS}),
+   * in which case the heatmap gates everything below it to background.
+   * Diagnostics / e2e (the vanish probe's ground truth).
+   */
+  get validFromSeq(): number {
+    return this.ring?.validFromSeq() ?? -1;
   }
 
   /** Resident absolute col_seq range (or null before any column). Diagnostics. */
@@ -1365,7 +1386,31 @@ export class Renderer {
       return;
     }
 
-    this.writeColumn(col, rows);
+    // Forward col_seq SKIP repair ("heatmap bir anda yok oluyor"): the server
+    // drops queued columns for a lagging client (LAG_DROP_NS = 2 s of backlog),
+    // so the next column can sit past `newest + 1`. Residency's conservative
+    // fallback gates EVERY older column to background — one dropped column
+    // blanks thousands of valid columns for minutes. If the skipped band is
+    // small enough to zero, fill it with honest empty texture and tell append
+    // the band is repaired, so `validFrom` stays put and the pre-gap region
+    // keeps painting; the seam shows exactly the dropped columns (with the
+    // GAP marker the stream carries). Larger skips keep the conservative gate.
+    let gapZeroed = false;
+    let gapFrom = -1;
+    if (range !== null && col.col_seq > range.newest + 1) {
+      const band = col.col_seq - range.newest - 1;
+      if (band <= GAP_ZERO_MAX_COLS) {
+        gapFrom = range.newest + 1;
+        ring.zeroColumns(gapFrom, col.col_seq - 1);
+        gapZeroed = true;
+      }
+    }
+
+    this.writeColumn(col, rows, false, gapZeroed);
+    // The zeroed band's SUM-mip groups must be re-baked or the coarse levels
+    // keep summing pre-zero stale members (the append above only baked the
+    // post-gap column's own group).
+    if (gapZeroed) this.bakeGapMips(gapFrom, col.col_seq);
 
     // Normalization (T9): seed the viewport normalizer once from the server's
     // per-session norm_seed (p99 of recent nonzero density) — thereafter u_norm
@@ -1423,9 +1468,9 @@ export class Renderer {
    * non-zero extent, and record (col_seq → t0_ns) for the loader's before_t
    * mapping.
    */
-  private writeColumn(col: DepthColumn, rows: number, deferMips = false): void {
+  private writeColumn(col: DepthColumn, rows: number, deferMips = false, gapZeroed = false): void {
     const ring = this.ring!;
-    ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows);
+    ring.append(col.col_seq, col.epoch, col.bid, col.ask, rows, gapZeroed);
     this.statsUploadsN++;
     if (deferMips) this.deferMipRange(col.col_seq);
     else this.mips?.updateFrom(ring, col.col_seq);
@@ -1543,6 +1588,21 @@ export class Renderer {
   private cancelPendingMips(): void {
     this.pendingMipFrom = -1;
     this.pendingMipTo = -1;
+  }
+
+  /**
+   * Re-bake the SUM-mips over a zeroed gap band + the post-gap column. Without
+   * this the coarse levels keep summing pre-zero stale group members (the
+   * append's own `updateFrom` only covers the new column's group). Range pass
+   * for a full band, per-column for a small one — same split as
+   * {@link flushPendingMips}.
+   */
+  private bakeGapMips(from: number, to: number): void {
+    const mips = this.mips;
+    const ring = this.ring;
+    if (mips === null || ring === null || from < 0) return;
+    if (to - from + 1 >= MIP_BATCH_MIN_COLS) mips.updateRange(ring, from, to);
+    else for (let s = from; s <= to; s++) mips.updateFrom(ring, s);
   }
 
   /**

@@ -343,6 +343,15 @@ export function DomLadder(): JSX.Element {
       : null;
   const model = buildLadder(snap, params, shape, visRows, centerOverride);
 
+  // The rendered window's center row is the middle of the returned rungs (the
+  // window is always odd-length, centered on the mid or the locked row). The
+  // spread separator's offset is measured from it, so it stays correct when a
+  // lock pins the window away from the live mid.
+  const centerRow =
+    model.rows.length > 0 ? model.rows[Math.floor(model.rows.length / 2)].row : null;
+  const midOffsetPx =
+    model.midRow !== null && centerRow !== null ? -(model.midRow - centerRow) * ROW_H : null;
+
   // Track the live mid AS A PRICE so locking freezes at the current center.
   useEffect(() => {
     if (!locked && model.midRow !== null && params) {
@@ -426,49 +435,68 @@ export function DomLadder(): JSX.Element {
           {model.rows.length === 0 ? (
             <div className="panel__empty">{emptyMsg}</div>
           ) : (
-            model.rows.map((r) => (
-              <div
-                key={r.row}
-                className={`ladder__row${r.isBestBid ? ' is-bestbid' : ''}${
-                  r.isBestAsk ? ' is-bestask' : ''
-                }`}
-                data-testid="ladder-row"
-                data-row={r.row}
-                data-price={r.price.toFixed(model.priceDecimals)}
-                data-bid={r.bidSz.toFixed(4)}
-                data-ask={r.askSz.toFixed(4)}
-              >
-                {shape === 'profile' ? (
-                  <div className="ladder__profile">
-                    <div className="ladder__bar ladder__bar--profile" style={{ width: `${r.profilePct}%` }} />
-                    {/* Keyed by the size VALUE: a quantity change remounts the span,
-                        which replays the CSS `ladder-flash` animation — a change
-                        indicator that costs no rAF/timer and stays silent while a
-                        level is unchanged (reduced-motion turns it off in CSS). */}
-                    <span key={r.profileSz} className="ladder__sz">
-                      {fmtSz(r.profileSz)}
-                    </span>
-                  </div>
-                ) : (
-                  <>
-                    <div className="ladder__cell ladder__cell--bid">
-                      <div className="ladder__bar ladder__bar--bid" style={{ width: `${r.bidPct}%` }} />
-                      <span key={r.bidSz} className="ladder__sz">
-                        {fmtSz(r.bidSz)}
+            <>
+              {(shape === 'book' || shape === 'l1') && midOffsetPx !== null && (
+                <div
+                  className="ladder__mid"
+                  aria-hidden="true"
+                  data-testid="ladder-mid"
+                  style={{ top: `calc(50% + ${midOffsetPx.toFixed(1)}px)` }}
+                />
+              )}
+              {model.rows.map((r) => (
+                <div
+                  key={r.row}
+                  className={`ladder__row${r.isBestBid ? ' is-bestbid' : ''}${
+                    r.isBestAsk ? ' is-bestask' : ''
+                  }`}
+                  data-testid="ladder-row"
+                  data-row={r.row}
+                  data-price={r.price.toFixed(model.priceDecimals)}
+                  data-bid={r.bidSz.toFixed(4)}
+                  data-ask={r.askSz.toFixed(4)}
+                >
+                  {shape === 'profile' ? (
+                    <div className="ladder__profile">
+                      <div
+                        className={`ladder__bar ladder__bar--profile${r.profilePct > 0 ? '' : ' is-empty'}`}
+                        style={{ width: `${r.profilePct}%` }}
+                      />
+                      {/* Keyed by the size VALUE: a quantity change remounts the span,
+                          which replays the CSS `ladder-flash` animation — a change
+                          indicator that costs no rAF/timer and stays silent while a
+                          level is unchanged (reduced-motion turns it off in CSS). */}
+                      <span key={r.profileSz} className="ladder__sz">
+                        {fmtSz(r.profileSz)}
                       </span>
                     </div>
-                    <div className="ladder__px">{r.price.toFixed(model.priceDecimals)}</div>
-                    <div className="ladder__cell ladder__cell--ask">
-                      <div className="ladder__bar ladder__bar--ask" style={{ width: `${r.askPct}%` }} />
-                      <span key={r.askSz} className="ladder__sz">
-                        {fmtSz(r.askSz)}
-                      </span>
-                    </div>
-                  </>
-                )}
-                {shape === 'profile' && <div className="ladder__px ladder__px--synth">{r.price.toFixed(model.priceDecimals)}</div>}
-              </div>
-            ))
+                  ) : (
+                    <>
+                      <div className="ladder__cell ladder__cell--bid">
+                        <div
+                          className={`ladder__bar ladder__bar--bid${r.bidPct > 0 ? '' : ' is-empty'}`}
+                          style={{ width: `${r.bidPct}%` }}
+                        />
+                        <span key={r.bidSz} className="ladder__sz">
+                          {fmtSz(r.bidSz)}
+                        </span>
+                      </div>
+                      <div className="ladder__px">{r.price.toFixed(model.priceDecimals)}</div>
+                      <div className="ladder__cell ladder__cell--ask">
+                        <div
+                          className={`ladder__bar ladder__bar--ask${r.askPct > 0 ? '' : ' is-empty'}`}
+                          style={{ width: `${r.askPct}%` }}
+                        />
+                        <span key={r.askSz} className="ladder__sz">
+                          {fmtSz(r.askSz)}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                  {shape === 'profile' && <div className="ladder__px ladder__px--synth">{r.price.toFixed(model.priceDecimals)}</div>}
+                </div>
+              ))}
+            </>
           )}
         </div>
       )}

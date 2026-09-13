@@ -42,13 +42,15 @@ function stubCtx(): CanvasRenderingContext2D {
 
 const mounted: Array<{ container: HTMLElement; root: Root }> = [];
 let fillRect: ReturnType<typeof vi.fn>;
+let clearRect: ReturnType<typeof vi.fn>;
 let rafCount: number;
 
 beforeEach(() => {
   vi.useFakeTimers();
   rafCount = 0;
   fillRect = vi.fn();
-  const ctx = { ...stubCtx(), fillRect };
+  clearRect = vi.fn();
+  const ctx = { ...stubCtx(), fillRect, clearRect };
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx);
   // jsdom lays nothing out: give the pane a fixed CSS box.
   Object.defineProperty(HTMLCanvasElement.prototype, 'clientWidth', { configurable: true, get: () => 800 });
@@ -98,8 +100,9 @@ describe('CvdPane loop pacing', () => {
   it('an idle pane paints once and stops spinning rAF (slow poll, not 60 fps)', () => {
     renderWith({ current: null });
     vi.advanceTimersByTime(500); // half a second of a completely idle chart
-    // One paint (the first frame), then the signature never changes.
-    expect(fillRect).toHaveBeenCalledTimes(1);
+    // One paint (the first frame), then the signature never changes. Paints are
+    // counted via clearRect (once per repaint), not fillRect (ground + plates).
+    expect(clearRect).toHaveBeenCalledTimes(1);
     // The old unconditional loop woke rAF ~31 times in 500 ms; the backed-off
     // idle poll stays far below that.
     expect(rafCount).toBeLessThan(20);
@@ -122,6 +125,28 @@ describe('CvdPane loop pacing', () => {
     // And it actually repainted the changing series.
     expect(fillRect.mock.calls.length).toBeGreaterThan(1);
   });
+
+  it('a theme switch re-inks a quiet pane (signature carries documentElement theme)', () => {
+    // A STATIC renderer: every view/value field constant, so only the theme can
+    // change the signature. Before the fix a quiet pane kept the old theme's
+    // ink until the next data mutation.
+    const staticRenderer = {
+      timeline: () => ({ viewStartCol: 0, viewEndCol: 10, newestSeq: 7, timeBase: null }),
+      cvdValueAt: () => 5,
+      cvdSeries: () => [{ col: 1, cvd: 2 }],
+    } as unknown as Renderer;
+    renderWith({ current: staticRenderer });
+    vi.advanceTimersByTime(500); // paints once, then the poll idles
+    expect(clearRect).toHaveBeenCalledTimes(1);
+
+    document.documentElement.dataset.theme = 'paper';
+    try {
+      vi.advanceTimersByTime(300);
+      expect(clearRect.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      delete document.documentElement.dataset.theme;
+    }
+  });
 });
 
 describe('CvdPane ink tokens (R1-H3)', () => {
@@ -140,7 +165,11 @@ describe('CvdPane ink tokens (R1-H3)', () => {
     expect(ink.zero).toBe('rgba(120, 132, 150, 0.28)');
     expect(ink.series).toBe(OVERLAY.cvd.css);
     expect(ink.fillTop).toBe('rgba(232, 176, 74, 0.26)');
+    expect(ink.fillMid).toBe('rgba(232, 176, 74, 0.10)');
     expect(ink.fillBottom).toBe('rgba(232, 176, 74, 0.02)');
+    expect(ink.lineCasing).toBe('rgba(5, 8, 14, 0.55)');
+    expect(ink.pillText).toBe('rgba(5, 8, 14, 1)');
+    expect(ink.tagPlate).toBe('rgba(5, 8, 14, 0.72)');
   });
 
   it('light ground follows --chart-price / -axis / -grid', () => {
@@ -157,7 +186,10 @@ describe('CvdPane ink tokens (R1-H3)', () => {
     expect(ink.zero).toBe('rgba(90, 100, 114, 0.28)');
     expect(ink.series).toBe('rgba(10, 97, 88, 1)');
     expect(ink.fillTop).toBe('rgba(10, 97, 88, 0.26)');
+    expect(ink.fillMid).toBe('rgba(10, 97, 88, 0.1)');
     expect(ink.fillBottom).toBe('rgba(10, 97, 88, 0.02)');
+    expect(ink.lineCasing).toBe('rgba(243, 241, 234, 0.55)');
+    expect(ink.pillText).toBe('rgba(243, 241, 234, 1)');
   });
 
   it('unresolvable tokens fall back to the shipped literals', () => {
@@ -165,5 +197,8 @@ describe('CvdPane ink tokens (R1-H3)', () => {
     expect(ink.axis).toBe('rgba(163, 176, 194, 0.75)');
     expect(ink.zero).toBe('rgba(120, 132, 150, 0.28)');
     expect(ink.series).toBe(OVERLAY.cvd.css);
+    expect(ink.lineCasing).toBe('rgba(9, 12, 16, 0.55)');
+    expect(ink.pillText).toBe('rgba(9, 12, 16, 1)');
+    expect(ink.tagPlate).toBe('rgba(9, 12, 16, 0.72)');
   });
 });

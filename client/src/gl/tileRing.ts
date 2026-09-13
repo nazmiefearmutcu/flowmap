@@ -95,6 +95,13 @@ export class Residency {
    * `[oldest, colSeq)` still holds PREVIOUS data while `range()` claims it.
    * Consumers that cannot tolerate stale texels (the heatmap's residency
    * uniform) gate on {@link validFromSeq} instead of `oldest`.
+   *
+   * A forward gap whose band the CALLER has physically zeroed (see
+   * {@link TileRing.zeroColumns}) no longer needs the gate: the band is
+   * honest empty texture, so validity stays continuous at the old value and
+   * the pre-gap columns remain paintable. That is the difference between a
+   * one-column server lag-drop blacking out the whole chart for minutes and
+   * it costing exactly one blank seam column.
    */
   private validFrom = -1;
   private clock = 0;
@@ -113,8 +120,18 @@ export class Residency {
     return this.capacityCols;
   }
 
-  /** Fold one written column at absolute `colSeq` into the resident window. */
-  note(colSeq: number): void {
+  /**
+   * Fold one written column at absolute `colSeq` into the resident window.
+   *
+   * `gapZeroed` is the caller's assertion that a forward skip's band
+   * `[newest+1, colSeq-1]` has been PHYSICALLY filled with zero density by
+   * {@link TileRing.zeroColumns}. When true, a forward gap does NOT move
+   * `validFrom` (the band is honest empty texture now, so every slot in the
+   * claimed window holds either its column or a zeroed dropped column);
+   * when false, the historical conservative gate applies — `validFrom`
+   * jumps to the gap edge and every older column paints background.
+   */
+  note(colSeq: number, gapZeroed = false): void {
     const cap = this.capacityCols;
     if (this.oldest < 0) {
       this.oldest = colSeq;
@@ -123,13 +140,14 @@ export class Residency {
     } else if (colSeq >= this.oldest && colSeq <= this.newest) {
       // In-place overwrite of a resident column — window unchanged.
     } else if (colSeq >= this.newest) {
-      if (colSeq > this.newest + 1) {
+      if (colSeq > this.newest + 1 && !gapZeroed) {
         // GAP forward growth: the modulo wrap clobbered exactly slot(colSeq);
         // every slot between the old newest and colSeq still holds whatever it
         // held before. The valid region restarts at colSeq.
         this.validFrom = colSeq;
       }
-      // Forward growth (adjacent live append, or a rare capped-gap skip).
+      // Forward growth (adjacent live append, or a rare capped-gap skip whose
+      // band the caller zeroed).
       this.newest = colSeq;
       if (this.newest - this.oldest + 1 > cap) this.oldest = this.newest - cap + 1;
     } else {
@@ -204,6 +222,13 @@ export class TileRing {
   private readonly residency: Residency;
   /** Scratch RG-interleaved upload buffer, reused per append (no per-call alloc). */
   private readonly scratch: Float32Array;
+  /**
+   * Dedicated zero-density upload buffer for {@link zeroColumns} — separate
+   * from {@link scratch} on purpose: the append scratch is overwritten by the
+   * very next append, so reusing it would corrupt any observer holding the
+   * upload (and muddies the repair's intent). Allocated once, on first use.
+   */
+  private zeroScratch: Float32Array | null = null;
 
   constructor(gl: WebGL2RenderingContext, rows: number, layers: number) {
     if (rows <= 0 || layers <= 0) {
@@ -257,6 +282,7 @@ export class TileRing {
     bid: Float32Array,
     ask: Float32Array | null,
     rows: number,
+    gapZeroed = false,
   ): void {
     if (rows !== this.rows) {
       throw new Error(`flowmap/tileRing: append rows ${rows} ≠ ring rows ${this.rows}`);
@@ -301,7 +327,52 @@ export class TileRing {
     );
     checkGLError(gl, 'TileRing.append');
 
-    this.residency.note(colSeq);
+    this.residency.note(colSeq, gapZeroed);
+  }
+
+  /**
+   * Physically fill a contiguous col_seq range `[lo, hi]` with ZERO density in
+   * its ring slots — the cure for a small forward col_seq skip (a server
+   * tx_lag drop burst, a go-live jump after a stalled scroll-back).
+   *
+   * A skip leaves the band's slots holding whatever they held before;
+   * {@link Residency} then conservatively gates every older column to
+   * background (a whole-chart blackout for one dropped column). Zeroing the
+   * band makes the dropped columns HONEST empty texture, so the caller can
+   * pass `gapZeroed: true` to {@link append} and keep the pre-gap columns on
+   * screen. The band is bounded by the caller; each column costs one
+   * `texSubImage3D` and never touches residency bookkeeping (these are not
+   * real columns — no window, no LRU, no extents).
+   *
+   * Safety: for `hi - lo + 1 ≤ capacityCols` every slot in the band is
+   * distinct, and the previous occupant of each slot is a column at least one
+   * full wrap OLDER than the band (its seq is `c - k·cap ≤ oldest - 1` after
+   * the window clamps), so zeroing can never clobber a resident column.
+   */
+  zeroColumns(lo: number, hi: number): void {
+    if (hi < lo) return;
+    const gl = this.gl;
+    if (this.zeroScratch === null) this.zeroScratch = new Float32Array(this.rows * 2);
+    const zeros = this.zeroScratch;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.texture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    for (let c = lo; c <= hi; c++) {
+      const { layer, x } = this.locate(c);
+      gl.texSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        x,
+        0,
+        layer,
+        1,
+        this.rows,
+        1,
+        gl.RG,
+        gl.FLOAT,
+        zeros,
+      );
+    }
+    checkGLError(gl, 'TileRing.zeroColumns');
   }
 
   /** Absolute colSeq range currently resident full-res (null before any append). */
