@@ -77,14 +77,18 @@ uniform float u_norm;
 // no per-column CPU cost, the O(1)-in-history invariant is untouched.
 uniform float u_gamma;
 
-// Two-segment transfer curve (Bookmap-class overhaul, lane F). u_knee is the
+// Two-segment transfer curve (Bookmap-class overhaul; low-span calibrated
+// 2026-09-13 after the owner-reported dark-field regression). u_knee is the
 // CPU's clamp(kneeNorm / white, 0.05, 0.95) — the fraction of u_norm where the
 // curve switches from the below-knee gamma lift to the above-knee log
-// compression (wall cores differentiate instead of clamping into the top few
-// LUT entries). u_logScale is the fixed module constant TRANSFER_LOG_SCALE.
-// Endpoints stay exact: f(0) = 0 (background), f(1) = 1 (LUT 255).
+// compression. u_lowSpan fixes the output share the BELOW-knee segment owns
+// (TRANSFER_LOW_SPAN, 0.72): letting it end at k (the original formula)
+// capped ~97% of active cells at LUT <= k*255 on heavy-tailed books and
+// rendered the field black. u_logScale is the fixed module constant
+// TRANSFER_LOG_SCALE. Endpoints stay exact: f(0) = 0, f(1) = 1 (LUT 255).
 uniform float u_knee;
 uniform float u_logScale;
+uniform float u_lowSpan;
 
 // Black point (§9 "Tolerance"). Density below u_floor collapses to LUT entry 0 —
 // bit-identical to what background() returns — so small resting size falls back
@@ -396,15 +400,17 @@ void main() {
   // curve would clip a curve, not a density, and the floor would mean a
   // different amount of size at every contrast setting.
   t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);
-  // Two-segment transfer (lane F): below the knee the display gamma lifts the
-  // mid-field; above it log compression spreads the wall band so cores
-  // differentiate instead of clamping. Both endpoints stay fixed (f(0)=0,
-  // f(1)=1) because 1 + u_logScale*(1-k)/(1-k) = 1 + u_logScale.
+  // Two-segment transfer (low-span calibrated 2026-09-13): below the knee the
+  // display gamma lifts the mid-field into a FIXED output share u_lowSpan of
+  // the ramp; above it log compression spreads the wall band across
+  // [u_lowSpan, 1] so cores differentiate instead of clamping. Both endpoints
+  // stay fixed (f(0)=0, f(1)=1) because 1 + u_logScale*(1-k)/(1-k) = 1 + u_logScale.
   float k = u_knee;
+  float span = u_lowSpan;
   if (t <= k) {
-    t = k * pow(t / k, u_gamma);
+    t = span * pow(t / k, u_gamma);
   } else {
-    t = k + (1.0 - k) * log(1.0 + u_logScale * (t - k) / (1.0 - k)) / log(1.0 + u_logScale);
+    t = span + (1.0 - span) * log(1.0 + u_logScale * (t - k) / (1.0 - k)) / log(1.0 + u_logScale);
   }
 
   int li = int(t * 255.0 + 0.5);

@@ -97,6 +97,19 @@ export const DEFAULT_CONTRAST = 40;
 export const TRANSFER_LOG_SCALE = 6.0;
 
 /**
+ * Output span of the BELOW-knee transfer segment (calibration fix 2026-09-13,
+ * owner report "heatmap buga girdi"). The knee sits at `p97 / p99.7` in
+ * t-space — a SMALL fraction on heavy-tailed books (≈0.18 live BTC) — so a
+ * curve whose below-knee segment ends at `k` capped ~97% of active cells at
+ * LUT ≤ k·255 (≈45): the field read as black in recorded/scrollback regions
+ * while only walls glowed. The below-knee segment now owns a FIXED output
+ * share [0, lowSpan] (the mids stay visible under the gamma lift) and the
+ * above-knee log compression owns the wall band [lowSpan, 1]. Both endpoints
+ * stay exact (f(0)=0, f(1)=1); the segments meet continuously at the knee.
+ */
+export const TRANSFER_LOW_SPAN = 0.85;
+
+/**
  * Knee fraction used when no {@link ViewportNormalizer} is attached (unit tests,
  * the synthetic e2e hook): `u_knee = 0.55`. With a normalizer attached the draw
  * uploads the live `knee / white` ratio (clamped [0.05, 0.95]) instead.
@@ -109,18 +122,26 @@ function clampKneeFraction(v: number): number {
 }
 
 /**
- * The two-segment transfer curve (Bookmap-class overhaul, lane F) — the TS
- * mirror of the fragment shader's post-floor mapping, for tests:
+ * The two-segment transfer curve (Bookmap-class overhaul) — the TS mirror of
+ * the fragment shader's post-floor mapping, for tests:
  *
- *   t <= k : t = k * pow(t / k, gamma)                                 // lift
- *   t >  k : t = k + (1-k) * log(1 + L*(t-k)/(1-k)) / log(1 + L)      // compress
+ *   t <= k : t = S * pow(t / k, gamma)                              // lift, span S
+ *   t >  k : t = S + (1-S) * log(1 + L*(t-k)/(1-k)) / log(1 + L)    // wall compress
  *
+ * `S = lowSpan` (default {@link TRANSFER_LOW_SPAN}) is the output share the
+ * below-knee segment owns — see the constant's docblock for why fixing it at
+ * `k` (the original lane-F formula) crushed the heavy-tail mid-field to black.
  * Endpoints are exact (f(0) = 0 → background, f(1) = 1 → LUT 255) and the two
- * segments meet continuously at the knee (both equal `k`). Gaussian-free, pure.
+ * segments meet continuously at the knee (both equal `S`). Gaussian-free, pure.
  */
 export function transferCurve(
   t: number,
-  { knee, gamma, logScale }: { knee: number; gamma: number; logScale: number },
+  {
+    knee,
+    gamma,
+    logScale,
+    lowSpan,
+  }: { knee: number; gamma: number; logScale: number; lowSpan?: number },
 ): number {
   const tc = Number.isFinite(t) ? Math.min(1, Math.max(0, t)) : 0;
   const k = Number.isFinite(knee)
@@ -128,8 +149,12 @@ export function transferCurve(
     : DEFAULT_KNEE_FRACTION;
   const g = Number.isFinite(gamma) ? Math.max(1e-6, gamma) : 1;
   const L = Number.isFinite(logScale) && logScale > 0 ? logScale : TRANSFER_LOG_SCALE;
-  if (tc <= k) return k * Math.pow(tc / k, g);
-  return k + (1 - k) * (Math.log1p((L * (tc - k)) / (1 - k)) / Math.log1p(L));
+  const S =
+    typeof lowSpan === 'number' && Number.isFinite(lowSpan) && lowSpan > 0 && lowSpan < 1
+      ? lowSpan
+      : TRANSFER_LOW_SPAN;
+  if (tc <= k) return S * Math.pow(tc / k, g);
+  return S + (1 - S) * (Math.log1p((L * (tc - k)) / (1 - k)) / Math.log1p(L));
 }
 
 /**
@@ -593,6 +618,7 @@ type UniformName =
   | 'u_rowFade'
   | 'u_knee'
   | 'u_logScale'
+  | 'u_lowSpan'
   | 'u_smoothTaps'
   | 'u_smoothOffsets'
   | 'u_smoothWeights';
@@ -655,6 +681,13 @@ export class Heatmap {
    * EMA pair instead (Bookmap-class overhaul, lane F).
    */
   knee = DEFAULT_KNEE_FRACTION;
+
+  /**
+   * Output span of the below-knee transfer segment (calibration fix
+   * 2026-09-13): {@link TRANSFER_LOW_SPAN}. A per-Heatmap field so tests can
+   * pin the upload without reaching into the shader constant.
+   */
+  lowSpan = TRANSFER_LOW_SPAN;
 
   /**
    * Optional viewport normalizer attachment (lane F): when set, the draw reads
@@ -745,6 +778,7 @@ export class Heatmap {
       u_rowFade: loc('u_rowFade'),
       u_knee: loc('u_knee'),
       u_logScale: loc('u_logScale'),
+      u_lowSpan: loc('u_lowSpan'),
       u_smoothTaps: loc('u_smoothTaps'),
       u_smoothOffsets: loc('u_smoothOffsets[0]'),
       u_smoothWeights: loc('u_smoothWeights[0]'),
@@ -825,10 +859,11 @@ export class Heatmap {
     gl.uniform1f(this.u.u_decodeScale, this.encoding.decodeScale);
     gl.uniform1f(this.u.u_norm, this.encoding.norm);
     gl.uniform1f(this.u.u_gamma, this.gamma);
-    // Two-segment transfer curve (lane F): the knee fraction comes from the
-    // normalizer's EMA pair when attached (the SAME merged CDF the renderer
-    // feeds `u_norm` from), else the module-default fallback. The log scale is
-    // the fixed module constant; both are per-draw constants — coherent branch.
+    // Two-segment transfer curve (lane F; low-span calibrated 2026-09-13): the
+    // knee fraction comes from the normalizer's EMA pair when attached (the
+    // SAME merged CDF the renderer feeds `u_norm` from), else the module-default
+    // fallback. `u_lowSpan` fixes how much of the ramp the below-knee segment
+    // owns (heavy-tail mid-field must not be capped at the knee fraction).
     const pcts = this.normalizer !== null ? this.normalizer.currentPercentiles : null;
     const kneeFraction =
       pcts !== null && Number.isFinite(pcts.white) && pcts.white > 0
@@ -836,6 +871,7 @@ export class Heatmap {
         : clampKneeFraction(this.knee);
     gl.uniform1f(this.u.u_knee, kneeFraction);
     gl.uniform1f(this.u.u_logScale, TRANSFER_LOG_SCALE);
+    gl.uniform1f(this.u.u_lowSpan, this.lowSpan);
     gl.uniform1i(this.u.u_ramp, this.encoding.ramp);
     gl.uniform1i(this.u.u_channel, this.channel);
 

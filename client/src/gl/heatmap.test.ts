@@ -21,6 +21,7 @@ import {
   TOLERANCE_MAX_FLOOR,
   transferCurve,
   TRANSFER_LOG_SCALE,
+  TRANSFER_LOW_SPAN,
 } from './heatmap';
 import { buildImbalanceLUT, buildFlowLUT, LUT_SIZE } from './lut';
 import { MipChain } from './mips';
@@ -216,13 +217,14 @@ describe('default visibility â€” the boxed heatmap must show the field, not
     const p99Lut = lut(P99, P99_7, floor, gamma);
     const whiteLut = lut(P99_7, P99_7, floor, gamma);
     // The wall band spreads across the ramp instead of all clamping to the top:
-    // p97 lands on the knee (â‰ˆLUT 57), p99 mid-high (â‰ˆLUT 169), p99.7 white.
-    expect(kneeLut).toBeGreaterThanOrEqual(40);
-    expect(kneeLut).toBeLessThanOrEqual(90);
-    expect(p99Lut).toBeGreaterThanOrEqual(140);
-    expect(p99Lut).toBeLessThanOrEqual(200);
+    // p97 (the knee) now sits at the low-span boundary (≈LUT 209 — the fixed
+    // 0.85 share, 2026-09-13), p99 mid-high (≈LUT 238), p99.7 white.
+    expect(kneeLut).toBeGreaterThanOrEqual(195);
+    expect(kneeLut).toBeLessThanOrEqual(228);
+    expect(p99Lut).toBeGreaterThanOrEqual(225);
+    expect(p99Lut).toBeLessThanOrEqual(250);
     expect(whiteLut).toBe(255);
-    expect(whiteLut - kneeLut).toBeGreaterThan(150); // real spread, no flat band
+    expect(whiteLut - kneeLut).toBeGreaterThan(40); // real spread, no flat band
   });
 
   it('hides everything below the floor exactly (LUT 0 == background)', () => {
@@ -230,13 +232,13 @@ describe('default visibility â€” the boxed heatmap must show the field, not
     const gamma = gammaForContrast(DEFAULT_CONTRAST);
     // At p99.7 white the median..p70 of the heavy model sits under the default
     // floor (the tolerance's job); p90 is the first decile of the field that
-    // reads as dark indigo.
+    // reads as a clear indigo-blue (≈LUT 80 with the fixed low span).
     expect(lut(cell(0), P99_7, floor, gamma)).toBe(0); // median
-    expect(lut(cell(0.5244), P99_7, floor, gamma)).toBeLessThanOrEqual(8); // p70
+    expect(lut(cell(0.5244), P99_7, floor, gamma)).toBeLessThanOrEqual(20); // p70
     const p90Lut = lut(cell(1.2816), P99_7, floor, gamma);
-    expect(p90Lut).toBeGreaterThanOrEqual(10);
-    expect(p90Lut).toBeLessThanOrEqual(40);
-    // Pre-fix regression pin: with floor â‰ˆ0.06 + p99 the median maps to LUT 0.
+    expect(p90Lut).toBeGreaterThanOrEqual(65);
+    expect(p90Lut).toBeLessThanOrEqual(100);
+    // Pre-fix regression pin: with floor ≈0.06 + p99 the median maps to LUT 0.
     expect(lut(cell(0), P99, floorForTolerance(15), gamma)).toBe(0);
   });
 });
@@ -541,25 +543,35 @@ describe('smoothPlanFor â€” the width-scaled Gaussian sampler plan (lane F)
   });
 });
 
-describe('transferCurve â€” the two-segment transfer (lane F)', () => {
+describe('transferCurve — the two-segment transfer (low-span calibrated)', () => {
   const K = 0.4;
+  const S = TRANSFER_LOW_SPAN;
   const base = { knee: K, gamma: 0.86, logScale: TRANSFER_LOG_SCALE };
   const above = (t: number): number =>
-    K +
-    (1 - K) *
+    S +
+    (1 - S) *
       (Math.log1p((TRANSFER_LOG_SCALE * (t - K)) / (1 - K)) / Math.log1p(TRANSFER_LOG_SCALE));
 
-  it('pins both endpoints exactly (f(0)=0 â†’ background, f(1)=1 â†’ LUT 255)', () => {
+  it('pins both endpoints exactly (f(0)=0 → background, f(1)=1 → LUT 255)', () => {
     expect(transferCurve(0, base)).toBe(0);
     expect(transferCurve(1, base)).toBe(1);
     expect(TRANSFER_LOG_SCALE).toBe(6.0);
+    expect(TRANSFER_LOW_SPAN).toBe(0.85);
   });
 
   it('is continuous at the knee and matches both analytic branches', () => {
-    expect(transferCurve(K, base)).toBeCloseTo(K, 12);
-    expect(transferCurve(K - 1e-9, base)).toBeCloseTo(K, 6);
-    expect(transferCurve(0.2, base)).toBeCloseTo(K * Math.pow(0.2 / K, 0.86), 12);
+    expect(transferCurve(K, base)).toBeCloseTo(S, 12);
+    expect(transferCurve(K - 1e-9, base)).toBeCloseTo(S, 6);
+    expect(transferCurve(0.2, base)).toBeCloseTo(S * Math.pow(0.2 / K, 0.86), 12);
     expect(transferCurve(0.7, base)).toBeCloseTo(above(0.7), 12);
+    // The below-knee segment owns a FIXED output share: a tiny knee (the live
+    // heavy-tail case ≈0.18) must not cap the mid-field near LUT 45 — the
+    // 2026-09-13 owner-reported black-field regression.
+    expect(transferCurve(0.18, { ...base, knee: 0.18 })).toBeCloseTo(S, 12);
+    expect(transferCurve(0.09, { ...base, knee: 0.18 })).toBeCloseTo(
+      S * Math.pow(0.5, 0.86),
+      12,
+    );
   });
 
   it('is monotone non-decreasing across [0,1]', () => {
@@ -708,10 +720,13 @@ describe('the Gaussian sampler + transfer curve in the fragment shader source (l
   it('applies the transfer AFTER the black point with exact endpoints', () => {
     expect(HEATMAP_FRAG).toContain('t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);');
     expect(HEATMAP_FRAG).toContain('if (t <= k) {');
-    expect(HEATMAP_FRAG).toContain('t = k * pow(t / k, u_gamma);');
+    expect(HEATMAP_FRAG).toContain('t = span * pow(t / k, u_gamma);');
     expect(HEATMAP_FRAG).toContain(
       'log(1.0 + u_logScale * (t - k) / (1.0 - k)) / log(1.0 + u_logScale)',
     );
+    // The fixed below-knee span (2026-09-13 calibration) must be in the shader.
+    expect(HEATMAP_FRAG).toContain('uniform float u_lowSpan;');
+    expect(HEATMAP_FRAG).toContain('float span = u_lowSpan;');
     // The pinned historical intensity expression is untouched.
     expect(HEATMAP_FRAG).toContain(
       'float intensity = (acc.r + acc.g) * u_decodeScale / float(blk);',
@@ -1001,6 +1016,7 @@ describe('Heatmap.draw â€” SUM-path level cross-fade uniform wiring (wave P
     // No normalizer attached: the module fallback fraction.
     expect(lastFloat(gl, 'u_knee')).toBeCloseTo(DEFAULT_KNEE_FRACTION, 12);
     expect(lastFloat(gl, 'u_logScale')).toBeCloseTo(TRANSFER_LOG_SCALE, 12);
+    expect(lastFloat(gl, 'u_lowSpan')).toBeCloseTo(TRANSFER_LOW_SPAN, 12);
     // cpp 0.5 → sigma 1.25 columns → the 5-tap tier (≥3σ truncation).
     expect(lastInt(gl, 'u_smoothTaps')).toBe(5);
     const arrays = gl.callsOf('uniform1fv');
