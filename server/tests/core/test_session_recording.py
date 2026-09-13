@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 
 import numpy as np
@@ -31,6 +32,7 @@ import flowmap_server.core.session as session_mod
 from flowmap_server.core.grid import Grid, GridCfg
 from flowmap_server.core.record import Recorder, SessionRecorder
 from flowmap_server.core.session import ClientTx, Session
+from flowmap_server.core.stats import SessionStats
 from flowmap_server.feeds.base import BookState
 from flowmap_server.feeds.sim import SimFeed
 from flowmap_server.proto import wire
@@ -312,8 +314,10 @@ async def test_transient_flush_failure_retries_and_session_continues(
     assert not sess.run_task.done()  # the feed loop survived
     assert sess._rec is not None  # recording NOT disabled by the transient error
 
-    # Let the cooldown elapse, then more events drive the cadence check into
-    # the retry: the restored rows plus the new ones land on disk.
+    # Let the cooldown elapse. NOTE (F2, 2026-09-13): the retry is clock-driven
+    # too now — the partial flusher's tick enters the retry as soon as the
+    # cooldown expires, without waiting for more feed events. The round-trip
+    # check below therefore drains the client AFTER the run completes.
     await asyncio.sleep(0.1)
     feed.q.put_nowait(BookState(6 * DT, *_book(100.0)))
     feed.q.put_nowait(BookState(7 * DT, *_book(100.0)))
@@ -331,10 +335,10 @@ async def test_transient_flush_failure_retries_and_session_continues(
     assert list((tmp_path / "rec").rglob("*-columns-*.parquet"))
 
     # Broadcasting continued after the failure the whole time.
-    later = [e for e in _drain(client) if isinstance(e, DepthColumn) and e.final]
-    assert later
     feed.q.put_nowait(None)
     await asyncio.wait_for(sess.run_task, timeout=5)
+    later = [e for e in _drain(client) if isinstance(e, DepthColumn) and e.final]
+    assert later
 
     # Round-trip: every broadcast column is on disk exactly once (nothing was
     # lost by the failed flush, nothing duplicated by the retry).
@@ -807,6 +811,98 @@ async def test_time_based_flush_lands_rows_below_column_cadence(tmp_path):
     await asyncio.wait_for(sess.run_task, timeout=5)
     tail = root.load_tail(MARKET, SYMBOL, max_age_ns=10**18, now_ns=10**18, limit_cols=100)
     assert tail is not None and len(tail.columns) >= 2
+
+
+# ---------------------------------------------------------------------------
+# i2. stall watchdog + event-independent cadence (2026-09-13 forensics)
+
+
+async def test_wedged_flush_is_detected_then_recovers(tmp_path, monkeypatch, caplog):
+    """F1 stall watchdog: an in-flight flush task that never completes used to
+    stall recording FOREVER silently (enabled=true, flush_failures=0, frozen
+    last_flush_ts - the observed incident signature). The watchdog must log +
+    count it exactly once, and clear when the task finally finishes."""
+    gate = threading.Event()
+    orig_flush = SessionRecorder.flush_buffers
+
+    def wedged_flush(self, bufs):
+        gate.wait(timeout=30)
+        return orig_flush(self, bufs)
+
+    monkeypatch.setattr(SessionRecorder, "flush_buffers", wedged_flush)
+    monkeypatch.setattr(session_mod, "REC_FLUSH_COLS", 2)
+
+    clock = {"now": 0}
+    stats = SessionStats(clock=lambda: clock["now"], wall_clock=lambda: clock["now"])
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "stall",
+        feed=feed,
+        grid=Grid(_cfg()),
+        recorder=root,
+        timer=FakeTimer(),
+        clock=lambda: clock["now"],
+        stats=stats,
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+    for i in range(4):  # crosses REC_FLUSH_COLS=2 -> one flush in flight
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: sess._flush_task is not None and not sess._flush_task.done())
+    assert stats.snapshot()["recording"]["flush_stalls"] == 0
+
+    # Advance the injectable clock past the stall bound: the next cadence
+    # check (event-driven or the partial flusher's tick) must flag the wedge.
+    clock["now"] = int(31.0 * 1e9)
+    feed.q.put_nowait(BookState(4 * DT, *_book(100.0)))
+    await _wait_for(lambda: stats.snapshot()["recording"]["flush_stalls"] == 1)
+    assert any("WEDGED" in r.getMessage() for r in caplog.records)
+    assert sess._flush_stall_logged is True
+
+    # Release the thread: the flush lands and the watchdog state clears.
+    gate.set()
+    await _wait_for(lambda: sess._flush_started_ns is None)
+    await _wait_for(
+        lambda: bool(list((tmp_path / "rec").rglob("*-columns-*.parquet"))) or None
+    )
+    assert sess._flush_stall_logged is False
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
+
+
+async def test_time_based_flush_fires_without_feed_events(tmp_path):
+    """F2: the time-based flush used to ride `_consume` per consumed event, so
+    a silently wedged feed stopped dropping parts altogether. The partial
+    flusher's recording tick must land a part with NO further events."""
+    clock = {"now": 0}
+    root = Recorder(tmp_path / "rec", 20.0)
+    feed = DrivenFeed()
+    sess = Session(
+        "time-flush-2",
+        feed=feed,
+        grid=Grid(_cfg()),
+        recorder=root,
+        timer=FakeTimer(),
+        clock=lambda: clock["now"],
+        rec_flush_interval_s=0.05,
+    )
+    client = ClientTx()
+    sess.attach(client)
+    await sess.start()
+    for i in range(3):  # 2 finalized columns - far below REC_FLUSH_COLS
+        feed.q.put_nowait(BookState(i * DT, *_book(100.0)))
+    await _wait_for(lambda: sess._cols_since_flush >= 2)
+    assert not list((tmp_path / "rec").rglob("*-columns-*.parquet"))
+
+    # Advance the clock and send NOTHING: the clock tick flushes anyway.
+    clock["now"] = int(0.06 * 1e9)
+    await _wait_for(
+        lambda: bool(list((tmp_path / "rec").rglob("*-columns-*.parquet"))) or None
+    )
+    feed.q.put_nowait(None)
+    await asyncio.wait_for(sess.run_task, timeout=5)
 
 
 # ---------------------------------------------------------------------------

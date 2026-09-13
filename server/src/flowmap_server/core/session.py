@@ -126,6 +126,15 @@ _BACKOFF_CAP_S = 30.0
 # Success resets the ladder. Failures are counted in stats.flush_failures.
 _REC_RETRY_BASE_S = 5.0
 _REC_RETRY_CAP_S = 300.0
+# Stall watchdog (2026-09-13 forensic follow-up). The ONLY silent permanent
+# stall path is a flush task that never completes (a hung thread inside the
+# Parquet write / retention walk): the task gate in `_flush_recording` then
+# early-returns forever, `recording.enabled` stays true, `flush_failures`
+# stays 0 and `last_flush_ts` freezes — exactly the observed signature. This
+# bound turns the stall LOUD (one log.error per task + stats.flush_stalls, so
+# /api/health exposes it). Recovery stays opt-in: abandoning a live thread is
+# a data-loss trade, never a default.
+_REC_STALL_S = 30.0
 # Backoff resets to base only once a restarted feed proves stable: it has run
 # for >=5 s (injectable clock) or delivered >=100 events, whichever first. A
 # yield-one-then-crash flapper therefore keeps escalating to the 30 s cap.
@@ -449,6 +458,10 @@ class Session:
         self.conn_stats: Callable[[], dict] | None = None
         self._cols_since_flush = 0
         self._flush_task: asyncio.Task | None = None
+        # Stall watchdog state (see _REC_STALL_S): when the in-flight flush
+        # task was created, and whether its stall was already reported.
+        self._flush_started_ns: int | None = None
+        self._flush_stall_logged = False
         self._boot_done = False
         self._start_lock = asyncio.Lock()
 
@@ -733,10 +746,27 @@ class Session:
         if self._rec_retry_at is not None and self._clock() < self._rec_retry_at:
             return  # cooldown after a failed flush: keep buffering, retry later
         if self._flush_task is not None and not self._flush_task.done():
+            # Stall watchdog (see _REC_STALL_S): a hung task never completes,
+            # so this gate would block every future flush silently. Report it
+            # loudly ONCE per task (health gets stats.flush_stalls).
+            started = self._flush_started_ns
+            if started is not None and self._clock() - started >= int(_REC_STALL_S * 1e9):
+                if not self._flush_stall_logged:
+                    self._flush_stall_logged = True
+                    logger.error(
+                        "recording flush WEDGED for session %s (in flight %.1fs; "
+                        "no part lands until it completes)",
+                        self.session_id,
+                        (self._clock() - started) / 1e9,
+                    )
+                    if self._stats is not None:
+                        self._stats.note_flush_stall()
             return  # previous flush still writing; next cadence catches up
         rec, bufs = self._rec, self._rec.take_buffers()
         if bufs is None:
             return
+        self._flush_started_ns = self._clock()
+        self._flush_stall_logged = False
         self._flush_task = asyncio.get_running_loop().create_task(
             self._flush_buffers_async(rec, bufs)
         )
@@ -782,7 +812,11 @@ class Session:
                 self._rec = None
                 if self._stats is not None:
                     self._stats.note_recording(self.session_id, False)
+            self._flush_started_ns = None
+            self._flush_stall_logged = False
             return
+        self._flush_started_ns = None
+        self._flush_stall_logged = False
         self._rec_failures = 0
         self._rec_retry_at = None
         self._cols_since_flush = 0
@@ -810,6 +844,8 @@ class Session:
                 await task
             except asyncio.CancelledError:
                 pass
+        self._flush_started_ns = None
+        self._flush_stall_logged = False
         if self._rec is None:
             return
         bufs = self._rec.take_buffers()
@@ -1042,6 +1078,24 @@ class Session:
         interval_s = self._flush_interval_ns / 1e9
         while True:
             await asyncio.sleep(interval_s)
+            # Event-independent recording cadence (2026-09-13): the time-based
+            # flush used to ride `_consume` per consumed event, so a feed that
+            # silently wedged stopped dropping parts altogether. This clock
+            # tick flushes with zero events; `_flush_recording` itself guards
+            # the retry cooldown and the single in-flight task.
+            if self._rec is not None:
+                try:
+                    now = self._clock()
+                    if (
+                        self._cols_since_flush >= REC_FLUSH_COLS
+                        or now - self._rec_cadence_ns >= self._rec_flush_interval_ns
+                    ):
+                        self._flush_recording()
+                except Exception:  # noqa: BLE001 — a flush must never kill the session
+                    logger.exception(
+                        "periodic recording flush failed for session %s",
+                        self.session_id,
+                    )
             if not self._clients:
                 continue
             try:

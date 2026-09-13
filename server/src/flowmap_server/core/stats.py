@@ -99,6 +99,7 @@ class SessionStats:
         self._restarts = 0
         self._rejected = 0
         self._flush_failures = 0
+        self._flush_stalls = 0
 
         self._latency_ms = 0.0
         self._clock_skew_ms = 0.0
@@ -180,6 +181,14 @@ class SessionStats:
         """Record a successful recording flush (wall-clock stamped)."""
         self._last_flush_ts = self._wall_clock()
 
+    def note_flush_stall(self) -> None:
+        """Count a WEDGED recording flush (see ``_REC_STALL_S`` in session.py).
+
+        A stall (an in-flight flush task that never completes) is the only
+        silent recording-stop path; this counter + the snapshot's
+        ``last_flush_age_s``/``stalled`` fields surface it on /api/health."""
+        self._flush_stalls += 1
+
     # -- snapshot (contract C1 — shape frozen) -----------------------------------
 
     def snapshot(self) -> dict[str, object]:
@@ -211,5 +220,20 @@ class SessionStats:
                 "enabled": bool(self._recording),
                 "flush_failures": self._flush_failures,
                 "last_flush_ts": self._last_flush_ts,
+                "flush_stalls": self._flush_stalls,
+                # Stall surfacing (2026-09-13): wall-clock age of the last
+                # successful flush, and a coarse flag (>60 s with an open
+                # recorder) so dashboards can see a wedged writer without
+                # polling timestamps themselves.
+                "last_flush_age_s": (
+                    round((now - self._last_flush_ts) / 1e9, 1)
+                    if self._last_flush_ts is not None
+                    else None
+                ),
+                "stalled": bool(
+                    self._recording
+                    and self._last_flush_ts is not None
+                    and (now - self._last_flush_ts) / 1e9 > 60.0
+                ),
             },
         }

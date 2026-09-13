@@ -30,7 +30,14 @@ C1_SNAPSHOT: dict = {
     "latency_ms": 12.5,
     "staleness_ms": {"crypto": 40.0},
     "clock_skew_ms": -3.25,
-    "recording": {"enabled": True, "flush_failures": 0, "last_flush_ts": None},
+    "recording": {
+        "enabled": True,
+        "flush_failures": 0,
+        "last_flush_ts": None,
+        "flush_stalls": 0,
+        "last_flush_age_s": None,
+        "stalled": False,
+    },
 }
 
 

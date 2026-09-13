@@ -124,7 +124,14 @@ def test_snapshot_shape_is_frozen():
     }
     assert set(snap["drops"]) == {"feed", "tx_lag", "snapshot"}
     assert set(snap["sessions"]) == {"active", "rejected"}
-    assert set(snap["recording"]) == {"enabled", "flush_failures", "last_flush_ts"}
+    assert set(snap["recording"]) == {
+        "enabled",
+        "flush_failures",
+        "last_flush_ts",
+        "flush_stalls",
+        "last_flush_age_s",
+        "stalled",
+    }
     assert snap == {
         "drops": {"feed": 0, "tx_lag": 0, "snapshot": 0},
         "restarts": 0,
@@ -132,7 +139,14 @@ def test_snapshot_shape_is_frozen():
         "latency_ms": 0.0,
         "staleness_ms": {},
         "clock_skew_ms": 0.0,
-        "recording": {"enabled": False, "flush_failures": 0, "last_flush_ts": None},
+        "recording": {
+            "enabled": False,
+            "flush_failures": 0,
+            "last_flush_ts": None,
+            "flush_stalls": 0,
+            "last_flush_age_s": None,
+            "stalled": False,
+        },
     }
 
 
