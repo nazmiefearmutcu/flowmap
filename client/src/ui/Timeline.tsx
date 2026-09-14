@@ -22,12 +22,25 @@
  * renderer at ≤5 Hz (never per-frame / per-column), so this stays clear of the
  * GL loop and the React high-frequency path; `following` and the behind-readout
  * ride that SAME poll rather than adding a timer.
+ *
+ * **Attach honesty (QA11 H1/H2/M1/M2).** The pill, time readout and controls
+ * describe the CURRENT subscription only once it has actually ATTACHED — a
+ * Hello for it has landed and the connection is live. Before that, every value
+ * still belongs to the session whose frame is on screen (the previous live
+ * chart). The old code claimed `REPLAY 1× PLAYING` and printed that dead
+ * session's frozen span (`00:02:07.250 / 00:02:07.250`) for as long as the
+ * server took to refuse — 1013 session-cap closes of a replay subscribe are
+ * the measured repro. Now: pre-attach the pill says what is really happening
+ * (`REPLAY CONNECTING…` / `REPLAY REFUSED` / `CONNECTING…`), the readout is
+ * `—`, the controls that cannot reach a server are disabled, and a waiting
+ * line with an indeterminate progress element carries the reason.
  */
 
 import { useEffect, useRef, useState, type ChangeEvent, type RefObject } from 'react';
 
-import type { Renderer } from '../gl/renderer';
 import { colsBehind } from '../gl/follow';
+import type { Renderer } from '../gl/renderer';
+import type { ConnStatus } from '../net/connection';
 import { useFlowMapStore } from '../state/store';
 import {
   behindNs,
@@ -40,6 +53,7 @@ import {
   transportPhase,
   type TimeExtent,
 } from './replay';
+import { closeReasonText } from './ReconnectBanner';
 
 /** Minimap poll interval (ms). */
 const POLL_MS = 200;
@@ -56,6 +70,37 @@ function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
+/**
+ * What the transport is ALLOWED to claim, given the attach state (QA11 H1/M1).
+ * Pure so the honesty contract is unit-locked:
+ *
+ * - `attached`  — a Hello for the CURRENT subscription has landed AND the
+ *                 connection is live. The ONLY state where the pill may say
+ *                 PLAYING/PAUSED and the readout may print a span.
+ * - `refused`   — close 1013 arrived while the desired subscription is a
+ *                 replay: the server's try-again-later refusal of THAT
+ *                 subscription (session limit). Distinct from a dropped
+ *                 connection: the transport keeps retrying (backoff), so the
+ *                 pill must say refused, not "playing" and not "reconnecting"
+ *                 as if a working session dropped.
+ * - `reconnecting` / `connecting` — the socket is down / being opened; a
+ *                 live fallback lands here (QA11 H2's empty chart).
+ * - `no-feed`   — no connection attempt is up (idle / closed terminal).
+ */
+export type TransportDisplay = 'attached' | 'connecting' | 'reconnecting' | 'refused' | 'no-feed';
+
+export function transportDisplay(
+  attached: boolean,
+  isReplay: boolean,
+  status: ConnStatus,
+  lastCloseCode: number | null,
+): TransportDisplay {
+  if (attached) return 'attached';
+  if (status === 'idle' || status === 'closed') return 'no-feed';
+  if (isReplay && lastCloseCode === 1013) return 'refused';
+  return status === 'reconnecting' ? 'reconnecting' : 'connecting';
+}
+
 interface TimelineProps {
   rendererRef: RefObject<Renderer | null>;
   /** Return the chart to the live edge and re-arm the persisted follow flags. */
@@ -70,6 +115,9 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
   const resume = useFlowMapStore((s) => s.resume);
   const setSpeed = useFlowMapStore((s) => s.setSpeed);
   const seek = useFlowMapStore((s) => s.seek);
+  const status = useFlowMapStore((s) => s.status);
+  const sessionId = useFlowMapStore((s) => s.sessionId);
+  const lastClose = useFlowMapStore((s) => s.lastClose);
 
   const [geom, setGeom] = useState<MinimapGeom>(EMPTY_GEOM);
   const [scrub, setScrub] = useState(0); // 0..1000 scrubber position (replay)
@@ -210,10 +258,64 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
   };
 
   const extent = geom.extent;
+  // The transport may describe the CURRENT subscription only once it has
+  // attached: before that, every value still belongs to the PREVIOUS session
+  // whose frame is on screen (QA11 H1/M1 — the frozen `00:02:07` span under a
+  // `REPLAY 1× PLAYING` pill over the stale live chart).
+  const attached = status === 'live' && sessionId !== null;
+  const display = transportDisplay(attached, isReplay, status, lastClose?.code ?? null);
+  const waiting =
+    display === 'connecting' || display === 'reconnecting' || display === 'refused';
   const durationNs = extent ? extent.endNs - extent.startNs : 0n;
   const positionNs = extent ? seekTargetNs(scrub / 1000, extent) - extent.startNs : 0n;
-  const playing = isReplay && !paused;
+  const playing = attached && isReplay && !paused;
   const phase = transportPhase(isReplay, paused, following);
+  // `—` until an attached session has produced real geometry — never the dead
+  // session's span, and never an invented `00:00:00.000` for "nothing yet".
+  const readout =
+    attached && extent
+      ? isReplay
+        ? `${formatDurationNs(positionNs)} / ${formatDurationNs(durationNs)}`
+        : formatDurationNs(durationNs)
+      : '—';
+  const pillClass =
+    display === 'attached'
+      ? `state-pill state-pill--${phase}`
+      : display === 'refused'
+        ? 'state-pill state-pill--live-detached'
+        : 'state-pill';
+  let pillText: string;
+  switch (display) {
+    case 'attached':
+      pillText = phaseLabel(phase, speed);
+      break;
+    case 'refused':
+      pillText = 'REPLAY REFUSED';
+      break;
+    case 'no-feed':
+      pillText = 'NO FEED';
+      break;
+    case 'reconnecting':
+      pillText = isReplay ? 'REPLAY CONNECTING…' : 'RECONNECTING…';
+      break;
+    default:
+      pillText = isReplay ? 'REPLAY CONNECTING…' : 'CONNECTING…';
+      break;
+  }
+  const pillTitle =
+    display === 'refused'
+      ? `replay refused — ${closeReasonText(lastClose)}; retrying`
+      : display === 'reconnecting'
+        ? `waiting for the feed — ${closeReasonText(lastClose)}`
+        : display === 'connecting'
+          ? 'waiting for the feed'
+          : undefined;
+  const waitText =
+    display === 'refused'
+      ? 'server at capacity — retrying'
+      : display === 'reconnecting'
+        ? `waiting for the feed — ${closeReasonText(lastClose)}`
+        : 'waiting for the feed…';
 
   return (
     <footer className="timeline" data-testid="timeline">
@@ -226,7 +328,14 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
               data-testid="transport-play"
               aria-label={playing ? 'pause' : 'play'}
               aria-pressed={playing}
-              title={playing ? 'pause' : 'play'}
+              title={
+                attached
+                  ? playing
+                    ? 'pause'
+                    : 'play'
+                  : 'waiting for the replay to attach'
+              }
+              disabled={!attached}
               onClick={() => (paused ? resume() : pause())}
             >
               {playing ? '❚❚' : '▶'}
@@ -238,6 +347,7 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
               data-speed={speed}
               aria-label={`replay speed ${speed}×, click to change`}
               title="replay speed — click to step up, shift-click to step down"
+              disabled={!attached}
               onClick={onCycleSpeed}
             >
               {speed}×
@@ -263,19 +373,43 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
           <span
             ref={pillRef}
             tabIndex={-1}
-            className={`state-pill state-pill--${phase}`}
+            className={pillClass}
             data-testid="transport-state"
+            data-transport={display}
+            title={pillTitle}
           >
-            {phaseLabel(phase, speed)}
+            {pillText}
           </span>
+          {waiting && (
+            <span
+              className="minimap__waiting"
+              data-testid="transport-waiting"
+              role="status"
+              aria-live="polite"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                minWidth: 0,
+                overflow: 'hidden',
+                whiteSpace: 'nowrap',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              <progress
+                data-testid="transport-progress"
+                aria-label="waiting for the feed"
+                style={{ width: 64, height: 6, accentColor: 'var(--accent)' }}
+              />
+              {waitText}
+            </span>
+          )}
           <span
             className="minimap__readout"
             data-testid="time-readout"
             style={{ fontVariantNumeric: 'tabular-nums' }}
           >
-            {isReplay
-              ? `${formatDurationNs(positionNs)} / ${formatDurationNs(durationNs)}`
-              : formatDurationNs(durationNs)}
+            {readout}
           </span>
         </div>
         <div className="minimap__track" data-testid="minimap-track">
@@ -293,6 +427,7 @@ export function Timeline({ rendererRef, onGoLive }: TimelineProps): JSX.Element 
               max={1000}
               step={1}
               value={scrub}
+              disabled={!attached}
               data-testid="seek-scrubber"
               aria-label="replay seek"
               onChange={onScrub}

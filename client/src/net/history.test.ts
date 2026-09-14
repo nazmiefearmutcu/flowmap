@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { HistoryLoader, type HistoryLoaderDeps } from './history';
 import type { ResidentRange } from '../gl/tileRing';
-import { MODE_L2, MsgType, type DepthColumn, type HistoryResponse } from '../proto/types';
+import { MODE_L2, MsgType, type DepthColumn, type HistoryResponse, type Marker } from '../proto/types';
 
 /**
  * The T8 backfill range-computation + debounce logic is pure — driven here by a
@@ -308,5 +308,158 @@ describe('HistoryLoader — session reset + page hygiene', () => {
     expect(loader.requestCount).toBe(2);
     expect(spliced).toEqual([99]);
     expect(loader.error).toBeNull(); // success clears the stale error
+  });
+});
+
+// --- page seam honesty + stale anchor prune (QA3 C-1) -------------------------
+// A history page can belong to a DIFFERENT grid than the resident window (a
+// reconstructed page, a session replacement under the same subscription). The
+// loader must (a) surface the seq→time break as a gap Marker on the response
+// the renderer forwards, and (b) re-seed its (col_seq→t0) anchors when the map
+// is re-anchored, so the OLD grid's exhaustion latch can't kill scroll-back.
+
+describe('HistoryLoader — page seam honesty (QA3 C-1)', () => {
+  const ANCHOR = 1000;
+
+  interface PageHarness {
+    loader: HistoryLoader;
+    win: { oldest: number; newest: number };
+    spliced: number[];
+    requests: { before_t: bigint; n: number }[];
+    resp: () => HistoryResponse | null;
+  }
+
+  function pageHarness(opts: {
+    cols: () => DepthColumn[];
+    markers?: HistoryResponse['markers'];
+    oldest?: number;
+    dt?: number;
+  }): PageHarness {
+    const win = { oldest: opts.oldest ?? ANCHOR, newest: (opts.oldest ?? ANCHOR) + 99 };
+    const spliced: number[] = [];
+    const requests: { before_t: bigint; n: number }[] = [];
+    let lastResp: HistoryResponse | null = null;
+    const loader = new HistoryLoader({
+      requestHistory: (before_t, n): Promise<HistoryResponse> => {
+        requests.push({ before_t, n });
+        return Promise.resolve({
+          type: MsgType.HISTORY_RESP,
+          req_id: 1,
+          epoch: 0,
+          oldest_available_t_ns: -1_000_000n,
+          depth_cols: opts.cols(),
+          bar_cols: [],
+          markers: opts.markers ? [...opts.markers] : [],
+          big_trades: [],
+        });
+      },
+      spliceColumn: (col) => {
+        spliced.push(col.col_seq);
+        if (col.col_seq < win.oldest) win.oldest = col.col_seq;
+      },
+      residentRange: () => ({ oldest: win.oldest, newest: win.newest, count: win.newest - win.oldest + 1 }),
+      budgetCols: () => 256,
+      dtNs: () => opts.dt ?? DT,
+      onSpliced: (resp) => {
+        lastResp = resp;
+      },
+    });
+    loader.noteColumn(win.oldest, BigInt(win.oldest * DT));
+    return { loader, win, spliced, requests, resp: () => lastResp };
+  }
+
+  it('adds ONE gap Marker when a page runs time BACKWARD, and still splices', async () => {
+    const seamTs = BigInt(996 * DT) - 2_000_000_000n; // 2 s backward at col 996
+    const cols = () => {
+      const out: DepthColumn[] = [];
+      for (let s = 990; s <= 999; s++) {
+        out.push(makeCol(s, s === 996 ? seamTs : BigInt(s * DT)));
+      }
+      return out;
+    };
+    const h = pageHarness({ cols });
+
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+
+    expect(h.spliced).toEqual([990, 991, 992, 993, 994, 995, 996, 997, 998, 999]);
+    const resp = h.resp();
+    expect(resp).not.toBeNull();
+    const synthetic = resp!.markers.filter((m) => m.text.startsWith('history page seam'));
+    expect(synthetic).toHaveLength(1);
+    expect(synthetic[0]).toMatchObject({ type: MsgType.MARKER, kind: 'gap', ts_ns: seamTs });
+  });
+
+  it('a clean page (anchor-consistent cadence) gets NO synthetic marker', async () => {
+    const cols = () => {
+      const out: DepthColumn[] = [];
+      for (let s = 990; s <= 999; s++) out.push(makeCol(s, BigInt(s * DT)));
+      return out;
+    };
+    const h = pageHarness({ cols });
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    expect(h.resp()!.markers).toHaveLength(0);
+  });
+
+  it('does not duplicate a server gap marker that already sits on the seam', async () => {
+    const seamTs = BigInt(996 * DT) - 2_000_000_000n;
+    const cols = () => {
+      const out: DepthColumn[] = [];
+      for (let s = 990; s <= 999; s++) {
+        out.push(makeCol(s, s === 996 ? seamTs : BigInt(s * DT)));
+      }
+      return out;
+    };
+    const serverMarker: Marker = {
+      type: MsgType.MARKER,
+      ts_ns: seamTs + 500n,
+      kind: 'gap',
+      text: 'backfill: reconstructed history ends, live resumes',
+      price: null,
+      size: null,
+    };
+    const h = pageHarness({ cols, markers: [serverMarker] });
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    const resp = h.resp()!;
+    expect(resp.markers).toHaveLength(1); // the server's own marker only
+    expect(resp.markers[0].text).toContain('backfill');
+  });
+
+  it('marks a page↔anchor grid mismatch at the resumption side', async () => {
+    // The page is internally clean but its t0s are on the OLD grid's scale:
+    // 999 columns × DT above where the resident window's t0 base sits.
+    const cols = () => {
+      const out: DepthColumn[] = [];
+      for (let s = 990; s <= 999; s++) out.push(makeCol(s, BigInt(s * DT) + 3_600_000_000_000n));
+      return out;
+    };
+    const h = pageHarness({ cols });
+    h.loader.ensureVisible({ leftCol: 0, span: 80, level: 0 });
+    await flush();
+    const resp = h.resp()!;
+    const synthetic = resp.markers.filter((m) => m.text.includes('page grid mismatch'));
+    expect(synthetic).toHaveLength(1);
+    // Resumption side = the resident anchor's t0.
+    expect(synthetic[0].ts_ns).toBe(BigInt(ANCHOR * DT));
+  });
+
+  it('prunes a stale exhaustion latch when the seq→time map is re-anchored', async () => {
+    // Empty page → start-of-history latched on the OLD grid.
+    const h = pageHarness({ cols: () => [], oldest: 260 });
+    h.loader.ensureVisible({ leftCol: 0, span: 50, level: 0 });
+    await flush();
+    expect(h.loader.startOfHistory).toBe(true);
+    expect(h.loader.requestCount).toBe(1);
+
+    // Same-subscription session replacement: col_seq 260 now carries a NEW t0.
+    h.loader.noteColumn(260, 26_000_000_000n);
+    expect(h.loader.startOfHistory).toBe(false); // stale latch pruned
+
+    h.loader.ensureVisible({ leftCol: 0, span: 50, level: 0 });
+    await flush();
+    expect(h.loader.requestCount).toBe(2); // scroll-back works on the new grid
+    expect(h.requests[1].before_t).toBe(26_000_000_000n); // new anchor, not the old
   });
 });

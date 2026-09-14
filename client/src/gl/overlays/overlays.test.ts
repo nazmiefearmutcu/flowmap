@@ -4,7 +4,6 @@ import { Bubbles, bubbleAlpha, bubbleRadiusPx, type BubbleOptions } from './bubb
 import { GridMap, type TimeMap } from './coords';
 import type { OverlayFrame } from './frame';
 import {
-  PRICE_FILL_TOP_ALPHA,
   PRICE_GLOW_ALPHA,
   PRICE_GLOW_WIDTH,
   PRICE_LINE_WIDTH,
@@ -246,11 +245,10 @@ describe('L6 price-line ink tuning', () => {
   const PRICE = { p0: 0, step: 0.5 };
   const TIME: TimeMap = { anchorSeq: 5, anchorT0Ns: 5n * 250_000_000n, dtNs: 250_000_000 };
 
-  it('pins the tightened widths/alphas', () => {
+  it('pins the tightened widths/alphas (no area-wash constant — F4 removed it)', () => {
     expect(PRICE_LINE_WIDTH).toBe(2.0);
     expect(PRICE_GLOW_WIDTH).toBe(6.0);
     expect(PRICE_GLOW_ALPHA).toBe(0.16);
-    expect(PRICE_FILL_TOP_ALPHA).toBe(0.09);
     expect(PRICE_LEVEL_ALPHA).toBe(0.28);
     expect(PRICE_STUB_ALPHA).toBe(0.7);
     expect(PRICE_LEVEL_DASH).toEqual([3, 6]);
@@ -262,7 +260,7 @@ describe('L6 price-line ink tuning', () => {
     expect(withAlpha('not-a-color', 0.5)).toBe('not-a-color');
   });
 
-  it('draw paints the wash/glow/stub/core/level with the tuned alphas (order kept)', () => {
+  it('draw paints glow/stub/core/level and NEVER an area fill (F4: QA3 H-1 wash removed)', () => {
     const g = new GridMap(VIEW, DIMS, TIME, PRICE);
     const pl = new PriceLine();
     pl.add({ col_seq: 4, c: 5 } as never);
@@ -272,6 +270,8 @@ describe('L6 price-line ink tuning', () => {
     const lines: Array<{ width: number; alpha?: number }> = [];
     const text = {
       fillUnder: (_p: unknown[], _yBase: number, top: string) => {
+        // The full-height wash was the measured defect (luma ~25 vs bg 7.8,
+        // tiling over reconstruct). Any call here is a regression.
         fill.push(top);
       },
       polyline: (_p: unknown[], o: { width: number; alpha?: number }) => {
@@ -290,7 +290,7 @@ describe('L6 price-line ink tuning', () => {
     };
     pl.draw({ gm: g, text, resident: null } as unknown as OverlayFrame);
 
-    expect(fill[0]).toBe('rgba(210, 225, 245, 0.09)'); // wash top (palette rgb kept)
+    expect(fill).toEqual([]); // NO area wash — the line + glow carry the trace
     expect(lines[0]).toEqual({ width: 6, alpha: 0.16 }); // glow (softened W6 swarm2)
     expect(lines[1]).toEqual({ width: 2, alpha: 0.7 }); // right-edge stub
     expect(lines[2]).toEqual({ width: 2, alpha: undefined }); // bright core

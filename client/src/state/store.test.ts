@@ -510,6 +510,41 @@ describe('FlowMap store — replay refusal fallback (close 1003)', () => {
     expect((sent as Extract<Msg, { type: MsgType.SUBSCRIBE }>).mode).toBe('live');
   });
 
+  it('bumps sessionRevision on the refused-replay fallback so the App re-arms the view (QA7 H1)', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'replay');
+    const sock = sockets[sockets.length - 1];
+    sock.open();
+    const before = store.getState().sessionRevision;
+
+    // The server refuses: close 1003 on the active replay subscribe.
+    sock.drop(1003);
+
+    const s = store.getState();
+    // The fallback begins a NEW server session under the SAME reset key
+    // (market:symbol:band — `mode` is deliberately excluded so a user toggle
+    // keeps scroll-back), so this counter is the only signal the App's
+    // symbol-switch reset (GL teardown + price-fit re-arm) has to key on.
+    expect(s.sessionRevision).toBe(before + 1);
+    // ...and the identity stays EXPLICIT: the fallback keeps the user's
+    // instrument; it never substitutes the demo stream (QA7 H2).
+    expect(s.subscription).toEqual({ market: 'crypto', symbol: 'BTCUSDT', mode: 'live', band: 'native' });
+  });
+
+  it('does NOT bump sessionRevision on a user mode toggle — live⇄replay keeps the scroll-back', () => {
+    installFakeTransport();
+    const store = useFlowMapStore;
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'live');
+    const before = store.getState().sessionRevision;
+
+    // A deliberate toggle is the documented "same grid, keep history" case: the
+    // App must NOT tear the ring down for it (the revision stays put).
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'replay');
+    store.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'live');
+    expect(store.getState().sessionRevision).toBe(before);
+  });
+
   it('KEEPS the flag across the fallback handshake (Hello) — the user must see WHY', () => {
     installFakeTransport();
     const store = useFlowMapStore;

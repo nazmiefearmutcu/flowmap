@@ -35,6 +35,17 @@
  * rows/pixel where level 2 ran out of footprint coverage). Panning past the
  * band stays allowed; zooming past it does not. See {@link limitsFor}.
  *
+ * **Time bounds.** The TIME axis is bounded by the KNOWN DATA window the
+ * renderer keeps in {@link CameraLimits.timeWindow}: `colOffset` is clamped so
+ * the view cannot leave the history ends by more than one small overscroll band
+ * ({@link COL_OVERSCROLL}, also capped at one viewport), and the manual
+ * zoom-out cap is halved-to-`resident.count` scale ({@link maxColSpanFor}) so
+ * the resident field can never be squeezed sub-pixel blank. Both are OPT-IN:
+ * a limits object without a `timeWindow` behaves exactly like the legacy free
+ * camera (all the pure-math tests), and the renderer refreshes the window via
+ * {@link Camera.setTimeWindow} without re-clamping a state the e2e harness
+ * installed directly.
+ *
  * All operations are PURE — they take a state (+ limits) and return a new state,
  * so the math is unit-testable with no GL context (see camera.test.ts). The
  * `Camera` class at the bottom is a thin imperative wrapper the renderer holds.
@@ -101,6 +112,25 @@ export const KILL_PRICE: FollowKill = { killTime: false, killPrice: true };
 /** No release (a programmatic reframe). */
 export const KILL_NONE: FollowKill = { killTime: false, killPrice: false };
 
+/**
+ * The client's KNOWN time data window. One object so the pan bound and the
+ * zoom-out floor always agree on what "the data" is. The renderer refreshes it
+ * on every view update ({@link Camera.setTimeWindow}); pure unit limits simply
+ * omit it (legacy free-camera behavior — pinned by camera.test.ts).
+ */
+export interface TimeWindow {
+  /** Oldest absolute col_seq data can exist at (start of history). Defaults to
+   *  {@link COL_SEQ_FLOOR}; the backfill loader treats col_seq 0 as the start of
+   *  the stream (net/history.ts). */
+  floor?: number;
+  /** Newest absolute col_seq the client has SEEN (the live edge), inclusive.
+   *  −1 before the first column. */
+  newest: number;
+  /** Full-res resident window — the zoom-out visibility floor. Null before the
+   *  first column. */
+  resident: ResidentRange | null;
+}
+
 /** Bounds the clamps enforce (from the tile ring geometry). */
 export interface CameraLimits {
   /** Price grid height — caps the FRAMING span (fit/reset) and bounds
@@ -121,7 +151,9 @@ export interface CameraLimits {
    * the wheel out never hits an artificial wall: past the resident window the
    * shader simply paints background / SUM-mips, and the history backfill fills it
    * in. Decoupling this from the ring capacity costs no GPU memory (it is only a
-   * clamp bound, not an allocation).
+   * clamp bound, not an allocation). NOTE: when {@link timeWindow} is known this
+   * is reduced by {@link maxColSpanFor} so the resident field never squeezes
+   * sub-pixel (the M3 max-zoom-out blank).
    */
   maxColSpanZoom: number;
   /**
@@ -133,7 +165,42 @@ export interface CameraLimits {
    * {@link rows} — see {@link fit} / {@link reset}.
    */
   maxRowSpanZoom: number;
+  /**
+   * Known TIME data window (see {@link TimeWindow}). When present:
+   *  - the pan clamp bounds `colOffset` to `[floor − slack, newest + 1 + slack −
+   *    colSpan]` with `slack = min(colSpan, COL_OVERSCROLL)`, so the view can
+   *    overscroll past the ends of history by at most one small band — a bounded
+   *    edge with the oldest data still on screen, never the unbounded col_seq
+   *    void the QA3 probe measured (`colOffset −92 129` / `−192 129` at
+   *    `oldest 0`, 0.31 % painted);
+   *  - the zoom-out cap becomes the full-res resident window over
+   *    {@link MIN_RESIDENT_COVERAGE} of the viewport, so a wheel-out can never
+   *    squeeze the resident field under half the screen (M3 H-1: 60 notches →
+   *    colScale 1 048 576 with 2 717 resident columns → 0/420 probes painted).
+   * Omitted (undefined) on bare unit limits and before the first column.
+   */
+  timeWindow?: TimeWindow | null;
 }
+
+/** Absolute col_seq the stream starts at — the pan clamp's hard floor (the
+ *  backfill loader's start-of-history contract, net/history.ts). */
+export const COL_SEQ_FLOOR = 0;
+
+/**
+ * How much of the viewport the full-res resident window must still cover at the
+ * widest manual time zoom-out. 0.5 = "you can always zoom out until the
+ * resident data fills half the screen"; below that the columns squeeze to
+ * sub-pixel and the field reads blank (M3 H-1).
+ */
+export const MIN_RESIDENT_COVERAGE = 0.5;
+
+/**
+ * How far past either end of the known history a pan may overscroll, in
+ * columns (also capped at one viewport — `min(colSpan, COL_OVERSCROLL)`). A
+ * bounded band instead of an infinite void: at the far limit the oldest/newest
+ * columns sit at the viewport edge, so the user sees where history ends.
+ */
+export const COL_OVERSCROLL = 64;
 
 /** Smallest time span in columns (one column fills the whole viewport). */
 export const MIN_COL_SPAN = 1;
@@ -188,15 +255,69 @@ export function rowCenterBounds(rowSpan: number, limits: CameraLimits): { lo: nu
 }
 
 /**
+ * The EFFECTIVE user time zoom-out cap for these limits. Without a known
+ * {@link TimeWindow} this is {@link CameraLimits.maxColSpanZoom} (the legacy
+ * "no wall" behavior pinned by the pre-resident unit tests). With one, it is
+ * the full-res resident window divided by {@link MIN_RESIDENT_COVERAGE}: at the
+ * widest allowed zoom the resident columns still cover at least half the
+ * viewport, so they can never be squeezed into the sub-pixel blank the M3
+ * repro captured (2 717 resident columns under a 1 048 576-column span).
+ *
+ * The span cap is `count / coverage` — e.g. 2× the resident count at 0.5 — so
+ * it grows with residency: deep scroll-back that loads more history widens
+ * what you may zoom out to, automatically.
+ */
+export function maxColSpanFor(limits: CameraLimits): number {
+  const resident = limits.timeWindow?.resident ?? null;
+  if (resident === null) return limits.maxColSpanZoom;
+  const count = Math.max(1, resident.count);
+  return clamp(count / MIN_RESIDENT_COVERAGE, limits.minColSpan, limits.maxColSpanZoom);
+}
+
+/**
+ * The band `colCenter` may roam in so the TIME view always keeps known history
+ * on screen: the view's LEFT edge is bounded to
+ * `[floor − slack, newest + 1 + slack − colSpan]` with
+ * `slack = min(colSpan, COL_OVERSCROLL)` — at either limit the oldest/newest
+ * data touches the viewport edge (the "start of history" cue QA3 asked for),
+ * with at most one small overscroll band past it. Returns null when there is no
+ * {@link TimeWindow} (unbounded, the legacy behavior) or before the first
+ * column (`newest < floor`).
+ *
+ * When the view is wider than the whole extent plus both overscroll bands the
+ * band collapses; the centre is then returned as a single point — the extent
+ * centred in the viewport — the continuous limit of the shrinking band.
+ */
+export function colCenterBounds(
+  colSpan: number,
+  limits: CameraLimits,
+): { lo: number; hi: number } | null {
+  const tw = limits.timeWindow;
+  if (tw === null || tw === undefined) return null;
+  const floor = tw.floor ?? COL_SEQ_FLOOR;
+  if (!(tw.newest >= floor) || !Number.isFinite(colSpan)) return null;
+  const slack = Math.min(colSpan, COL_OVERSCROLL);
+  const loLeft = floor - slack;
+  const hiLeft = tw.newest + 1 + slack - colSpan;
+  if (loLeft <= hiLeft) {
+    return { lo: loLeft + colSpan / 2, hi: hiLeft + colSpan / 2 };
+  }
+  const centered = (floor + tw.newest + 1) / 2;
+  return { lo: centered, hi: centered };
+}
+
+/**
  * Enforce the clamps on a candidate state:
- *   - colSpan  ∈ [minColSpan, maxColSpanZoom]       (time zoom limits)
+ *   - colSpan  ∈ [minColSpan, maxColSpanFor]        (time zoom limits)
  *   - rowSpan  ∈ [MIN_ROW_SPAN, maxRowSpanZoom]     (price zoom limits)
  *   - rowCenter ∈ rowCenterBounds(rowSpan)         (price overscroll band)
+ *   - colCenter ∈ colCenterBounds(colSpan)         (time overscroll band, when
+ *                                                   the known data window is
+ *                                                   present — see TimeWindow)
  * `rowSpan` is clamped FIRST so the two price clamps compose deterministically
  * (the centre band is derived from the FINAL span, never a pre-clamp one).
- * `colCenter` is intentionally NOT clamped: panning/zooming freely through all
- * of history (and a little past either end, where the shader draws background)
- * is the whole point, and it stays O(1).
+ * Without a {@link TimeWindow} `colCenter` stays unclamped — panning freely
+ * through all of history is the legacy point, and it stays O(1).
  */
 export function clampCamera(s: CameraState, limits: CameraLimits): CameraState {
   // USER zoom-out bound, not the framing bound: a state produced by fit/reset/
@@ -204,11 +325,15 @@ export function clampCamera(s: CameraState, limits: CameraLimits): CameraState {
   // framed span. (The colSpan branch below is the same decoupling for time.)
   const rowSpan = clamp(s.rowSpan, MIN_ROW_SPAN, limits.maxRowSpanZoom);
   const bounds = rowCenterBounds(rowSpan, limits);
+  // Zoom-out bound, not the framing bound: a state produced by fit/reset is
+  // already ≤ maxColSpan ≤ maxColSpanFor, so this never shrinks a framed span.
+  const colSpan = clamp(s.colSpan, limits.minColSpan, maxColSpanFor(limits));
+  const cb = colCenterBounds(colSpan, limits);
+  const colCenter =
+    cb !== null && Number.isFinite(s.colCenter) ? clamp(s.colCenter, cb.lo, cb.hi) : s.colCenter;
   return {
-    colCenter: s.colCenter,
-    // Zoom-out bound, not the framing bound: a state produced by fit/reset is
-    // already ≤ maxColSpan ≤ maxColSpanZoom, so this never shrinks a framed span.
-    colSpan: clamp(s.colSpan, limits.minColSpan, limits.maxColSpanZoom),
+    colCenter,
+    colSpan,
     rowCenter: clamp(s.rowCenter, bounds.lo, bounds.hi),
     rowSpan,
     followTime: s.followTime,
@@ -279,7 +404,11 @@ export function pan(
  * Derivation: keep the anchor's pixel offset from center constant. With the
  * post-clamp span ratio `eff = newSpan/oldSpan`, the new center is
  * `anchorCol + eff·(oldCenter − anchorCol)` — so the anchor is exact even when
- * the span clamps (colCenter is unclamped on the time axis).
+ * the span clamps. The span clamps against {@link maxColSpanFor} (the
+ * resident-aware cap) BEFORE the anchor math so the zoom-out floor does not
+ * re-shrink the span afterwards and break the anchoring; the remaining
+ * colCenter bound from {@link colCenterBounds} is inherent, exactly like the
+ * price overscroll bounds.
  */
 export function zoomTime(
   s: CameraState,
@@ -291,7 +420,7 @@ export function zoomTime(
   // (NaN fails both comparisons) and poison colCenter via the anchor math.
   // Leave the state — including its follow flags — exactly as it was.
   if (!Number.isFinite(factor) || factor <= 0 || !Number.isFinite(anchorCol)) return s;
-  const newSpan = clamp(s.colSpan * factor, limits.minColSpan, limits.maxColSpanZoom);
+  const newSpan = clamp(s.colSpan * factor, limits.minColSpan, maxColSpanFor(limits));
   const eff = newSpan / s.colSpan;
   const colCenter = anchorCol + eff * (s.colCenter - anchorCol);
   return clampCamera(applyKill({ ...s, colSpan: newSpan, colCenter }, KILL_TIME), limits);
@@ -475,6 +604,21 @@ export class Camera {
     this.limits = limits;
     // Re-clamp so a shrunk grid can't leave the view out of bounds.
     this.state = clampCamera(this.state, limits);
+  }
+
+  /**
+   * Refresh the known TIME data window (see {@link TimeWindow}). Called by the
+   * renderer on every view update; only affects the NEXT gesture/gated frame.
+   *
+   * Deliberately does NOT re-clamp the current state: an existing view is a
+   * product of a legal op, and re-clamping here would mutate states the e2e
+   * harness installs directly through `setViewForTest` / `setView` (a wide
+   * synthetic framing the gl4 mip spec depends on) or a scrollback frame that
+   * the resident window is still growing under. The clamps apply to the ops,
+   * which is where a user gesture can actually leave the data.
+   */
+  setTimeWindow(window: TimeWindow | null): void {
+    this.limits = { ...this.limits, timeWindow: window };
   }
 
   pan(dCols: number, dRows: number, kill: FollowKill = KILL_BOTH): void {

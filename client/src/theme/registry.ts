@@ -223,14 +223,20 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       price: '#0a6158',
       sell: '#99272c',
       warn: '#8a6410',
-      // Ink on paper: cream → steel blue → indigo → deep ink. Deliberately
-      // teal-free so the teal price/accent ink stays distinguishable.
+      // Ink on paper (F8 / QA4-H1): the low/mid band carries STRUCTURE —
+      // cool steel (t≈0.08) → steel blue → slate/azure → indigo — instead of
+      // the old near-neutral `#c8cdd2` at t=0.2 that left ~55–70% of the
+      // sheet as a chroma≈1.5 gray fog plateau. Chroma rises fast while luma
+      // falls; deliberately teal-free so the teal price/accent ink stays
+      // ≥48 Chebyshev from every stop (chart.test.ts).
       density: [
         { t: 0.0, rgb: [243, 241, 234] },
-        { t: 0.2, rgb: [200, 205, 210] },
-        { t: 0.45, rgb: [120, 145, 180] },
-        { t: 0.7, rgb: [60, 75, 135] },
-        { t: 1.0, rgb: [25, 30, 72] },
+        { t: 0.08, rgb: [206, 214, 226] },
+        { t: 0.22, rgb: [168, 186, 213] },
+        { t: 0.42, rgb: [112, 138, 188] },
+        { t: 0.62, rgb: [66, 86, 152] },
+        { t: 0.82, rgb: [36, 44, 108] },
+        { t: 1.0, rgb: [22, 28, 66] },
       ],
       // Warm sepia ink family, clearly channel-separated from the cool density.
       synth: [
@@ -412,13 +418,17 @@ export const THEMES: Readonly<Record<ThemeId, ThemeMeta>> = {
       price: '#075149',
       sell: '#24499c',
       warn: '#6d3fa8',
-      // Same ink-on-paper family as `paper`, slightly cooler stop spacing.
+      // Same ink-on-paper family as `paper` (F8 / QA4-H1): periwinkle-steel
+      // low band → slate azure → violet-leaning indigo, slightly cooler/softer
+      // stop spacing than `paper` and never the old neutral gray at low t.
       density: [
         { t: 0.0, rgb: [243, 241, 234] },
-        { t: 0.22, rgb: [196, 201, 214] },
-        { t: 0.48, rgb: [110, 135, 175] },
-        { t: 0.72, rgb: [52, 72, 126] },
-        { t: 1.0, rgb: [20, 26, 64] },
+        { t: 0.1, rgb: [208, 213, 228] },
+        { t: 0.26, rgb: [170, 182, 216] },
+        { t: 0.46, rgb: [116, 134, 192] },
+        { t: 0.64, rgb: [74, 88, 158] },
+        { t: 0.82, rgb: [40, 48, 124] },
+        { t: 1.0, rgb: [24, 28, 72] },
       ],
       synth: [
         { t: 0.0, rgb: [243, 241, 234] },

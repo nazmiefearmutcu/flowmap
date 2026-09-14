@@ -1801,6 +1801,18 @@ export class Renderer {
    */
   private updateView(): void {
     const before = this.view;
+    // F3 (swarm wave 2): refresh the known TIME data window so user pan/zoom
+    // ops clamp to it (bounded overscroll past the history ends; zoom-out floor
+    // = resident coverage). See gl/camera.ts TimeWindow. No re-clamp here.
+    // Floor: the protocol's start of stream (0) while older history may still
+    // exist; once the loader reports exhaustion it is the loaded data edge, so
+    // the pan stops ON data instead of a region the server can never supply.
+    const range = this.ring?.residentRange() ?? null;
+    this.camera.setTimeWindow({
+      floor: this.history?.startOfHistory ? (range?.oldest ?? 0) : 0,
+      newest: this.newestSeq,
+      resident: range,
+    });
     if (this.camera.followTime) this.applyTimeFollowFrame();
     if (this.camera.followPrice === 'fit') this.applyPriceFitFrame();
     this.view = this.camera.toView();

@@ -50,4 +50,8 @@ describe('overlayStack', () => {
     pushOverlay('settings');
     expect(isTopOverlay('palette')).toBe(false);
   });
+
+  // NOTE (QA12 M-1): the drawer's own Escape listener also honors
+  // `e.defaultPrevented` for the React-handled palette close; that half of the
+  // contract is pinned in SettingsDrawer.test.tsx ("escape ordering").
 });

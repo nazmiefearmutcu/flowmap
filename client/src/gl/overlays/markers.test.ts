@@ -7,31 +7,43 @@ import type { Marker } from '../../proto/types';
 /**
  * Minimal frame stub for driving `Markers.draw`. The GridMap methods used are
  * stubbed with simple, deterministic transforms so we can assert where glyphs
- * and labels land. `cssY(0)` maps to the bottom of the canvas (grid row 0),
- * which is what makes off-canvas label placement observable.
+ * and labels land. Marker `ts_ns` doubles as the label x anchor: `tsToCol`
+ * returns it and `cssX` is the identity, so a marker's chip starts at
+ * `ts + glyphPx + 2` for priced kinds and `ts + 3` for vertical kinds.
+ * `cssY(0)` maps to the bottom of the canvas (grid row 0), which is what makes
+ * off-canvas label placement observable.
  */
 const CSS_H = 600;
 const CSS_W = 800;
 
 function makeFrame() {
   const textCalls: Array<{ x: number; y: number; label: string }> = [];
+  const hatchXs: number[] = [];
   const gm = {
     hasEvents: true,
     dims: { cssW: CSS_W, cssH: CSS_H },
     pxToClipW: (px: number) => px / CSS_W,
     pxToClipH: (px: number) => px / CSS_H,
-    // Keep every marker on-screen for the test.
-    tsToCol: (_ts: bigint) => 10,
+    // Keep every marker on-screen and let ts BE the anchor x.
+    tsToCol: (ts: bigint) => Number(ts),
     clipX: (_col: number) => 0,
     clipY: (row: number) => (row === 0 ? -1 : 0),
-    cssX: (_col: number) => 100,
+    cssX: (col: number) => col,
     // Bottom-of-canvas for row 0, so an off-canvas label is easy to detect.
     cssY: (row: number) => CSS_H - row,
     priceToRow: (_p: number) => 5,
   };
   const frame = {
     gm,
-    solid: { begin() {}, addThickLine() {}, addTri() {}, addQuad() {}, flush() {} },
+    solid: {
+      begin() {},
+      addThickLine(x: number) {
+        hatchXs.push(x);
+      },
+      addTri() {},
+      addQuad() {},
+      flush() {},
+    },
     points: {},
     text: {
       text(x: number, y: number, label: string) {
@@ -42,11 +54,15 @@ function makeFrame() {
     capability: null,
     columnArrays: () => null,
   } as unknown as OverlayFrame;
-  return { frame, textCalls };
+  return { frame, textCalls, hatchXs };
 }
 
-function marker(kind: Marker['kind'], price: number | null): Marker {
-  return { ts_ns: 1000, price, kind } as unknown as Marker;
+function marker(kind: Marker['kind'], price: number | null, ts = 1000): Marker {
+  return { ts_ns: ts, price, kind, text: '' } as unknown as Marker;
+}
+
+function seamMarker(ts = 1000): Marker {
+  return { ts_ns: ts, price: null, kind: 'gap', text: 'history seam (cadence break)' } as unknown as Marker;
 }
 
 describe('Markers label placement', () => {
@@ -88,5 +104,81 @@ describe('Markers label placement', () => {
     // Vertical markers use a fixed cssY of 12; null-price glyph labels match it.
     expect(a.textCalls[0].y).toBe(12);
     expect(b.textCalls[0].y).toBe(12);
+  });
+});
+
+describe('Markers declutter policy (QA14 gapstack)', () => {
+  it('collapses a near-identical kind run into one counted badge, keeping every hatch', () => {
+    const m = new Markers();
+    // Six gaps ~9 px apart (the real BTC pile-up geometry): one chip, six hatches.
+    for (const ts of [100, 109, 118, 127, 136, 145]) m.add(marker('gap', null, ts));
+    const { frame, textCalls, hatchXs } = makeFrame();
+    m.draw(frame);
+
+    expect(hatchXs).toHaveLength(6); // honour: every gap still draws its hatch
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].label).toBe('GAP ×6');
+  });
+
+  it('does not merge kinds that are far apart', () => {
+    const m = new Markers();
+    m.add(marker('gap', null, 100));
+    m.add(marker('gap', null, 300));
+    const { frame, textCalls } = makeFrame();
+    m.draw(frame);
+
+    expect(textCalls.map((t) => t.label)).toEqual(['GAP', 'GAP']);
+    expect(textCalls[0].y).toBe(12);
+    expect(textCalls[1].y).toBe(12);
+  });
+
+  it('labels seam markers SEAM and collapses them separately from plain gaps', () => {
+    const m = new Markers();
+    m.add(seamMarker(100));
+    m.add(seamMarker(106));
+    m.add(marker('gap', null, 103));
+    const { frame, textCalls } = makeFrame();
+    m.draw(frame);
+
+    const labels = textCalls.map((t) => t.label).sort();
+    expect(labels).toEqual(['GAP', 'SEAM ×2']);
+  });
+
+  it('offsets overlapping labels away from each other vertically', () => {
+    const m = new Markers();
+    m.add(marker('large_lot', null, 100)); // rank 2, top lane at y 12
+    m.add(marker('gap', null, 100)); // rank 0, same top lane
+    const { frame, textCalls } = makeFrame();
+    m.draw(frame);
+
+    const gap = textCalls.find((t) => t.label === 'GAP');
+    const lot = textCalls.find((t) => t.label === 'LOT');
+    expect(gap).toBeTruthy();
+    expect(lot).toBeTruthy();
+    expect(gap!.y).toBe(12);
+    expect(lot!.y).toBe(24); // pushed one pitch down — no overprint
+  });
+
+  it('caps labels by priority gap > seam > marker (lowest dropped, glyphs intact)', () => {
+    const m = new Markers({ maxLabels: 2 });
+    m.add(marker('info', null, 100)); // rank 2
+    m.add(marker('gap', null, 100)); // rank 0
+    m.add(seamMarker(104)); // rank 1
+    const { frame, textCalls, hatchXs } = makeFrame();
+    m.draw(frame);
+
+    expect(textCalls.map((t) => t.label)).toEqual(['GAP', 'SEAM']);
+    // The dropped INFO chip must not cost its glyph, and both verticals keep hatches.
+    expect(hatchXs).toHaveLength(2);
+  });
+
+  it('merges chained near markers even when the first-to-last span exceeds the radius', () => {
+    const m = new Markers();
+    // 12 gaps at 10 px steps → 110 px total span; single-linkage still → one badge.
+    for (let i = 0; i < 12; i++) m.add(marker('gap', null, 100 + i * 10));
+    const { frame, textCalls } = makeFrame();
+    m.draw(frame);
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].label).toBe('GAP ×12');
   });
 });

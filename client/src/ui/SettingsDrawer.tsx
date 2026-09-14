@@ -117,10 +117,16 @@ export function SettingsDrawer({ settings, onChange, onClose }: SettingsDrawerPr
   // overlay. If the `?` shortcuts overlay sits above it, that overlay's own
   // Escape handler owns the keystroke; `stopPropagation` cannot express this
   // between two listeners on the same window target (see ui/overlayStack.ts).
+  // `e.defaultPrevented` covers the other half (QA12 M-1): a surface whose
+  // Escape is handled in REACT (the symbol palette) flushes its update — and
+  // its registry pop — before this window listener runs, so the stack alone
+  // would read this drawer as top and close a second surface on one Escape.
+  // A consumed keystroke must stay consumed.
   useEffect(() => {
     const off = pushOverlay('settings');
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape' && isTopOverlay('settings')) {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (isTopOverlay('settings')) {
         onClose();
       }
     };

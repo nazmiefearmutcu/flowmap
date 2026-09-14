@@ -157,4 +157,60 @@ describe('PriceAxis chip', () => {
     expect(r.setPriceFollow).toHaveBeenCalledWith('track');
     expect(chip(container).textContent).toBe('TRACK');
   });
+
+  // --- QA9-1: born-blank gutter self-heal (no window resize) -----------------
+
+  interface HealRenderer extends FakeRenderer {
+    attachOverlaySurfaces: ReturnType<typeof vi.fn>;
+    overlays: {
+      timeAxis: { canvas: HTMLCanvasElement };
+      syncGutters: ReturnType<typeof vi.fn>;
+    };
+  }
+
+  function healRenderer(): HealRenderer {
+    return {
+      ...fakeRenderer('fit'),
+      attachOverlaySurfaces: vi.fn(),
+      overlays: { timeAxis: { canvas: document.createElement('canvas') }, syncGutters: vi.fn() },
+    };
+  }
+
+  function layoutBox(c: HTMLCanvasElement, w: number, h: number): void {
+    Object.defineProperty(c, 'clientWidth', { value: w, configurable: true });
+    Object.defineProperty(c, 'clientHeight', { value: h, configurable: true });
+  }
+
+  it('self-heals a born-blank gutter: rebinds the live canvas + re-syncs the bitmap', () => {
+    const r = healRenderer();
+    const { container } = render(
+      <PriceAxis canvasRef={{ current: null }} rendererRef={{ current: r as unknown as Renderer }} />,
+    );
+    const canvas = container.querySelector('.axis-canvas') as HTMLCanvasElement;
+    // The defect state: browser-default bitmap (300×150) on a laid-out box.
+    canvas.width = 300;
+    canvas.height = 150;
+    layoutBox(canvas, 61, 231);
+
+    poll();
+
+    expect(r.attachOverlaySurfaces).toHaveBeenCalledWith(canvas, r.overlays.timeAxis.canvas);
+    expect(r.overlays.syncGutters).toHaveBeenCalledWith(1);
+  });
+
+  it('does not rebind while the gutter bitmap already matches its box', () => {
+    const r = healRenderer();
+    const { container } = render(
+      <PriceAxis canvasRef={{ current: null }} rendererRef={{ current: r as unknown as Renderer }} />,
+    );
+    const canvas = container.querySelector('.axis-canvas') as HTMLCanvasElement;
+    canvas.width = 61;
+    canvas.height = 231;
+    layoutBox(canvas, 61, 231);
+
+    poll();
+
+    expect(r.attachOverlaySurfaces).not.toHaveBeenCalled();
+    expect(r.overlays.syncGutters).not.toHaveBeenCalled();
+  });
 });

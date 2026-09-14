@@ -13,6 +13,12 @@ import { checkGLError, type GLContext } from './context';
 import { RAMP_FLOW } from './lut';
 import type { MipChain } from './mips';
 import type { ViewportNormalizer } from './normalize';
+import {
+  DEFAULT_RECON_FLOOR_SCALE,
+  reconFloorFor,
+  RegionTracker,
+  REGION_LIVE,
+} from './regionFloor';
 import { HEATMAP_FRAG, HEATMAP_VERT } from './shaders/heatmap';
 import { TileRing } from './tileRing';
 
@@ -57,26 +63,39 @@ const LUT_UNIT = 1;
 const MIP1_UNIT = 2;
 const MIP2_UNIT = 3;
 const ROWMIP_UNIT = 4;
+const REGION_UNIT = 5;
 
 /**
  * Default perceptual display gamma (§8.3). Order-flow density is heavy-tailed:
  * the median active cell is a few percent of the viewport white point while
- * walls sit at 10-100×. A LIFTING curve (~0.45) paints every one of those
- * small orders at mid-ramp brightness and the field reads as a rainbow
- * barcode; the Bookmap-class default therefore sits at ~0.86, which keeps the
- * small sizes near the dark head of the ramp and reserves the warm top for
- * size worth reading. Walls and the white point stay pinned (pow fixes both
- * ends). The settings drawer can override this — see the "Contrast" control.
- * Pinned equal to gammaForContrast(DEFAULT_CONTRAST) by the tests.
+ * walls sit at 10-100×, so the below-knee exponent decides how much of the
+ * faint field is visible at all.
+ *
+ * Wave 3 / F10 (2026-09-14, owner "hâlâ yarak gibi" = still too dark): with
+ * DEFAULT_TOLERANCE = 0 the floor no longer hides faint cells, but F2 measured
+ * that ~28pp of the newly-painted fill differed from background by ≤3 luma —
+ * sub-perceptual on the frozen ramp head (#05080E). F10's frozen-BTC A/B
+ * (runtime `setContrast` emulation, same data per condition; see
+ * swarm2/F10.md §A/B) measured the below-knee lift as the only lever that
+ * moves that band: at γ 0.86 the sub-3-luma share of the crop is 15.5pp and
+ * the crop median is 20.0 luma; at γ 0.653 it is 3.5pp / 27.1 luma while the
+ * wall band is untouched (knee p97 → LUT 217, white → 255, max luma 204 in
+ * every state; gVar 104 → 96 = dilution from the joined mids, not wall
+ * flattening). 0.653 = gammaForContrast(17) — the default slider position.
+ *
+ * The old 0.86 stays available on the Contrast slider (which reaches 1.4);
+ * nothing else in the chain changed: f(0)=0 (background), f(knee)=lowSpan,
+ * f(1)=1 (LUT 255) are still exact. Pinned equal to
+ * gammaForContrast(DEFAULT_CONTRAST) by the tests.
  */
-export const DEFAULT_DISPLAY_GAMMA = 0.86;
+export const DEFAULT_DISPLAY_GAMMA = 0.653;
 
 /**
  * Map a 0–100 "Contrast" slider to a display gamma. HIGHER contrast → HIGHER
  * gamma → a darker mid-field with punchier walls (more separation); LOWER
  * contrast → lower gamma → the field is lifted flat/bright (washed, less
- * separation). The default ({@link DEFAULT_CONTRAST}) lands on 0.86 — the
- * Bookmap-class dark-field default (see {@link DEFAULT_DISPLAY_GAMMA}).
+ * separation). The default ({@link DEFAULT_CONTRAST}, 17) lands on 0.653 —
+ * the wave-3 below-knee low-end lift (see {@link DEFAULT_DISPLAY_GAMMA}).
  * Clamped to the legible band [0.5, 1.4].
  */
 export function gammaForContrast(contrast: number): number {
@@ -85,7 +104,7 @@ export function gammaForContrast(contrast: number): number {
 }
 
 /** Slider position (0–100) whose gamma equals the default — the reset point. */
-export const DEFAULT_CONTRAST = 40;
+export const DEFAULT_CONTRAST = 17;
 
 /**
  * Above-knee log-compression strength of the two-segment transfer curve
@@ -174,22 +193,27 @@ export const TOLERANCE_MAX_FLOOR = 0.85;
 export const TOLERANCE_CURVE = 1.4;
 
 /**
- * Default Tolerance slider position. A gentle non-zero denoise (not the old
- * hard 0) so the app opens with the faintest sub-threshold specks already
- * suppressed and the tradeable liquidity reads cleaner out of the box. Slider 0
- * remains an exact algebraic no-op for anyone who wants every speck back.
+ * Default Tolerance slider position. Wave 3 / F10 (2026-09-14): 5 → 0.
  *
- * 15 (floor ≈ 0.060) was the "empty heatmap" default: order-flow density is
- * heavy-tailed, and with the old p99 white point the MEDIAN active cell sat at
- * ~2% of norm — a third of the floor — so out of the box the whole ladder
- * painted background and only the walls showed. 5 maps to a floor of ≈ 0.013,
- * which on the same tail shape suppresses just the quiet end while the p75+
- * cells clear the floor and read as dark indigo. Lane F moved the white point
- * to p99.7, so on the heavy-tail model the floor now cuts ≈56% of active cells
- * (≈44% visible). The math is pinned by the "default visibility" test in
- * heatmap.test.ts.
+ * History: 15 (floor ≈ 0.060) was the "empty heatmap" default and read black
+ * out of the box; 5 (floor ≈ 0.013 × the row footprint) cut ≈56% of active
+ * cells on the heavy-tail model. F2's display-policy A/B (frozen BTC window,
+ * same data across conditions) measured that even 5 leaves the field
+ * discontinuous: with the floor at 0 the rows carrying ink went 59.2% → 98.6%
+ * and non-background pixels 45.2% → 95.6% (void 54.8% → 4.4%) — the only
+ * candidate that reaches the Bookmap continuity target (D3-C1: no cell that
+ * has data may render background). The isolated-speck count DROPPED (5 → 1
+ * component; the faint cells connect instead of dotting), and the wall band is
+ * untouched (knee/white outputs and max luma unchanged). The one honest cost —
+ * the added faint fill needs low-end brightness to be legible — is carried by
+ * {@link DEFAULT_DISPLAY_GAMMA}'s below-knee lift, not by this slider.
+ *
+ * Slider 0 is (and always was) an exact algebraic no-op: floor 0 keeps the
+ * shader's remap the identity. Existing installs persist their stored
+ * tolerance; pushing the new default to them needs a settings migration
+ * (flagged in swarm2/F10.md — settings.ts is outside this lane).
  */
-export const DEFAULT_TOLERANCE = 5;
+export const DEFAULT_TOLERANCE = 0;
 
 /**
  * Map a 0–100 "Tolerance" slider to the shader's black point.
@@ -197,9 +221,10 @@ export const DEFAULT_TOLERANCE = 5;
  * Eased (exponent {@link TOLERANCE_CURVE}), not linear, because the useful floors
  * are small: order-flow density is heavy-tailed, so a floor around 1–2% of the
  * white point separates the real ladder from the specks without hiding the field
- * (at the default floor of ≈0.013 a cell needs ~1.3% of the white point to paint
- * at all). The eased curve gives fine control at the low end and meaningful bite
- * through the middle, reaching the cap at 100.
+ * (a cell needs that fraction of the white point to paint at all). The default
+ * is now 0 — the F2-measured continuity endpoint (see {@link DEFAULT_TOLERANCE});
+ * the eased curve still gives fine control when a denoise IS wanted, reaching
+ * the cap at 100.
  *
  * Non-finite input yields 0 rather than NaN — a NaN floor would blank the entire
  * heatmap, and this is reachable from `window.__flowmapLive` in dev/e2e builds.
@@ -223,6 +248,15 @@ interface LevelSel {
    */
   rowOnly?: boolean;
 }
+
+/**
+ * `selectLevel`/`Heatmap.draw` row-mip threshold (rpp >= 1.5) — the row-mip
+ * eligibility edge. Wave 3 / F10: 2.5 → 1.5 to close D4's 2.0–2.5 barcode zone
+ * with the row-mip chain's DENSE Gaussian kernel (the level-0 triple is
+ * structurally sparse — its ±dy taps do not overlap an isolated single-row
+ * level when dy > 1 row; D4 measured 98% sub-3-px edges at rpp 2.07).
+ */
+const ROW_MIP_EDGE = 1.5;
 
 /**
  * Choose the SUM-mip level from the pixel's footprint on BOTH axes.
@@ -285,16 +319,25 @@ export function selectLevel(
   const floorLevel = Number.isFinite(levelFloor)
     ? Math.max(0, Math.min(maxLevel, Math.floor(levelFloor)))
     : 0;
-  // Row-only decoupling (campaign visual 2026-09-11, R2-M1): at rpp >= 2.5 the
-  // ROW axis alone needs 4-row grouping, and when the time axis is NOT zoomed
-  // out (cpp < 1.5) that grouping is done WITHOUT the 4-column averaging the
-  // 4x4 SUM mip applies — the owner's scrolled-back / reconstructed regime
-  // (rpp 3.05, cpp < 1) keeps crisp cell edges instead of 4-column blocks. The
-  // flag is additive: level/blk stay the historical SUM-path fields so every
-  // pre-existing consumer output is unchanged, and the draw derives the actual
-  // row-mip taps (blk 4) itself. A tick-grouping floor keeps the forced SUM
-  // path (the floor is an explicit user choice of block size).
-  const rowOnly = rpp >= 2.5 && cpp < 1.5 && floorLevel === 0;
+  // Row-only decoupling (campaign visual 2026-09-11, R2-M1): the ROW axis alone
+  // needs 4-row grouping (at rpp >= {@link ROW_MIP_EDGE}), and when the time
+  // axis is NOT zoomed out (cpp < 1.5) that grouping is done WITHOUT the
+  // 4-column averaging the 4x4 SUM mip applies — the owner's scrolled-back /
+  // reconstructed regime (rpp 3.05, cpp < 1) keeps crisp cell edges instead of
+  // 4-column blocks. The flag is additive: level/blk stay the historical
+  // SUM-path fields so every pre-existing consumer output is unchanged, and the
+  // draw derives the actual row-mip taps (blk 4) itself. A tick-grouping floor
+  // keeps the forced SUM path (the floor is an explicit user choice of block
+  // size).
+  //
+  // Wave 3 / F10 (D4 zones): the edge moved 2.5 → {@link ROW_MIP_EDGE} (1.5).
+  // D4 measured that one wheel notch in from the default (rpp 2.07) landed in a
+  // barcode dead zone — the rowFade renormalization zeroed the row-mip path
+  // exactly through [2.0, 2.5] while the level-0 triple at dy 4.55 rows paints
+  // isolated levels as three sparse hairlines instead of a band. The row-mip
+  // chain IS the dense kernel; engaging it from 1.5 with a continuous weight
+  // (see rowFadeFor) removes the cliff.
+  const rowOnly = rpp >= ROW_MIP_EDGE && cpp < 1.5 && floorLevel === 0;
   const level = Math.max(floorLevel, Math.max(0, Math.max(rowLevel, colLevel)));
   const blk = 4 ** level;
   // COVERAGE, not rounding (campaign 4.2): round(rpp/blk) picked 1 tap for rpp
@@ -449,24 +492,41 @@ export function smoothPlanFor(colsPerPixel: number): SmoothPlan {
 
 /** Vertical softening target in SCREEN pixels (barcode fix, 2026-09-13). */
 export const SMOOTH_ROW_SIGMA_PX = 2.2;
-/** Cap on the vertical blend offset in ROW units (perf + band-width bound). */
-const SMOOTH_ROW_DY_MAX = 1.2;
+/**
+ * Cap on the total vertical blend band in SCREEN pixels (barcode fix wave 2,
+ * 2026-09-14). The triple spans ±dy rows → `2·dy / rowsPerPixel` screen px;
+ * the pixel-denominated dy already bounds that at `2·sigma_px` = 4.4 px. The
+ * cap is the guard for a future sigma raise (and documents the ≤10 px
+ * acceptance bound) — it never binds at the shipped 2.2 px sigma.
+ */
+export const SMOOTH_ROW_BAND_MAX_PX = 10;
 
 /**
  * Vertical (price-axis) softening offset in ROW units for a draw — the
- * barcode fix (owner: "barkod görünüm var hala default olarak"). A live
- * book concentrates liquidity on single price ROWS; at ~2 px per row the
- * field paints as hard hairlines. The shader blends a 0.25/0.5/0.25 triple at
+ * barcode killer (owner: "barkod görünüm var hala default olarak"; wave-2
+ * mandate 2026-09-14). A live book concentrates liquidity on single price
+ * ROWS; the rows-per-pixel at the DEFAULT book zoom is ~3, so each level
+ * paints as a hard 1-px hairline. The shader blends a 0.25/0.5/0.25 triple at
  * ±dy rows around each sample, turning each level into a soft band (the
- * Bookmap look). dy scales with the row footprint so the softening is a
- * constant ~{@link SMOOTH_ROW_SIGMA_PX}px: dy = sigma_px * rowsPerPixel,
- * capped; sub-pixel rows (rpp >= 2) and non-finite inputs return 0 — the
- * exact legacy single-sample path (byte-identical endpoints).
+ * Bookmap look).
+ *
+ * dy is PIXEL-denominated and ACTIVE at every zoom: `dy = sigma_px ·
+ * rowsPerPixel` makes ±dy a constant ~{@link SMOOTH_ROW_SIGMA_PX} screen px
+ * worth of rows (a level spreads over ~2·sigma_px px, edge 10–90 ≈ 4 px —
+ * soft, never a hairline, under the mush bar). The old `rpp >= 2 → 0` cutoff
+ * made the mechanism inert EXACTLY at the default (rpp ≈ 3) — the field
+ * stayed a barcode; the cutoff is gone. The only 0 endpoint left is
+ * non-finite / non-positive input (legacy single-sample path for a poisoned
+ * view). The shader applies this triple in BOTH display paths: the level-0
+ * field (`fieldAt`) and the deep-row mip fetch (`rowMipSoft`, converted to
+ * 4-row texel units by the draw's `* 0.25`), so the default view — which
+ * rides the row-mip path — is softened too.
  */
 export function rowSmoothDyFor(rowsPerPixel: number): number {
   if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 0) return 0;
-  if (rowsPerPixel >= 2.0) return 0;
-  return Math.min(SMOOTH_ROW_DY_MAX, SMOOTH_ROW_SIGMA_PX * rowsPerPixel);
+  const dyRows = SMOOTH_ROW_SIGMA_PX * rowsPerPixel;
+  const capRows = (SMOOTH_ROW_BAND_MAX_PX / 2) * rowsPerPixel;
+  return Math.min(dyRows, capRows);
 }
 
 /** Deep-row softening enable (see {@link rowMipSoftenFor}) — 1 mip-row step. */
@@ -502,58 +562,55 @@ function gaussianTaps(
 }
 
 /**
- * Row-mip cross-fade weight (resolution-transition polish, lane P).
+ * Row-mip cross-fade weight (resolution-transition polish, lane P; wave-3
+ * edge moved to {@link ROW_MIP_EDGE} by F10 per D4's zone map).
  *
  * The historical row LOD switch was a hard threshold: rpp < 2.5 sampled the
  * level-0 single-row bilinear, rpp >= 2.5 sampled the 4-row-sum mip — a
  * measured brightness/pop spike in the zoom ladder through rpp 2.4–3.9 (the
  * band where row aggregation flips). This ramps the handoff instead:
  *
- *   - rpp <= 2.0  → 0 (pure level-0 rows, EXACT legacy output)
- *   - rpp >= 3.0  → 1 (pure row-mip sums, EXACT post-4.1 output)
- *   - in between  → linear (rpp-2.0)/1.0
+ *   - rpp <= 1.5  → 0 (pure level-0 rows, EXACT legacy output)
+ *   - rpp >= 2.5  → 1 (pure row-mip sums, EXACT post-4.1 output)
+ *   - in between  → linear (rpp−1.5)/1.0
  *
- * The 3.0 upper edge is a W1 barcode-fix decision (2026-09-13): the widened
- * 4.5 edge (lane P) left ~72% raw single-row weight at the DEFAULT book zoom
- * (rpp ~3.05), which kept the owner's "barkod" hairlines alive even with the
- * deep-row Gaussian active — the raw side is a single-row sample and its
- * 1-px core caps the composite 10-90 edge at ~2.5 px. Completing the handoff
- * by rpp 3.0 makes the deep-row regime pure Gaussian (soft bands), while both
- * endpoints stay exact and the blend stays a continuous ramp (~1.1 wheel
- * notches at ~19%/notch, no step).
+ * The lower edge is the F10 coverage extension (D4 zones: "2.0–2.5 rowFade
+ * renormalization cliff" and "0.70–2.0 the pixel triple misses the feature").
+ * At the old [2.0, 3.0] ramp the renormalization zeroed the row-mip weight
+ * through [2.0, 2.5], so one wheel notch in from the default (rpp 2.07) rode
+ * the SPARSE level-0 triple (dy 4.55 rows → three disconnected hairlines);
+ * D4 measured 98% sub-3-px edges there. Ramping from 1.5 gives that zone a
+ * real row-mip share (2.07 → 0.57) while the DEFAULT keeps the completed
+ * handoff F1 calibrated (rpp ≥ 2.5 → pure row-mip). Both endpoints stay exact:
+ * 1.5 → 0 is the legacy level-0 sample, 2.5 → 1 is the full row path.
  *
  * Non-finite input degrades to 0 (the legacy level-0 path) rather than
  * poisoning the blend weight. NOTE the DRAW applies this only inside the
- * row-mip eligibility regime and renormalizes the edge — see
- * {@link effectiveRowMode}, which is the single source of truth for the
- * uploaded weight.
+ * row-mip eligibility regime — see {@link effectiveRowMode}, which is the
+ * single source of truth for the uploaded weight.
  */
 export function rowFadeFor(rowsPerPixel: number): number {
-  if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 2.0) return 0;
-  if (rowsPerPixel >= 3.0) return 1;
+  if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= ROW_MIP_EDGE) return 0;
+  if (rowsPerPixel >= 2.5) return 1;
   // Linear ramp (see levelBlendFor): uniform weight deltas minimize the max
-  // per-step pop; the regime edges are renormalized by effectiveRowMode anyway.
-  return (rowsPerPixel - 2.0) / (3.0 - 2.0);
+  // per-step pop; the edge is exact (knee = rowFadeFor(ROW_MIP_EDGE) = 0, so
+  // effectiveRowMode's renormalization is the identity).
+  return (rowsPerPixel - ROW_MIP_EDGE) / (2.5 - ROW_MIP_EDGE);
 }
-
-/** `selectLevel`'s row-mip threshold (rpp >= 2.5) — the fade's eligibility edge. */
-const ROW_MIP_EDGE = 2.5;
 
 /**
  * The draw-side effective row mode for a frame — the SINGLE source of truth for
  * `{rowOnly, rowFade}`. `Heatmap.draw` and `testHook.levelInfo` both call this,
  * so the reported selection can never drift from the painted one.
  *
- * The hard row-mip threshold (`selectLevel`'s `rowOnly`, which already encodes
- * rpp >= 2.5 AND a deep time zoom AND no tick-grouping floor) is replaced by a
- * smooth blend, but the regime edges themselves are preserved: a frame is only
- * eligible inside that regime (`rowEligible`), so the time-zoomed-out SUM path,
- * a forced tick-grouping floor, and the rpp < 2.5 level-0 path keep their exact
- * historical output. Inside the regime the weight from {@link rowFadeFor} is
- * RENORMALIZED to 0 at the regime edge (rpp 2.5) — the draw switches from the
- * legacy level-0 sample to the row-mip mix with a zero-weight blend, so there is
- * no step at the edge — and reaches 1 at rpp 3.0 (W1 barcode-fix edge; lane P
- * spread it to 4.5 for pop reasons, but that left the default zoom ~72% raw).
+ * Eligibility (`rowEligible`) is `selectLevel`'s `rowOnly` regime: rpp >=
+ * {@link ROW_MIP_EDGE}, a deep time zoom, and no tick-grouping floor. Outside
+ * it the time-zoomed-out SUM path, a forced tick-grouping floor, and the
+ * rpp < ROW_MIP_EDGE level-0 path keep their exact historical output. Inside
+ * the regime the weight from {@link rowFadeFor} is renormalized against the
+ * edge knee — with the edge at 1.5 that knee is exactly 0, so the ramp is
+ * continuous from the legacy level-0 sample (fade 0) to the full row path
+ * (fade 1 at rpp 2.5) with no step at either end.
  *
  * Without a usable row-mip chain (`rowUsable` false) the weight is 0: the
  * legacy selection is used verbatim.
@@ -571,17 +628,19 @@ export function effectiveRowMode(
 }
 
 /**
- * Deep-row softening enable for a draw (barcode fix, 2026-09-13). When the
- * price axis collapses rows into sub-pixel footprints (the row-mip regime,
- * rpp >= 2.5 — the same {@link ROW_MIP_EDGE} {@link effectiveRowMode} uses), a
- * single price level paints as a ~1-px hairline at the DEFAULT book zoom
- * (rpp ~3): the owner's "barkod" look. The shader then blends each 4-row mip
- * texel with its MIP-row neighbours (0.25/0.5/0.25), spreading a level over
- * ~12 rows — ~4 px at rpp 3 — so levels read as soft bands while staying
- * distinguishable. Returns exactly 0 outside the regime so the historical
- * single-fetch row path stays byte-exact, and it only affects the row-mip
- * fetch — {@link rowSmoothDyFor}'s dy=0 endpoint is untouched (the two
- * mechanisms are disjoint by construction).
+ * Deep-row softening enable for a draw (barcode fix, 2026-09-13; wave-2
+ * 2026-09-14 composes it with {@link rowSmoothDyFor}). When the price axis
+ * collapses rows into sub-pixel footprints (the row-mip regime, rpp >=
+ * {@link ROW_MIP_EDGE} — the same edge {@link effectiveRowMode} uses), a single
+ * price level paints as a ~1-px hairline at the DEFAULT book zoom (rpp ~3): the
+ * owner's "barkod" look. The shader then blends each 4-row mip texel with its
+ * MIP-row neighbours, and — since wave 2 — wraps that fetch in the SAME
+ * pixel-denominated 0.25/0.5/0.25 triple the level-0 field uses (`rowMipSoft`
+ * in the shader, offset = `rowSmoothDyFor(rpp) / 4` mip texels). Without the
+ * triple the isolated-wall exemption kept exactly the single-level spikes
+ * crisp, which is what defeated the first fix at the default. Returns exactly
+ * 0 outside the regime so the historical single-fetch row path stays
+ * byte-exact.
  */
 export function rowMipSoftenFor(rowsPerPixel: number): number {
   if (!Number.isFinite(rowsPerPixel)) return 0;
@@ -677,6 +736,7 @@ type UniformName =
   | 'u_mip2'
   | 'u_rowMip1'
   | 'u_lut'
+  | 'u_region'
   | 'u_colOffset'
   | 'u_colScale'
   | 'u_rowOffset'
@@ -691,6 +751,8 @@ type UniformName =
   | 'u_gamma'
   | 'u_floor'
   | 'u_floorScale'
+  | 'u_floorRecon'
+  | 'u_floorScaleRecon'
   | 'u_ramp'
   | 'u_channel'
   | 'u_level'
@@ -785,6 +847,38 @@ export class Heatmap {
   normalizer: ViewportNormalizer | null = null;
 
   /**
+   * Per-REGION black point (lane F17; D5 lever L1, owner's scrollback
+   * complaint). The shipped Tolerance floor is calibrated on the LIVE book;
+   * reconstructed (stretched-candle) columns carry a different density scale
+   * (measured recon/live ≈ 0.5× on BTC but ≈26× on ETH), so one global floor
+   * hides the recon carpet. Columns tagged {@link RegionTracker} as reconstructed
+   * get `floor × reconFloorScale` instead — a RELATIVE cut (same t-space as the
+   * live floor), never an absolute brightness lift. 1 = inert: every column
+   * (tagged or not) paints with the exact shipped live floor. Live columns stay
+   * byte-identical for any value: untagged/stale slots resolve to REGION_LIVE.
+   */
+  reconFloorScale = DEFAULT_RECON_FLOOR_SCALE;
+
+  /**
+   * Per-column region tags in ring-slot space (pure; see gl/regionFloor.ts).
+   * The caller (renderer / e2e harness) classifies columns and calls
+   * `regions.mark`/`markRange` — the next draw uploads the changed mask as ONE
+   * RGBA8 array texture (colsPerTile × 1 × layers, `r` byte = 255 for recon).
+   * Nothing marked → the mask is all zero and the shader selects the live floor
+   * for every fragment (bit-identical to the pre-region pipeline).
+   */
+  readonly regions: RegionTracker;
+
+  private readonly regionTex: WebGLTexture;
+  /** Interleaved RGBA upload mirror for {@link regionTex} (slot-indexed tags). */
+  private readonly regionTexData: Uint8Array;
+  /** Tag revision last uploaded to {@link regionTex} (-1 = never). */
+  private regionRevApplied = -1;
+
+  /** Uploaded region floors from the last draw (diagnostics/tests). */
+  private lastRegion = { floorRecon: 0, floorScaleRecon: 1, reconColumns: 0 };
+
+  /**
    * Gaussian sampler + cross-fade diagnostics from the LAST {@link draw} (lane
    * F): the time-axis footprint, the sampler plan, and the row/level fade
    * weights that were uploaded. Defaults to the plan at `colsPerPixel = 1`
@@ -809,6 +903,31 @@ export class Heatmap {
     this.lut = lut;
 
     this.program = linkProgram(gl, HEATMAP_VERT, HEATMAP_FRAG);
+
+    // Per-region mask (lane F17): one RGBA8 texel per COLUMN in ring-slot space
+    // (colsPerTile × 1 × layers), red byte 0 = live / 255 = reconstructed. Kept
+    // zero-initialized (immutable storage zero-fills) so the default pipeline is
+    // the exact pre-region one. Re-uploaded as ONE texSubImage3D when the
+    // RegionTracker revision changes (see draw) — never per fragment.
+    this.regions = new RegionTracker(tileRing.capacityCols);
+    this.regionTexData = new Uint8Array(tileRing.capacityCols * 4);
+    const regionTex = gl.createTexture();
+    if (!regionTex) throw new Error('flowmap/heatmap: region texture alloc failed');
+    this.regionTex = regionTex;
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, regionTex);
+    gl.texStorage3D(
+      gl.TEXTURE_2D_ARRAY,
+      1,
+      gl.RGBA8,
+      tileRing.colsPerTile,
+      1,
+      tileRing.layers,
+    );
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
 
     // Full-viewport quad as a triangle strip: (pos.xy, uv.xy) interleaved.
     // uv spans 0..1 with y up (uv.y 0 = bottom of the price grid).
@@ -843,6 +962,7 @@ export class Heatmap {
       u_mip2: loc('u_mip2'),
       u_rowMip1: loc('u_rowMip1'),
       u_lut: loc('u_lut'),
+      u_region: loc('u_region'),
       u_colOffset: loc('u_colOffset'),
       u_colScale: loc('u_colScale'),
       u_rowOffset: loc('u_rowOffset'),
@@ -857,6 +977,8 @@ export class Heatmap {
       u_gamma: loc('u_gamma'),
       u_floor: loc('u_floor'),
       u_floorScale: loc('u_floorScale'),
+      u_floorRecon: loc('u_floorRecon'),
+      u_floorScaleRecon: loc('u_floorScaleRecon'),
       u_ramp: loc('u_ramp'),
       u_channel: loc('u_channel'),
       u_level: loc('u_level'),
@@ -930,6 +1052,17 @@ export class Heatmap {
     gl.activeTexture(gl.TEXTURE0 + ROWMIP_UNIT);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, rowMip);
     gl.uniform1i(this.u.u_rowMip1, ROWMIP_UNIT);
+
+    // Per-region mask (lane F17): one RGBA8 texel per ring column. Bound every
+    // draw; re-uploaded as a single texSubImage3D only when the tag revision
+    // moved, so the steady-state cost is a bind + a uniform.
+    gl.activeTexture(gl.TEXTURE0 + REGION_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.regionTex);
+    gl.uniform1i(this.u.u_region, REGION_UNIT);
+    if (this.regionRevApplied !== this.regions.revision) {
+      this.uploadRegions();
+      this.regionRevApplied = this.regions.revision;
+    }
 
     gl.uniform1f(this.u.u_colOffset, view.colOffset);
     gl.uniform1f(this.u.u_colScale, view.colScale);
@@ -1043,13 +1176,16 @@ export class Heatmap {
     // no recompile, no crisp/blur handoff.
     const plan = smoothPlanFor(colsPerPixel);
     const taps = gaussianTaps(plan.sigmaCols, plan.taps);
-    // Vertical softening (barcode fix): a per-draw constant from the row
-    // footprint — see rowSmoothDyFor. 0 keeps the exact legacy path.
+    // Vertical softening (barcode fix; wave 2: pixel-denominated, active at
+    // every zoom) — see rowSmoothDyFor. 0 only for a poisoned view; the shader
+    // now applies this triple in BOTH the level-0 field and the deep-row mip
+    // fetch (the latter via u_rowSmoothDy * 0.25), so the DEFAULT view — which
+    // rides the row-mip path — is softened too.
     const rowDy = rowSmoothDyFor(rowsPerPixel);
     // Deep-row softening (barcode fix): 1 inside the row-mip regime so the
     // 4-row texel fetch gains the vertical Gaussian (see rowMipWeightsFor /
-    // rowMipSoftenFor). Only the row-mip branches read it; 0 keeps their exact
-    // historical single-fetch output.
+    // rowMipSoftenFor) wrapped in the rowSmoothDyFor triple. Only the row-mip
+    // branches read it; 0 keeps their exact historical single-fetch output.
     const rowMipSoften = rowMipSoftenFor(rowsPerPixel);
     const rowMipWeights = rowMipWeightsFor(rowsPerPixel);
     const rowMipSigma = rowMipSoften > 0 ? SMOOTH_ROW_MIP_SIGMA_PX * rowsPerPixel / 4 : 0;
@@ -1082,6 +1218,25 @@ export class Heatmap {
     );
     gl.uniform1f(this.u.u_floor, floor);
     gl.uniform1f(this.u.u_floorScale, 1 / Math.max(1 - floor, 1e-6));
+    // Per-REGION floor (lane F17; D5 lever L1): reconstructed columns use a
+    // RELATIVE cut of the live slider floor (× reconFloorScale) — scaled by the
+    // SAME nRowTaps·blk row footprint, so the t-space semantics match at every
+    // zoom. scale 1 (the default-safe endpoint) uploads values bit-equal to the
+    // live pair; with no tagged columns the shader's live branch is selected
+    // anyway, keeping live pixels byte-identical.
+    const rawRecon = reconFloorFor(this.floor, this.reconFloorScale);
+    const floorRecon = Math.min(
+      TOLERANCE_MAX_FLOOR,
+      Math.max(0, rawRecon) * nRowTaps * blk,
+    );
+    const floorScaleRecon = 1 / Math.max(1 - floorRecon, 1e-6);
+    gl.uniform1f(this.u.u_floorRecon, floorRecon);
+    gl.uniform1f(this.u.u_floorScaleRecon, floorScaleRecon);
+    this.lastRegion = {
+      floorRecon,
+      floorScaleRecon,
+      reconColumns: this.regions.reconColumns,
+    };
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
@@ -1113,10 +1268,57 @@ export class Heatmap {
     return { ...this.lastSample };
   }
 
+  /**
+   * Per-region diagnostics from the LAST draw (lane F17): the uploaded recon
+   * floor pair and the number of tracker-tagged reconstructed columns. The mask
+   * texture itself is slot-addressed; tests assert the uniforms and the
+   * `texSubImage3D` transcript instead (see heatmap.test.ts).
+   */
+  regionInfo(): { floorRecon: number; floorScaleRecon: number; reconColumns: number } {
+    return { ...this.lastRegion };
+  }
+
+  /**
+   * Re-upload the whole region mask as ONE texSubImage3D from the slot-indexed
+   * {@link RegionTracker.tags} array (capacity × 4 bytes — 64 KiB at the
+   * production ring, and only on revision change). Red 0/255 so the shader's
+   * `> 0.5` test is exact; alpha carries a mirror for debug readback.
+   */
+  private uploadRegions(): void {
+    const gl = this.gl;
+    const tags = this.regions.tags;
+    const data = this.regionTexData;
+    for (let i = 0; i < tags.length; i++) {
+      const v = tags[i] === REGION_LIVE ? 0 : 255;
+      const o = i * 4;
+      data[o] = v;
+      data[o + 1] = 0;
+      data[o + 2] = 0;
+      data[o + 3] = v;
+    }
+    gl.activeTexture(gl.TEXTURE0 + REGION_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.regionTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texSubImage3D(
+      gl.TEXTURE_2D_ARRAY,
+      0,
+      0,
+      0,
+      0,
+      this.tileRing.colsPerTile,
+      1,
+      this.tileRing.layers,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      data,
+    );
+  }
+
   dispose(): void {
     const gl = this.gl;
     gl.deleteBuffer(this.quad);
     gl.deleteVertexArray(this.vao);
     gl.deleteProgram(this.program);
+    gl.deleteTexture(this.regionTex);
   }
 }

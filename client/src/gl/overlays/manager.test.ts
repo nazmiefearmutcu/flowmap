@@ -235,4 +235,44 @@ describe('OverlayManager (fake GL + recording 2D)', () => {
     expect(badges).toContain('VWAP approx');
     expect(badges).not.toContain('VWAP ≈ reconstructed');
   });
+
+  // --- QA9-1: born-blank gutters must re-match without a window resize -------
+
+  /** Give a jsdom canvas a real layout box (clientWidth/Height are 0 there). */
+  function box(el: HTMLCanvasElement, w: number, h: number): void {
+    Object.defineProperty(el, 'clientWidth', { value: w, configurable: true });
+    Object.defineProperty(el, 'clientHeight', { value: h, configurable: true });
+  }
+
+  it('syncGutters matches both gutters to their OWN live box (born-blank heal)', () => {
+    // Fresh App canvases start at the browser default 300×150 with zero ink.
+    expect([priceCanvas.width, priceCanvas.height]).toEqual([300, 150]);
+    box(priceCanvas, 61, 231);
+    box(timeCanvas, 352, 22);
+
+    expect(manager.syncGutters(1)).toBe(true);
+    expect([priceCanvas.width, priceCanvas.height]).toEqual([61, 231]);
+    expect([timeCanvas.width, timeCanvas.height]).toEqual([352, 22]);
+
+    // Idempotent: a converged pair reports no change (no heal-loop upstream).
+    expect(manager.syncGutters(1)).toBe(false);
+  });
+
+  it('draw() sizes the gutters from their own live box, not a stale dims snapshot', () => {
+    box(priceCanvas, 61, 231);
+    box(timeCanvas, 352, 22);
+    const ctx = drawCtx();
+    ctx.dims = { drawW: 640, drawH: 480, cssW: 999, cssH: 999 }; // deliberately stale
+    manager.draw(ctx);
+    expect([priceCanvas.width, priceCanvas.height]).toEqual([61, 231]);
+    expect([timeCanvas.width, timeCanvas.height]).toEqual([352, 22]);
+  });
+
+  it('syncGutters leaves a zero-box (pre-layout/hidden) gutter untouched', () => {
+    // jsdom default: no layout box. Sizing to 1×1 would blank a gutter that is
+    // merely not laid out yet — the manager must skip instead.
+    expect(manager.syncGutters(1)).toBe(false);
+    expect([priceCanvas.width, priceCanvas.height]).toEqual([300, 150]);
+    expect([timeCanvas.width, timeCanvas.height]).toEqual([300, 150]);
+  });
 });

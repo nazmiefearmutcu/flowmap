@@ -4,13 +4,18 @@ import {
   applyKill,
   Camera,
   clampCamera,
+  colCenterBounds,
+  COL_OVERSCROLL,
+  COL_SEQ_FLOOR,
   fit,
   follow,
   KILL_BOTH,
   KILL_PRICE,
   KILL_TIME,
   limitsFor,
+  maxColSpanFor,
   MIN_COL_SPAN,
+  MIN_RESIDENT_COVERAGE,
   MIN_ROW_SPAN,
   pan,
   priceFrame,
@@ -440,6 +445,111 @@ describe('clampCamera', () => {
     );
     expect(c.rowSpan).toBe(ROWS);
     expect(c.rowCenter).toBe(rowCenterBounds(ROWS, LIMITS).hi);
+  });
+});
+
+/**
+ * QA3 H-2 + M3 H-1 (swarm wave 2, F3): the time axis must not leave the known
+ * data. The renderer supplies a {@link TimeWindow}; these tests pin the two
+ * bounds it drives:
+ *   - pan  → colOffset stops one small overscroll band past either history end
+ *            (QA3 measured colOffset −92 129 at oldest 0, 0.31 % painted);
+ *   - zoom → the span cap is the resident window over MIN_RESIDENT_COVERAGE, so
+ *            the field can never squeeze sub-pixel blank (M3: 60 notches out →
+ *            colScale 1 048 576 covering 2 717 resident columns, 0/420 probes).
+ * The window is OPT-IN: bare limits keep the legacy free camera.
+ */
+describe('time data window — pan + zoom bounds (F3)', () => {
+  /** LIMITS + a known window whose full-res resident span equals the extent. */
+  function winLimits(oldest: number, newest: number): CameraLimits {
+    return { ...LIMITS, timeWindow: { newest, resident: range(oldest, newest) } };
+  }
+
+  it('is opt-in: without a window the pan stays free (legacy behavior)', () => {
+    expect(colCenterBounds(200, LIMITS)).toBeNull();
+    expect(pan(baseState(), LIMITS, -100_000, 0).colCenter).toBe(1000 - 100_000);
+    expect(maxColSpanFor(LIMITS)).toBe(LIMITS.maxColSpanZoom);
+  });
+
+  it('maxColSpanFor is the resident count over the coverage floor', () => {
+    // 200 resident columns must cover half the viewport at the widest zoom.
+    expect(maxColSpanFor(winLimits(800, 999))).toBe(200 / MIN_RESIDENT_COVERAGE);
+    // Grows with residency (deep scroll-back widens the allowed zoom-out).
+    expect(maxColSpanFor(winLimits(600, 999))).toBe(400 / MIN_RESIDENT_COVERAGE);
+    // Never below the minimum span, never above the hard numeric ceiling.
+    expect(maxColSpanFor(winLimits(5, 5))).toBe(2);
+    expect(maxColSpanFor(winLimits(0, 10_000_000))).toBe(LIMITS.maxColSpanZoom);
+  });
+
+  it('zoomTime caps the span at the resident coverage floor', () => {
+    const z = zoomTime({ ...baseState(), colSpan: 50 }, winLimits(800, 999), 1e9, 1000);
+    expect(z.colSpan).toBe(200 / MIN_RESIDENT_COVERAGE);
+    expect(z.followTime).toBe(false);
+  });
+
+  it('the cap is applied BEFORE the anchor math, so anchoring stays exact', () => {
+    // View [4900, 5100], cursor at 70 % → column 5040. The zoom-out lands the
+    // span at the 4000-column cap (2000 resident / 0.5) with the view well
+    // inside the extent, so the pan bound must not interfere and the anchor is
+    // exact.
+    const s = { ...baseState(), colCenter: 5000 };
+    const anchor = colAtFrac(s, 0.7);
+    const z = zoomTime(s, winLimits(8000, 9999), 1e9, anchor);
+    expect(z.colSpan).toBe(4000);
+    expect(colAtFrac(z, 0.7)).toBeCloseTo(anchor, 9);
+  });
+
+  it('pan stops one small overscroll band past the start of history', () => {
+    const limits = winLimits(500, 999); // span 200, slack = min(200, 64)
+    const p = pan(baseState(), limits, -100_000, 0);
+    expect(toView(p).colOffset).toBe(COL_SEQ_FLOOR - COL_OVERSCROLL);
+    expect(p.colCenter).toBe(COL_SEQ_FLOOR - COL_OVERSCROLL + 100);
+    // The next pan is a no-op — there is a hard edge, not a growing void.
+    expect(pan(p, limits, -100_000, 0).colCenter).toBe(p.colCenter);
+  });
+
+  it('pan stops symmetrically past the newest known column', () => {
+    const limits = winLimits(500, 999);
+    const p = pan(baseState(), limits, +100_000, 0);
+    // view left = newest + 1 + slack − span = 1000 + 64 − 200
+    expect(toView(p).colOffset).toBe(864);
+    expect(toView(p).colOffset + toView(p).colScale).toBe(1064); // newest + 65
+  });
+
+  it('the overscroll band shrinks with the viewport (renderer.scrolled-back case)', () => {
+    const limits = winLimits(500, 999);
+    const tight = { ...baseState(), colSpan: 1 };
+    const p = pan(tight, limits, -100_000, 0);
+    // slack = min(1, 64) = 1: the view is [−1, 0) at the far limit, so the
+    // oldest column (0) is off screen — the state renderer.test.ts pins when it
+    // asserts liveEdgeVisible=false after panColumnsForTest(−100000).
+    const v = toView(p);
+    expect(v.colOffset).toBe(-1);
+    expect(v.colOffset + v.colScale).toBe(0);
+  });
+
+  it('centres the extent when the view is wider than it (degenerate band)', () => {
+    const limits = winLimits(0, 999); // extent length 1000; cap = 2000
+    const c = clampCamera({ ...baseState(), colCenter: -5000, colSpan: 2000 }, limits);
+    expect(c.colSpan).toBe(2000);
+    expect(c.colCenter).toBe(500); // (floor + newest + 1) / 2
+  });
+
+  it('colCenterBounds skips a window that has no columns yet', () => {
+    expect(colCenterBounds(200, { ...LIMITS, timeWindow: { newest: -1, resident: null } })).toBeNull();
+  });
+
+  it('setTimeWindow refreshes the bounds without re-clamping the state', () => {
+    // The e2e harness installs wide synthetic framings through setViewForTest
+    // AFTER the window is known; a refresh must never mutate them.
+    const cam = new Camera(LIMITS);
+    cam.state = { ...baseState(), colCenter: -50_000, colSpan: 1000 };
+    cam.setTimeWindow({ newest: 999, resident: range(0, 999) });
+    expect(cam.state.colCenter).toBe(-50_000);
+    expect(cam.state.colSpan).toBe(1000);
+    // ...but the NEXT gesture is bounded by the fresh window.
+    cam.pan(-1, 0);
+    expect(cam.state.colCenter).toBe(COL_SEQ_FLOOR - COL_OVERSCROLL + 1000 / 2);
   });
 });
 

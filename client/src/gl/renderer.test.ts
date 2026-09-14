@@ -496,8 +496,11 @@ describe('Renderer (fake GL harness)', () => {
     r.setTickGrouping(1);
     store.emit(makeCol(4, true, 512));
     pump(80);
+    // F10 (2026-09-14) moved ROW_MIP_EDGE 2.5 → 1.5 for the sampler coverage
+    // fix; at this view (rowScale 512 over the harness buffer) the natural
+    // selection is now the ROW-MIP path itself: level 0, blk 4, rowFade > 0.
     expect(lastUniform('u_level')).toBe(0);
-    expect(lastUniform('u_blk')).toBe(1);
+    expect(lastUniform('u_blk')).toBe(4);
   });
 
   it('P1: the tick-grouping floor does NOT suppress history backfill', () => {

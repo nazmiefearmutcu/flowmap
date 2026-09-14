@@ -980,6 +980,61 @@ function sockets_reconnect_scheduled(events: { attempts: number[] }): boolean {
 }
 void sockets_reconnect_scheduled;
 
+// --- session-cap refusal contract (close 1013 while a replay was desired) -----
+//
+// QA11 H1 (F12 lane): a REPLAY subscribe refused at the session cap closes with
+// 1013 — NOT 1003. The two refusals mean different things and the transport must
+// not conflate them: 1003 = "no recording for this session" (the store's honest
+// live fallback), 1013 = "server at capacity, try again later" (retry with
+// backoff; the subscription stays replay). What Timeline keys its honest
+// `REPLAY REFUSED` pill off is `closeInfo.code === 1013` + a replay
+// subscription, so this pins that the close info carries 1013, that NO
+// onReplayRefused fires (a live fallback here would be an unrelated stream),
+// and that a backoff tick IS scheduled.
+
+describe('Connection — session-cap refusal (close 1013 on a replay subscribe)', () => {
+  it('carries 1013 in closeInfo, keeps retrying, and does NOT fire the no-recording fallback', () => {
+    const events = {
+      refused: 0,
+      closeInfo: [] as { code: number | null; wasClean: boolean }[],
+      attempts: [] as number[],
+    };
+    let sock: FakeWebSocket | undefined;
+    const conn = new Connection({
+      url: 'wss://test.invalid/ws',
+      wsFactory: (url) => {
+        sock = new FakeWebSocket(url);
+        return sock;
+      },
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
+      onReplayRefused: () => {
+        events.refused += 1;
+      },
+      onCloseInfo: (info) => events.closeInfo.push(info),
+      onReconnectScheduled: (attempt) => events.attempts.push(attempt),
+    });
+    conn.subscribe('crypto', 'BTCUSDT', 'replay');
+    const s = sock as FakeWebSocket;
+    s.open();
+    // The server's refusal contract: Status(degraded) immediately before close.
+    s.deliver(
+      coldFrame(MsgType.STATUS, {
+        feed_state: 'degraded',
+        capability: {},
+        latency_ms: 0.0,
+        clock_skew_ms: 0.0,
+        next_open_ts: null,
+      }),
+    );
+    s.drop(1013);
+    expect(events.refused).toBe(0); // capacity is NOT the no-recording refusal
+    expect(events.closeInfo.at(-1)).toEqual({ code: 1013, wasClean: false });
+    expect(events.attempts.length).toBe(1); // try-again-later: the backoff runs
+    expect(conn.status).toBe('reconnecting');
+  });
+});
+
 // --- close info / attempt counter / retry-now (reconnect banner surface) ------
 
 describe('Connection — closeInfo, attempts, reconnectNow', () => {
@@ -1046,5 +1101,153 @@ describe('Connection — closeInfo, attempts, reconnectNow', () => {
     // A completed handshake is a completed session attach: the counter zeroes.
     expect(conn.attempts).toBe(0);
     expect(conn.status).toBe('live');
+  });
+});
+
+// --- depth seam honesty (QA3 C-1) --------------------------------------------
+// A session reattach can append a reconstructed block from another grid onto
+// the old session's live columns with a seq→time break. The transport must
+// surface the boundary as a `gap` Marker instead of letting the ring hold two
+// unmarked timelines.
+
+describe('Connection — depth seam markers (QA3 C-1)', () => {
+  const DT = 250_000_000n; // 250 ms, matches buildHello's epoch_params
+
+  /** A depth column with an explicit t0 (buildDepthCol derives t0 from seq). */
+  function buildDepthColAt(epoch: number, colSeq: number, t0: bigint, final = true): Uint8Array {
+    const payload = new Uint8Array(32);
+    const dv = new DataView(payload.buffer);
+    dv.setUint32(0, epoch, true);
+    dv.setUint32(4, colSeq, true);
+    dv.setBigInt64(8, t0, true);
+    dv.setUint8(16, 0); // mode L2
+    dv.setUint8(17, final ? 1 : 0);
+    dv.setUint16(18, 0, true); // pad
+    dv.setUint32(20, 1, true); // n_rows
+    dv.setFloat32(24, 5.0, true);
+    dv.setFloat32(28, 4.0, true);
+    return frameBytes(MsgType.DEPTH_COL, payload, 0);
+  }
+
+  function liveT0(seq: number): bigint {
+    return BigInt(seq) * DT;
+  }
+
+  it('emits one gap Marker at a backward reattach seam, then stops (no spam)', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('crypto', 'ETHUSDT', 'live');
+    h.sockets[0].open();
+    // Attach handshake carries the epoch dt the tracker measures against.
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 100, liveT0(100)));
+    h.sockets[0].deliver(buildDepthColAt(0, 101, liveT0(101)));
+    expect(onStream).toHaveBeenCalledTimes(2); // clean run: columns only
+
+    // Reconstructed block head: wall-time runs BACKWARD ~30 min.
+    const head = liveT0(101) - 1_806_500_000_000n;
+    h.sockets[0].deliver(buildDepthColAt(0, 102, head));
+    expect(onStream).toHaveBeenCalledTimes(4); // column + synthetic marker
+    const forwardedCol = onStream.mock.calls[2][0];
+    const marker = onStream.mock.calls[3][0];
+    expect(forwardedCol.type).toBe(MsgType.DEPTH_COL);
+    expect(forwardedCol.col_seq).toBe(102);
+    expect(marker).toMatchObject({ type: MsgType.MARKER, kind: 'gap', ts_ns: head });
+
+    // The block marches at 3.75 s/col against a 250 ms dt: every step is a
+    // warp, but only the head is news — the tracker must not flood markers.
+    let t0 = head;
+    for (let seq = 103; seq < 140; seq++) {
+      t0 += 3_750_000_000n;
+      h.sockets[0].deliver(buildDepthColAt(0, seq, t0));
+    }
+    expect(onStream).toHaveBeenCalledTimes(4 + (140 - 103)); // columns only
+
+    // Trailing backward seam (block ends ahead, live resumes earlier): fires.
+    const resume = t0 - 9_000_000_000n;
+    h.sockets[0].deliver(buildDepthColAt(0, 140, resume));
+    const trailing = onStream.mock.calls[onStream.mock.calls.length - 1][0];
+    expect(trailing).toMatchObject({ type: MsgType.MARKER, kind: 'gap', ts_ns: resume });
+  });
+
+  it('does NOT mark a warp across an epoch change (a re-anchor is legitimate)', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    h.sockets[0].open();
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 10, liveT0(10)));
+    // A new epoch (new price frame) whose t0 steps by a large but plausible
+    // amount: no marker — the epoch change is announced, not data corruption.
+    h.sockets[0].deliver(coldFrame(MsgType.EPOCH_START, {
+      epoch: 1,
+      epoch_params: { epoch: 1, tick: 0.01, tick_multiple: 5, dt_ns: Number(DT), p0: 100.0, rows: 2048 },
+    }));
+    h.sockets[0].deliver(buildDepthColAt(1, 11, liveT0(11) + 60_000_000_000n));
+    expect(onStream).toHaveBeenCalledTimes(2); // both columns, no marker
+  });
+
+  it('never marks replay streams (a SEEK is a user-steered time jump)', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('crypto', 'BTCUSDT', 'replay');
+    h.sockets[0].open();
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 10, liveT0(10)));
+    h.sockets[0].deliver(buildDepthColAt(0, 11, liveT0(11) - 600_000_000_000n)); // seek back
+    expect(onStream).toHaveBeenCalledTimes(2); // columns only
+  });
+
+  it('a session replacement clears the seam cursor (the new grid starts clean)', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    h.sockets[0].open();
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 50, liveT0(50)));
+    h.sockets[0].deliver(buildDepthColAt(0, 51, liveT0(51)));
+    expect(onStream).toHaveBeenCalledTimes(2);
+    // The sidecar respawned: a new session id, col_seq restarting low with an
+    // unrelated t0 base. Without the reset this FIRST column would measure
+    // against the old cursor and fabricate a seam marker.
+    h.sockets[0].deliver(buildHello('session-B', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 1, 7_000_000_000n));
+    h.sockets[0].deliver(buildDepthColAt(0, 2, 7_250_000_000n));
+    expect(onStream).toHaveBeenCalledTimes(4);
+  });
+
+  it('a subscription switch clears the seam cursor too (no cross-session compare)', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('crypto', 'BTCUSDT', 'live');
+    h.sockets[0].open();
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 50, liveT0(50)));
+    conn.subscribe('sim', 'SIM-DEMO', 'live');
+    h.sockets[0].deliver(buildHello('session-B', 0));
+    // New stream's first column with a wildly different t0 base: first sample,
+    // nothing to compare against — no marker.
+    h.sockets[0].deliver(buildDepthColAt(0, 1, 3_000_000_000n));
+    h.sockets[0].deliver(buildDepthColAt(0, 2, 3_250_000_000n));
+    expect(onStream).toHaveBeenCalledTimes(3); // col + col + col, no marker
+  });
+
+  it('clean cadence with a seq gap (server-owned gap) emits no marker', () => {
+    const h = harness();
+    const onStream = vi.fn();
+    const conn = h.makeConn({ onStream });
+    conn.subscribe('sim', 'SIM-DEMO', 'live');
+    h.sockets[0].open();
+    h.sockets[0].deliver(buildHello('session-A', 0));
+    h.sockets[0].deliver(buildDepthColAt(0, 10, liveT0(10)));
+    // seq jumps 20 columns; t0 advances exactly 20 × dt — consistent, and the
+    // server emits its own gap marker for this case.
+    h.sockets[0].deliver(buildDepthColAt(0, 30, liveT0(30)));
+    expect(onStream).toHaveBeenCalledTimes(2);
   });
 });

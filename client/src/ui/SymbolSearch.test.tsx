@@ -497,3 +497,158 @@ describe('SymbolSearch recents + keyboard navigation', () => {
     expect(input.getAttribute('aria-activedescendant')).toBe('sympal-opt-0');
   });
 });
+
+// --- F18 / QA12 M-5: the preview must survive row-identity churn -------------
+// `rows` is rebuilt whenever the movers or the universe resolves, so every row
+// changes object identity on each such recompute. Keying the preview effect on
+// that identity aborted the in-flight `/api/quote` (request #1 always wasted;
+// BTCUSDT's preview arrived 4-8 s late). These tests pin the keyed keep-alive.
+describe('SymbolSearch preview keep-alive (QA12 M-5)', () => {
+  function type(el: Element, value: string): void {
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+
+  function key(el: Element, k: string): void {
+    act(() => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    });
+  }
+
+  /** Wait past the 160 ms quote debounce (real timers, like the rest of the file). */
+  async function pastDebounce(): Promise<void> {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 220));
+    });
+  }
+
+  it('keeps the in-flight quote alive when the movers answer lands late', async () => {
+    const moversWaiters: Array<() => void> = [];
+    const quoteWaiters: Array<(q: unknown) => void> = [];
+    const aborted: boolean[] = [];
+    let quoteCalls = 0;
+
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/movers')) {
+        // Deferred: the real movers response lands ~1.1 s after open, i.e.
+        // AFTER the first quote request is already in flight.
+        return new Promise((resolve) => {
+          moversWaiters.push(() =>
+            resolve({ ok: true, json: async () => ({ movers: [] }) } as unknown as Response),
+          );
+        });
+      }
+      if (url.includes('/api/quote')) {
+        quoteCalls += 1;
+        const idx = quoteCalls - 1;
+        const signal = (init?.signal ?? null) as AbortSignal | null;
+        signal?.addEventListener('abort', () => {
+          aborted[idx] = true;
+        });
+        return new Promise((resolve) => {
+          quoteWaiters.push((q) =>
+            resolve({ ok: true, json: async () => q } as unknown as Response),
+          );
+        });
+      }
+      if (url.includes('/api/venues')) {
+        return Promise.resolve({ ok: true, json: async () => ({ venues: VENUES }) } as unknown as Response);
+      }
+      if (url.includes('market=all')) {
+        return Promise.resolve({ ok: true, json: async () => ({ symbols: BUNDLED }) } as unknown as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ symbols: [] }) } as unknown as Response);
+    }) as unknown as typeof fetch;
+
+    await open();
+    const input = document.body.querySelector('[data-testid="symbol-search-input"]')!;
+    type(input, 'btc');
+    await settle();
+    expect(quoteCalls).toBe(0); // still inside the debounce window
+
+    await pastDebounce();
+    expect(quoteCalls).toBe(1); // request #1 is in flight...
+
+    // ...when the movers answer lands and rebuilds `rows` (object identity
+    // churn). The in-flight request must NOT be aborted and no second one
+    // issued — one symbol, one request.
+    act(() => {
+      for (const r of moversWaiters) r();
+    });
+    await settle();
+    expect(quoteCalls).toBe(1);
+    expect(aborted[0]).not.toBe(true);
+
+    // The original request resolving paints the preview.
+    act(() => {
+      quoteWaiters[0]?.({ market: 'binance-spot', symbol: 'BTCUSDT', price: 76824, changePct: 1.5, spark: [1, 2] });
+    });
+    await settle();
+    expect(palette().querySelector('.sympal__pv-px')!.textContent).toBe('76,824');
+  });
+
+  it('serves a re-highlighted symbol from the visit memo instead of refetching', async () => {
+    const list = [
+      { market: 'sim', symbol: 'AAA', capability: {} },
+      { market: 'sim', symbol: 'AAB', capability: {} },
+    ];
+    const quoteWaiters = new Map<string, (q: unknown) => void>();
+    let quoteCalls = 0;
+
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/movers')) {
+        return Promise.resolve({ ok: true, json: async () => ({ movers: [] }) } as unknown as Response);
+      }
+      if (url.includes('/api/quote')) {
+        quoteCalls += 1;
+        const symbol = new URL(url, 'http://x').searchParams.get('symbol') ?? '';
+        return new Promise((resolve) => {
+          quoteWaiters.set(symbol, (q) =>
+            resolve({ ok: true, json: async () => q } as unknown as Response),
+          );
+        });
+      }
+      if (url.includes('/api/venues')) {
+        return Promise.resolve({ ok: true, json: async () => ({ venues: VENUES }) } as unknown as Response);
+      }
+      if (url.includes('market=all')) {
+        return Promise.resolve({ ok: true, json: async () => ({ symbols: list }) } as unknown as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ symbols: [] }) } as unknown as Response);
+    }) as unknown as typeof fetch;
+
+    await open();
+    const input = document.body.querySelector('[data-testid="symbol-search-input"]')!;
+    type(input, 'a');
+    await settle();
+    const firstSym = document.body.querySelector('[data-testid="symbol-row"][data-symbol]')!.getAttribute('data-symbol')!;
+    await pastDebounce();
+    expect(quoteCalls).toBe(1);
+    act(() => quoteWaiters.get(firstSym)?.({ market: 'sim', symbol: firstSym, price: 1.5, changePct: 1, spark: [1, 2] }));
+    await settle();
+    expect(palette().querySelector('.sympal__pv-px')!.textContent).toBe('1.50');
+
+    // Move to the second row: a fresh request for the other symbol.
+    key(input, 'ArrowDown');
+    await settle();
+    const secondSym = document.body
+      .querySelectorAll('[data-testid="symbol-row"][data-symbol]')[1]!
+      .getAttribute('data-symbol')!;
+    await pastDebounce();
+    expect(quoteCalls).toBe(2);
+    act(() => quoteWaiters.get(secondSym)?.({ market: 'sim', symbol: secondSym, price: 2.5, changePct: -1, spark: [2, 1] }));
+    await settle();
+    expect(palette().querySelector('.sympal__pv-px')!.textContent).toBe('2.50');
+
+    // Back to the first row: answered from the visit memo, no third request.
+    key(input, 'ArrowUp');
+    await settle();
+    expect(quoteCalls).toBe(2);
+    expect(palette().querySelector('.sympal__pv-px')!.textContent).toBe('1.50');
+  });
+});

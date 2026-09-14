@@ -42,6 +42,7 @@
 
 import type { DepthColumn, HistoryResponse } from '../proto/types';
 import type { ResidentRange } from '../gl/tileRing';
+import { detectDepthSeam, seamGapMarker, seamToleranceNs } from './seam';
 
 /** How close (in columns) the visible left edge must get to the oldest resident
  *  column before a prefetch fires. One viewport-ish margin so data is ready
@@ -93,13 +94,36 @@ export class HistoryLoader {
   private lastError: string | null = null;
   /** Server's oldest retained t0 (from the latest response); 0 until known. */
   private oldestAvailableT0 = 0n;
+  /** Recently emitted synthetic seam t0s (bounded) — suppresses repeats. */
+  private readonly recentSeams: bigint[] = [];
 
   constructor(deps: HistoryLoaderDeps) {
     this.deps = deps;
   }
 
-  /** Record a column's (col_seq, t0_ns) as it enters the ring (live or backfill). */
+  /**
+   * Record a column's (col_seq, t0_ns) as it enters the ring (live or backfill).
+   *
+   * Self-heals a re-anchored seq→time map (QA3 C-1): a session replacement under
+   * the SAME subscription does not run `resetForSession()`, so this loader (and
+   * its ring) survive into the new session — whose grid restarts col_seq on a
+   * fresh t0 base. A `col_seq` that is already cached with a DIFFERENT t0 is the
+   * deterministic signature of that remap; the stale half (before_t anchors,
+   * oldest-known anchor, server bound, exhaustion latch) is derived from the OLD
+   * grid and would corrupt every subsequent history request, so it is pruned and
+   * re-seeded from the live stream.
+   */
   noteColumn(colSeq: number, t0Ns: bigint): void {
+    const known = this.colT0.get(colSeq);
+    if (known !== undefined && known !== t0Ns) {
+      this.colT0.clear();
+      this.oldestKnownSeq = -1;
+      this.oldestKnownT0 = 0n;
+      this.oldestAvailableT0 = 0n;
+      this.startOfHistoryFlag = false;
+      this.lastError = null;
+      this.recentSeams.length = 0;
+    }
     this.colT0.set(colSeq, t0Ns);
     if (this.oldestKnownSeq < 0 || colSeq < this.oldestKnownSeq) {
       this.oldestKnownSeq = colSeq;
@@ -193,6 +217,12 @@ export class HistoryLoader {
         // Nothing older on the server → scroll-back exhausted.
         this.startOfHistoryFlag = true;
       } else {
+        // Honesty (QA3 C-1): a page can belong to a different grid than the
+        // resident window (reconstructed/backfilled pages, a session
+        // replacement) and splice in with a seq→time break. Surface it as a
+        // gap Marker — the renderer forwards `resp.markers` to the overlay
+        // manager — instead of silently concatenating two timelines.
+        this.markSeams(resp, cols);
         for (const col of cols) {
           this.noteColumn(col.col_seq, col.t0_ns);
           this.deps.spliceColumn(col);
@@ -215,6 +245,100 @@ export class HistoryLoader {
     } finally {
       this.inFlightBeforeT = null;
     }
+  }
+
+  /**
+   * Append synthetic `gap` Markers to a page about to be spliced when the page
+   * cannot be one continuous timeline with the resident window (QA3 C-1).
+   *
+   * Two boundaries are checked:
+   *  1. inside the page — consecutive columns must march forward at the epoch
+   *     cadence. Only the FIRST inconsistent pair of a run is reported: a
+   *     reconstructed page is uniformly warped (one marker at its head is the
+   *     honest report, not 256).
+   *  2. page ↔ resident anchor — the newest page column's t0 must sit
+   *     `(anchorSeq − pageSeq) × dt` below the resident oldest's t0. A mismatch
+   *     means the page and the ring span different grids; the marker lands at
+   *     the resumption side (the anchor), where the chart shows the jump.
+   *
+   * Markers already present on the response (the server's own gap markers) and
+   * recently emitted seams are not duplicated.
+   */
+  private markSeams(resp: HistoryResponse, cols: DepthColumn[]): void {
+    const dtRaw = this.deps.dtNs();
+    const dtNs = Number.isFinite(dtRaw) && dtRaw > 0 ? BigInt(Math.round(dtRaw)) : null;
+    const tol = seamToleranceNs(dtNs);
+    const found: { ts: bigint; text: string }[] = [];
+
+    let runConsistent = true;
+    for (let i = 1; i < cols.length; i++) {
+      const prev = cols[i - 1];
+      const next = cols[i];
+      if (next.col_seq <= prev.col_seq) continue;
+      const verdict = detectDepthSeam(prev, next, dtNs);
+      if (verdict === null) {
+        runConsistent = true;
+        continue;
+      }
+      if (runConsistent || verdict.kind === 'backward') {
+        found.push({
+          ts: next.t0_ns,
+          text:
+            verdict.kind === 'backward'
+              ? 'history page seam (time went backward)'
+              : 'history page seam (cadence break)',
+        });
+      }
+      runConsistent = false;
+    }
+
+    const range = this.deps.residentRange();
+    if (range !== null && dtNs !== null) {
+      const anchorT0 = this.colT0.get(range.oldest);
+      const newest = cols[cols.length - 1];
+      if (anchorT0 !== undefined && newest.col_seq < range.oldest) {
+        const expected = anchorT0 - BigInt(range.oldest - newest.col_seq) * dtNs;
+        const delta = newest.t0_ns - expected;
+        const dev = delta > 0n ? delta : -delta;
+        if (dev > tol) {
+          found.push({ ts: anchorT0, text: 'history seam (page grid mismatch)' });
+        }
+      }
+    }
+
+    for (const seam of found) {
+      if (this.seamRecentlyReported(seam.ts, dtNs)) continue;
+      if (this.hasServerGapNear(resp, seam.ts, dtNs)) continue;
+      resp.markers.push(seamGapMarker(seam.ts, seam.text));
+      this.recentSeams.push(seam.ts);
+      if (this.recentSeams.length > 8) this.recentSeams.shift();
+    }
+  }
+
+  /** Dedupe window: wide enough to collapse the two sides of one gap. */
+  private seamDedupeNs(dtNs: bigint | null): bigint {
+    const fromDt = dtNs !== null && dtNs > 0n ? dtNs * 64n : 0n;
+    const floor = 30_000_000_000n; // 30 s
+    return fromDt > floor ? fromDt : floor;
+  }
+
+  private seamRecentlyReported(tsNs: bigint, dtNs: bigint | null): boolean {
+    const win = this.seamDedupeNs(dtNs);
+    for (const seen of this.recentSeams) {
+      const d = seen > tsNs ? seen - tsNs : tsNs - seen;
+      if (d <= win) return true;
+    }
+    return false;
+  }
+
+  private hasServerGapNear(resp: HistoryResponse, tsNs: bigint, dtNs: bigint | null): boolean {
+    const win = this.seamDedupeNs(dtNs);
+    for (const m of resp.markers) {
+      if (m.kind !== 'gap') continue;
+      const d = m.ts_ns > tsNs ? m.ts_ns - tsNs : tsNs - m.ts_ns;
+      if (d <= win) return true;
+    }
+    return false;
   }
 
   /**

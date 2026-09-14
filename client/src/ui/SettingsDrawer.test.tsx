@@ -8,6 +8,7 @@ import { resetIndicatorStoreForTest } from '../indicators/store';
 import { setLocale } from '../i18n';
 import { setTheme, THEME_IDS } from '../theme';
 import { closeOnboarding, isOnboardingOpen } from './OnboardingCard';
+import { pushOverlay } from './overlayStack';
 import { SettingsDrawer } from './SettingsDrawer';
 import { DEFAULT_SETTINGS, type FlowMapSettings } from './settings';
 
@@ -397,5 +398,50 @@ describe('SettingsDrawer alert sound (P3)', () => {
     expect(toggle.getAttribute('aria-checked')).toBe('false');
     click(toggle);
     expect(patches).toEqual([{ alertSound: true }]);
+  });
+});
+
+describe('SettingsDrawer escape ordering (QA12 M-1)', () => {
+  const esc = (): KeyboardEvent =>
+    new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+
+  it('an Escape already consumed by a React handler (defaultPrevented) never closes the drawer', () => {
+    // The symbol palette closes itself inside its own React keydown handler and
+    // preventDefaults the keystroke; by the time this window listener runs, the
+    // palette's registry entry is already gone. Only the flag proves the
+    // keystroke was consumed — otherwise the drawer would close a SECOND
+    // surface on one Escape.
+    let closes = 0;
+    render(<SettingsDrawer settings={settings()} onChange={() => {}} onClose={() => { closes += 1; }} />);
+
+    const consumed = esc();
+    consumed.preventDefault();
+    act(() => {
+      window.dispatchEvent(consumed);
+    });
+    expect(closes).toBe(0);
+
+    // A plain Escape (nothing consumed it, drawer is stack-top) still closes.
+    act(() => {
+      window.dispatchEvent(esc());
+    });
+    expect(closes).toBe(1);
+  });
+
+  it('defers to a later-pushed overlay (stack top) and takes Escape back when it pops', () => {
+    let closes = 0;
+    render(<SettingsDrawer settings={settings()} onChange={() => {}} onClose={() => { closes += 1; }} />);
+
+    const off = pushOverlay('palette');
+    act(() => {
+      window.dispatchEvent(esc());
+    });
+    expect(closes).toBe(0); // the palette sits above the drawer
+
+    off();
+    act(() => {
+      window.dispatchEvent(esc());
+    });
+    expect(closes).toBe(1);
   });
 });

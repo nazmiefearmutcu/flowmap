@@ -12,6 +12,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App';
+import { bookStore } from './state/bookStore';
 import { setFlowMapTransport, useFlowMapStore } from './state/store';
 import type { SocketLike } from './net/connection';
 import { resetDrawingsForTest } from './drawings/store';
@@ -33,6 +34,13 @@ class FakeWebSocket implements SocketLike {
   send(): void {}
   close(): void {
     this.onclose?.();
+  }
+  /** Server-side drop with the CloseEvent code (e.g. the 1003 replay refusal). */
+  drop(code?: number): void {
+    this.onclose?.({ code });
+  }
+  open(): void {
+    this.onopen?.();
   }
 }
 
@@ -226,5 +234,66 @@ describe('App integration smoke', () => {
     const skip = container.querySelector('[data-testid="onboarding-skip"]');
     if (skip) click(skip);
     expect(window.localStorage.getItem('flowmap.onboarded')).toBe('1');
+  });
+});
+
+describe('App — refused-replay fallback + explicit session identity (QA7 H1/H2)', () => {
+  it('re-runs the symbol-switch reset when a refused replay falls back to LIVE (QA7 H1)', () => {
+    mountApp(); // jsdom: gl-fallback path, but the reset effect is the same
+    const spy = vi.spyOn(bookStore, 'resetForSession');
+    // Subscribe replay on the shared connection, then let the server refuse it
+    // with the unsupported close (1003) exactly as ws.py does.
+    act(() => {
+      useFlowMapStore.getState().connectAndSubscribe('crypto', 'BTCUSDT', 'replay');
+    });
+    const sock = sockets[sockets.length - 1];
+    act(() => sock.open());
+    // The market switch above legitimately reset; the FALLBACK is what we pin:
+    // it re-subscribes the SAME instrument, so only the store's sessionRevision
+    // can tell the App a new server session began under the unchanged key.
+    spy.mockClear();
+    act(() => sock.drop(1003));
+    expect(useFlowMapStore.getState().subscription?.mode).toBe('live');
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
+  it('mode toggle keeps the CURRENT band — it must not drag the drawer band (QA7 H1)', () => {
+    const { container } = mountApp();
+    // A session on 'native' while the persisted drawer default is 'deep' (the
+    // QA7 harness shape). The replay button renders only when the server says
+    // replay exists.
+    act(() => {
+      useFlowMapStore.setState({
+        capability: { replay: true },
+        subscription: { market: 'crypto', symbol: 'BTCUSDT', mode: 'live', band: 'native' },
+      });
+    });
+    click(container.querySelector('[data-testid="mode-replay"]')!);
+    // The mode changed; the GRID did not. Dragging settings.priceBand ('deep')
+    // along re-subscribed a different grid — the pancaked-scale repro.
+    expect(useFlowMapStore.getState().subscription).toEqual({
+      market: 'crypto',
+      symbol: 'BTCUSDT',
+      mode: 'replay',
+      band: 'native',
+    });
+  });
+
+  it('mode toggle with no subscription is a no-op — never substitutes the demo stream (QA7 H2)', () => {
+    const { container } = mountApp();
+    act(() => {
+      useFlowMapStore.getState().disconnect();
+    });
+    expect(useFlowMapStore.getState().subscription).toBeNull();
+    const socketsBefore = sockets.length;
+
+    click(container.querySelector('[data-testid="mode-live"]')!);
+
+    // Explicit-only identity: with nothing subscribed there is no stream to
+    // switch modes on; the old `?? SIM_MARKET` fallback silently made the user's
+    // live symbol sim:SIM-DEMO.
+    expect(useFlowMapStore.getState().subscription).toBeNull();
+    expect(sockets.length).toBe(socketsBefore);
   });
 });

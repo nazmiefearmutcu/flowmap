@@ -43,7 +43,7 @@ import { Timeline } from './ui/Timeline';
 import { Toaster } from './ui/Toaster';
 import { TopBar } from './ui/TopBar';
 import { Watchlist } from './ui/Watchlist';
-import { runPngExport } from './ui/exportPng';
+import { collectExportLayers, exportProvenanceNotes, runPngExport } from './ui/exportPng';
 import type { SymbolSearchHandle } from './ui/SymbolSearch';
 import {
   DEPTH_CHANNELS,
@@ -381,14 +381,14 @@ export function App() {
       // follows.
       if (settings.priceBand !== prevSettingsRef.current.priceBand) {
         const sub = useFlowMapStore.getState().subscription;
-        useFlowMapStore
-          .getState()
-          .connectAndSubscribe(
-            sub?.market ?? SIM_MARKET,
-            sub?.symbol ?? SIM_SYMBOL,
-            sub?.mode ?? 'live',
-            settings.priceBand,
-          );
+        // QA7 H2 (explicit-only identity): a band change re-grids the ACTIVE
+        // stream. With none there is nothing to re-grid — substituting the demo
+        // default here would be a silent session-identity change.
+        if (sub) {
+          useFlowMapStore
+            .getState()
+            .connectAndSubscribe(sub.market, sub.symbol, sub.mode, settings.priceBand);
+        }
       }
       if (settings.followPrice !== prevSettingsRef.current.followPrice) {
         const wantOn = settings.followPrice;
@@ -451,16 +451,24 @@ export function App() {
   // starts empty.
   const subscription = useFlowMapStore((s) => s.subscription);
   const subKey = sessionResetKey(subscription);
+  // QA7 H1: a refused replay falls back to LIVE on the SAME market:symbol:band,
+  // so `subKey` alone does not change and the reset below would not run — the
+  // renderer would keep the dead session's ring + camera while the replacement
+  // session's columns arrive, leaving the price scale stuck on the epoch's
+  // nominal extent. `sessionRevision` marks that fallback; folding it into the
+  // effect key runs the EXACT teardown + re-arm a symbol switch performs.
+  const sessionRevision = useFlowMapStore((s) => s.sessionRevision);
+  const resetKey = subKey === null ? null : `${subKey}#${sessionRevision}`;
   const prevSubKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (subKey === null) return;
+    if (resetKey === null) return;
     const prev = prevSubKeyRef.current;
-    prevSubKeyRef.current = subKey;
+    prevSubKeyRef.current = resetKey;
     // Skip the first subscription (nothing to reset) and any no-op re-run.
-    if (prev === null || prev === subKey) return;
+    if (prev === null || prev === resetKey) return;
     rendererRef.current?.resetForSession();
     bookStore.resetForSession();
-  }, [subKey]);
+  }, [resetKey]);
 
   // The reset above fires when we ASK for a new symbol; frames for the old one
   // are still in flight and land in the freshly-cleared buffers. On a liquid
@@ -632,11 +640,18 @@ export function App() {
 
   const onSetMode = useCallback((mode: StreamMode) => {
     const sub = useFlowMapStore.getState().subscription;
-    const market = sub?.market ?? SIM_MARKET;
-    const symbol = sub?.symbol ?? SIM_SYMBOL;
-    useFlowMapStore
-      .getState()
-      .connectAndSubscribe(market, symbol, mode, settingsRef.current.priceBand);
+    // QA7 H2 (explicit-only identity): the mode toggle acts on the stream the
+    // app already owns. With no subscription there is nothing to switch — the
+    // old `?? SIM_MARKET` fallback silently replaced the user's live symbol
+    // with sim:SIM-DEMO in any race where the subscription read null.
+    if (!sub) return;
+    // QA7 H1: a mode toggle is a MODE change on the CURRENT grid, so the band
+    // must ride along from the subscription, never from the drawer default. The
+    // old `settingsRef.current.priceBand` re-gridded the stream whenever they
+    // diverged (e.g. settings 'deep' + a session on 'native'), and the deep
+    // band's auto-fit frames the whole ±50% band — exactly the pancaked scale
+    // QA7 measured right after clicking REPLAY.
+    useFlowMapStore.getState().connectAndSubscribe(sub.market, sub.symbol, mode, sub.band);
   }, []);
 
   // GO LIVE routes through App (not straight to the renderer) so it also re-arms
@@ -724,17 +739,30 @@ export function App() {
   );
 
   // PNG export (top-bar button AND the bare `E` key route through this one
-  // handler): snapshot the renderer synchronously, download on success, and on
-  // a null snapshot (lost GL context) show the TopBar's dismissible note —
-  // never a fake success. The subscription is read at call time so the filename
-  // always names what is on screen right now.
+  // handler): F11 (QA13 H1+H2) composes the download from ALL chart layers —
+  // GL heat + 2D ink + both gutters + legend chips + provenance footer —
+  // `collectExportLayers` forces the fresh frame through `snapshot()` and gates
+  // the honest null (lost GL context); on null, show the TopBar's dismissible
+  // note — never a fake success. State is read at call time so the filename and
+  // the caveats always describe what is on screen right now.
   const exportPng = useCallback(() => {
-    const sub = useFlowMapStore.getState().subscription;
+    const { subscription: sub, capability } = useFlowMapStore.getState();
+    const renderer = rendererRef.current;
     const filename = runPngExport(
-      rendererRef.current?.snapshot() ?? null,
+      collectExportLayers(renderer, document),
       sub?.market ?? SIM_MARKET,
       sub?.symbol ?? SIM_SYMBOL,
       new Date(),
+      undefined,
+      {
+        mode: sub?.mode ?? 'live',
+        notes: exportProvenanceNotes({ following: renderer?.following ?? null, mode: sub?.mode, capability }),
+        legend: {
+          colormap: settingsRef.current.colormap,
+          synth: typeof capability?.depth === 'string' && capability.depth.startsWith('SYNTH'),
+          tier: typeof capability?.depth === 'string' ? capability.depth : undefined,
+        },
+      },
     );
     setExportNotice(
       filename

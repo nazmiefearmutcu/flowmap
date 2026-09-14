@@ -28,6 +28,7 @@
  */
 
 import { decodeFrame } from '../proto/decode';
+import { seamGapMarker, SeamTracker } from './seam';
 import { wsUrl } from './serverBase';
 import {
   encodeHistoryRequest,
@@ -241,6 +242,15 @@ export class Connection {
   /** Latest col_seq forwarded per epoch — the (epoch, col_seq) dedup cursor. */
   private readonly lastColSeq = new Map<number, number>();
   private readonly epochMap = new Map<number, EpochParams>();
+  /**
+   * Depth-stream seam observer (QA3 C-1): a session reattach can append a
+   * reconstructed block from another grid onto the old session's live columns
+   * with a seq→time break and no marker. The tracker spots the boundary and
+   * {@link noteDepthSeam} surfaces it as a synthetic `gap` Marker on the same
+   * stream the renderer already consumes. Session-scoped: cleared wherever the
+   * dedup cursor is (subscription change / Hello with a new session id).
+   */
+  private readonly depthSeams = new SeamTracker();
 
   private nextReqId = 1;
   private readonly historyWaiters = new Map<number, HistoryWaiter>();
@@ -353,6 +363,7 @@ export class Connection {
   private resetSessionState(): void {
     this.lastColSeq.clear();
     this.epochMap.clear();
+    this.depthSeams.reset();
     this.sessionId = null;
     this.lastStatusFeedState = null; // the refused stream's verdict dies with it
     this.failHistoryWaiters(
@@ -667,6 +678,7 @@ export class Connection {
         // forwarded re-delivery overwrites idempotently.
         if (this.isDuplicateFinalizedDepth(msg)) return;
         this.handlers.onStream?.(msg);
+        this.noteDepthSeam(msg);
         return;
       case MsgType.BAR_COL:
         // BarColumn has no `final` flag; forming + final + reconnect all resolve
@@ -702,6 +714,7 @@ export class Connection {
     if (this.sessionId !== null && this.sessionId !== hello.session_id) {
       this.lastColSeq.clear();
       this.epochMap.clear();
+      this.depthSeams.reset();
       this.failHistoryWaiters(
         new Error('flowmap: history request abandoned — server session changed'),
       );
@@ -719,6 +732,27 @@ export class Connection {
     if (last !== undefined && msg.col_seq <= last) return true; // reconnect re-send
     this.lastColSeq.set(msg.epoch, msg.col_seq);
     return false;
+  }
+
+  /**
+   * QA3 C-1 honesty: after forwarding an accepted depth column, check the step
+   * against the previous one. A seq→time break (time running BACKWARD, or a
+   * cadence that disagrees with the epoch's dt) means the ring is about to hold
+   * two grids — surface a synthetic `gap` Marker on the same stream instead of
+   * letting the seam appear unmarked.
+   *
+   * Replay sessions are excluded: SEEK is a user-steered time jump by design,
+   * so marking it would be dishonest noise.
+   */
+  private noteDepthSeam(msg: DepthColumn): void {
+    if (this.desiredSub?.mode === 'replay') return;
+    const dt = this.epochMap.get(msg.epoch)?.dt_ns;
+    const dtNs = typeof dt === 'number' && Number.isFinite(dt) && dt > 0 ? BigInt(Math.round(dt)) : null;
+    const verdict = this.depthSeams.observe(msg, dtNs);
+    if (verdict === null) return;
+    const text =
+      verdict.kind === 'backward' ? 'history seam (time went backward)' : 'history seam (cadence break)';
+    this.handlers.onStream?.(seamGapMarker(msg.t0_ns, text));
   }
 
   private sendPong(ping: Ping): void {

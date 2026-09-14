@@ -14,6 +14,12 @@
   gap: var(--sp-2);
 }
 
+/* Rail title scale: DOM/T&S titles render at 11px (their .panel__collapse sets
+   it); this bare title inherited 12px — one rail, one title scale. */
+.watchlist__header .panel__title {
+  font-size: var(--fs-sm);
+}
+
 .watchlist__count {
   font-variant-numeric: tabular-nums;
 }
@@ -99,7 +105,10 @@
 
 .watchlist__sym {
   flex: 1 1 auto;
-  min-width: 0;
+  /* Hard floor: the label carries the row's identity and must NEVER be starved
+     to 0px by the fixed price/change/chip columns — a full base symbol stays
+     readable at the default 260px rail (flex-grow takes any slack). */
+  min-width: 52px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -112,13 +121,26 @@
 }
 
 .watchlist__spark {
-  flex: 0 0 auto;
+  /* Shrinkable: when the row squeezes, the label keeps its floor and the
+     spark narrows first (down to a legible 24px stub). */
+  flex: 0 1 auto;
+  min-width: 24px;
+  width: 40px;
   display: block;
+}
+
+/* No spark to draw (quote absent) or a data-quality state: suppress the glyph
+   so the identity/price/chip trio owns the row — an empty 64px slot is what
+   crushed the label in the first place. */
+.watchlist__spark:empty,
+.watchlist__row.is-stale .watchlist__spark,
+.watchlist__row.is-unreachable .watchlist__spark {
+  display: none;
 }
 
 .watchlist__spark-path {
   fill: none;
-  stroke-width: 1.25;
+  stroke-width: 1.6; /* 64-unit viewBox rendered at 40px → ~1px ink */
   stroke-linejoin: round;
   stroke-linecap: round;
 }
@@ -170,8 +192,19 @@
   color: var(--text-3);
 }
 
+/* Unreachable: the chip already states "no data" — the twin em-dash change
+   cell is redundant noise and is the column that starved the symbol. */
+.watchlist__row.is-unreachable .watchlist__chg {
+  display: none;
+}
+
 .watchlist__chip {
-  flex: 0 0 auto;
+  /* Shrinkable + truncatable: never let a status chip collapse the label. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--fs-2xs);
   letter-spacing: 0.05em;
   text-transform: uppercase;

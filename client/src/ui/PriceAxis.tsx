@@ -29,7 +29,7 @@
  *     (no callback) it falls back to driving the renderer directly.
  */
 
-import { useEffect, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 
 import type { PriceFollow } from '../gl/camera';
 import type { Renderer } from '../gl/renderer';
@@ -37,6 +37,11 @@ import type { Renderer } from '../gl/renderer';
 /** Poll interval (ms) for the chip's state. Short: the chip must not visibly lag
  *  the gesture that changed it (a wheel over the gutter changes it instantly). */
 const POLL_MS = 100;
+
+/** Minimum gap between two gutter rebinds (ms). A rebind re-runs the App's
+ *  attach path (fresh TextLayer wrapper + gesture handlers) and re-dirties the
+ *  frame, so a persistent box mismatch must not thrash it every poll tick. */
+const HEAL_COOLDOWN_MS = 1000;
 
 /** Chip text per mode. Decorative — the accessible name is static (see below). */
 const CHIP_TEXT: Record<PriceFollow, string> = {
@@ -52,6 +57,22 @@ const CHIP_TEXT: Record<PriceFollow, string> = {
  */
 type RendererCp1 = Renderer & { readonly liveEdgeVisible?: boolean };
 
+/**
+ * QA9-1 heal surface. `overlays` is TS-private on the Renderer, so this is a
+ * STANDALONE structural view (casting) rather than an intersection — a
+ * `Renderer & { overlays }` intersection collapses to `never` (private member
+ * in one constituent, public in the other). `syncGutters` is the manager's
+ * public re-match primitive; it stays optional so the heal degrades to a
+ * rebind + redirty on a build without it.
+ */
+type AxisHealView = {
+  attachOverlaySurfaces: (price: HTMLCanvasElement | null, time: HTMLCanvasElement | null) => void;
+  overlays?: {
+    readonly timeAxis?: { readonly canvas: HTMLCanvasElement } | null;
+    syncGutters?: (dpr: number) => boolean;
+  } | null;
+};
+
 interface PriceAxisProps {
   canvasRef: RefObject<HTMLCanvasElement>;
   rendererRef: RefObject<Renderer | null>;
@@ -63,6 +84,56 @@ interface PriceAxisProps {
 export function PriceAxis({ canvasRef, rendererRef, onSetPriceFollow }: PriceAxisProps): JSX.Element {
   const [mode, setMode] = useState<PriceFollow>('fit');
   const [edgeVisible, setEdgeVisible] = useState(true);
+  const healedAtRef = useRef(0);
+
+  /**
+   * QA9-1: keep the LIVE canvas bound to the renderer and its backing store
+   * matched to the on-screen box — WITHOUT waiting for a window resize.
+   *
+   * Two failure shapes this closes: (a) a fresh boot whose first frames landed
+   * before layout froze the bitmap at the browser default 300×150, leaving the
+   * gutter with no tick labels and no last-price pill until something forced a
+   * frame; (b) a hot remount replaced the canvas ELEMENT while the App's
+   * mount-only `attachOverlaySurfaces` still holds the old (detached) node, so
+   * the on-screen canvas never receives another sync. A rebind points the
+   * manager at the live element again and re-dirties the renderer; the
+   * manager's `syncGutters` re-matches the bitmap immediately, so the next ink
+   * lands on the right grid even before the next data-driven frame.
+   */
+  const healAxis = useCallback((): void => {
+    const r = rendererRef.current as unknown as AxisHealView | null;
+    const c = canvasRef.current;
+    if (r === null || c === null || typeof r.attachOverlaySurfaces !== 'function') return;
+    const cw = c.clientWidth;
+    const ch = c.clientHeight;
+    if (cw <= 0 || ch <= 0) return; // pre-layout / hidden: nothing to match yet
+    const dpr = window.devicePixelRatio || 1;
+    const wantW = Math.max(1, Math.round(cw * dpr));
+    const wantH = Math.max(1, Math.round(ch * dpr));
+    if (c.width === wantW && c.height === wantH) return; // already in sync
+    const now = Date.now();
+    if (now - healedAtRef.current < HEAL_COOLDOWN_MS) return;
+    healedAtRef.current = now;
+    // Rebind (same element → fresh wrapper; replaced element → live again) and
+    // redirty through the public attach API, then re-size the 2D backing store
+    // immediately (requestAnimationFrame may be starved under CPU load; the
+    // bitmap fix must not wait for it).
+    const timeCanvas = r.overlays?.timeAxis?.canvas ?? null;
+    r.attachOverlaySurfaces(c, timeCanvas);
+    r.overlays?.syncGutters?.(dpr);
+  }, [canvasRef, rendererRef]);
+
+  // Callback ref: React hands us the element on mount AND on any replacement,
+  // and the App-owned RefObject keeps its previous meaning for every other
+  // consumer (mount attach, e2e hooks). A replacement heals immediately when
+  // the renderer already exists (the detached-node case).
+  const bindCanvas = useCallback(
+    (el: HTMLCanvasElement | null): void => {
+      (canvasRef as { current: HTMLCanvasElement | null }).current = el;
+      if (el !== null && rendererRef.current !== null) healAxis();
+    },
+    [canvasRef, rendererRef, healAxis],
+  );
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -71,9 +142,10 @@ export function PriceAxis({ canvasRef, rendererRef, onSetPriceFollow }: PriceAxi
       setMode((m) => (m === r.priceFollow ? m : r.priceFollow));
       const edge = r.liveEdgeVisible !== false;
       setEdgeVisible((e) => (e === edge ? e : edge));
+      healAxis();
     }, POLL_MS);
     return () => window.clearInterval(id);
-  }, [rendererRef]);
+  }, [rendererRef, healAxis]);
 
   const onToggle = (): void => {
     const r = rendererRef.current;
@@ -93,8 +165,9 @@ export function PriceAxis({ canvasRef, rendererRef, onSetPriceFollow }: PriceAxi
   return (
     <div className="price-axis">
       {/* aria-hidden lives on the CANVAS, not the wrapper: an interactive button
-          must never sit inside an aria-hidden subtree. */}
-      <canvas ref={canvasRef} className="axis-canvas" aria-hidden="true" />
+          must never sit inside an aria-hidden subtree. The callback ref keeps
+          the App-owned RefObject in sync (see bindCanvas). */}
+      <canvas ref={bindCanvas} className="axis-canvas" aria-hidden="true" />
       <button
         type="button"
         className={`axis-auto${on ? ' is-on' : ''}`}

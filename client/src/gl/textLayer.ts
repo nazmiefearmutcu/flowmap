@@ -109,13 +109,21 @@ export class TextLayer {
   }
 
   /**
-   * Snap a CSS-px coordinate onto the center of the nearest DEVICE pixel — the
-   * condition for a 1px stroke to rasterize on one device-pixel row/column
-   * instead of straddling two (the fuzzy-gridline effect at fractional
-   * positions, worst at DPR 1 where the grid is coarsest).
+   * Snap a CSS-px coordinate so an axis-aligned hairline of CSS width `width`
+   * rasterizes with BOTH stroke edges on device-pixel boundaries — the
+   * condition for the stroke to cover whole device pixels instead of straddling
+   * with 50% edge alpha:
+   *   - odd device width (1 device px at DPR 1, 3 at DPR 3) → center on a device
+   *     pixel CENTER: one crisp row/column, exactly the old DPR1 behavior;
+   *   - even device width (1 CSS px at DPR 2 = 2 device px) → center on a device
+   *     pixel BOUNDARY: two full rows/columns instead of the `0.5/1/0.5` smear
+   *     that pixel-center snapping produces for even widths (QA10 M1).
+   * The edges land at `round(v·dpr − dw/2)` and `+ dw` — both integers whenever
+   * the device width `dw` is an integer, for every DPR.
    */
-  private snap1(v: number): number {
-    return (Math.round(v * this.dpr - 0.5) + 0.5) / this.dpr;
+  private snapStroke(v: number, width: number): number {
+    const dw = width * this.dpr;
+    return (Math.round(v * this.dpr - dw / 2) + dw / 2) / this.dpr;
   }
 
   /** Clear the whole layer (call once at the start of a dirty frame). */
@@ -220,8 +228,9 @@ export class TextLayer {
   }
 
   /** A dashed 1px line (the last-price level marker across the chart). A
-   *  horizontal run at hairline width snaps to the device-pixel grid so the
-   *  dashes stay crisp; thicker or sloped runs keep anti-aliased placement. */
+   *  horizontal run at hairline width snaps its constant axis to the device
+   *  stroke grid (see {@link snapStroke}) so the dashes stay crisp; thicker or
+   *  sloped runs keep anti-aliased placement. */
   dashedLine(x0: number, y0: number, x1: number, y1: number, color: string, dash: number[] = [4, 4], width = 1): void {
     const ctx = this.ctx;
     ctx.save();
@@ -230,7 +239,7 @@ export class TextLayer {
     ctx.setLineDash(dash);
     ctx.beginPath();
     if (width <= 1 && y0 === y1) {
-      const y = this.snap1(y0);
+      const y = this.snapStroke(y0, width);
       ctx.moveTo(x0, y);
       ctx.lineTo(x1, y);
     } else {
@@ -242,14 +251,16 @@ export class TextLayer {
   }
 
   /** A thin 1px CSS-px line (axis ticks / rules on the text layer). Axis-aligned
-   *  hairlines snap onto the device-pixel grid — a 1px stroke drawn at a
-   *  fractional coordinate covers two physical pixel rows at 50% alpha each,
-   *  which is exactly why unaligned gridlines look fuzzy (worst at DPR 1).
-   *  Snapping only the CONSTANT axis of an axis-aligned run keeps every other
-   *  shape's anti-aliasing untouched. `alpha` (default 1) is for chrome that
-   *  must read quieter than the labels it serves — e.g. the axis tick marks,
-   *  which are deliberately dimmer than the tick text (§9 Bookmap-class axis:
-   *  the ladder data is the ink, the ticks are guides). */
+   *  hairlines snap their constant axis onto the device STROKE grid — a 1px
+   *  stroke drawn at a fractional coordinate covers two physical rows at 50%
+   *  alpha each, and at DPR 2 the pixel-center convention smears it over THREE
+   *  rows (0.5/1/0.5) — see {@link snapStroke}: odd device widths center on a
+   *  device pixel, even widths land on a device boundary (2 clean device px at
+   *  DPR 2). Snapping only the CONSTANT axis of an axis-aligned run keeps every
+   *  other shape's anti-aliasing untouched. `alpha` (default 1) is for chrome
+   *  that must read quieter than the labels it serves — e.g. the axis tick
+   *  marks, which are deliberately dimmer than the tick text (§9 Bookmap-class
+   *  axis: the ladder data is the ink, the ticks are guides). */
   line(x0: number, y0: number, x1: number, y1: number, color: string, width = 1, alpha = 1): void {
     const ctx = this.ctx;
     ctx.save();
@@ -259,11 +270,11 @@ export class TextLayer {
     ctx.beginPath();
     if (width <= 1 && (y0 === y1 || x0 === x1)) {
       if (y0 === y1) {
-        const y = this.snap1(y0);
+        const y = this.snapStroke(y0, width);
         ctx.moveTo(x0, y);
         ctx.lineTo(x1, y);
       } else {
-        const x = this.snap1(x0);
+        const x = this.snapStroke(x0, width);
         ctx.moveTo(x, y0);
         ctx.lineTo(x, y1);
       }

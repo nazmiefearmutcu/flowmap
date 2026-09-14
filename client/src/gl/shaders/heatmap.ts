@@ -106,6 +106,20 @@ uniform float u_lowSpan;
 uniform float u_floor;
 uniform float u_floorScale;
 
+// Per-REGION black point (lane F17; D5 lever L1). Reconstructed (stretched
+// 1 m-candle) columns carry a different density scale from the live book —
+// measured recon/live ≈ 0.5× on BTC but ≈26× on ETH — so ONE global floor is
+// calibrated for at most one regime and the dim side reads as background. The
+// mask below tags each ring slot as live (0) or reconstructed (1); tagged
+// columns use u_floorRecon / u_floorScaleRecon (a RELATIVE cut of the live
+// floor — same t-space, same row-footprint scaling) while LIVE columns keep
+// the exact shipped u_floor / u_floorScale pair. With no tagged columns the
+// mask is all zero and every fragment takes the live branch, so live pixels
+// stay byte-identical by construction.
+uniform highp sampler2DArray u_region; // RGBA8, 1 row: r > 0.5 = reconstructed
+uniform float u_floorRecon;
+uniform float u_floorScaleRecon;
+
 // Colormap row: 0 = inferno (default), 1 = synth (amber), 2 = classic thermal.
 uniform int u_ramp;
 
@@ -178,12 +192,16 @@ uniform int u_smoothTaps;
 uniform float u_smoothOffsets[9];
 uniform float u_smoothWeights[9];
 
-// Vertical softening offset in ROW units (barcode fix 2026-09-13, CPU:
-// rowSmoothDyFor). ~0 = single-sample legacy path; > 0 blends a 0.25/0.5/0.25
-// vertical triple around each sample so single-row liquidity reads as a soft
-// band instead of a hard hairline (the owner's default-look complaint). The
-// offset scales with the row footprint, so the softening is ~constant in
-// screen pixels.
+// Vertical softening offset in ROW units (barcode fix 2026-09-13; wave-2
+// 2026-09-14 pixel-denominated + active at every zoom, CPU: rowSmoothDyFor).
+// ~0 = single-sample legacy path (only a poisoned view); > 0 blends a
+// 0.25/0.5/0.25 vertical triple at ±dy rows around each sample so single-row
+// liquidity reads as a soft band instead of a hard hairline (the owner's
+// default-look complaint). The offset scales with the row footprint
+// (dy = sigma_px * rowsPerPixel), so the band stays ~constant in SCREEN
+// pixels at every zoom — including the rpp ~3 DEFAULT. Read by BOTH the
+// level-0 field (fieldAt) and the deep-row mip fetch (rowMipSoft, where the
+// draw's conversion is dy/4 mip texels).
 uniform float u_rowSmoothDy;
 
 // Deep-row softening (barcode fix 2026-09-13, CPU: rowMipSoftenFor +
@@ -255,6 +273,23 @@ vec2 fetchRowMipGauss(int x, int layer, float yMip) {
   }
   vec2 keep = clamp(1.0 - 2.0 * neighborMax / max(center, vec2(1e-6)), 0.0, 1.0);
   return mix(acc, center, keep);
+}
+
+// Deep-row barcode killer, wave 2 (2026-09-14): the SAME pixel-denominated
+// vertical triple the level-0 field uses (u_rowSmoothDy, CPU: rowSmoothDyFor),
+// applied to the deep-row Gaussian. dyMip = u_rowSmoothDy * 0.25 converts the
+// row-unit offset to 4-row mip texels. The center evaluation keeps the
+// wall-preserving texel (fetchRowMipGauss' edge-aware keep), so an isolated
+// single-level spike becomes a ~4–5 px soft band whose core still carries the
+// SUM-mip magnitude — a gradient core, never a flat stripe, never a hairline.
+// Each flank is a full Gaussian evaluation; the two flanks are what spread the
+// isolated spikes the first fix left crisp. u_rowSmoothDy <= 0 (poisoned view)
+// keeps the exact single-fetch path.
+vec2 rowMipSoft(int x, int layer, float yMip, float dyMip) {
+  if (u_rowSmoothDy <= 0.0) return fetchRowMipGauss(x, layer, yMip);
+  return 0.25 * fetchRowMipGauss(x, layer, yMip - dyMip)
+       + 0.50 * fetchRowMipGauss(x, layer, yMip)
+       + 0.25 * fetchRowMipGauss(x, layer, yMip + dyMip);
 }
 
 // One level-0 texel at an ABSOLUTE column, clamped into the VALID resident
@@ -360,11 +395,25 @@ void main() {
     // 4-column block average). Bounds-clamped like the SUM path (a tap outside
     // the grid contributes nothing). No level-0 fetches at this endpoint.
     // Deep-row barcode fix: with a 1-tap footprint the sum is replaced by the
-    // vertical Gaussian reconstruction (fetchRowMipGauss) — same 4-row mip
-    // source, smooth falloff. Larger footprints (rpp > 4) keep the exact
-    // historical tap loop (byte-identical endpoint).
+    // vertical Gaussian reconstruction (fetchRowMipGauss) wrapped in the
+    // pixel-denominated triple (rowMipSoft) — same 4-row mip source, smooth
+    // falloff that reaches the isolated single-level spikes too. Larger
+    // footprints (rpp > 4, D4 zone a: 88–90% sub-3-px hairlines with the bare
+    // loop) soften PER TAP through the same Gaussian + triple, so a collapsing
+    // price axis spreads isolated levels instead of painting needles. A
+    // non-finite/poisoned view (soften 0) keeps the exact historical loop.
     if (u_rowMipSoften > 0.0 && u_nRowTaps == 1) {
-      acc = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);
+      acc = rowMipSoft(x0, layer, (rowf + 0.5) * 0.25 - 0.5, u_rowSmoothDy * 0.25);
+    } else if (u_rowMipSoften > 0.0) {
+      int rowsR = u_rows / 4;
+      int yBase = (row / 4) - (u_nRowTaps / 2);
+      acc = vec2(0.0);
+      for (int t = 0; t < 4; t++) {
+        if (t >= u_nRowTaps) break;
+        int y = yBase + t;
+        if (y < 0 || y >= rowsR) continue;
+        acc += rowMipSoft(x0, layer, float(y), u_rowSmoothDy * 0.25);
+      }
     } else {
       int rowsR = u_rows / 4;
       int yBase = (row / 4) - (u_nRowTaps / 2);
@@ -390,9 +439,21 @@ void main() {
     if (u_rowFade > 0.001) {
       vec2 accRow;
       // Deep-row barcode fix: 1-tap footprints use the smooth Gaussian
-      // reconstruction; wider footprints keep the historical tap loops.
+      // reconstruction wrapped in the pixel-denominated triple; wider
+      // footprints soften per tap through the same kernel (see the full-row
+      // endpoint above); soften 0 keeps the historical tap loop.
       if (u_rowMipSoften > 0.0 && u_nRowTaps == 1) {
-        accRow = fetchRowMipGauss(x0, layer, (rowf + 0.5) * 0.25 - 0.5);
+        accRow = rowMipSoft(x0, layer, (rowf + 0.5) * 0.25 - 0.5, u_rowSmoothDy * 0.25);
+      } else if (u_rowMipSoften > 0.0) {
+        int rowsR = u_rows / 4;
+        int yBase = (row / 4) - (u_nRowTaps / 2);
+        accRow = vec2(0.0);
+        for (int t = 0; t < 4; t++) {
+          if (t >= u_nRowTaps) break;
+          int y = yBase + t;
+          if (y < 0 || y >= rowsR) continue;
+          accRow += rowMipSoft(x0, layer, float(y), u_rowSmoothDy * 0.25);
+        }
       } else {
         int rowsR = u_rows / 4;
         int yBase = (row / 4) - (u_nRowTaps / 2);
@@ -481,8 +542,14 @@ void main() {
   float t = clamp(intensity / max(u_norm, 1e-9), 0.0, 1.0);
   // Black point, then the transfer curve. Order matters: clipping AFTER the
   // curve would clip a curve, not a density, and the floor would mean a
-  // different amount of size at every contrast setting.
-  t = clamp((t - u_floor) * u_floorScale, 0.0, 1.0);
+  // different amount of size at every contrast setting. The region mask
+  // (lane F17) selects the live floor for every untagged column — mix(a,b,0)
+  // is exactly a, so the shipped pixels are bit-identical — and the RELATIVE
+  // recon floor for tagged (reconstructed) columns.
+  int region = texelFetch(u_region, ivec3(x0, 0, layer), 0).r > 0.5 ? 1 : 0;
+  float floorSel = mix(u_floor, u_floorRecon, float(region));
+  float floorScaleSel = mix(u_floorScale, u_floorScaleRecon, float(region));
+  t = clamp((t - floorSel) * floorScaleSel, 0.0, 1.0);
   // Two-segment transfer (low-span calibrated 2026-09-13): below the knee the
   // display gamma lifts the mid-field into a FIXED output share u_lowSpan of
   // the ramp; above it log compression spreads the wall band across

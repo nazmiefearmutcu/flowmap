@@ -103,6 +103,18 @@ export interface FlowMapState {
    */
   replayUnavailable: boolean;
   /**
+   * Bumped each time a refused replay subscription causes an AUTOMATIC live
+   * re-subscribe (see `onReplayRefused`). That fallback begins a new server
+   * session but keeps the SAME `market:symbol:band` identity — `sessionResetKey`
+   * deliberately ignores `mode` so a user's live⇄replay toggle keeps
+   * scrolled-back history — so without this counter the App would not run its
+   * symbol-switch reset (GL ring teardown + camera price-fit re-arm) and the
+   * view would stay frozen on the dead session's scale (QA7 H1: the whole book
+   * pancaked onto the epoch's nominal extent). The App composes it into the
+   * reset effect's key; user-initiated toggles never touch it.
+   */
+  sessionRevision: number;
+  /**
    * TERMINAL: the server refused this subscription with a pre-close Status
    * naming feed_state='closed' + close 1003 — NO feed exists for this market at
    * all (server ws.py NotImplementedError path). Unlike `replayUnavailable`
@@ -186,6 +198,7 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
   epochs: new Map(),
   subscription: null,
   replayUnavailable: false,
+  sessionRevision: 0,
   noFeed: false,
   lastClose: null,
   reconnectAttempts: 0,
@@ -289,6 +302,12 @@ export const useFlowMapStore = create<FlowMapState>((set, get) => ({
           set({ replayUnavailable: true });
           const sub = get().subscription;
           if (sub && sub.mode === 'replay') {
+            // The fallback re-subscribes the SAME instrument, so the reset key
+            // (market:symbol:band) would not change; bump the revision the App
+            // composes into that key so its symbol-switch reset — the GL ring
+            // teardown + price-fit re-arm — actually runs for this new server
+            // session (QA7 H1).
+            set({ sessionRevision: get().sessionRevision + 1 });
             get().connectAndSubscribe(sub.market, sub.symbol, 'live', sub.band);
           }
         },

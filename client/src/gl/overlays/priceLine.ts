@@ -16,13 +16,19 @@
  * depth history and never truncates independently.
  *
  * It draws on the 2D text layer (NOT the GL batches): canvas stroking gives
- * anti-aliased joins and a gradient wash that raw GL triangles cannot, which is
- * the difference between a chart-grade line and a jagged one. Three passes — a
- * soft area wash under the line, a wide translucent glow, then the bright core —
- * plus a short solid stub that carries the trace to the right gutter. It also
- * paints the dashed last-price level marker across the chart (the TradingView
- * signature) and exposes {@link last} so the price axis can draw the matching
- * right-edge price pill.
+ * anti-aliased joins that raw GL triangles cannot, which is the difference
+ * between a chart-grade line and a jagged one. Two passes — a wide translucent
+ * glow, then the bright core — plus a short solid stub that carries the trace
+ * to the right gutter. It also paints the dashed last-price level marker across
+ * the chart (the TradingView signature) and exposes {@link last} so the price
+ * axis can draw the matching right-edge price pill.
+ *
+ * NO AREA WASH (swarm2 F4, QA3 H-1): the old `fillUnder(pts, cssH)` gradient
+ * flooded the whole field below the line (measured luma ≈25 vs bg 7.8, fading
+ * over ~440 px — the single most luminous structure in the default live view)
+ * and, over reconstructed history where `add()` gets one point per candle, it
+ * tiled into hard-edged ~1 px slabs. Bookmap has no such wash; the glow + core
+ * carry the trace alone. Do not reintroduce a fill here.
  */
 
 import type { OverlayFrame } from './frame';
@@ -40,11 +46,9 @@ export const PRICE_GLOW_WIDTH = 6.0;
  *  read as a ~5px-thick line at 1:1; 0.16 keeps the depth cue while the 2px
  *  core stays the crisp protagonist. */
 export const PRICE_GLOW_ALPHA = 0.16;
-/** Alpha of the area wash's TOP stop (the bottom stop stays transparent).
- *  `OVERLAY.priceFillTop` / `OVERLAY.priceLevel` are palette-lane owned; the
- *  price-line slice re-stamps their alpha here so hues stay palette-owned. */
-export const PRICE_FILL_TOP_ALPHA = 0.09;
-/** Alpha of the dashed last-price level marker (quieter than the trace). */
+/** Alpha of the dashed last-price level marker (quieter than the trace).
+ *  `OVERLAY.priceLevel` is palette-lane owned; this slice re-stamps its alpha
+ *  here so hues stay palette-owned. */
 export const PRICE_LEVEL_ALPHA = 0.28;
 /** Dash pattern of the last-price level (on/off CSS px). W6 swarm2: [2,4] read
  *  as a fine dotted texture at 1:1 (223 dashes across the chart); the calmer
@@ -143,14 +147,9 @@ export class PriceLine {
     }
     if (pts.length === 0) return;
 
-    // Soft area wash under the line — the chart-grade "area" cue, kept faint so
-    // the density field stays the protagonist.
-    text.fillUnder(
-      pts,
-      gm.dims.cssH,
-      withAlpha(OVERLAY.priceFillTop.css, PRICE_FILL_TOP_ALPHA),
-      OVERLAY.priceFillBottom.css,
-    );
+    // No area wash (swarm2 F4): the old full-height `fillUnder` slab flooded the
+    // field (QA3 H-1) and tiled into flat 1-px slabs over reconstructed history.
+    // The glow + core carry the trace, like Bookmap.
 
     // Glow pass (wide, translucent) — flushed first so the bright core sits on
     // top; canvas AA + round joins make the two passes read as one smooth line.

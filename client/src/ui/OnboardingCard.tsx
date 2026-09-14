@@ -23,6 +23,7 @@
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
 
 import { useT } from '../i18n/useT';
+import { isTopOverlay, pushOverlay } from './overlayStack';
 import '../theme/shell.css';
 
 /** localStorage flag marking the tour as dismissed ('1'). */
@@ -129,17 +130,23 @@ export function OnboardingCard(): JSX.Element | null {
   }, [isOpen]);
 
   // Escape DEFERS the tour — it closes but never persists. The listener
-  // exists only while the overlay is open.
+  // exists only while the overlay is open, and the tour joins the open-overlay
+  // registry while it does (ui/overlayStack): when a Settings drawer opened it
+  // (or sits underneath), ONE keystroke closes only the topmost surface — the
+  // drawer's own window listener defers to whoever pushed later (QA12 M-1).
   useEffect(() => {
     if (!isOpen) return;
+    const off = pushOverlay('onboard');
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
+      if (e.key === 'Escape' && isTopOverlay('onboard')) {
         closeOnboarding();
       }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      off();
+    };
   }, [isOpen]);
 
   // Focus trap: Tab wraps inside the panel in both directions.

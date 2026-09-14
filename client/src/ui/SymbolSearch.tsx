@@ -166,6 +166,11 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     // Holds ANSWERS ONLY — a failed listing is deliberately absent, so the next
     // attempt refetches instead of inheriting a fabricated empty list forever.
     const scopeCache = useRef(new Map<string, SymbolEntry[]>());
+    // Per-`market:symbol` memo of `/api/quote` answers for ONE palette visit, so
+    // arrowing away and back (or a mover landing under the highlighted row) never
+    // re-issues a request. Cleared on open: a later visit must re-read a live
+    // price rather than show a minutes-old one as current.
+    const previewCache = useRef(new Map<string, Quote>());
     const inputRef = useRef<HTMLInputElement>(null);
     const triggerRef = useRef<HTMLButtonElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
@@ -174,6 +179,8 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       setOpen(true);
       setQuery('');
       setActive(0);
+      // A new visit re-reads quotes; only the in-visit keep-alive survives.
+      previewCache.current.clear();
       // The venue LIST closes, but the chosen SCOPE persists across opens — a
       // trader working one venue should not re-pick it every ⌘K.
       setPickingVenue(false);
@@ -322,21 +329,40 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
     const activeRow = pickingVenue ? undefined : rows[active];
     const activeVenue = pickingVenue ? venueRows[active] : undefined;
 
+    // The stable identity of the highlighted row. `rows` is rebuilt whenever the
+    // movers or the universe resolves, so a row OBJECT changes identity on every
+    // such recompute — an effect keyed on it aborts the in-flight quote every
+    // time (QA12 M-5: first request always wasted, preview 4–8 s late). The
+    // preview follows `market:symbol`; the latest row is read through a ref.
+    const activeKey = !pickingVenue && activeRow
+      ? `${activeRow.entry.market}:${activeRow.entry.symbol}`
+      : null;
+    const activeRowRef = useRef<Row | undefined>(activeRow);
+    activeRowRef.current = activeRow;
+
     // Live preview for the active row: reuse its mover quote if we have one, else
     // fetch /api/quote (debounced) so scanning the list doesn't hammer the server.
+    // Keyed on `market:symbol` so mover/universe churn cannot abort a request,
+    // and memoised for the visit so re-highlighting a row is instant.
     useEffect(() => {
-      if (!open || !activeRow) {
+      if (!open || !activeKey) {
         setPreview(null);
         return;
       }
-      if (activeRow.quote) {
-        setPreview(activeRow.quote);
+      const row = activeRowRef.current;
+      if (row?.quote) {
+        setPreview(row.quote);
         return;
       }
-      const { market, symbol } = activeRow.entry;
+      const cached = previewCache.current.get(activeKey);
+      if (cached) {
+        setPreview(cached);
+        return;
+      }
       // Drop the previous row's quote immediately so a symbol NAME never renders
       // over another symbol's live-looking price/%/sparkline during the debounce.
       setPreview(null);
+      const { market, symbol } = row!.entry;
       const ctrl = new AbortController();
       const t = window.setTimeout(() => {
         void getJson<Quote>(
@@ -347,14 +373,16 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
           // On an unreachable/failed provider, resolve to an explicit
           // reachable:false so the honest "data unavailable" state renders —
           // never leave a stale quote standing (§7).
-          setPreview(q ?? { market, symbol, price: null, changePct: null, spark: [], reachable: false });
+          const quote = q ?? { market, symbol, price: null, changePct: null, spark: [], reachable: false };
+          previewCache.current.set(activeKey, quote);
+          setPreview(quote);
         });
       }, QUOTE_DEBOUNCE_MS);
       return () => {
         ctrl.abort();
         window.clearTimeout(t);
       };
-    }, [open, activeRow]);
+    }, [open, activeKey]);
 
     const close = useCallback(() => {
       setOpen(false);
@@ -479,7 +507,10 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
       listRef.current?.querySelector(`#sympal-opt-${active}`)?.scrollIntoView({ block: 'nearest' });
     }, [active, open]);
 
-    const previewDir = preview ? sparkDirection(preview.spark) : 0;
+    // The mover quote is already in hand when the row is one of the day's movers;
+    // prefer it (it updates with each /api/movers answer) over the fetched copy.
+    const shownPreview = activeRow?.quote ?? preview;
+    const previewDir = shownPreview ? sparkDirection(shownPreview.spark) : 0;
     const scopeLabel = scopeOption?.label ?? scope;
     const scopeDepth = scopeOption?.depth ? scopeOption.depth.toUpperCase() : '';
     const placeholder = pickingVenue
@@ -795,18 +826,18 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                         <div className="sympal__pv-sym">{activeRow.entry.symbol}</div>
                         <div className="sympal__pv-mkt">{activeRow.entry.market}</div>
                         <div className={`sympal__pv-px ${previewDir >= 0 ? 'is-up' : 'is-down'}`}>
-                          {fmtPrice(preview?.price)}
+                          {fmtPrice(shownPreview?.price)}
                         </div>
-                        <div className={`sympal__pv-chg ${(preview?.changePct ?? 0) >= 0 ? 'is-up' : 'is-down'}`}>
-                          {fmtPct(preview?.changePct)}
+                        <div className={`sympal__pv-chg ${(shownPreview?.changePct ?? 0) >= 0 ? 'is-up' : 'is-down'}`}>
+                          {fmtPct(shownPreview?.changePct)}
                         </div>
-                        {preview?.spark?.length ? (
+                        {shownPreview?.spark?.length ? (
                           <svg className="sympal__pv-spark" viewBox="0 0 220 60" preserveAspectRatio="none" aria-hidden="true">
-                            <path d={sparkPath(preview.spark, 220, 60, 3)} className={previewDir >= 0 ? 'spark-up' : 'spark-down'} fill="none" />
+                            <path d={sparkPath(shownPreview.spark, 220, 60, 3)} className={previewDir >= 0 ? 'spark-up' : 'spark-down'} fill="none" />
                           </svg>
                         ) : (
                           <div className="sympal__pv-note">
-                            {preview?.reachable === false ? 'data unavailable' : 'no preview'}
+                            {shownPreview?.reachable === false ? 'data unavailable' : 'no preview'}
                           </div>
                         )}
                         <div className="sympal__pv-caps">
@@ -816,7 +847,7 @@ export const SymbolSearch = forwardRef<SymbolSearchHandle, SymbolSearchProps>(
                             </span>
                           ))}
                         </div>
-                        {preview?.stale && <div className="sympal__pv-stale">stale — market closed or last known</div>}
+                        {shownPreview?.stale && <div className="sympal__pv-stale">stale — market closed or last known</div>}
                       </>
                     ) : (
                       <div className="sympal__pv-note">

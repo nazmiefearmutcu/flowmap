@@ -114,6 +114,34 @@ export class OverlayManager {
     this.timeAxis = timeCanvas ? new TextLayer(timeCanvas, false) : null;
   }
 
+  /**
+   * Re-match both gutter backing stores to their OWN live CSS boxes at `dpr`
+   * (pure 2D — no GL, no camera, no draw). Wired into the draw path so every
+   * frame keeps the gutters sized, and exposed for the PriceAxis self-heal
+   * (QA9-1): a fresh boot could leave the gutter bitmap at the browser default
+   * 300×150 with ZERO ink — labels and the last-price pill missing — until a
+   * window resize forced a frame. The heal closes that gap by (a) reading the
+   * canvas's own box (not a frame-time snapshot, which may predate layout) and
+   * (b) letting the App rebind + redirty the layer. Returns true when either
+   * store changed size. Hidden/pre-layout canvases (box ≤ 0) are left as-is —
+   * sizing to zero would blank a gutter that is merely not laid out yet.
+   */
+  syncGutters(dpr: number): boolean {
+    let changed = false;
+    for (const layer of [this.priceAxis, this.timeAxis]) {
+      if (layer === null) continue;
+      const c = layer.canvas;
+      const w = c.clientWidth;
+      const h = c.clientHeight;
+      if (w <= 0 || h <= 0) continue;
+      const beforeW = c.width;
+      const beforeH = c.height;
+      layer.syncSize(w, h, dpr > 0 ? dpr : 1);
+      if (c.width !== beforeW || c.height !== beforeH) changed = true;
+    }
+    return changed;
+  }
+
   setVisibility(v: Partial<OverlayVisibility>): void {
     this.visibility = { ...this.visibility, ...v };
   }
@@ -302,13 +330,11 @@ export class OverlayManager {
     // gutters are wiped on EVERY repaint: with axes off they would otherwise
     // keep the last tick labels and the price pill, and nothing else ever
     // clears those canvases (survey S3 C-4). drawPriceAxis/drawTimeAxis clear
-    // before they draw, so each path clears exactly once.
-    if (this.priceAxis) {
-      this.priceAxis.syncSize(this.priceAxis.canvas.clientWidth, ctx.dims.cssH, ctx.dpr);
-    }
-    if (this.timeAxis) {
-      this.timeAxis.syncSize(ctx.dims.cssW, this.timeAxis.canvas.clientHeight, ctx.dpr);
-    }
+    // before they draw, so each path clears exactly once. Sizing goes through
+    // `syncGutters()` so the SAME box math runs here and on the PriceAxis
+    // self-heal path (a boot whose first frames predate layout, or a canvas
+    // element replaced under the manager, must re-match without a resize).
+    this.syncGutters(ctx.dpr);
     if (this.visibility.axes) {
       if (this.priceAxis) {
         drawPriceAxis(this.priceAxis, this.gm, this.visibility.price ? this.priceLine.last() : null);

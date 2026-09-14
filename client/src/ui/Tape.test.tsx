@@ -8,6 +8,7 @@ import { flushForTest, ingestForTest, resetForTest, type TapeTrade } from '../st
 import { useFlowMapStore } from '../state/store';
 import {
   Tape,
+  fmtTapeSize,
   fmtTapeTime,
   isBigTrade,
   largeThreshold,
@@ -99,6 +100,27 @@ describe('fmtTapeTime', () => {
     // 1h 2m 3.004s in ns.
     const ns = BigInt((1 * 3600 + 2 * 60 + 3) * 1_000_000_000 + 4_000_000);
     expect(fmtTapeTime(ns)).toBe('01:02:03.004');
+  });
+});
+
+describe('fmtTapeSize (adaptive precision)', () => {
+  it('shows real sub-unit fills instead of a wall of 0.00', () => {
+    expect(fmtTapeSize(0.0001)).toBe('0.0001');
+    expect(fmtTapeSize(0.002)).toBe('0.0020');
+    expect(fmtTapeSize(0.0129)).toBe('0.0129');
+    expect(fmtTapeSize(0.1718)).toBe('0.172');
+  });
+
+  it('keeps the coarse tiers for larger sizes', () => {
+    expect(fmtTapeSize(1.5)).toBe('1.50');
+    expect(fmtTapeSize(123.45)).toBe('123.5');
+    expect(fmtTapeSize(1234.5)).toBe('1235');
+  });
+
+  it('never rounds a real print down to a fake zero', () => {
+    expect(fmtTapeSize(0.00005)).toBe('0.000050');
+    expect(fmtTapeSize(0)).toBe('0');
+    expect(fmtTapeSize(Number.NaN)).toBe('—');
   });
 });
 
@@ -215,6 +237,13 @@ describe('Tape render', () => {
     expect(rows[1].className).toContain('tape__row--sell');
     // Price precision from the epoch step (0.5 → 1 decimal).
     expect(rows[0].querySelector('.tape__px')?.textContent).toBe('100.5');
+  });
+
+  it('renders a real 0.0001 fill as 0.0001, never as 0.00', () => {
+    seedStore();
+    ingestForTest({ type: 5, ts_ns: 1n, price: 100, size: 0.0001, side: SIDE_BUY, side_src: 0, venue: 'sim' } as never);
+    const { container } = render(<Tape />);
+    expect(container.querySelector('.tape__sz')?.textContent).toBe('0.0001');
   });
 
   it('emphasizes large trades above the rolling threshold', () => {

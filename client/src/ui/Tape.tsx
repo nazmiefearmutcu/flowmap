@@ -87,10 +87,22 @@ export function fmtTapeTime(ns: bigint): string {
   }
 }
 
-function fmtTapeSize(v: number): string {
+/**
+ * Tape size text with adaptive precision (2–4 significant decimals by
+ * magnitude). The old fixed 2dp printed "0.00" for BTC-class fills of
+ * 0.0001–0.004 — a wall of fake zeros. Sub-unit sizes keep 3dp down to 0.1
+ * and 4dp below (the data-size precision); anything smaller than even 4dp
+ * falls back to 2 significant digits so a real print never reads "0.0000".
+ */
+export function fmtTapeSize(v: number): string {
+  if (!Number.isFinite(v)) return '—';
   if (v >= 1000) return v.toFixed(0);
   if (v >= 100) return v.toFixed(1);
-  return v.toFixed(2);
+  if (v >= 1) return v.toFixed(2);
+  if (v <= 0) return '0';
+  if (v >= 0.1) return v.toFixed(3);
+  if (v >= 0.0001) return v.toFixed(4);
+  return v.toPrecision(2);
 }
 
 /**
