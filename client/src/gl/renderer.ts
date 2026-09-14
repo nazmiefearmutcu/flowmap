@@ -446,6 +446,17 @@ export class Renderer {
   private wantFollowTime = true;
   private wantPriceFollow: PriceFollow = 'fit';
 
+  /**
+   * Owner contract (2026-09-14): a manual TIME zoom (wheel / keyboard) marks
+   * the span user-owned, and every later follow re-arm (GO LIVE, Space, the
+   * tracking chip) re-pins ONLY the right edge at that exact span. Without
+   * this flag the follow frame re-derived the default `cssW / columnPx`
+   * window and snapped a zoomed-out (or zoomed-in) view back to it — the
+   * reported "GO LIVE → very close view" bug. Cleared on session reset, where
+   * the default window is the correct initial frame.
+   */
+  private userTimeZoomed = false;
+
   private dirty = false;
   /** The view moved this frame → ask the HistoryLoader to ensure visible range. */
   private viewMoved = false;
@@ -1065,6 +1076,7 @@ export class Renderer {
     // follow frame fits the price axis to the new book.
     this.camera.setLimits(limitsFor(1, this.opts.capacityColsTarget));
     this.camera.reset(null);
+    this.userTimeZoomed = false; // new session: the default window is the frame
     this.applyWantedFollow();
     this.view = this.camera.toView();
 
@@ -1166,6 +1178,7 @@ export class Renderer {
       zoomTimeAtFraction: (factor, fracX) => {
         const anchorCol = this.view.colOffset + this.view.colScale * fracX;
         this.camera.zoomTime(factor, anchorCol);
+        this.userTimeZoomed = true; // user-owned span: follow must preserve it
         this.onCameraChanged();
       },
       zoomPriceAtFraction: (factor, fracFromTop) => {
@@ -1189,6 +1202,7 @@ export class Renderer {
       },
       zoomTimeCentered: (factor) => {
         this.camera.zoomTime(factor, this.camera.state.colCenter);
+        this.userTimeZoomed = true; // user-owned span: follow must preserve it
         this.onCameraChanged();
       },
       toggleFollow: () => {
@@ -1844,8 +1858,24 @@ export class Renderer {
 
     const cap = ring.capacityCols;
     const cssW = Math.max(1, this.canvas.clientWidth);
-    let visible = Math.round(cssW / this.opts.columnPx);
-    visible = clamp(visible, MIN_VISIBLE_COLS, this.opts.maxVisibleCols);
+    let visible: number;
+    if (this.userTimeZoomed) {
+      // Owner contract (2026-09-14): the user's time zoom is sacred — GO LIVE /
+      // any follow re-arm keeps EXACTLY their span (float, un-rounded) and only
+      // slides the right edge. NO default-window clamp and NO data clamp here:
+      // the SAME camera limits the wheel zoom already respected (minColSpan /
+      // the F3 residency-scaled zoom-out cap) are re-applied by setTimeFrame,
+      // so a span the user could reach passes through unchanged. (The data
+      // min() below stays on the default path only — clamping a preserved
+      // zoom to ring capacity snapped 17136 → 8634 in live verification.)
+      visible = this.camera.state.colSpan;
+      if (!Number.isFinite(visible) || visible < 1) visible = MIN_VISIBLE_COLS;
+      this.camera.setTimeFrame(range.newest - visible + 1, visible);
+      return;
+    } else {
+      visible = Math.round(cssW / this.opts.columnPx);
+      visible = clamp(visible, MIN_VISIBLE_COLS, this.opts.maxVisibleCols);
+    }
     // Fill the width with what we have, then lock and scroll once it's full.
     visible = Math.min(visible, cap, range.count);
 

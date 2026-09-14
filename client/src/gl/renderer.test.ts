@@ -748,6 +748,41 @@ describe('Renderer (fake GL harness)', () => {
     expect(r.liveEdgeVisible).toBe(true);
   });
 
+  it('GO LIVE preserves the user TIME zoom exactly (owner contract 2026-09-14)', () => {
+    const { r, store } = makeRenderer();
+    // Enough resident data that the preserved span is not clamped by the
+    // available-column count (real sessions carry thousands).
+    for (let s = 0; s < 200; s++) store.emit(makeCol(s, true));
+    pump(16);
+    const priv = r as unknown as {
+      controller: {
+        zoomTimeAtFraction: (f: number, x: number) => void;
+        goLive: () => void;
+      };
+      camera: { state: { colSpan: number } };
+    };
+    const defaultSpan = priv.camera.state.colSpan;
+    expect(defaultSpan).toBeGreaterThan(0);
+
+    // Zoom OUT via the wheel path (follow releases; span becomes user-owned).
+    priv.controller.zoomTimeAtFraction(2, 0.5);
+    const zoomedOut = priv.camera.state.colSpan;
+    expect(zoomedOut).toBeGreaterThan(defaultSpan);
+    // GO LIVE re-pins the right edge but must keep THAT span — the old code
+    // re-derived the default window here (the "GO LIVE → çok yakın" bug).
+    priv.controller.goLive();
+    expect(priv.camera.state.colSpan).toBeCloseTo(zoomedOut, 6);
+    expect(r.liveEdgeVisible).toBe(true);
+
+    // The zoom-IN case is symmetric: a deliberate close-up survives GO LIVE.
+    priv.controller.zoomTimeAtFraction(0.2, 0.5);
+    const zoomedIn = priv.camera.state.colSpan;
+    expect(zoomedIn).toBeLessThan(zoomedOut);
+    priv.controller.goLive();
+    expect(priv.camera.state.colSpan).toBeCloseTo(zoomedIn, 6);
+    expect(r.liveEdgeVisible).toBe(true);
+  });
+
   it('B2-CP1: resetOverlaysForNewSession rewinds cursors + clears ink but KEEPS the ring', () => {
     const { r, store } = makeRenderer();
     for (let s = 0; s < 5; s++) store.emit(makeCol(s, true));
