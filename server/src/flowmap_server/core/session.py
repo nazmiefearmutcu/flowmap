@@ -1460,12 +1460,13 @@ class ReplayStaleError(ReplayUnavailableError):
 # Crypto grid shape FALLBACK (mirrors feeds.sim private constants: mid starts
 # at 100.0, tick 0.5; kept local so this module does not reach into sim
 # internals). Despite the names this shape prices REAL crypto books too: the
-# first book re-anchors p0 to the real mid and a re-anchor scales via
-# tick_multiple, which is correct for majors — but a sub-cent coin collapses
-# into 1-2 rows at a 0.5 tick. The honest escapes, in priority order, are
-# FLOWMAP_CRYPTO_TICK and a feed-declared ``preferred_tick`` (see
-# :func:`_crypto_tick_for`); wiring venue tick metadata automatically is
-# parked (needs the ccxt markets table at grid-build time).
+# first book re-anchors p0 to the real mid, which is correct for majors — but
+# a sub-cent coin collapses into 1-2 rows at a 0.5 tick. The honest escapes,
+# in priority order, are FLOWMAP_CRYPTO_TICK and a feed-declared
+# ``preferred_tick`` (see :func:`_crypto_tick_for`); when NEITHER answers, a
+# feed that declares ``price_adaptive_tick`` (CryptoFeed does) gets a tick
+# scaled to the instrument's price at the first real mid — see
+# :func:`_crypto_tick_auto` and ``core.grid.adaptive_tick_for``.
 _SIM_MID0 = 100.0
 _SIM_TICK = 0.5
 _SIM_ROWS = 2048
@@ -1484,6 +1485,22 @@ def _crypto_tick_for(feed: Feed, cfg_tick: float) -> float:
         if isinstance(candidate, (int, float)) and math.isfinite(candidate) and candidate > 0:
             return float(candidate)
     return _SIM_TICK
+
+
+def _crypto_tick_auto(feed: Feed, cfg_tick: float) -> bool:
+    """Whether the grid may TICK-SCALE to the symbol's price magnitude.
+
+    Only when the tick was not declared: an explicit FLOWMAP_CRYPTO_TICK or a
+    feed ``preferred_tick`` is an answer and is never second-guessed. Otherwise
+    a feed that opts in (``price_adaptive_tick``, CryptoFeed) lets the grid
+    replace the sim-shaped fallback with ``adaptive_tick_for(mid, tick)`` at
+    the first real mid — BTC/ETH keep 0.5 there; DOGE/SOL-class get a
+    power-of-10 fraction of their own price.
+    """
+    for candidate in (cfg_tick, getattr(feed, "preferred_tick", None)):
+        if isinstance(candidate, (int, float)) and math.isfinite(candidate) and candidate > 0:
+            return False
+    return bool(getattr(feed, "price_adaptive_tick", False))
 
 # Equity grid shape (spec §7/§7.1): a cent tick (SEC Rule 612, >=$1 stocks),
 # a ~$41 vertical span at 4096 rows, and a nominal $100 p0 that the grid
@@ -1620,6 +1637,7 @@ class SessionManager:
         if feed.market in EQUITY_MARKETS:
             return self._equity_grid_for(feed, band)
         tick = _crypto_tick_for(feed, self._cfg.crypto_tick)
+        auto_tick = _crypto_tick_auto(feed, self._cfg.crypto_tick)
         rows = min(_SIM_ROWS, self._cfg.max_rows)
         step = tick  # tick_multiple 1
         p0 = round((_SIM_MID0 - rows * step / 2.0) / step) * step
@@ -1640,6 +1658,7 @@ class SessionManager:
                 band_down=spec.down if spec else None,
                 band_hybrid=spec.hybrid if spec else False,
                 core_rows=spec.core_rows if spec else 0,
+                auto_tick=auto_tick,
             )
         )
 

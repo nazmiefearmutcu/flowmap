@@ -183,9 +183,11 @@ uniform float u_rowFade;
 
 // Gaussian field sampler (Bookmap-class overhaul, lane F). Per-draw constants
 // derived from the view's cols-per-pixel (columns / drawingBufferWidth): a
-// symmetric tap table around the sample column, sigma pinned in screen pixels
-// (2.5 px → ~6.4 px 10–90 edge) and capped at 2 columns as columns become
-// sub-pixel. Taps outside [u_validFrom, u_residentNewest] contribute NOTHING
+// symmetric tap table around the sample column, sigma pinned in CSS screen
+// pixels (2.5 CSS px → ~6.4 px 10–90 edge; the CPU scales the framebuffer
+// footprint by the device-pixel ratio so retina keeps the same CSS softness —
+// F14 §L2 / wave-4 F20) and capped at 2 columns as columns become sub-pixel.
+// Taps outside [u_validFrom, u_residentNewest] contribute NOTHING
 // and their weight is dropped from the normalizer, so window edges fold into
 // the core and the newest column keeps full weight (tail-columns contract).
 uniform int u_smoothTaps;
@@ -193,15 +195,16 @@ uniform float u_smoothOffsets[9];
 uniform float u_smoothWeights[9];
 
 // Vertical softening offset in ROW units (barcode fix 2026-09-13; wave-2
-// 2026-09-14 pixel-denominated + active at every zoom, CPU: rowSmoothDyFor).
+// 2026-09-14 pixel-denominated + active at every zoom, CPU: rowSmoothDyFor;
+// wave-4 F20 CSS-denominated via the CPU's device-pixel-ratio scale).
 // ~0 = single-sample legacy path (only a poisoned view); > 0 blends a
 // 0.25/0.5/0.25 vertical triple at ±dy rows around each sample so single-row
 // liquidity reads as a soft band instead of a hard hairline (the owner's
 // default-look complaint). The offset scales with the row footprint
-// (dy = sigma_px * rowsPerPixel), so the band stays ~constant in SCREEN
-// pixels at every zoom — including the rpp ~3 DEFAULT. Read by BOTH the
-// level-0 field (fieldAt) and the deep-row mip fetch (rowMipSoft, where the
-// draw's conversion is dy/4 mip texels).
+// (dy = sigma_css_px · rowsPerPixel · dpr), so the band stays ~constant in
+// CSS pixels at every zoom and every DPR — including the rpp ~3 DEFAULT.
+// Read by BOTH the level-0 field (fieldAt) and the deep-row mip fetch
+// (rowMipSoft, where the draw's conversion is dy/4 mip texels).
 uniform float u_rowSmoothDy;
 
 // Deep-row softening (barcode fix 2026-09-13, CPU: rowMipSoftenFor +

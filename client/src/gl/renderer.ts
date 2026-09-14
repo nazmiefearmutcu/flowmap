@@ -1409,8 +1409,14 @@ export class Renderer {
     this.writeColumn(col, rows, false, gapZeroed);
     // The zeroed band's SUM-mip groups must be re-baked or the coarse levels
     // keep summing pre-zero stale members (the append above only baked the
-    // post-gap column's own group).
-    if (gapZeroed) this.bakeGapMips(gapFrom, col.col_seq);
+    // post-gap column's own group). Then ask the loader to fetch the dropped
+    // band from the session's grid ring: a server tx_lag drop evicts only THIS
+    // client's queue, so the columns are usually still servable and can replace
+    // the zeroes with real data (F24; the zeroes stay the honest fallback).
+    if (gapZeroed) {
+      this.bakeGapMips(gapFrom, col.col_seq);
+      this.history?.refetchBand(gapFrom, col.col_seq - 1, col.t0_ns);
+    }
 
     // Normalization (T9): seed the viewport normalizer once from the server's
     // per-session norm_seed (p99 of recent nonzero density) — thereafter u_norm

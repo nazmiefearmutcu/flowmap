@@ -146,11 +146,11 @@
 }
 
 .watchlist__spark-path.is-up {
-  stroke: var(--accent);
+  stroke: var(--accent-bright);
 }
 
 .watchlist__spark-path.is-down {
-  stroke: var(--sell);
+  stroke: var(--sell-bright);
 }
 
 .watchlist__spark-path.is-flat {
@@ -168,7 +168,7 @@
 }
 
 .watchlist__px.is-empty {
-  color: var(--text-4);
+  color: var(--text-3);
 }
 
 .watchlist__chg {
@@ -180,12 +180,16 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Direction inks follow the theme channels; the BRIGHT variants are the ones
+   that clear 4.5:1 on the active-row `--bg-3` tint in all 7 themes (base
+   accent dips to 4.17:1 on paper, base sell to 4.22:1 midnight / 4.43 sea) —
+   same rule as the symbol palette (App.css .sympal__chg.is-up/is-down). */
 .watchlist__chg.is-up {
-  color: var(--accent);
+  color: var(--accent-bright);
 }
 
 .watchlist__chg.is-down {
-  color: var(--sell);
+  color: var(--sell-bright);
 }
 
 .watchlist__chg.is-flat {
@@ -263,7 +267,7 @@
   font-size: var(--fs-2xs);
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-4);
+  color: var(--text-3);
 }
 
 .watchlist__suggestions {

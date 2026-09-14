@@ -23,11 +23,24 @@
  * only ever draws markers the FEED actually sent (kinds present = exactly the
  * ones the capability advertises, e.g. equity keyless emits only `gap`).
  *
+ * SEAM ANCHORING (F22, F9-L1): a time-instant marker (gap/session_break) whose
+ * `ts_ns` is one of the ring's per-column t0 KNOTS is drawn ON that knot's left
+ * edge — the column boundary the instant denotes. This matters at a reattach
+ * seam, where the piecewise table is locally NON-monotonic (a reconstructed
+ * block's t0 runs backward of the columns it lands after) and the coords.ts
+ * ascending binary search otherwise interpolates a seam marker's knot several
+ * block columns INTO the block (or, centered at +0.5, half a block column in).
+ * Measured F9-L1: the trailing seam badge sat ~4 block columns inside the
+ * block; the leading one half a block column in. With a knot match the leading
+ * badge sits exactly at the first column of the discontinuity and the trailing
+ * one at the block end (their shared boundary is the knot column's left edge);
+ * markers with no knot keep the column-center placement.
+ *
  * Markers live in a bounded ring (oldest first evicted) and only visible ones
  * are drawn → O(visible).
  */
 
-import { toBigNs } from './coords';
+import { toBigNs, type TimeSlots } from './coords';
 import type { OverlayFrame } from './frame';
 import { OVERLAY } from './palette';
 import type { Marker, MarkerKind } from '../../proto/types';
@@ -58,6 +71,13 @@ const COLLAPSE_PX = 44;
 const COLLAPSE_DY = 14;
 /** Bounded vertical displacement attempts before a label is drawn in place. */
 const STACK_MAX = 6;
+/**
+ * Search radius (columns) for the exact t0 knot of a time-instant marker. The
+ * knot is at most a seam-jump/cadence away from the naive interpolation (the
+ * measured F9-L1 burial is ~3-4 block columns), so this is generous while
+ * keeping the scan bounded and allocation-free.
+ */
+const KNOT_SCAN_COLS = 512;
 
 export interface MarkerOptions {
   capacity?: number;
@@ -157,11 +177,25 @@ export class Markers {
     // (unbounded here — priority/collapse decide what the text pass keeps).
     for (let i = 0; i < this.count; i++) {
       const idx = (this.head - 1 - i + n) % n;
-      const colf = gm.tsToCol(this.ts[idx]) + 0.5;
-      const cx = gm.clipX(colf);
-      if (cx < -1.04 || cx > 1.04) continue;
       const code = this.kind[idx];
       const seam = this.seam[idx] === 1;
+      const ts = this.ts[idx];
+      let colf = gm.tsToCol(ts);
+      if (VERTICAL.has(code)) {
+        // Time-instant markers anchor on their exact column knot when the
+        // piecewise table has one (F22/F9-L1): the hatch and chip land on the
+        // discontinuity edge, not half a block column inside it. A seam's knot
+        // can sit far from the naive mapping (coords.ts's range guard hands the
+        // block region to the live affine → off-view), so seam markers get a
+        // full-table fallback when the bounded local scan misses.
+        let knot = this.knotCol(gm, ts, colf, false);
+        if (knot === null && seam) knot = this.knotCol(gm, ts, colf, true);
+        colf = knot === null ? colf + 0.5 : knot;
+      } else {
+        colf += 0.5; // center within the column
+      }
+      const cx = gm.clipX(colf);
+      if (cx < -1.04 || cx > 1.04) continue;
 
       if (VERTICAL.has(code)) {
         // Full-height vertical hatch (time event, no price).
@@ -199,6 +233,48 @@ export class Markers {
 
   private pushCand(x: number, y: number, code: number, seam: boolean): void {
     this.cands.push({ x, y, code, seam, rank: this.rankOf(code, seam) });
+  }
+
+  /**
+   * The column whose t0 knot IS this marker's instant, or null. The piecewise
+   * table is the ring's own per-column truth, but a reattach seam makes it
+   * locally non-monotonic, and coords.ts's ascending binary search can then
+   * interpolate a seam marker's ts — which IS one of the knots — several block
+   * columns into the block (measured F9-L1: the trailing seam ~4 block columns
+   * early), or reject it outright (ts below the table's first knot → the live
+   * affine → the leading badge maps off-view). A knot is a column boundary, so
+   * matching it places the badge exactly on the discontinuity (leading) / the
+   * block end (trailing).
+   *
+   * Compared in float64 — the table's own storage domain (`slotT0` is written
+   * as `Number(t0_ns)`, and the marker ts is converted the same way), so the
+   * equality is exact for a knot that came from the same wire bigint. Searches
+   * outward from the naive column; `full` lifts the {@link KNOT_SCAN_COLS}
+   * bound (seam markers only — their knot may be anywhere in the table while
+   * the naive mapping is nonsense). Null lets the caller keep the center
+   * placement; allocation-free either way.
+   */
+  private knotCol(gm: OverlayFrame['gm'], ts: bigint, naive: number, full: boolean): number | null {
+    const slots: TimeSlots | undefined = gm.time?.slots;
+    if (slots === undefined) return null;
+    const t0 = slots.t0;
+    const n = t0.length;
+    if (n === 0 || !Number.isFinite(naive)) return null;
+    const tsf = Number(ts);
+    if (!Number.isFinite(tsf)) return null;
+    let at = Math.round(naive) - slots.startSeq;
+    if (at < 0) at = 0;
+    else if (at >= n) at = n - 1;
+    if (t0[at] === tsf) return slots.startSeq + at;
+    const max = full ? n : KNOT_SCAN_COLS;
+    for (let d = 1; d <= max; d++) {
+      const a = at - d;
+      if (a >= 0 && t0[a] === tsf) return slots.startSeq + a;
+      const b = at + d;
+      if (b < n && t0[b] === tsf) return slots.startSeq + b;
+      if (a < 0 && b >= n) return null;
+    }
+    return null;
   }
 
   /**

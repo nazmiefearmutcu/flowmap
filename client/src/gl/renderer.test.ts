@@ -256,6 +256,79 @@ describe('Renderer (fake GL harness)', () => {
     expect(r.validFromSeq).toBe(1000);
   });
 
+  // --- F24: a repaired skip band is refetched from the session grid ring ------
+
+  /** Await the loader's async band refetch (requestHistory → splice loop). */
+  const flushMicrotasks = async (): Promise<void> => {
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  };
+
+  it('refetches a repaired skip band from history and splices the REAL columns', async () => {
+    const { r, store } = makeRenderer();
+    for (let s = 10; s <= 14; s++) store.emit(makeCol(s, true));
+
+    const calls: Array<{ before_t: bigint; n: number }> = [];
+    store.state.requestHistory = (before_t: bigint, n: number) => {
+      calls.push({ before_t, n });
+      // The server evicted only OUR queue; it still holds the band — plus older
+      // columns, exactly like its exclusive `history(before_t)` page.
+      const depth_cols = [13, 14, 15, 16, 17].map((s) => makeCol(s, true));
+      return Promise.resolve({
+        type: MsgType.HISTORY_RESP,
+        req_id: 1,
+        epoch: 0,
+        oldest_available_t_ns: 0n,
+        depth_cols,
+        bar_cols: [],
+        markers: [],
+        big_trades: [],
+      });
+    };
+
+    // A server tx_lag drop burst: cols 15..17 are gone; 18 arrives.
+    store.emit(makeCol(18, true));
+    expect(r.validFromSeq).toBe(10); // the synchronous repair contract first
+
+    await flushMicrotasks();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].before_t).toBe(BigInt(18) * BigInt(DT_NS)); // anchored at the post-band column
+    // The zeroes were replaced by the real columns: they are cached/resident now.
+    for (const s of [15, 16, 17]) expect(r.columnCacheForTest.has(s)).toBe(true);
+    expect(r.validFromSeq).toBe(10); // in-place splices never move validity
+  });
+
+  it('a failed band refetch leaves the honest zeroes in place (no throw)', async () => {
+    const { r, store } = makeRenderer();
+    for (let s = 10; s <= 14; s++) store.emit(makeCol(s, true));
+    store.state.requestHistory = () => Promise.reject(new Error('history request timed out'));
+
+    expect(() => store.emit(makeCol(18, true))).not.toThrow();
+    await flushMicrotasks();
+    expect(r.validFromSeq).toBe(10);
+    expect(r.columnCacheForTest.has(15)).toBe(false); // zeroes still the fallback
+  });
+
+  it('an empty band page (server no longer holds it) keeps the zeroes', async () => {
+    const { r, store } = makeRenderer();
+    for (let s = 10; s <= 14; s++) store.emit(makeCol(s, true));
+    store.state.requestHistory = () =>
+      Promise.resolve({
+        type: MsgType.HISTORY_RESP,
+        req_id: 1,
+        epoch: 0,
+        oldest_available_t_ns: 0n,
+        depth_cols: [],
+        bar_cols: [],
+        markers: [],
+        big_trades: [],
+      });
+
+    store.emit(makeCol(18, true));
+    await flushMicrotasks();
+    expect(r.validFromSeq).toBe(10);
+    expect(r.columnCacheForTest.has(15)).toBe(false);
+  });
+
   // --- B-7(d): the CPU column cache covers the ring (profile window honesty) ----
 
   it('keeps every resident column cached so the profile window matches residency', () => {
@@ -734,6 +807,7 @@ describe('Renderer (fake GL harness)', () => {
       markers: false,
       axes: false,
       price: false,
+      volume: false, // F26 lane's strip: an explicit off, or anyVisible stays true
     });
     (r as unknown as { drawOverlays(): void }).drawOverlays();
     expect(inkSpy).toHaveBeenCalledTimes(1);

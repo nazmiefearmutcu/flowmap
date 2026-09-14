@@ -311,6 +311,149 @@ describe('HistoryLoader — session reset + page hygiene', () => {
   });
 });
 
+// --- repaired-skip band refetch (F24) ------------------------------------------
+// A server tx_lag drop evicts only THIS client's queue; the columns stay in the
+// session grid ring and `history(before_t)` still serves them. The renderer's
+// repair zeroes the skipped band; this refetch replaces the zeroes with the
+// real columns when the server still holds them (bounded, single-flight, and a
+// no-op fallback — the zeroes stay — on failure or an empty page).
+
+describe('HistoryLoader — repaired-skip band refetch (F24)', () => {
+  interface BandHarness {
+    loader: HistoryLoader;
+    spliced: number[];
+    requests: { before_t: bigint; n: number }[];
+    flushCount: () => number;
+    release: () => void;
+  }
+
+  /** Fake server: a dense store of columns at t0 = seq·DT down to `floor`. */
+  function bandHarness(floor: number, hold = false): BandHarness {
+    let releaseFn: (() => void) | null = null;
+    const gate = hold ? new Promise<void>((res) => { releaseFn = res; }) : null;
+    const spliced: number[] = [];
+    const requests: { before_t: bigint; n: number }[] = [];
+    let flushes = 0;
+    const loader = new HistoryLoader({
+      requestHistory: (before_t, n): Promise<HistoryResponse> => {
+        requests.push({ before_t, n });
+        // The server's exclusive page: the n newest columns with t0 < before_t,
+        // ascending (like the real grid ring).
+        const cols: DepthColumn[] = [];
+        for (let s = Number(before_t / BigInt(DT)) - 1; s >= floor && cols.length < n; s--) {
+          cols.push(makeCol(s, BigInt(s * DT)));
+        }
+        cols.reverse();
+        const resp: HistoryResponse = {
+          type: MsgType.HISTORY_RESP,
+          req_id: 1,
+          epoch: 0,
+          oldest_available_t_ns: BigInt(floor * DT),
+          depth_cols: cols,
+          bar_cols: [],
+          markers: [],
+          big_trades: [],
+        };
+        return gate ? gate.then(() => resp) : Promise.resolve(resp);
+      },
+      spliceColumn: (col) => spliced.push(col.col_seq),
+      residentRange: () => ({ oldest: 200, newest: 299, count: 100 }),
+      budgetCols: () => 512,
+      dtNs: () => DT,
+      onSpliced: () => {
+        flushes++;
+      },
+    });
+    return { loader, spliced, requests, flushCount: () => flushes, release: () => releaseFn?.() };
+  }
+
+  it('splices ONLY the missing band, ascending, anchored at the post-band column', async () => {
+    const h = bandHarness(0);
+    // Band 50..53 was dropped; col 54 arrived live with t0 = 54·DT.
+    h.loader.refetchBand(50, 53, BigInt(54 * DT));
+    await flush();
+
+    expect(h.requests).toHaveLength(1);
+    expect(h.requests[0].before_t).toBe(BigInt(54 * DT));
+    // Older page members (below 50) are NOT re-spliced here, and the order is
+    // ascending (each lands adjacent to the window).
+    expect(h.spliced).toEqual([50, 51, 52, 53]);
+  });
+
+  it('is single-flight and processes a band arriving mid-refetch (one pending slot)', async () => {
+    const h = bandHarness(0, true);
+    h.loader.refetchBand(50, 53, BigInt(54 * DT)); // holds on the gate
+    h.loader.refetchBand(55, 57, BigInt(58 * DT)); // arrives while in flight → pending
+    expect(h.requests).toHaveLength(1);
+
+    h.release();
+    await flush();
+    await flush();
+    expect(h.requests).toHaveLength(2); // the pending band ran right after
+    // Each band was covered exactly (they are disjoint here: col 54 is the
+    // anchor of the first band, already resident — never part of any drop).
+    expect(new Set(h.spliced)).toEqual(new Set([50, 51, 52, 53, 55, 56, 57]));
+    expect(h.flushCount()).toBe(2); // one mip flush per completed page walk
+  });
+
+  it('walks multiple pages for a band wider than one page (≤3 pages)', async () => {
+    const h = bandHarness(0);
+    // A 300-column band (1..300): page 1 returns 256 cols (45..300), page 2 the
+    // rest (1..44).
+    h.loader.refetchBand(1, 300, BigInt(301 * DT));
+    await flush();
+    await flush();
+    await flush();
+    expect(h.requests.length).toBeLessThanOrEqual(3);
+    expect(h.spliced.length).toBe(300);
+    expect([...h.spliced].sort((a, b) => a - b)).toEqual(Array.from({ length: 300 }, (_, i) => i + 1));
+  });
+
+  it('an empty page (server no longer holds the band) keeps the zeroes and stops', async () => {
+    const h = bandHarness(100); // server floor ABOVE the band
+    h.loader.refetchBand(50, 53, BigInt(54 * DT));
+    await flush();
+    expect(h.spliced).toEqual([]);
+  });
+
+  it('a transient failure leaves the zeroes, never throws, and a later band still refetches', async () => {
+    let fail = true;
+    const spliced: number[] = [];
+    const loader = new HistoryLoader({
+      requestHistory: (before_t): Promise<HistoryResponse> => {
+        if (fail) return Promise.reject(new Error('history request timed out'));
+        const cols: DepthColumn[] = [];
+        for (let s = Number(before_t / BigInt(DT)) - 1; s >= 0 && cols.length < 8; s--) cols.push(makeCol(s, BigInt(s * DT)));
+        cols.reverse();
+        return Promise.resolve({
+          type: MsgType.HISTORY_RESP,
+          req_id: 2,
+          epoch: 0,
+          oldest_available_t_ns: 0n,
+          depth_cols: cols,
+          bar_cols: [],
+          markers: [],
+          big_trades: [],
+        });
+      },
+      spliceColumn: (col) => spliced.push(col.col_seq),
+      residentRange: () => ({ oldest: 200, newest: 299, count: 100 }),
+      budgetCols: () => 512,
+      dtNs: () => DT,
+    });
+
+    loader.refetchBand(50, 53, BigInt(54 * DT));
+    await flush();
+    expect(spliced).toEqual([]);
+    expect(loader.error).toMatch(/timed out/);
+
+    fail = false;
+    loader.refetchBand(60, 62, BigInt(63 * DT));
+    await flush();
+    expect(spliced).toEqual([60, 61, 62]);
+  });
+});
+
 // --- page seam honesty + stale anchor prune (QA3 C-1) -------------------------
 // A history page can belong to a DIFFERENT grid than the resident window (a
 // reconstructed page, a session replacement under the same subscription). The

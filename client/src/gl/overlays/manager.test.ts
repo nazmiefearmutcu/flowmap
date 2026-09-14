@@ -214,6 +214,16 @@ describe('OverlayManager (fake GL + recording 2D)', () => {
     expect(internals().cvd.size).toBe(0);
   });
 
+  it('prune()/reset() bound the volume-strip columns (F26)', () => {
+    manager.onBar({ ...bar(0, 1), col_seq: 0, vol_buy: 1, vol_sell: 0 });
+    manager.onBar({ ...bar(500, 1), col_seq: 500, vol_buy: 1, vol_sell: 0 });
+    expect(manager.debug().volumeBars).toBe(2);
+    manager.prune(400, 600, 64);
+    expect(manager.debug().volumeBars).toBe(1);
+    manager.reset();
+    expect(manager.debug().volumeBars).toBe(0);
+  });
+
   it('badges a reconstructed-history VWAP (S2 D1 honesty), not when vwap is approx', () => {
     const badges: string[] = [];
     const text = internals().text as unknown as {

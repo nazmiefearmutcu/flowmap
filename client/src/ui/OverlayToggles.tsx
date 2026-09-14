@@ -12,6 +12,7 @@ import type { OverlayVisibility } from '../gl/overlays/frame';
 const ITEMS: Array<[keyof OverlayVisibility, string, string]> = [
   ['price', 'Price', 'Price — last-price line over the heatmap'],
   ['bubbles', 'Bubbles', 'Bubbles — trade size bubbles on the tape'],
+  ['volume', 'Volume', 'Volume — traded volume bars along the chart bottom'],
   ['bbo', 'BBO', 'BBO — best bid/offer'],
   ['vwap', 'VWAP', 'VWAP — volume-weighted average price'],
   ['cvd', 'CVD', 'CVD — cumulative volume delta (lower pane)'],

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { Markers } from './markers';
+import { GridMap, type TimeSlots } from './coords';
 import type { OverlayFrame } from './frame';
 import type { Marker } from '../../proto/types';
 
@@ -180,5 +181,141 @@ describe('Markers declutter policy (QA14 gapstack)', () => {
     m.draw(frame);
     expect(textCalls).toHaveLength(1);
     expect(textCalls[0].label).toBe('GAP ×12');
+  });
+});
+
+/**
+ * Seam knot anchoring (F22, F9-L1). Geometry mirrors the measured reattach
+ * seam: live columns at 1 s cadence, then a reconstructed block whose t0 runs
+ * BACKWARD of the column it lands after (the head jump), then the live
+ * resumption at the trailing knot. The piecewise table is therefore
+ * non-monotonic, and coords.ts's ascending binary search buries the trailing
+ * knot several block columns inside the block; with a long pre-block run the
+ * leading knot is also outside the table's time range, so the naive mapping
+ * hands it to the live affine (far off-view).
+ */
+function seamGrid(liveBefore: number, blockCols = 60) {
+  const startSeq = 100;
+  const t0 = new Float64Array(liveBefore + blockCols + 3);
+  for (let i = 0; i < liveBefore; i++) t0[i] = 1000 + i; // pre-block live, 1 s cadence
+  const headT0 = 900; // backward jump of (t0 of last live col) − 900
+  for (let j = 0; j < blockCols; j++) t0[liveBefore + j] = headT0 + j * 3.75; // block, 3.75 s
+  const resumeT0 = t0[liveBefore + blockCols - 1] - 5.25; // measured trailing overshoot
+  t0[liveBefore + blockCols] = resumeT0;
+  t0[liveBefore + blockCols + 1] = resumeT0 + 1;
+  t0[liveBefore + blockCols + 2] = resumeT0 + 2;
+  const slots: TimeSlots = { t0, startSeq };
+  return {
+    slots,
+    headCol: startSeq + liveBefore,
+    headTs: headT0,
+    tailCol: startSeq + liveBefore + blockCols,
+    tailTs: resumeT0,
+    lastT0: resumeT0 + 2,
+  };
+}
+
+function makeSeamFrame(g: ReturnType<typeof seamGrid>, colScale = 80) {
+  const textCalls: Array<{ x: number; y: number; label: string }> = [];
+  const hatchXs: number[] = [];
+  // 80 columns across the 800 px canvas, framed on the block head + tail.
+  const gm = new GridMap(
+    { colOffset: g.headCol - 4, colScale, rowOffset: 0, rowScale: 8 },
+    { drawW: 1600, drawH: 600, cssW: 800, cssH: 600 },
+    // dt matches the production ratio (live 0.25 s columns vs the block's
+    // stretched cadence), so the affine fallback is as wrong as it is live.
+    { anchorSeq: g.tailCol + 2, anchorT0Ns: BigInt(g.lastT0), dtNs: 0.25, slots: g.slots },
+    { p0: 0, step: 1 },
+  );
+  const frame = {
+    gm,
+    solid: {
+      begin() {},
+      addThickLine(x: number) {
+        hatchXs.push(x);
+      },
+      addTri() {},
+      addQuad() {},
+      flush() {},
+    },
+    points: {},
+    text: {
+      text(x: number, y: number, label: string) {
+        textCalls.push({ x, y, label });
+      },
+    },
+    resident: null,
+    capability: null,
+    columnArrays: () => null,
+  } as unknown as OverlayFrame;
+  return { frame, textCalls, hatchXs, gm };
+}
+
+describe('Markers seam knot anchoring (F22, F9-L1)', () => {
+  it('anchors the trailing seam badge on the block-end knot, not N columns inside the block', () => {
+    const g = seamGrid(12);
+    const m = new Markers();
+    m.add(seamMarker(g.tailTs));
+    const { frame, textCalls, hatchXs, gm } = makeSeamFrame(g);
+
+    // Precondition: the naive mapping really is buried inside the block (the
+    // binary search over the non-monotonic table stops early).
+    const naive = gm.tsToCol(BigInt(g.tailTs));
+    expect(g.tailCol - naive).toBeGreaterThan(1);
+
+    m.draw(frame);
+    expect(hatchXs).toHaveLength(1);
+    expect(hatchXs[0]).toBeCloseTo(gm.clipX(g.tailCol), 10); // the block end, exactly
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].label).toBe('SEAM');
+    expect(textCalls[0].x).toBeCloseTo(gm.cssX(g.tailCol) + 3, 10);
+  });
+
+  it('anchors the leading seam badge on the discontinuity edge even when the affine maps it off-view', () => {
+    // A pre-block run longer than the bounded local scan: only the seam
+    // markers' full-table fallback can find the head knot.
+    const g = seamGrid(1100);
+    const m = new Markers();
+    m.add(seamMarker(g.headTs));
+    const { frame, textCalls, hatchXs, gm } = makeSeamFrame(g);
+
+    // Precondition: the naive mapping is nowhere near the seam (off-view affine).
+    const naive = gm.tsToCol(BigInt(g.headTs));
+    expect(Math.abs(naive - g.headCol)).toBeGreaterThan(400);
+
+    m.draw(frame);
+    expect(hatchXs).toHaveLength(1);
+    expect(hatchXs[0]).toBeCloseTo(gm.clipX(g.headCol), 10); // first column of the block
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].x).toBeCloseTo(gm.cssX(g.headCol) + 3, 10);
+  });
+
+  it('keeps the column-center placement for a vertical marker that is not a knot', () => {
+    const g = seamGrid(12);
+    const ts = g.tailTs - 1.5; // between knots (1114.5 → stored as 1115, no knot)
+    const m = new Markers();
+    m.add(marker('gap', null, ts));
+    const { frame, textCalls, hatchXs, gm } = makeSeamFrame(g);
+
+    const naive = gm.tsToCol(BigInt(Math.round(ts)));
+    m.draw(frame);
+    expect(hatchXs).toHaveLength(1);
+    expect(hatchXs[0]).toBeCloseTo(gm.clipX(naive + 0.5), 10);
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].x).toBeCloseTo(gm.cssX(naive + 0.5) + 3, 10);
+  });
+
+  it('reads SEAM ×2 for two co-located seam knots once collapsed (F16 policy)', () => {
+    const g = seamGrid(12);
+    const m = new Markers();
+    // Head + tail knots collapse once the block is only ~30 px wide.
+    m.add(seamMarker(g.headTs));
+    m.add(seamMarker(g.tailTs));
+    const { frame, textCalls, hatchXs } = makeSeamFrame(g, 1600);
+
+    m.draw(frame);
+    expect(hatchXs).toHaveLength(2); // honesty: both hatches stay
+    expect(textCalls).toHaveLength(1);
+    expect(textCalls[0].label).toBe('SEAM ×2');
   });
 });

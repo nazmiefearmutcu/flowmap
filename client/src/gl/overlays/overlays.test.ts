@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { Bubbles, bubbleAlpha, bubbleRadiusPx, type BubbleOptions } from './bubbles';
+import {
+  Bubbles,
+  bubbleAlpha,
+  bubbleRadiusPx,
+  histBucketFor,
+  refFromHistogram,
+  HIST_BUCKETS,
+  type BubbleScale,
+} from './bubbles';
 import { GridMap, type TimeMap } from './coords';
 import type { OverlayFrame } from './frame';
 import {
@@ -18,34 +26,166 @@ import { accumulateProfile } from './profile';
 import { sessionVwap } from './vwap';
 import { makeHybrid, rowToPrice } from '../priceScale';
 
-const BUBBLE_DEFAULTS: Required<BubbleOptions> = {
-  capacity: 120_000,
-  minSize: 0,
-  refSize: 4,
+/**
+ * Live BTCUSDT anchor — measured from the owner's own recordings
+ * (`~/.flowmap/recordings/binance-spot/BTCUSDT`, 40 part files, n=278 prints):
+ *   p50 5.3e-4 · p75 6.4e-3 · p90 3.0e-2 · p95 6.9e-2 · p99 2.5e-1 · max 1.07
+ * The adaptive reference lands on p90 ≈ 0.03; the band is 6–24 px diameter.
+ */
+const LIVE_REF = 0.03;
+const BUBBLE_SCALE: BubbleScale = {
+  refSize: LIVE_REF,
   baseRadiusPx: 5,
   minRadiusPx: 3,
-  maxRadiusPx: 20,
+  maxRadiusPx: 12,
 };
 
-describe('bubbleRadiusPx (√-area scaling, clamped)', () => {
-  it('maps the reference size to the base radius', () => {
-    expect(bubbleRadiusPx(4, BUBBLE_DEFAULTS)).toBeCloseTo(5);
+describe('bubbleRadiusPx (√-area scaling, 6–24 px band)', () => {
+  it('maps the reference (p90) print to the base radius', () => {
+    expect(bubbleRadiusPx(LIVE_REF, BUBBLE_SCALE)).toBeCloseTo(5);
   });
   it('scales with √size', () => {
-    expect(bubbleRadiusPx(16, BUBBLE_DEFAULTS)).toBeCloseTo(10); // 5·√(16/4)
+    expect(bubbleRadiusPx(0.12, BUBBLE_SCALE)).toBeCloseTo(10); // 4× size → 2× radius
   });
   it('clamps to the min/max radius', () => {
-    expect(bubbleRadiusPx(0, BUBBLE_DEFAULTS)).toBe(3);
-    expect(bubbleRadiusPx(1e9, BUBBLE_DEFAULTS)).toBe(20);
+    expect(bubbleRadiusPx(0, BUBBLE_SCALE)).toBe(3);
+    expect(bubbleRadiusPx(1e9, BUBBLE_SCALE)).toBe(12);
   });
-  it('keeps small trades as dots and big prints under the cap', () => {
-    // size=1: raw 5·√(1/4)=2.5 → clamped to the 3px minimum (6px dot) — the
-    // W6 swarm2 visibility floor at live BTC sizes.
-    expect(bubbleRadiusPx(1, BUBBLE_DEFAULTS)).toBe(3);
-    // size=10: 5·√(10/4) ≈ 7.9px.
-    expect(bubbleRadiusPx(10, BUBBLE_DEFAULTS)).toBeCloseTo(5 * Math.sqrt(10 / 4));
-    // size=100: raw 5·√(100/4)=25 → capped at 20px (40px diameter, was 88px).
-    expect(bubbleRadiusPx(100, BUBBLE_DEFAULTS)).toBe(20);
+  it('spreads the measured live BTC percentiles across the band', () => {
+    // p75 → floor (6 px dot), p90 → 10 px, p95 → ~15 px, p99/max → cap (24 px).
+    // Pre-F25 (refSize 4, cap 20) EVERY print below ~2 BTC measured 2–4 px of
+    // ink (QA19 H5 = 3/10); these pins are the measured calibration.
+    expect(bubbleRadiusPx(6.4e-3, BUBBLE_SCALE)).toBe(3);
+    expect(bubbleRadiusPx(3.0e-2, BUBBLE_SCALE)).toBeCloseTo(5);
+    expect(bubbleRadiusPx(6.9e-2, BUBBLE_SCALE)).toBeCloseTo(5 * Math.sqrt(6.9e-2 / LIVE_REF));
+    expect(bubbleRadiusPx(2.5e-1, BUBBLE_SCALE)).toBe(12);
+    expect(bubbleRadiusPx(1.07, BUBBLE_SCALE)).toBe(12);
+  });
+});
+
+describe('adaptive size reference (p90 of the session tape)', () => {
+  const ANCHOR = 5n * 250_000_000n;
+  const DT = 250_000_000;
+  const gm = (): GridMap =>
+    new GridMap(
+      { colOffset: 0, colScale: 10, rowOffset: 0, rowScale: 100 },
+      { drawW: 800, drawH: 400, cssW: 800, cssH: 400 },
+      { anchorSeq: 5, anchorT0Ns: ANCHOR, dtNs: DT },
+      { p0: 0, step: 0.5 },
+    );
+  /** ts for a fractional column under the affine above (col 5 = the anchor). */
+  const tsOfCol = (col: number): bigint => ANCHOR + BigInt(Math.round((col - 5) * DT));
+  const sink = (out: number[]) => ({
+    begin: () => {},
+    add: (_x: number, _y: number, s: number) => {
+      out.push(s);
+    },
+    flush: () => {},
+  });
+
+  it('histBucketFor is monotonic and clamps to the table', () => {
+    expect(histBucketFor(0)).toBe(0);
+    expect(histBucketFor(1e-9)).toBe(0);
+    expect(histBucketFor(1e9)).toBe(HIST_BUCKETS - 1);
+    expect(histBucketFor(0.03)).toBeGreaterThan(histBucketFor(0.003));
+  });
+
+  it('refFromHistogram returns the p90 bucket centre, 0 when empty', () => {
+    const hist = new Uint32Array(HIST_BUCKETS);
+    expect(refFromHistogram(hist, 0)).toBe(0);
+    hist[histBucketFor(1)] = 10;
+    // Bucket resolution is 1/3 decade, so the centre is within ±half a bucket
+    // (≈ ×1.47) of the true sample — a ±8% radius effect, not a size error.
+    const r = refFromHistogram(hist, 10);
+    expect(Math.abs(Math.log10(r))).toBeLessThanOrEqual((16 / HIST_BUCKETS) * 0.5);
+  });
+
+  it('a live-shaped tape yields refSize ≈ p90 and spreads the ladder', () => {
+    const emitted: number[] = [];
+    const b = new Bubbles();
+    // 40 floor prints (off-view left — still counted in the histogram) + the
+    // ladder, whose two 0.03 prints put p90 on the measured BTC bucket.
+    for (let i = 0; i < 40; i++) {
+      b.add({ ts_ns: -1_000_000_000n, price: 5, size: 0.0005, side: 1 } as never);
+    }
+    const ladder = [0.03, 0.03, 0.07, 0.25, 1];
+    ladder.forEach((s, i) => {
+      b.add({ ts_ns: tsOfCol(5.5 + i), price: 5, size: s, side: i % 2 } as never);
+    });
+    b.draw({ gm: gm(), points: sink(emitted), resident: null } as unknown as OverlayFrame);
+
+    // Newest first: 1 → cap (24 px), 0.25 → cap, 0.07 → ~14.9, 0.03 → ~9.7.
+    expect(emitted).toHaveLength(5);
+    expect(emitted[0]).toBeCloseTo(24, 0);
+    expect(emitted[1]).toBeCloseTo(24, 0);
+    expect(emitted[2]).toBeCloseTo(14.9, 0);
+    expect(emitted[3]).toBeCloseTo(9.7, 0);
+  });
+
+  it('honours a fixed refSize override', () => {
+    const b = new Bubbles({ refSize: 2 });
+    expect(b.refSize()).toBe(2);
+    b.add({ ts_ns: ANCHOR, price: 5, size: 2, side: 1 } as never);
+    expect(b.refSize()).toBe(2); // override wins over the histogram
+  });
+
+  it('reset clears the tape and the adaptive reference', () => {
+    const b = new Bubbles();
+    b.add({ ts_ns: ANCHOR, price: 5, size: 1, side: 1 } as never);
+    b.reset();
+    expect(b.length).toBe(0);
+    expect(b.refSize()).toBe(1); // empty histogram fallback
+  });
+});
+
+describe('overlap thinning (F25 clutter control)', () => {
+  const ANCHOR = 5n * 250_000_000n;
+  const DT = 250_000_000;
+  const gm = (): GridMap =>
+    new GridMap(
+      { colOffset: 0, colScale: 10, rowOffset: 0, rowScale: 100 },
+      { drawW: 800, drawH: 400, cssW: 800, cssH: 400 },
+      { anchorSeq: 5, anchorT0Ns: ANCHOR, dtNs: DT },
+      { p0: 0, step: 0.5 },
+    );
+  const tsOfCol = (col: number): bigint => ANCHOR + BigInt(Math.round((col - 5) * DT));
+  const sink = (out: number[]) => ({
+    begin: () => {},
+    add: (x: number) => {
+      out.push(x);
+    },
+    flush: () => {},
+  });
+
+  it('keeps the newest print when two land on the same pixel', () => {
+    const xs: number[] = [];
+    const b = new Bubbles();
+    b.add({ ts_ns: tsOfCol(6), price: 5, size: 1, side: 1 } as never);
+    b.add({ ts_ns: tsOfCol(6), price: 5, size: 1, side: 1 } as never);
+    b.draw({ gm: gm(), points: sink(xs), resident: null } as unknown as OverlayFrame);
+    expect(xs).toHaveLength(1);
+  });
+
+  it('keeps prints separated by more than the radius sum', () => {
+    const xs: number[] = [];
+    const b = new Bubbles();
+    b.add({ ts_ns: tsOfCol(6), price: 5, size: 1, side: 1 } as never);
+    b.add({ ts_ns: tsOfCol(8), price: 5, size: 1, side: 1 } as never); // 160 px away
+    b.draw({ gm: gm(), points: sink(xs), resident: null } as unknown as OverlayFrame);
+    expect(xs).toHaveLength(2);
+  });
+
+  it('thins a dense chain but never the first print of a frame', () => {
+    const xs: number[] = [];
+    const b = new Bubbles();
+    // 9 prints ~4 px apart (0.05 col at colScale 10) — a chain the radius sum
+    // (2×4.8 px at ref≈1) fully covers, so the field thins to a few marks.
+    for (let i = 0; i < 9; i++) {
+      b.add({ ts_ns: tsOfCol(5.5 + i * 0.05), price: 5, size: 1, side: 1 } as never);
+    }
+    b.draw({ gm: gm(), points: sink(xs), resident: null } as unknown as OverlayFrame);
+    expect(xs.length).toBeGreaterThanOrEqual(1);
+    expect(xs.length).toBeLessThan(9);
   });
 });
 

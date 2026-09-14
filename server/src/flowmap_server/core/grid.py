@@ -73,6 +73,39 @@ BAND_MARGIN = 1.25
 # storm epochs forever.
 BAND_TRIP_RATIO = 1.25
 
+# Price-adaptive ticking for feeds that declare ``price_adaptive_tick``.
+# The fixed crypto fallback tick ($0.50) is calibrated for BTC-scale
+# instruments: at a $2.5k mid it spans ±512 USD, at a $0.08 mid the book
+# collapses into <1 row (and the axis frame reaches negative prices). A fixed
+# tick at/above ``mid * TICK_COARSE_RATIO`` is "coarse" for that instrument and
+# is replaced by the 5th significant digit of its own price.
+TICK_COARSE_RATIO = 1e-3
+# Significant digits kept by the adapted tick: tick = 10**floor(log10(mid))
+# scaled down to the TICK_SIG_DIGITS-th digit. 5 digits gives DOGE $0.0825 ->
+# 1e-6 (half-frame $0.0010, ~10 rows per $0.00001 venue tick) and SOL $99.6 ->
+# 1e-3, while every mid keeps a strictly positive frame at 2048 rows.
+TICK_SIG_DIGITS = 5
+
+
+def adaptive_tick_for(mid: float, tick: float) -> float:
+    """Price-proportional tick for a small instrument, else the given tick.
+
+    Returns ``tick`` unchanged when it is already fine enough relative to
+    ``mid`` (``tick < mid * TICK_COARSE_RATIO``) — BTC/ETH keep their $0.50
+    step byte-for-byte. Otherwise the tick becomes the 5th significant digit
+    of the mid itself (a power-of-10 fraction of price). Any non-finite or
+    non-positive input is returned unchanged: this is called straight off feed
+    data, never raises.
+    """
+    if not math.isfinite(mid) or mid <= 0.0:
+        return tick
+    if not math.isfinite(tick) or tick <= 0.0:
+        return tick
+    if tick < mid * TICK_COARSE_RATIO:
+        return tick
+    decade = 10.0 ** math.floor(math.log10(mid))
+    return decade * 10.0 ** -(TICK_SIG_DIGITS - 1)
+
 
 class GridCfg(msgspec.Struct, frozen=True):
     """Immutable grid configuration for one session."""
@@ -94,6 +127,11 @@ class GridCfg(msgspec.Struct, frozen=True):
     band_hybrid: bool = False
     # Rows given to the linear core; 0 => rows // 2.
     core_rows: int = 0
+    # Opt into price-proportional ticking on the legacy (native) linear grid:
+    # at the first real mid a fallback tick too coarse for the instrument is
+    # replaced by ``adaptive_tick_for(mid, tick)`` (see there). Off by default
+    # so explicit ticks and every existing grid stay exactly as configured.
+    auto_tick: bool = False
 
 
 def band_frame(
@@ -155,9 +193,15 @@ class Grid:
             raise ValueError("rows, ring_columns and dt_ns must be positive")
         self._cfg = cfg
         # tick_multiple is MUTABLE only until the first real-mid band anchor,
-        # then frozen for the session (see maybe_reanchor).
+        # then frozen for the session (see maybe_reanchor). ``_tick`` is mutable
+        # for the same reason on auto_tick grids: the fallback tick cannot
+        # serve a sub-dollar instrument, so the first real mid may install a
+        # price-proportional one (never after a column exists or a tail was
+        # preloaded — the client draws all resident columns through ONE row
+        # affine).
+        self._tick = cfg.tick
         self._tick_multiple = cfg.tick_multiple
-        self._step = cfg.tick * cfg.tick_multiple
+        self._step = self._tick * cfg.tick_multiple
         self._p0 = cfg.p0
         self._epoch = 0
         # Band state. `_anchor_mid` is the mid the current frame was built for;
@@ -165,6 +209,16 @@ class Grid:
         self._banded = cfg.band_up is not None and cfg.band_down is not None
         self._anchor_mid: float | None = None
         self._band_anchored = False
+        # True once the tick is frozen for the session: set by a rehydrated/
+        # backfilled frame (preload) or by the first real mid on an auto_tick
+        # grid. The adaptive path only fires while this is False.
+        self._tick_anchored = False
+        # True once ANY column with nonzero density has been finalized. A live
+        # feed can emit trades before the first depth snapshot, finalizing
+        # all-zero columns; adapting the tick is still safe then (nothing real
+        # was painted), but never once ink is in the ring — the client draws
+        # every resident column through ONE row affine.
+        self._frozen_nonzero = False
         # The row<->price map. For a linear grid this is kept in lockstep with
         # _p0/_step, which remain the truth there; a hybrid band replaces it
         # wholesale on its first real-mid anchor.
@@ -176,7 +230,7 @@ class Grid:
         self._epoch_params: dict[int, EpochParams] = {
             0: EpochParams(
                 epoch=0,
-                tick=cfg.tick,
+                tick=self._tick,
                 tick_multiple=cfg.tick_multiple,
                 dt_ns=cfg.dt_ns,
                 p0=cfg.p0,
@@ -245,8 +299,13 @@ class Grid:
         ``columns`` must be chronological with strictly increasing
         ``col_seq``/``t0_ns`` (what :meth:`Recorder.load_tail` returns) and
         ``epochs`` must cover every epoch they reference; every epoch must
-        match this grid's ``(tick, tick_multiple, dt_ns, rows)`` (``p0`` is
-        per-epoch by design). ``ValueError`` otherwise.
+        match this grid's ``(dt_ns, rows)`` and carry either the nominal
+        ``tick`` or the NEWEST epoch's tick (an ``auto_tick`` grid records the
+        adapted one — e.g. DOGE 1e-6). A tail whose tick is still too coarse
+        for its own recorded price (a pre-fix DOGE recording at $0.50) is
+        rejected too: the caller cold-starts and the backfill re-bins the
+        history in a usable frame instead of perpetuating the collapse.
+        ``ValueError`` otherwise.
 
         Live columns then continue at ``col_seq = columns[-1].col_seq + 1``
         with wall-anchored ``t0`` — the seq<->t0 affinity intentionally
@@ -270,10 +329,14 @@ class Grid:
         # one (M3). So the shape fields must match for every epoch, but the
         # multiple only has to be either the nominal one or the NEWEST epoch's
         # frozen one — anything else is a shape change and rejects the tail.
-        newest_tm = ep_map[columns[-1].epoch].tick_multiple
+        # The tick gets the same treatment on an auto_tick grid: the adapted
+        # tick (e.g. DOGE 1e-6) is not cfg.tick but is what the tail carries.
+        newest = ep_map[columns[-1].epoch]
+        newest_tm = newest.tick_multiple
         allowed_tm = {cfg.tick_multiple, newest_tm}
+        allowed_tick = {cfg.tick, newest.tick} if cfg.auto_tick else {cfg.tick}
         for e in ep_map.values():
-            if (e.tick, e.dt_ns, e.rows) != (cfg.tick, cfg.dt_ns, cfg.rows):
+            if e.tick not in allowed_tick or (e.dt_ns, e.rows) != (cfg.dt_ns, cfg.rows):
                 raise ValueError(
                     f"epoch {e.epoch} params {e} do not match grid cfg "
                     f"(tick={cfg.tick}, dt_ns={cfg.dt_ns}, rows={cfg.rows})"
@@ -284,6 +347,21 @@ class Grid:
                     f"neither cfg {cfg.tick_multiple} nor the tail's frozen "
                     f"{newest_tm}"
                 )
+        # Refuse a tail recorded on a tick its own price has outgrown (a
+        # pre-fix DOGE/USDT recording: $0.50 rows on a $0.08 asset). Keeping
+        # it would perpetuate the sub-row collapse; the caller cold-starts and
+        # the backfill re-bins the candles in the adapted frame.
+        newest_close = columns[-1].bar.c
+        if (
+            cfg.auto_tick
+            and math.isfinite(newest_close)
+            and newest_close > 0.0
+            and newest.tick >= newest_close * TICK_COARSE_RATIO
+        ):
+            raise ValueError(
+                f"recorded tick {newest.tick} is too coarse for the recorded "
+                f"price {newest_close}; re-bin via cold start"
+            )
         columns = columns[-cfg.ring_columns :]
         prev = None
         for c in columns:
@@ -320,13 +398,18 @@ class Grid:
         self._epoch = last.epoch
         self._epoch_params.update(ep_map)
         self._p0 = ep_map[last.epoch].p0
-        # Adopt the tail's frame, including its FROZEN tick_multiple, and
-        # reconstruct the band anchor from the restored p0. Without this a
-        # rehydrated banded session would treat its first book as the initial
-        # anchor and emit a spurious EpochStart (and, worse, recompute the
-        # multiple against a grid whose history was written with another one).
-        self._tick_multiple = ep_map[last.epoch].tick_multiple
-        self._step = self._cfg.tick * self._tick_multiple
+        # Adopt the tail's frame, including its FROZEN tick_multiple (and, on
+        # an auto_tick grid, its adapted tick), and reconstruct the band anchor
+        # from the restored p0. Without this a rehydrated banded session would
+        # treat its first book as the initial anchor and emit a spurious
+        # EpochStart (and, worse, recompute the multiple against a grid whose
+        # history was written with another one).
+        self._tick = newest.tick
+        self._tick_multiple = newest.tick_multiple
+        self._step = self._tick * self._tick_multiple
+        # The restored frame freezes the tick: a rehydrated grid must never
+        # adapt mid-session (resident columns share one row affine).
+        self._tick_anchored = True
         if self._banded:
             self._band_anchored = True
             self._anchor_mid = self._p0 + (self._cfg.rows * self._step) / 2.0
@@ -487,6 +570,8 @@ class Grid:
         self._ring_t0[i] = t0
         self._ring_seq[i] = self._count
         self._ring_bars[i] = bar
+        if not self._frozen_nonzero and float(density16.max()) > 0.0:
+            self._frozen_nonzero = True
 
         col = FinalizedColumn(
             epoch=self._epoch,
@@ -656,6 +741,16 @@ class Grid:
           ``[anchor/BAND_TRIP_RATIO, anchor*BAND_TRIP_RATIO]``) and moves
           ``p0`` ONLY.
 
+        Auto-tick grids (``cfg.auto_tick``, feeds serving sub-dollar
+        instruments) get one extra step before the legacy rule: the FIRST call
+        with a usable mid may replace a fallback tick too coarse for the
+        instrument with a price-proportional one (``adaptive_tick_for``) and
+        centre the frame in the same commit. That is safe exactly once — no
+        column with nonzero density has been finalized (pre-book trade
+        intervals may emit all-zero columns; they stay zero under the new
+        affine), and a preloaded frame sets ``_tick_anchored`` in
+        :meth:`preload`, so a rehydrated grid never adapts.
+
         Freezing the multiple is load-bearing, not tidiness. In band mode the
         multiple is proportional to mid, so recomputing it on every re-anchor
         would CHANGE ``step`` mid-session — and the fragment shader applies ONE
@@ -733,6 +828,24 @@ class Grid:
             return self._commit_anchor(new_p0, rebuild_state=True)
 
         # --- legacy fixed-span rule --------------------------------------
+        if cfg.auto_tick and not self._tick_anchored:
+            self._tick_anchored = True
+            new_tick = adaptive_tick_for(mid, self._tick)
+            if new_tick != self._tick and not self._frozen_nonzero:
+                # First real mid on a fallback tick too coarse for this
+                # instrument (DOGE at $0.50/row collapses into <1 row and puts
+                # negative prices in the frame). Install the price-proportional
+                # tick and centre the frame in one commit. Only ever safe
+                # before any density was finalized (pre-book trade intervals
+                # may have emitted all-zero columns; they stay zero under the
+                # new affine), and epoch 0 announced no painted column.
+                self._tick = new_tick
+                self._tick_multiple = 1
+                self._step = new_tick
+                span = cfg.rows * self._step
+                new_p0 = round((mid - span / 2.0) / self._step) * self._step
+                self._anchor_mid = mid
+                return self._commit_anchor(new_p0, rebuild_state=True)
         span = cfg.rows * self._step
         lo = self._p0 + 0.15 * span
         hi = self._p0 + 0.85 * span
@@ -747,12 +860,13 @@ class Grid:
         The in-progress accumulator is row-shifted by the p0 delta when that
         delta is an exact whole number of rows (always true when the step is
         unchanged); when the step itself just changed — only possible on the
-        FIRST band anchor, before any column of this session has been
-        finalized — the accumulator is zeroed instead, because there is no
-        integer row mapping between the two grids.
+        FIRST band anchor or the FIRST real mid of an auto_tick grid, before
+        any column of this session has been finalized — the accumulator is
+        zeroed instead, because there is no integer row mapping between the
+        two grids.
         """
         cfg = self._cfg
-        if self._step == cfg.tick * self._tick_multiple and self._p0 != new_p0:
+        if self._step == self._tick * self._tick_multiple and self._p0 != new_p0:
             delta = (new_p0 - self._p0) / self._step
             offset = round(delta)
             if abs(delta - offset) < 1e-9:
@@ -771,7 +885,7 @@ class Grid:
             self._scale = linear_scale(new_p0, self._step, cfg.rows)
         params = EpochParams(
             epoch=self._epoch,
-            tick=cfg.tick,
+            tick=self._tick,
             tick_multiple=self._tick_multiple,
             dt_ns=cfg.dt_ns,
             p0=new_p0,

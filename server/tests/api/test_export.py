@@ -161,6 +161,57 @@ async def test_json_export_shape(app, client):
     assert cols[-1]["asks"] == pytest.approx([float(v) for v in depth.ask])
 
 
+async def test_adaptive_tick_is_reported_in_export_metadata(app, client):
+    """A price-adaptive grid (DOGE-class) reports its ACTIVE tick, not the
+    nominal fallback the GridCfg still carries (QA20 C1 export truth)."""
+    active = 1e-6
+    close = 0.0825
+    p0 = close - ROWS * active / 2.0
+    grid = Grid(
+        GridCfg(
+            tick=TICK, tick_multiple=1, dt_ns=DT_NS, p0=p0, rows=ROWS,
+            ring_columns=RING, mode=events.MODE_L2, auto_tick=True,
+        )
+    )
+    cols = []
+    for i in range(3):
+        bar = events.BarColumn(
+            epoch=0, col_seq=i, t0_ns=i * DT_NS,
+            o=close, h=close, l=close, c=close,
+            vol_buy=1.0, vol_sell=1.0, cvd_cum=0.0,
+            vwap_num_cum=close, vwap_den_cum=1.0,
+        )
+        cols.append(
+            FinalizedColumn(
+                epoch=0, col_seq=i, t0_ns=i * DT_NS,
+                bid=np.ones(ROWS, dtype=np.float16),
+                ask=np.ones(ROWS, dtype=np.float16),
+                bar=bar,
+            )
+        )
+    grid.preload(
+        cols,
+        [events.EpochParams(epoch=0, tick=active, tick_multiple=1,
+                            dt_ns=DT_NS, p0=p0, rows=ROWS)],
+    )
+    session = Session(
+        "doge", feed=_StubFeed("DOGEUSDT", "binance-spot"), grid=grid
+    )
+    app.state.manager._sessions[
+        ("binance-spot", "DOGEUSDT", "live", None, "0")
+    ] = session
+
+    csv_body = await client.get("/api/export", params={"format": "csv", "columns": 3})
+    assert csv_body.status_code == 200
+    assert "tick=1e-06" in csv_body.text.splitlines()[0]
+    json_body = json.loads(
+        (
+            await client.get("/api/export", params={"format": "json", "columns": 3})
+        ).text
+    )
+    assert json_body["tick"] == pytest.approx(active)
+
+
 # --- selection --------------------------------------------------------------
 
 

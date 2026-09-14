@@ -4,8 +4,8 @@
  * Owns the two shared GL batches, the over-heatmap text layer, the optional
  * price/time gutter layers, and every overlay instance; routes the canonical
  * stream (Trade/BBO/BarColumn/Marker) into them; and draws them in the spec order
- * (heatmap already drawn → profile → vwap → bbo → price → bubbles → markers →
- * text/axes) each dirty frame. The renderer holds ONE of these and calls
+ * (heatmap already drawn → volume → profile → vwap → bbo → price → bubbles →
+ * markers → text/axes) each dirty frame. The renderer holds ONE of these and calls
  * {@link draw} after the heatmap pass — keeping renderer.ts focused on the tile
  * ring / camera.
  *
@@ -32,6 +32,7 @@ import { PriceLine } from './priceLine';
 import { Profile } from './profile';
 import { Cvd } from './cvd';
 import { Vwap } from './vwap';
+import { VolBars } from './volbars';
 import { TextLayer } from '../textLayer';
 import type { HeatmapView } from '../heatmap';
 import { rowToPrice as scaleRowToPrice } from '../priceScale';
@@ -75,6 +76,9 @@ export class OverlayManager {
    *  pane (it is not a price), so the manager only owns its DATA; the CvdPane
    *  reads {@link cvdSeries} + the camera transform and draws its own canvas. */
   private readonly cvd = new Cvd();
+  /** Traded-volume bars along the chart's bottom edge (Bookmap H7, F26):
+   *  bar-derived like CVD but drawn IN the chart, on the shared text layer. */
+  private readonly volumeBars = new VolBars();
 
   private visibility: OverlayVisibility = { ...DEFAULT_OVERLAY_VISIBILITY };
 
@@ -175,6 +179,7 @@ export class OverlayManager {
     this.vwap.add(b);
     this.priceLine.add(b);
     this.cvd.add(b);
+    this.volumeBars.add(b);
   }
 
   onMarker(m: Marker): void {
@@ -186,6 +191,7 @@ export class OverlayManager {
     this.vwap.prune(oldest, newest, pad);
     this.priceLine.prune(oldest, newest, pad);
     this.cvd.prune(oldest, newest, pad);
+    this.volumeBars.prune(oldest, newest, pad);
   }
 
   /** Drop all overlay data (context loss / go-live re-seed / test reset). */
@@ -195,6 +201,7 @@ export class OverlayManager {
     this.vwap.reset();
     this.priceLine.reset();
     this.cvd.reset();
+    this.volumeBars.reset();
     this.markers.reset();
     this.resetCursor();
   }
@@ -250,6 +257,7 @@ export class OverlayManager {
     hasChannelBbo: boolean;
     profilePoc: number;
     profileMax: number;
+    volumeBars: number;
   } {
     return {
       bubbles: this.bubbles.length,
@@ -258,13 +266,14 @@ export class OverlayManager {
       hasChannelBbo: this.hasChannelBbo,
       profilePoc: this.profile.last?.pocRow ?? -1,
       profileMax: this.profile.last?.max ?? 0,
+      volumeBars: this.volumeBars.size,
     };
   }
 
   /** Whether any overlay could draw (used by the renderer to skip cheaply). */
   get anyVisible(): boolean {
     const v = this.visibility;
-    return v.bubbles || v.bbo || v.vwap || v.profile || v.markers || v.axes || v.price;
+    return v.bubbles || v.bbo || v.vwap || v.profile || v.markers || v.axes || v.price || v.volume;
   }
 
   // --- draw ---------------------------------------------------------------------
@@ -308,6 +317,11 @@ export class OverlayManager {
     this.text.syncSize(ctx.dims.cssW, ctx.dims.cssH, ctx.dpr);
     this.text.clear();
     if (this.visibility.axes) drawGridlines(this.text, this.gm);
+
+    // Volume strip FIRST among the data overlays: it is a bottom-edge band, so
+    // the price line / BBO / bubbles stay on top where the trace dips into it.
+    // Drawn after the gridlines so the bars are ink, not a hole in the grid.
+    if (this.visibility.volume) this.volumeBars.draw(frame);
 
     // GL overlays in the effective z-order (each flushes its own geometry →
     // z-order). BBO draws BEFORE the price line so the near-white last-price

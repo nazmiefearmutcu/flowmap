@@ -575,6 +575,14 @@ class CryptoFeed:
     restart loop owns recovery.
     """
 
+    # Crypto venues list instruments priced from cents to six figures, so the
+    # sim-shaped $0.50 fallback tick is only right for the top of that range.
+    # Declaring the opt-in lets the grid tick-scale to the symbol's price
+    # magnitude at the first real mid (see core.grid.adaptive_tick_for); an
+    # explicit FLOWMAP_CRYPTO_TICK or a ``preferred_tick`` still wins, and
+    # BTC/ETH keep 0.5 (their fallback is already fine for the price).
+    price_adaptive_tick = True
+
     def __init__(
         self,
         exchange: str,

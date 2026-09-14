@@ -425,13 +425,22 @@ export function levelBlendFor(
  * smear/step aliasing). The new sampler is one width-scaled Gaussian on the
  * TIME axis, `sigma` pinned in SCREEN pixels:
  *
- *   sigmaCols = clamp(SMOOTH_SIGMA_PX * colsPerPixel, 0.12, 2.0)
+ *   sigmaCols = clamp(SMOOTH_SIGMA_PX * colsPerPixel · dpr, 0.12, 2.0)
  *   taps      = 9 (offsets −4..+4) when sigmaCols > 0.12, else 1 (pure bilinear)
  *
  * so the edge response stays ~`2.563 * 2.5 ≈ 6.4 px` (10–90) at deep zoom and
  * only sharpens as columns become sub-pixel (the 2.0-column cap). The vertical
  * axis is untouched — price stays crisp. Non-finite input degrades to the
  * minimum plan (single bilinear tap).
+ *
+ * F14 §L2 DPR portability (wave 4, 2026-09-14): the screen pixel here is a
+ * **CSS pixel**, NOT a framebuffer pixel. The caller ({@link Heatmap.draw})
+ * converts the framebuffer-denominated footprints to CSS px with the
+ * device-pixel ratio (`colsPerPixel = colScale / drawingBufferWidth · dpr` /
+ * `rowsPerPixel · dpr`) BEFORE applying any law, so a retina panel renders the
+ * same CSS edge widths as DPR1 instead of a ~2× harder field (at DPR2 the
+ * un-scaled law measured 1-tap barcodes, 96–98% sub-3-px hairlines). DPR1 is
+ * byte-identical: the ratio reads exactly 1 there.
  */
 export const SMOOTH_SIGMA_PX = 2.5;
 /** Odd tap budget baked into the GLSL loop bound (offsets −4..+4). */
@@ -466,13 +475,16 @@ export interface SmoothPlan {
 }
 
 /**
- * Map the time-axis footprint (`colsPerPixel = view.colScale /
- * drawingBufferWidth`, always `> 0` in the time-grid convention) to the
- * frame's sampler plan. Pure and monotone in `colsPerPixel`; non-finite input
- * (and negatives) degrade to the minimum plan. `taps` follows the tier table
- * above; the truncation is honest about its cost (see {@link SMOOTH_TAPS_TIERS}
- * — effective σ shifts ≲13% downward at tier boundaries, a perf trade whose
- * result the smooth-zoom pixel bars enforce).
+ * Map the time-axis footprint (`colsPerPixel`, SCREEN = CSS pixels — the
+ * caller scales the framebuffer footprint by the device-pixel ratio, see
+ * {@link SMOOTH_SIGMA_PX} / F14 §L2) to the frame's sampler plan. Pure and
+ * monotone in `colsPerPixel`; non-finite input (and negatives) degrade to the
+ * minimum plan. `taps` follows the tier table above; the truncation is honest
+ * about its cost (see {@link SMOOTH_TAPS_TIERS} — effective σ shifts ≲13%
+ * downward at tier boundaries, a perf trade whose result the smooth-zoom
+ * pixel bars enforce). In CSS units the plan is DPR-invariant:
+ * `smoothPlanFor(cpp_fb · dpr)` is the same plan at every DPR for the same
+ * CSS framing.
  */
 export function smoothPlanFor(colsPerPixel: number): SmoothPlan {
   const cpp = Number.isFinite(colsPerPixel) ? Math.max(0, colsPerPixel) : 0;
@@ -490,14 +502,14 @@ export function smoothPlanFor(colsPerPixel: number): SmoothPlan {
   return { sigmaCols, taps };
 }
 
-/** Vertical softening target in SCREEN pixels (barcode fix, 2026-09-13). */
+/** Vertical softening target in SCREEN (CSS) pixels (barcode fix, 2026-09-13). */
 export const SMOOTH_ROW_SIGMA_PX = 2.2;
 /**
- * Cap on the total vertical blend band in SCREEN pixels (barcode fix wave 2,
- * 2026-09-14). The triple spans ±dy rows → `2·dy / rowsPerPixel` screen px;
- * the pixel-denominated dy already bounds that at `2·sigma_px` = 4.4 px. The
- * cap is the guard for a future sigma raise (and documents the ≤10 px
- * acceptance bound) — it never binds at the shipped 2.2 px sigma.
+ * Cap on the total vertical blend band in SCREEN (CSS) pixels (barcode fix
+ * wave 2, 2026-09-14). The triple spans ±dy rows → `2·dy / rowsPerPixel`
+ * screen px; the pixel-denominated dy already bounds that at `2·sigma_px` =
+ * 4.4 px. The cap is the guard for a future sigma raise (and documents the
+ * ≤10 px acceptance bound) — it never binds at the shipped 2.2 px sigma.
  */
 export const SMOOTH_ROW_BAND_MAX_PX = 10;
 
@@ -511,8 +523,8 @@ export const SMOOTH_ROW_BAND_MAX_PX = 10;
  * Bookmap look).
  *
  * dy is PIXEL-denominated and ACTIVE at every zoom: `dy = sigma_px ·
- * rowsPerPixel` makes ±dy a constant ~{@link SMOOTH_ROW_SIGMA_PX} screen px
- * worth of rows (a level spreads over ~2·sigma_px px, edge 10–90 ≈ 4 px —
+ * rowsPerPixel · dpr` makes ±dy a constant ~{@link SMOOTH_ROW_SIGMA_PX} CSS
+ * px worth of rows (a level spreads over ~2·sigma_px px, edge 10–90 ≈ 4 px —
  * soft, never a hairline, under the mush bar). The old `rpp >= 2 → 0` cutoff
  * made the mechanism inert EXACTLY at the default (rpp ≈ 3) — the field
  * stayed a barcode; the cutoff is gone. The only 0 endpoint left is
@@ -521,6 +533,11 @@ export const SMOOTH_ROW_BAND_MAX_PX = 10;
  * field (`fieldAt`) and the deep-row mip fetch (`rowMipSoft`, converted to
  * 4-row texel units by the draw's `* 0.25`), so the default view — which
  * rides the row-mip path — is softened too.
+ *
+ * `rowsPerPixel` is in SCREEN = CSS pixels (the caller scales the
+ * framebuffer footprint by the device-pixel ratio, see {@link SMOOTH_SIGMA_PX}
+ * / F14 §L2), so at DPR2 the kernel covers twice the ROWS for the same CSS
+ * framing and the band measures the same CSS px. DPR1 is byte-identical.
  */
 export function rowSmoothDyFor(rowsPerPixel: number): number {
   if (!Number.isFinite(rowsPerPixel) || rowsPerPixel <= 0) return 0;
@@ -647,7 +664,7 @@ export function rowMipSoftenFor(rowsPerPixel: number): number {
   return rowsPerPixel >= ROW_MIP_EDGE ? SMOOTH_ROW_MIP_DY : 0;
 }
 
-/** Deep-row Gaussian target in SCREEN pixels (barcode fix, 2026-09-13). */
+/** Deep-row Gaussian target in SCREEN (CSS) pixels (barcode fix, 2026-09-13). */
 export const SMOOTH_ROW_MIP_SIGMA_PX = 2.0;
 /** Deep-row Gaussian tap count (offsets -3..3 in 4-row mip texels). */
 export const SMOOTH_ROW_MIP_TAPS = 7;
@@ -655,13 +672,19 @@ export const SMOOTH_ROW_MIP_TAPS = 7;
 /**
  * The deep-row Gaussian weights for a draw — the vertical counterpart of
  * {@link smoothPlanFor}'s column kernel. Taps sit on integer 4-row mip texels
- * (offset -3..3); the Gaussian sigma is pinned in SCREEN pixels and converted
- * to texel units by 4/rowsPerPixel (one mip texel = 4 rows), clamped to
- * [0.4, 2.5] texels so the kernel stays inside the 7-tap support at both ends
- * of the regime. Normalized to sum 1 (edge taps clamp to the grid edge in the
- * shader). At the rpp ~3.05 default zoom sigma ≈ 1.2 texels → a ~5 px soft
- * band with a smooth falloff (the shader reconstructs between texels
- * bilinearly), replacing the hard 1-px hairline the owner reported.
+ * (offset -3..3); the Gaussian sigma is pinned in SCREEN (CSS) pixels and
+ * converted to texel units by `SMOOTH_ROW_MIP_SIGMA_PX · rpp / 4` (one mip
+ * texel = 4 rows), clamped to [0.4, 2.5] texels so the kernel stays inside the
+ * 7-tap support at both ends of the regime. Normalized to sum 1 (edge taps
+ * clamp to the grid edge in the shader). At the rpp ~3.05 default zoom sigma ≈
+ * 1.2 texels → a ~5 px soft band with a smooth falloff (the shader
+ * reconstructs between texels bilinearly), replacing the hard 1-px hairline
+ * the owner reported.
+ *
+ * `rowsPerPixel` is in SCREEN = CSS pixels (same convention as
+ * {@link rowSmoothDyFor}); the caller scales the framebuffer footprint by the
+ * device-pixel ratio (F14 §L2), so the same CSS framing gets the same texel
+ * sigma at every DPR. DPR1 is byte-identical.
  */
 export function rowMipWeightsFor(rowsPerPixel: number): Float32Array {
   const w = new Float32Array(SMOOTH_ROW_MIP_TAPS);
@@ -677,6 +700,22 @@ export function rowMipWeightsFor(rowsPerPixel: number): Float32Array {
   }
   for (let i = 0; i < w.length; i++) w[i] /= sum;
   return w;
+}
+
+/**
+ * Device-pixel ratio the softness/selection footprints are denominated against
+ * (F14 §L2 handoff, wave 4 / F20). The renderer sizes the drawing buffer as
+ * `round(cssWidth · window.devicePixelRatio)` (renderer.ts `resize()` — the
+ * same source as the overlay gutters' `ctx.dpr`), so this is the exact ratio
+ * between the framebuffer and CSS spaces the view math divides by. The draw
+ * multiplies the framebuffer footprints (`rowsPerPixel`, `colsPerPixel`) by
+ * this ratio before any law or LOD selection runs. A missing/poisoned value
+ * degrades to 1 (DPR1, the calibrated and byte-pinned state).
+ */
+function drawingDpr(): number {
+  if (typeof window === 'undefined') return 1;
+  const ratio = window.devicePixelRatio;
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
 }
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -1112,11 +1151,25 @@ export class Heatmap {
     const maxLevel = mips ? mips.maxLevel : 0;
     const rowsPerPixel = view.rowScale / Math.max(1, gl.drawingBufferHeight);
     const colsPerPixel = view.colScale / Math.max(1, gl.drawingBufferWidth);
-    const sel = selectLevel(rowsPerPixel, maxLevel, colsPerPixel, this.levelFloor);
+    // CSS-px denomination (F14 §L2, wave 4 / F20): every softness kernel AND
+    // the row-axis LOD regime below is defined in SCREEN = CSS pixels. The
+    // framebuffer footprints are scaled by the device-pixel ratio here (the
+    // CPU scale factor) so a retina panel renders the SAME CSS softness as
+    // DPR1 — without this, DPR2 halved both footprints: the column Gaussian
+    // fell to the 1-tap tier and rpp 1.525 disabled the row-mip regime, so the
+    // default view painted a 96–98% sub-3-px-px barcode (measured, F20).
+    // DPR1 reads exactly 1 — the calibrated output is byte-identical — and the
+    // SELECTION inputs (selectLevel/levelBlendFor/effectiveRowMode) now ride
+    // the same CSS quantities, so the same CSS view picks the same level and
+    // row regime at every DPR.
+    const dpr = drawingDpr();
+    const rppCss = rowsPerPixel * dpr;
+    const cppCss = colsPerPixel * dpr;
+    const sel = selectLevel(rppCss, maxLevel, cppCss, this.levelFloor);
     // Row-mip cross-fade (lane P; see rowFadeFor/effectiveRowMode). The hard
     // row-mip threshold pops while zooming; instead the row-mip blend weight
     // ramps smoothly across the row-mip eligibility regime (sel.rowOnly:
-    // rpp >= 2.5, deep time zoom, no tick-grouping floor), renormalized to 0 at
+    // rpp >= 1.5, deep time zoom, no tick-grouping floor), renormalized to 0 at
     // the regime edge so the switch has no step. Any fade > 0 uploads the
     // row-mip geometry explicitly — level 0 / 4-ROW block, taps = ceil(rpp/4)
     // (the row-mip texel is 4 rows tall) — because the shader's blend branch
@@ -1125,9 +1178,9 @@ export class Heatmap {
     // ramps raw 1-row sample → 4-row sum and both endpoints stay exact. The
     // floor below scales by the same `nRowTaps * blk` row footprint as every
     // other path. Ineligible frames (no usable chain, cpp zoomed out, forced
-    // floor, rpp < 2.5) keep the legacy selection verbatim.
+    // floor, rpp < 1.5) keep the legacy selection verbatim.
     const rowEligible = sel.rowOnly === true && mips !== null && mips.rowUsable;
-    const rowFade = effectiveRowMode(rowsPerPixel, rowEligible).rowFade;
+    const rowFade = effectiveRowMode(rppCss, rowEligible).rowFade;
     // SUM-mip level cross-fade (wave P2; see levelBlendFor). The hard 4^k LOD
     // switch is a measured brightness pop; outside a transition band the blend
     // is pure: `fade <= 0` uploads sel verbatim, `fade === 1` uploads the
@@ -1145,9 +1198,9 @@ export class Heatmap {
     if (rowFade > 0) {
       level = 0;
       blk = 4;
-      nRowTaps = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / 4)));
+      nRowTaps = Math.max(1, Math.min(4, Math.ceil(rppCss / 4)));
     } else {
-      const fp = Math.max(rowsPerPixel, colsPerPixel);
+      const fp = Math.max(rppCss, cppCss);
       const blend = levelBlendFor(fp, maxLevel, this.levelFloor);
       if (blend.fade <= 0) {
         level = sel.level;
@@ -1156,9 +1209,9 @@ export class Heatmap {
       } else {
         level = blend.level;
         blk = 4 ** level;
-        nRowTaps = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / blk)));
+        nRowTaps = Math.max(1, Math.min(4, Math.ceil(rppCss / blk)));
         levelFade = blend.fade;
-        nRowTapsFine = Math.max(1, Math.min(4, Math.ceil(rowsPerPixel / (blk / 4))));
+        nRowTapsFine = Math.max(1, Math.min(4, Math.ceil(rppCss / (blk / 4))));
         finerLevel = blend.finerLevel;
       }
     }
@@ -1174,22 +1227,25 @@ export class Heatmap {
     // kernel on the TIME axis, per-draw constants (sigma/weights computed here,
     // no per-fragment exp). The plan covers the whole zoom range coherently —
     // no recompile, no crisp/blur handoff.
-    const plan = smoothPlanFor(colsPerPixel);
+    const plan = smoothPlanFor(cppCss);
     const taps = gaussianTaps(plan.sigmaCols, plan.taps);
     // Vertical softening (barcode fix; wave 2: pixel-denominated, active at
-    // every zoom) — see rowSmoothDyFor. 0 only for a poisoned view; the shader
-    // now applies this triple in BOTH the level-0 field and the deep-row mip
-    // fetch (the latter via u_rowSmoothDy * 0.25), so the DEFAULT view — which
-    // rides the row-mip path — is softened too.
-    const rowDy = rowSmoothDyFor(rowsPerPixel);
+    // every zoom; F14 §L2: CSS-denominated via `rppCss`) — see rowSmoothDyFor.
+    // 0 only for a poisoned view; the shader now applies this triple in BOTH
+    // the level-0 field and the deep-row mip fetch (the latter via
+    // `u_rowSmoothDy * 0.25`), so the DEFAULT view — which rides the row-mip
+    // path — is softened too.
+    const rowDy = rowSmoothDyFor(rppCss);
     // Deep-row softening (barcode fix): 1 inside the row-mip regime so the
     // 4-row texel fetch gains the vertical Gaussian (see rowMipWeightsFor /
     // rowMipSoftenFor) wrapped in the rowSmoothDyFor triple. Only the row-mip
     // branches read it; 0 keeps their exact historical single-fetch output.
-    const rowMipSoften = rowMipSoftenFor(rowsPerPixel);
-    const rowMipWeights = rowMipWeightsFor(rowsPerPixel);
-    const rowMipSigma = rowMipSoften > 0 ? SMOOTH_ROW_MIP_SIGMA_PX * rowsPerPixel / 4 : 0;
+    const rowMipSoften = rowMipSoftenFor(rppCss);
+    const rowMipWeights = rowMipWeightsFor(rppCss);
+    const rowMipSigma = rowMipSoften > 0 ? (SMOOTH_ROW_MIP_SIGMA_PX * rppCss) / 4 : 0;
     this.lastSample = {
+      // Framebuffer-denominated, as every pre-F14 caller reported it; the
+      // CSS-side footprint is `colsPerPixel · dpr` (see drawingDpr).
       colsPerPixel,
       smoothSigma: plan.sigmaCols,
       smoothTaps: plan.taps,

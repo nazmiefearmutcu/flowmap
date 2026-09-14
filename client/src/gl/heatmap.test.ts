@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_CONTRAST,
@@ -644,6 +644,126 @@ describe('rowMipSoftenFor — deep-row (row-mip) softening gate (2026-09-13)', (
       const f = rowMipWeightsFor(v);
       expect(Array.from(f).some((x) => Number.isNaN(x))).toBe(false);
       expect(Array.from(f).reduce((a, b) => a + b, 0)).toBeCloseTo(1, 6);
+    }
+  });
+});
+
+describe('F14 §L2 — DPR softness portability (wave 4 / F20)', () => {
+  function makeHeatmap(): { heatmap: Heatmap; gl: FakeGL } {
+    const gl = makeFakeGL({ colorBufferFloat: true });
+    const ctx: GLContext = {
+      gl,
+      caps: {
+        maxTextureImageUnits: 16,
+        maxArrayTextureLayers: 2048,
+        maxTextureSize: 8192,
+        colorBufferFloat: true,
+      },
+    };
+    const ring = new TileRing(gl, 16, 1);
+    const heatmap = new Heatmap(ctx, ring, gl.createTexture()!);
+    // A usable mip chain: the row-mip regime (and its cross-fade weight) only
+    // engages when a row-mip texture exists — the default live view rides it.
+    heatmap.mips = new MipChain(ctx, COLS_PER_TILE, 16, 1);
+    return { heatmap, gl };
+  }
+  const lastFloat = (g: FakeGL, name: string): number | undefined => {
+    const calls = g
+      .callsOf('uniform1f')
+      .filter((c) => (c.args[0] as { uniform?: string } | null)?.uniform === name);
+    return calls.length > 0 ? (calls[calls.length - 1].args[1] as number) : undefined;
+  };
+  const lastInt = (g: FakeGL, name: string): number | undefined => {
+    const calls = g
+      .callsOf('uniform1i')
+      .filter((c) => (c.args[0] as { uniform?: string } | null)?.uniform === name);
+    return calls.length > 0 ? (calls[calls.length - 1].args[1] as number) : undefined;
+  };
+  /** One JSON-comparable snapshot of every draw-side softness/selection value. */
+  function drawDigest(heatmap: Heatmap, gl: FakeGL): Record<string, number | undefined> {
+    const info = heatmap.sampleInfo();
+    return {
+      smoothSigma: info.smoothSigma,
+      smoothTaps: info.smoothTaps,
+      rowDy: info.rowDy,
+      rowMipSoften: info.rowMipSoften,
+      rowMipSigma: info.rowMipSigma,
+      rowFade: info.rowFade,
+      levelFade: info.levelFade,
+      finerLevel: info.finerLevel,
+      u_level: lastInt(gl, 'u_level'),
+      u_blk: lastInt(gl, 'u_blk'),
+      u_nRowTaps: lastInt(gl, 'u_nRowTaps'),
+      u_rowOnly: lastInt(gl, 'u_rowOnly'),
+      u_rowSmoothDy: lastFloat(gl, 'u_rowSmoothDy'),
+      u_rowMipSoften: lastFloat(gl, 'u_rowMipSoften'),
+      u_rowFade: lastFloat(gl, 'u_rowFade'),
+    };
+  }
+
+  it('draw(): a DPR2 framebuffer with the same CSS framing paints the DPR1 plan', () => {
+    // FakeGL drawingBuffer is 320x240. The DPR2 page that renders the SAME CSS
+    // view has a framebuffer twice as dense, i.e. the same data view spans half
+    // the cpp/rpp: colScale 0.125·320 with dpr 2 == 0.25·320 at dpr 1;
+    // rowsPerPixel 3.05/2 with dpr 2 == 3.05 at dpr 1.
+    const dpr2 = makeHeatmap();
+    try {
+      vi.spyOn(window, 'devicePixelRatio', 'get').mockReturnValue(2);
+      dpr2.heatmap.draw({
+        colOffset: 0,
+        colScale: 0.125 * 320,
+        rowOffset: 0,
+        rowScale: (3.05 / 2) * 240,
+      });
+    } finally {
+      vi.restoreAllMocks();
+    }
+    const dpr1 = makeHeatmap();
+    dpr1.heatmap.draw({ colOffset: 0, colScale: 0.25 * 320, rowOffset: 0, rowScale: 3.05 * 240 });
+    // Byte-level identical selection + softness across the two DPRs.
+    expect(drawDigest(dpr2.heatmap, dpr2.gl)).toEqual(drawDigest(dpr1.heatmap, dpr1.gl));
+    // And it is the calibrated DPR1 values (CSS law, not the retina halving):
+    // sigma = 2.5 · 0.25 CSS cpp → 3-tap tier; the row regime engages
+    // (rowFade 1, row-mip soften 1, dy = 2.2 · 3.05 rows).
+    expect(dpr2.heatmap.sampleInfo().smoothSigma).toBeCloseTo(0.625, 12);
+    expect(lastInt(dpr2.gl, 'u_smoothTaps')).toBe(3);
+    expect(lastFloat(dpr2.gl, 'u_rowSmoothDy')).toBeCloseTo(2.2 * 3.05, 9);
+    expect(lastInt(dpr2.gl, 'u_rowOnly')).toBe(1);
+    expect(lastFloat(dpr2.gl, 'u_rowFade')).toBeCloseTo(1, 9);
+  });
+
+  it('draw(): the row-mip regime is CSS-denominated (DPR2 keeps the default view off the sparse triple)', () => {
+    // rpp_css 2.0 at DPR2 => the framebuffer footprint is 1.0 — with a
+    // device-denominated edge (ROW_MIP_EDGE 1.5) the row path would NOT engage
+    // and the level-0 sparse triple (~1 px hairlines) would paint. CSS-px
+    // eligibility keeps DPR1's row-mip path: rowFade 0.5, soften 1, taps 1.
+    const { heatmap, gl } = makeHeatmap();
+    try {
+      vi.spyOn(window, 'devicePixelRatio', 'get').mockReturnValue(2);
+      heatmap.draw({ colOffset: 0, colScale: 0.125 * 320, rowOffset: 0, rowScale: (2 / 2) * 240 });
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(lastInt(gl, 'u_rowOnly')).toBe(1);
+    expect(lastFloat(gl, 'u_rowFade')).toBeCloseTo(0.5, 9);
+    expect(lastFloat(gl, 'u_rowMipSoften')).toBe(SMOOTH_ROW_MIP_DY);
+    expect(lastInt(gl, 'u_nRowTaps')).toBe(1); // ceil(2.0 / 4)
+    expect(heatmap.sampleInfo().rowDy).toBeCloseTo(2.2 * 2.0, 9);
+  });
+
+  it('draw(): a poisoned devicePixelRatio degrades to the DPR1 output', () => {
+    const view = { colOffset: 0, colScale: 0.25 * 320, rowOffset: 0, rowScale: 3.05 * 240 };
+    const clean = makeHeatmap();
+    clean.heatmap.draw(view);
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { heatmap, gl } = makeHeatmap();
+      try {
+        vi.spyOn(window, 'devicePixelRatio', 'get').mockReturnValue(bad);
+        heatmap.draw(view);
+      } finally {
+        vi.restoreAllMocks();
+      }
+      expect(drawDigest(heatmap, gl), `dpr ${bad}`).toEqual(drawDigest(clean.heatmap, clean.gl));
     }
   });
 });

@@ -87,6 +87,13 @@ class ReplayFeed:
         # Honesty: the descriptor states exactly what a replay subscribe
         # delivers — real recorded depth/tape, synthesized side.
         self.capability = {"depth": "L2", "tape": "tick", "trade_side": "exchange", "replay": True}
+        # A replay session's grid is VIRGIN (the recording is re-integrated
+        # through the session grid, never preloaded), so a crypto replay may
+        # adopt the price-adaptive tick at its first synthesized book — a DOGE
+        # replay must not inherit the fixed $0.50 collapse. Sim replays keep
+        # their fixed shape (mid ~100 is exactly what the fallback was built
+        # for); equity replays never reach the crypto grid path.
+        self.price_adaptive_tick = market != "sim"
 
         self._cols = sorted(tail.columns, key=lambda c: c.col_seq)
         self._t0s = [c.t0_ns for c in self._cols]

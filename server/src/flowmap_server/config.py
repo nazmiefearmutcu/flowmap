@@ -129,11 +129,13 @@ class Config(msgspec.Struct, frozen=True):
     # resting size.
     book_top_n: int = 20_000
     # Crypto grid tick override (0 = auto). The default crypto grid tick is the
-    # sim-shaped 0.5, which a re-anchor scales via tick_multiple — correct for
-    # majors, but a sub-cent coin collapses into 1-2 rows. A feed that knows
-    # its venue tick may declare ``preferred_tick``; this env knob
-    # (FLOWMAP_CRYPTO_TICK) overrides both for the whole server when neither
-    # path can answer.
+    # sim-shaped 0.5 — correct for majors, but a sub-cent coin collapses into
+    # 1-2 rows. A feed that knows its venue tick may declare ``preferred_tick``;
+    # this env knob (FLOWMAP_CRYPTO_TICK) overrides both for the whole server
+    # when neither path can answer. With no override and no declaration, a
+    # feed opting into ``price_adaptive_tick`` (CryptoFeed) gets a tick scaled
+    # to the instrument's price magnitude at the first real mid — see
+    # core.grid.adaptive_tick_for (BTC/ETH keep 0.5; DOGE/PEPE get 1e-6-class).
     crypto_tick: float = 0.0
     # Time-based recording flush cadence in seconds (FLOWMAP_FLUSH_INTERVAL_S,
     # default 10): in addition to the REC_FLUSH_COLS column-count cadence, a

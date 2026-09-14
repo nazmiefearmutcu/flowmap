@@ -127,13 +127,17 @@ def _csv_lines(
     cfg = grid.cfg
     rows = cfg.rows
     scale = grid.scale
+    # The ACTIVE epoch's tick, not cfg.tick: a price-adaptive crypto grid
+    # installs a scaled tick (e.g. 1e-6 for DOGE) at its first real mid, and
+    # the exported metadata must describe the rows the scale actually maps.
+    tick = grid.current_epoch_params().tick
     price_lo = row_to_price(scale, 0.0)
     price_hi = row_to_price(scale, float(rows))
     # The comment line must stay ONE line and header-safe: the symbol is raw
     # Subscribe text, so project it (see _safe_export_name).
     yield (
         f"# symbol={_safe_export_name(symbol)} market={_safe_export_name(market)} "
-        f"tick={cfg.tick} "
+        f"tick={tick} "
         f"dt_ns={cfg.dt_ns} rows={rows} columns={len(cols)}\n"
     )
     names = ",".join(f"b{i},a{i}" for i in range(rows))
@@ -156,7 +160,7 @@ def _json_chunks(
     """JSON body as stream chunks: ``{"symbol","tick","columns":[...]}``."""
     yield (
         '{"symbol":' + json.dumps(symbol)
-        + ',"tick":' + json.dumps(grid.cfg.tick)
+        + ',"tick":' + json.dumps(grid.current_epoch_params().tick)
         + ',"columns":['
     )
     for i, c in enumerate(cols):

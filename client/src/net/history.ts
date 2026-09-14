@@ -53,6 +53,13 @@ export const HISTORY_PAGE_COLS = 256;
 /** Keep the visible span resident: never fetch so many that the just-viewed
  *  columns get evicted in the same slide. Leave this much headroom. */
 const RESIDENT_HEADROOM_COLS = 32;
+/** Slack columns fetched below a repaired skip band so the page is aligned to
+ *  the server's `before_t` shape (the band's own columns are the newest of the
+ *  page; the slack guards the first page's boundary). */
+const BAND_REFETCH_SLACK = 8;
+/** Max pages one band refetch may consume (band ≤ GAP_ZERO_MAX_COLS = 512 →
+ *  2 pages of 256 + one guard page; bounds a hostile/huge request). */
+const BAND_REFETCH_MAX_PAGES = 3;
 
 export interface HistoryLoaderDeps {
   /** Request a page of history (the store's `requestHistory`). */
@@ -96,6 +103,12 @@ export class HistoryLoader {
   private oldestAvailableT0 = 0n;
   /** Recently emitted synthetic seam t0s (bounded) — suppresses repeats. */
   private readonly recentSeams: bigint[] = [];
+  /** Single-flight guard for {@link refetchBand} (the repaired-skip heal). */
+  private bandInFlight = false;
+  /** Coalesced band waiting behind an in-flight refetch (merged by min/max —
+   *  adjacent bands sharing the later anchor are harmless: already-resident
+   *  columns splice idempotently). */
+  private pendingBand: { lo: number; hi: number; anchorT0: bigint } | null = null;
 
   constructor(deps: HistoryLoaderDeps) {
     this.deps = deps;
@@ -244,6 +257,82 @@ export class HistoryLoader {
       // retries. Just clear in-flight so the next frame can re-issue.
     } finally {
       this.inFlightBeforeT = null;
+    }
+  }
+
+  // --- repaired-skip band refetch (F24) ---------------------------------------
+
+  /**
+   * Refetch a REPAIRED forward-skip band `[lo, hi]` and splice the REAL columns
+   * over the zeroed slots.
+   *
+   * The renderer's forward-skip repair (see gl/renderer `GAP_ZERO_MAX_COLS`)
+   * zeroes the dropped band so the pre-gap history keeps painting — but a
+   * server `tx_lag` drop only evicts the CLIENT'S QUEUE: the columns themselves
+   * stay in the session's grid ring and `history(before_t)` still serves them
+   * (measured: `inBandN` 2–89 on a live stack). Without this refetch the band
+   * stays an honest-but-permanent dark scar (up to 512 columns wide), which is
+   * the visible "heatmap bir anda yok oluyor" residue on a stalled/frozen tab.
+   *
+   * `anchorT0` is the t0 of the FIRST column AFTER the band (the live column
+   * whose arrival exposed the skip). The server's `history(before_t, n)` is
+   * EXCLUSIVE, so `before_t = anchorT0` returns the band as the newest columns
+   * of the page; each page is filtered to `[lo, need]` before splicing (older
+   * members of the page are already resident / not ours to write here).
+   *
+   * Bounded and guarded: single-flight (an arriving band coalesces into one
+   * pending slot), at most {@link BAND_REFETCH_MAX_PAGES} pages, and any
+   * failure (timeout, disconnect, grid moved on) leaves the zeroes in place —
+   * the repair's honest fallback. Splices are idempotent by absolute col_seq,
+   * so an overlap with already-resident columns is harmless.
+   */
+  refetchBand(lo: number, hi: number, anchorT0: bigint): void {
+    if (hi < lo) return;
+    if (this.bandInFlight) {
+      const p = this.pendingBand;
+      this.pendingBand =
+        p === null ? { lo, hi, anchorT0 } : { lo: Math.min(p.lo, lo), hi: Math.max(p.hi, hi), anchorT0 };
+      return;
+    }
+    void this.runBandRefetch(lo, hi, anchorT0);
+  }
+
+  private async runBandRefetch(lo: number, hi: number, anchorT0: bigint): Promise<void> {
+    this.bandInFlight = true;
+    try {
+      let need = hi;
+      let beforeT = anchorT0;
+      let lastResp: HistoryResponse | null = null;
+      for (let page = 0; page < BAND_REFETCH_MAX_PAGES && need >= lo; page++) {
+        const want = need - lo + 1;
+        const n = Math.min(HISTORY_PAGE_COLS, want + BAND_REFETCH_SLACK);
+        const resp = await this.deps.requestHistory(beforeT, n);
+        const cols = resp.depth_cols
+          .filter((c) => c.col_seq >= lo && c.col_seq <= need)
+          .sort((a, b) => a.col_seq - b.col_seq);
+        if (cols.length === 0) break; // the server does not hold the band — keep zeroes
+        for (const col of cols) {
+          this.noteColumn(col.col_seq, col.t0_ns);
+          this.deps.spliceColumn(col);
+        }
+        lastResp = resp;
+        // The next page must be strictly older than everything this page held.
+        let oldestT = cols[0].t0_ns;
+        for (const c of resp.depth_cols) if (c.t0_ns < oldestT) oldestT = c.t0_ns;
+        beforeT = oldestT;
+        need = cols[0].col_seq - 1;
+        if (resp.depth_cols.length < n) break; // server exhausted
+      }
+      if (lastResp !== null) this.deps.onSpliced?.(lastResp);
+    } catch (err) {
+      // Transient failure: the zeroed band stays the honest fallback; do not
+      // latch anything — the next skip gets its own attempt.
+      this.lastError = err instanceof Error ? err.message : String(err);
+    } finally {
+      this.bandInFlight = false;
+      const p = this.pendingBand;
+      this.pendingBand = null;
+      if (p !== null) void this.runBandRefetch(p.lo, p.hi, p.anchorT0);
     }
   }
 

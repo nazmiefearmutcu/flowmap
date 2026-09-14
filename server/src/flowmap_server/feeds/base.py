@@ -146,6 +146,14 @@ class Feed(Protocol):
     ``preferred_tick: float`` — the venue's price tick for its own symbols.
     The crypto grid honors it when present and finite (see
     ``core.session._crypto_tick_for``); absent means "no opinion".
+
+    A feed whose symbols can be priced far below the fixed crypto fallback
+    tick MAY additionally declare ``price_adaptive_tick: bool = True``: when
+    NEITHER an explicit FLOWMAP_CRYPTO_TICK nor a ``preferred_tick`` answers,
+    the grid then scales the tick to the instrument's price magnitude at the
+    first real mid (``core.grid.adaptive_tick_for``) so sub-dollar symbols get
+    a sane frame and a resolvable book. BTC/ETH keep the fallback (it is
+    already fine for their price). Absent/False means "never".
     """
 
     market: str

@@ -58,35 +58,49 @@ layout(location=0) in vec2 a_pos;    // clip space, y-up
 layout(location=1) in float a_size;  // device px diameter
 layout(location=2) in vec4 a_color;
 out vec4 v_color;
+out float v_size;                    // device px diameter (gloss gating)
 void main() {
   v_color = a_color;
+  v_size = a_size;
   gl_PointSize = a_size;
   gl_Position = vec4(a_pos, 0.0, 1.0);
 }`;
 
-// Round mask + a soft 1px edge so bubbles read as dots, not squares, plus a
-// slightly darker outer rim (Bookmap-style). fwidth(r) is ~one fragment wide in
-// r-space at the rim (~1-2 px), so the existing POINTS pass carries the ring
-// with no second draw call and no extra attributes.
+// Bookmap-style glossy sphere in ONE POINTS pass: round mask + soft AA edge
+// (dots, not squares), a soft spherical fill (bright core → translucent edge),
+// a darker outer rim, and a top-left specular glint on dots big enough to read
+// as spheres. fwidth() is ~one fragment wide at the rim, so all shading stays
+// inside the existing pass — no second draw call, no extra attributes beyond
+// the size varying the vertex stage already knows.
 const POINT_FRAG = `#version 300 es
 precision highp float;
 in vec4 v_color;
+in float v_size;
 out vec4 o_color;
-const float RIM_DARKEN = 0.32;
+const float RIM_DARKEN = 0.34;
 void main() {
   vec2 d = gl_PointCoord * 2.0 - 1.0;
-  float r = dot(d, d);
+  float r = sqrt(dot(d, d));
   if (r > 1.0) discard;
-  float edge = smoothstep(1.0, 1.0 - fwidth(r) * 2.0, r);
+  float fw = fwidth(r);
+  float edge = smoothstep(1.0, 1.0 - fw * 1.6, r);
+  // Soft spherical fill: brightest at the core, dimmer toward the translucent
+  // edge. Keeps the palette hue; the alpha falloff does the sphere read.
+  float fill = mix(0.62, 1.0, smoothstep(1.0, 0.25, r));
+  float a = v_color.a * edge * fill;
   // Darker rim: a ~1-2 px band ENDING where the soft AA fade starts, so the
   // shading lands on visible pixels (peaking at the half-alpha edge) instead of
   // hiding inside the fade. Fractions clamp so tiny dots stay mostly solid.
-  float fw = fwidth(r);
   float rim = smoothstep(max(1.0 - 3.5 * fw, 0.55), max(1.0 - 0.75 * fw, 0.80), r);
-  float a = v_color.a * edge;
-  // Premultiplied output (see SolidBatch's fragment shader); the outer rim is
-  // darkened afterwards — still premultiplied (rgb ≤ a).
+  // Top-left gloss (gl_PointCoord y is down → negative y is up). Gated to dots
+  // ≥ ~10 px so the 6 px floor dots stay flat specks instead of noisy blobs.
+  vec2 hl = vec2(-0.34, -0.36);
+  float spec = smoothstep(0.40, 0.06, length(d - hl)) * smoothstep(7.0, 12.0, v_size);
+  // Premultiplied output (see SolidBatch's fragment shader); the glint mixes
+  // toward premultiplied white (≤ a) and the outer rim is darkened afterwards —
+  // still premultiplied (rgb ≤ a).
   o_color = vec4(v_color.rgb * a, a);
+  o_color.rgb = mix(o_color.rgb, vec3(a), 0.55 * spec);
   o_color.rgb *= (1.0 - RIM_DARKEN * rim);
 }`;
 

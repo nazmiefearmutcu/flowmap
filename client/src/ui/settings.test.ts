@@ -205,12 +205,14 @@ describe('normalizeSettings', () => {
     expect(n.follow).toBe(false);
     expect(n.railVisible).toBe(false);
     // Legacy overlay keys are preserved verbatim; overlay keys added in this
-    // release (price, cvd) adopt their defaults — the generic key-iteration in
-    // normalizeSettings is exactly what makes new overlays migration-free.
+    // release (price, cvd, volume) adopt their defaults — the generic
+    // key-iteration in normalizeSettings is exactly what makes new overlays
+    // migration-free.
     expect(n.overlays).toEqual({
       ...legacy.overlays,
       price: DEFAULT_SETTINGS.overlays.price,
       cvd: DEFAULT_SETTINGS.overlays.cvd,
+      volume: DEFAULT_SETTINGS.overlays.volume,
     });
     // New fields adopt defaults (colormap deliberately does NOT keep 'thermal':
     // the v1→v2 chart-harmony migration forces 'theme').

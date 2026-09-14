@@ -30,7 +30,11 @@ Conversion rules (mirrors :meth:`Grid.preload`'s contract):
   forced strictly increasing;
 - a single synthetic epoch 0 whose ``p0`` is centered on the last candle's
   close (so live data continues in the SAME epoch with no spurious re-anchor),
-  with ``tick``/``tick_multiple``/``dt_ns``/``rows`` equal to the grid cfg;
+  with ``tick_multiple``/``dt_ns``/``rows`` equal to the grid cfg and the tick
+  equal to ``cfg.tick`` — or, on an auto_tick grid, the price-proportional
+  tick ``adaptive_tick_for(close, cfg.tick)`` the live first mid will adopt
+  (so a DOGE-class symbol's reconstructed history is binned in the same sane
+  frame as its live columns);
 - each candle's volume spread across its ``[low, high]`` row band and split at
   the candle close into the bid channel (``price <= close``) and the ask
   channel (``price > close``) — a two-sided volume-at-price profile. The band
@@ -63,7 +67,7 @@ from collections.abc import Awaitable, Callable, Sequence
 import msgspec
 import numpy as np
 
-from flowmap_server.core.grid import FinalizedColumn, GridCfg
+from flowmap_server.core.grid import FinalizedColumn, GridCfg, adaptive_tick_for
 from flowmap_server.proto.events import BarColumn, EpochParams
 
 __all__ = ["Candle", "BackfillFn", "columns_from_candles", "default_backfill_fn"]
@@ -228,6 +232,14 @@ def columns_from_candles(
     ref = float(clean[-1].c)
     if not (ref > 0.0):
         return None
+    # The tick is resolved AFTER the reference close so an auto_tick grid
+    # (crypto feeds serving sub-dollar instruments) can bin the reconstructed
+    # history on the same price-proportional step the live first mid will
+    # install. For every other grid this is cfg.tick verbatim.
+    tick = adaptive_tick_for(ref, cfg.tick) if cfg.auto_tick else cfg.tick
+    step = tick * cfg.tick_multiple
+    if tick <= 0.0 or step <= 0.0:
+        return None
     # Frame centered on the last close, snapped onto the step grid, so live data
     # continues in this epoch without an immediate re-anchor.
     span = rows * step
@@ -352,7 +364,7 @@ def columns_from_candles(
 
     epoch = EpochParams(
         epoch=0,
-        tick=cfg.tick,
+        tick=tick,
         tick_multiple=cfg.tick_multiple,
         dt_ns=dt,
         p0=p0,

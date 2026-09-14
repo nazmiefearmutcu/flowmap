@@ -2485,3 +2485,159 @@ body,
     overscroll-behavior: contain;
   }
 }
+
+/* ============================================================================
+   F23 · PRINT STYLESHEET (QA13 M3, 2026-09-14) — appended after every earlier
+   block on purpose; nothing above is touched.
+
+   Before this block print media changed NOTHING (the stylesheet scan found 0
+   `@media print` / `@page` rules in the app): a midnight sheet printed as a
+   near-black page (measured 2026-09-14, full-viewport mean luma 25.5, 88.9% of
+   pixels below luma 40) — or, with background graphics off, as light ink at
+   ~1.2:1 on white. Interactive chrome printed with it in every theme.
+
+   Three moves, all print-only (screen rendering stays byte-identical):
+
+   1. FORCE THE LIGHT TOKEN SET. The `paper` theme's variables are re-declared
+      on <html> at `:root:root[...]` specificity — beats themes.css and its
+      legacy-ramp override regardless of import order — so the DOM chrome
+      (topbar, panels, legends, gutters) prints dark-on-light in every theme.
+
+   2. INVERT THE DARK CHART. The GL canvas keeps painting its theme ramp (CSS
+      cannot recolor canvas pixels), so everywhere the chart ground is DARK —
+      a dark theme with `colormap: theme`, or a legacy flow/inferno/classic
+      ramp under ANY theme (the `data-chart-ramp` dark-island rule) — the whole
+      canvas stack prints through `invert(1) hue-rotate(180deg)`: the classic
+      light-paper transform. Hue is preserved, lightness flips, so the field
+      prints light with dark liquidity bands and dark price/axis ink instead of
+      burning a black page. HeatLegend's gradient bar and ChartLegend's
+      swatches take the same filter so the key still matches the field it
+      describes (a light swatch on a light plate would be invisible).
+
+   3. STRIP THE CONTROLS. Buttons and inputs never print; transport, drawers,
+      scrims, palettes, onboarding, toasts, HUD and transient banners are
+      display:none. What frames the sheet: topbar (brand / venue / symbol /
+      caps / status / clock), the stage with axes + both legends, the rail
+      panels, and the timeline readout.
+
+   @page margin 10mm = sane paper margins.
+   ========================================================================= */
+
+@page {
+  margin: 10mm;
+}
+
+@media print {
+  /* --- 1) forced light token set — values copied from the `paper` theme ---- */
+  :root:root,
+  :root:root[data-theme],
+  :root:root[data-chart-ramp] {
+    --bg: #f3f1ea;
+    --bg-1: #f9f8f3;
+    --bg-2: #fffdf8;
+    --bg-3: #ece9df;
+    --bg-inset: #ebe8dd;
+    --scrim: rgba(28, 26, 18, 0.45);
+    --line: #d6d0c0;
+    --line-2: #bfb8a4;
+    --line-soft: rgba(214, 208, 192, 0.55);
+    --text: #24272d;
+    --text-2: #57606c;
+    --text-3: #5f6875;
+    --text-4: #8d949e;
+    --text-money: #101318;
+    --accent: #0e7c72;
+    --accent-bright: #0a6158;
+    --accent-dim: #dceeea;
+    --accent-line: #b8ddd7;
+    --accent-glow: rgba(14, 124, 114, 0.35);
+    --sell: #b3383d;
+    --sell-bright: #99272c;
+    --sell-dim: #f4dedd;
+    --sell-line: #e4bcb9;
+    --warn: #87610d;
+    --warn-dim: #f1e7cd;
+    --warn-line: #ddcea0;
+    --replay: var(--warn);
+    --live: var(--accent);
+    --chart-bg: #f3f1ea;
+    --chart-ink: #24272d;
+    --chart-ink-dim: #57606c;
+    --chart-chip-bg: rgba(255, 253, 248, 0.92);
+    --chart-chip-border: #d6d0c0;
+    --chart-accent: #0a6158;
+    --chart-gutter-bg: #ebe8dd;
+    --chart-grid: #5a6472;
+    --chart-axis: #3a414d;
+    --chart-price: #0a6158;
+    --chart-sell: #99272c;
+    --chart-warn: #8a6410;
+    color-scheme: light;
+  }
+
+  /* --- 2) dark-ground charts print through the light-paper transform ------- */
+  :root:root[data-theme='midnight'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-theme='amber'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-theme='sea'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-theme='contrast'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-chart-ramp='flow'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-chart-ramp='inferno'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot),
+  :root:root[data-chart-ramp='classic'] :is(.stage canvas, .heat-legend__bar, .chart-legend__line, .chart-legend__dot) {
+    filter: invert(1) hue-rotate(180deg);
+  }
+
+  /* Keep the legend key actual ink: solid swatches and the ramp gradient are
+     CSS paints the browser may drop in economy ink mode. */
+  .heat-legend__bar,
+  .chart-legend__line,
+  .chart-legend__dot,
+  .venue__dot,
+  .status__dot,
+  .closed-banner__dot {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* --- 3) interactive chrome never prints --------------------------------- */
+  button,
+  input,
+  select,
+  textarea {
+    display: none !important;
+  }
+  .transport,
+  .modeseg,
+  .overlay-toggles,
+  .symsearch__kbd,
+  .export-note,
+  .perfhud,
+  .livectl,
+  .draw-toolbar,
+  .indi-picker,
+  .measure,
+  .crosshair,
+  .alerts-pop,
+  .sympal,
+  .sympal__backdrop,
+  .drawer,
+  .drawer-scrim,
+  .onboard,
+  .onboard__scrim,
+  .keyshelp,
+  .keyshelp__backdrop,
+  .toasts,
+  .reconnect-banner {
+    display: none !important;
+  }
+
+  /* The closed-market banner is status, not chrome — keep it, but as a light
+     amber plate instead of its hardcoded near-black one. */
+  .closed-banner {
+    background: #fdf6e3;
+    border-color: #ddcea0;
+    box-shadow: none;
+  }
+  .closed-banner__dot {
+    box-shadow: none;
+  }
+}

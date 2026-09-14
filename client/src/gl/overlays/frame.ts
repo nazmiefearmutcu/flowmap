@@ -60,6 +60,8 @@ export interface OverlayVisibility {
   price: boolean;
   /** CVD (cumulative volume delta) lower pane. */
   cvd: boolean;
+  /** Traded-volume bars along the chart's bottom edge (Bookmap H7; F26). */
+  volume: boolean;
 }
 
 export const DEFAULT_OVERLAY_VISIBILITY: OverlayVisibility = {
@@ -71,4 +73,7 @@ export const DEFAULT_OVERLAY_VISIBILITY: OverlayVisibility = {
   axes: true,
   price: true,
   cvd: true,
+  // Bookmap shows the volume strip by default; ours is a low, subtle band that
+  // does not fight the heatmap (see F26 report) — and it is one click to hide.
+  volume: true,
 };

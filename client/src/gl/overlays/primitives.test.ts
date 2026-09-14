@@ -46,6 +46,21 @@ describe('SolidBatch blend state (premultiplied over)', () => {
   it('the point fragment shader premultiplies through its softened alpha', () => {
     expect(SOURCE).toMatch(/vec4\(v_color\.rgb \* a,\s*a\)/);
   });
+
+  it('the point program carries the Bookmap sphere shading (soft fill, rim, gated gloss)', () => {
+    // F25: soft spherical fill (core → translucent edge)…
+    expect(SOURCE).toMatch(/float fill = mix\(0\.62, 1\.0/);
+    // …a darker outer rim…
+    expect(SOURCE).toMatch(/RIM_DARKEN/);
+    // …and a top-left specular glint gated to dots ≥ ~10 px via the size varying
+    // (the 6 px floor dots stay flat), all inside the single POINTS pass.
+    expect(SOURCE).toMatch(/out float v_size/);
+    expect(SOURCE).toMatch(/smoothstep\(7\.0, 12\.0, v_size\)/);
+    expect(SOURCE).toMatch(/mix\(o_color\.rgb, vec3\(a\), 0\.55 \* spec\)/);
+    // The glint must stay premultiplied: mixing two premultiplied values with a
+    // scalar keeps rgb ≤ a, and the rim darkens after.
+    expect(SOURCE).toMatch(/o_color\.rgb \*= \(1\.0 - RIM_DARKEN \* rim\)/);
+  });
 });
 
 describe('PointBatch blend state (premultiplied over)', () => {

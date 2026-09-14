@@ -136,7 +136,10 @@ test('§8.3 T9: viewport normalization renormalizes a dim region + crosshair rea
   // The dim region is NOT near-black (a global norm would leave it ≈ 0 thermal)
   // and its contrast is COMPARABLE to the bright region after renormalization.
   expect(dim.thermal, `dim thermal ${dim.thermal} (near-black would be ~0)`).toBeGreaterThan(3000);
-  expect(dim.thermal).toBeGreaterThan(bright.thermal * 0.5);
+  // F10 (2026-09-14) moved the global policy (tol 0, gamma 0.653), which lifts
+  // the bright field far more than the dim one: QA25's same-data A/B measured
+  // dim/bright 0.306 shipped vs 0.808 pre-F10 (normRatio unchanged ~12.3).
+  expect(dim.thermal).toBeGreaterThan(bright.thermal * 0.25);
   expect(dim.thermal).toBeLessThan(bright.thermal * 2);
 
   // --- (b) Crosshair: hover the known wall cell via a CDP mouse move. -----------

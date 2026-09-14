@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
+import { THEMES, type ThemeId } from '../../src/theme/registry';
+
 /**
  * Visual campaign 2026-09-11 (lane L4) — the chart follows the active theme.
  *
@@ -35,6 +37,21 @@ function chartVar(page: Page, name: string): Promise<string> {
 
 function luma(px: Px): number {
   return 0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2];
+}
+
+/**
+ * Min Manhattan distance from a probed dominant canvas colour to the nearest
+ * density stop of the given theme (2026-09-14, QA25 recalibration): the F10
+ * tolerance-0 coverage policy makes the MODAL field colour a ramp stop rather
+ * than the bare background, so the old pins (distance to the chart bg) no
+ * longer describe the shipped render. Bounding the distance to the active
+ * ramp keeps the check honest and policy-robust.
+ */
+function nearestStopDistance(dom: Px, themeId: ThemeId): number {
+  const stops = THEMES[themeId].chart.density.map((s) => s.rgb as Px);
+  return Math.min(
+    ...stops.map((r) => Math.abs(dom[0] - r[0]) + Math.abs(dom[1] - r[1]) + Math.abs(dom[2] - r[2])),
+  );
 }
 
 /** The most common (quantized) color on the GL canvas — the chart ground, which
@@ -161,10 +178,12 @@ test('default midnight + theme colormap keeps the shipped dark chart ground', as
   const dom = await dominantCanvasColor(page);
   if (dom) {
     expect(luma(dom), `dark ground expected, dominant=${dom.join(',')}`).toBeLessThan(70);
+    // F10 policy: the modal colour is the midnight ramp head (~10,25,67), not
+    // the bare bg — pin it to the active ramp instead (QA25, measured dist 7).
     expect(
-      Math.abs(dom[0] - 5) + Math.abs(dom[1] - 8) + Math.abs(dom[2] - 14),
-      `dominant=${dom.join(',')}`,
-    ).toBeLessThanOrEqual(72);
+      nearestStopDistance(dom, 'midnight'),
+      `dominant=${dom.join(',')} nearest midnight stop`,
+    ).toBeLessThanOrEqual(48);
   } else {
     test.info().annotations.push({
       type: 'gated',
@@ -210,10 +229,11 @@ test('paper theme flips the chart ground + ink to the light palette', async ({ p
   expect(mean!, `light canvas expected, mean luma ${mean}`).toBeGreaterThan(90);
   const dom = await dominantCanvasColor(page);
   expect(dom, 'GL canvas probe should be reachable').not.toBeNull();
+  // F10 policy (QA25, measured dist 26): modal colour is a paper ramp stop.
   expect(
-    Math.abs(dom![0] - 243) + Math.abs(dom![1] - 241) + Math.abs(dom![2] - 234),
-    `dominant=${dom!.join(',')}`,
-  ).toBeLessThanOrEqual(70);
+    nearestStopDistance(dom!, 'paper'),
+    `dominant=${dom!.join(',')} nearest paper stop`,
+  ).toBeLessThanOrEqual(48);
 });
 
 test('legacy classic colormap pins the dark chart ground regardless of theme', async ({ page }) => {
