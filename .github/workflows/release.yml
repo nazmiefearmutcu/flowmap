@@ -190,6 +190,23 @@ jobs:
       # --- macOS: the existing all-in-one script (client → pyruntime → tauri →
       #     ditto → ad-hoc codesign → dmg). Arch-aware, so it drives both the
       #     Apple-Silicon and Intel runners. ------------------------------------
+      # The committed DMG artwork carries a version stamp; a release bump that
+      # forgets to re-render it would otherwise fail the whole mac leg. Render
+      # it on the runner (Menlo lives on macOS) whenever the stamp is stale.
+      - name: Refresh DMG artwork when the version stamp is stale
+        if: matrix.kind == 'macos'
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' app/src-tauri/tauri.conf.json | head -1)"
+          STAMP="$(cat app/icons/dmg/RENDERED_VERSION 2>/dev/null || true)"
+          if [ "$STAMP" != "$VERSION" ]; then
+            echo "artwork stamp '$STAMP' != version '$VERSION' — regenerating"
+            python3 -m pip install --quiet --user pillow
+            python3 app/icons/dmg/make-bg.py "$VERSION" --all
+          else
+            echo "artwork stamp current ($STAMP)"
+          fi
+
       - name: Build macOS installer (build-dmg.sh)
         if: matrix.kind == 'macos'
         env:
@@ -337,7 +354,7 @@ jobs:
           while IFS= read -r n; do
             [ -z "$n" ] && continue
             new="$(printf '%s' "$n" | sed -E 's#^(.*/)?FlowMap_[^_]+#\1FlowMap_'"$REL"'#')"
-            mv "$n" "$new"
+            [ "$n" = "$new" ] || mv "$n" "$new"
             RENAMED="${RENAMED}${new}"$'\n'
           done <<< "$FILES"
           echo "$RENAMED"
