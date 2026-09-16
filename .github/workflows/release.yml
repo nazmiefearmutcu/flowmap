@@ -201,7 +201,8 @@ jobs:
           STAMP="$(cat app/icons/dmg/RENDERED_VERSION 2>/dev/null || true)"
           if [ "$STAMP" != "$VERSION" ]; then
             echo "artwork stamp '$STAMP' != version '$VERSION' — regenerating"
-            python3 -m pip install --quiet --user pillow
+            # macOS runners are PEP 668-managed; pillow is a dev-time dep here.
+            python3 -m pip install --quiet --user --break-system-packages pillow
             python3 app/icons/dmg/make-bg.py "$VERSION" --all
           else
             echo "artwork stamp current ($STAMP)"
